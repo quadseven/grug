@@ -28,6 +28,7 @@ import os
 import re
 import threading
 from collections import deque
+from datetime import datetime, timezone
 from dataclasses import replace
 from typing import Any, Literal
 from urllib.parse import quote
@@ -89,7 +90,10 @@ from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_fu
 from personas.code_reviewer.criteria_coverage import (
     LinkedCriterion, scan_criteria_coverage,
 )
-from personas.code_reviewer.lint import scan_ruff
+from personas.code_reviewer.analyzers import (
+    RepoAnalyzerConfig, configured_engines, merge_analyzer_findings,
+    run_analyzers,
+)
 from personas.code_reviewer.suggestion import checked_suggestion
 from markdown_safety import neutralize_mentions
 from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
@@ -129,7 +133,8 @@ from personas.code_reviewer.persona import (
 )
 from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
-from personas.code_reviewer import carry_forward, living_review
+from personas.code_reviewer import carry_forward, hunt_link, living_review
+from personas.hunt_recorder import PrRef, now as hunt_now
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion, gate_sentence, lead_with_degraded_line,
 )
@@ -529,29 +534,83 @@ _CLAIM_HINT_RE = re.compile(
 )
 
 
-def _merge_lint_evidence(evaluation, hunks, file_contents, ruff_policy=None, policy_dropped=None):
-    """Fold deterministic ruff findings into the evaluation (#681, epic #707).
+def _merge_lint_evidence(
+    evaluation, hunks, file_contents, ruff_policy=None, policy_dropped=None,
+    *, semgrepignore=None, skipped=None, engines=None,
+):
+    """Fold the configured OSS analyzers' findings into the evaluation
+    (#681 / #1254, epic #707).
 
-    RECALL work: ruff catches the mechanical class the model skims past, and
-    cannot hallucinate because the findings are measured rather than
+    RECALL work: ruff (Python) and opengrep over grug's own rule pack
+    (JavaScript/TypeScript) catch the mechanical class the model skims past,
+    and cannot hallucinate because the findings are measured rather than
     generated. Merged with the other deterministic sources - i.e. AFTER the
     verification pass and refute gate, both of which exist to police MODEL
-    judgment and should not second-guess a linter.
+    judgment and should not second-guess a linter. An analyzer finding on the
+    same line as one of the model's own findings is folded into it rather
+    than posted twice (`merge_analyzer_findings`).
 
     Extracted rather than inlined so it costs `dispatch_code_review` ONE
-    branch instead of four: that function already measures cyclomatic 61 /
-    cognitive 62 against caps of 15/25, and its decomposition is #725's job,
-    not this slice's. Inert unless GRUG_LINT_EVIDENCE=ruff.
+    branch: that function's decomposition is #725's job, not this slice's.
+    Inert unless GRUG_ELDER_ANALYZERS (or the older GRUG_LINT_EVIDENCE=ruff)
+    names an engine. `skipped`, when given, collects (engine, reason) for the
+    check summary.
     """
+    engines = configured_engines() if engines is None else engines
+    if not engines:
+        return evaluation
     try:
-        lint_findings = scan_ruff(hunks, file_contents or {}, ruff_policy, policy_dropped)
+        run = run_analyzers(
+            hunks, file_contents or {}, engines,
+            RepoAnalyzerConfig(ruff_policy=ruff_policy, semgrepignore=semgrepignore),
+        )
     except Exception:  # noqa: BLE001 - lint evidence must never break a review
         log.warning("code_review_lint_scan_failed", exc_info=True)
         return evaluation
-    if not lint_findings:
+    if policy_dropped is not None and run.policy_dropped:
+        policy_dropped.append(run.policy_dropped)
+    if skipped is not None:
+        skipped.extend(run.skipped)
+    if not run.findings:
         return evaluation
-    log.info("code_review_lint_findings", extra={"count": len(lint_findings)})
-    return with_extra_findings(evaluation, lint_findings)
+    existing, extra = merge_analyzer_findings(evaluation.findings, run.findings)
+    log.info("code_review_lint_findings", extra={
+        "count": len(extra), "folded": len(run.findings) - len(extra),
+        "engines": ",".join(run.ran),
+    })
+    return with_extra_findings(with_findings(evaluation, existing), extra)
+
+
+def _analyzer_skip_note(skipped: list[tuple[str, str]]) -> str:
+    """One summary line naming each analyzer that degraded to a skip."""
+    if not skipped:
+        return ""
+    return "\n\nAnalyzers skipped: " + ", ".join(
+        f"{engine} ({reason})" for engine, reason in skipped
+    ) + ". The review went on without them."
+
+
+_SEMGREPIGNORE_PATH = ".semgrepignore"
+
+
+def _load_repo_semgrepignore(
+    installation_id: int, owner: str, repo_name: str, base_ref: str,
+) -> str | None:
+    """The repo's `.semgrepignore` at the PR base, or None. Read at the BASE
+    so a PR cannot widen its own ignore list to hide its own findings."""
+    if not base_ref:
+        return None
+    try:
+        fetched = with_install_token_retry(
+            installation_id,
+            lambda token: fetch_file_contents(
+                token, owner, repo_name, (_SEMGREPIGNORE_PATH,), base_ref,
+            ),
+        ) or {}
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        log.info("repo_semgrepignore_fetch_failed", extra={"kind": type(exc).__name__})
+        return None
+    return fetched.get(_SEMGREPIGNORE_PATH)
 
 
 def _enrich_claim_check_sources(
@@ -731,6 +790,11 @@ def _coverage_lines(coverage) -> str:
         parts += f"; failed: {', '.join(str(i) for i in ran_and_failed)}"
     if unattempted:
         parts += f"; never attempted: {', '.join(str(i) for i in unattempted)}"
+    # Completed but cut off at the token cap: without this a capped review read
+    # "N/N cohorts completed" and still failed as partial with no cause shown.
+    capped = coverage.capped_cohorts
+    if capped:
+        parts += f"; hit the token cap: {', '.join(str(i) for i in capped)}"
     lines = (
         f"\n\nCoverage: {coverage.completed_cohorts}/{coverage.total_cohorts} "
         f"cohorts completed{parts}."
@@ -2014,6 +2078,10 @@ def build_review_result(
     if evaluation.degraded_reason not in (None, "", *PUBLISHABLE_DEGRADATIONS):
         return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
+    # GitHub inline review comments must anchor to the PR diff. Outside-diff
+    # findings remain visible in the check summary, where their advisory label
+    # and file:line are retained, but are not submitted as invalid inline rows.
+    new_findings = tuple(f for f in new_findings if f.outside_diff_reason is None)
     # Complexity is summary advice by default. An inline thread requires a
     # changed-line suggestion the reviewer can apply in this PR; heavy-lift
     # findings never create reply-required threads.
@@ -2085,6 +2153,32 @@ def _comment_record_origins(
     return finding_origins, review_span_context
 
 
+def _pair_comments(
+    comments: list[dict], findings: tuple[Finding, ...],
+) -> list[tuple[int, Finding]]:
+    """Match each posted inline comment to the Finding that produced it, by
+    (file, RULE) - recovered from the comment's `path` and its hidden
+    `<!-- grug-rule:NAME -->` marker (parsed by `parse_rule`, the same marker
+    `dedup` uses) - never by re-deriving a line number from anything GitHub
+    computes. See `_capture_comment_records` for why, and for the FIFO rule
+    that settles two findings of one rule in one file."""
+    queues: dict[tuple[str, str], deque[Finding]] = {}
+    for f in findings:
+        queues.setdefault((f.file, f.rule_name), deque()).append(f)
+    pairs: list[tuple[int, Finding]] = []
+    for c in comments:
+        cid, path = c.get("id"), c.get("path")
+        if cid is None or path is None:
+            continue
+        rule = parse_rule(c.get("body", ""))
+        if rule is None:
+            continue
+        queue = queues.get((path, rule))
+        if queue:
+            pairs.append((int(cid), queue.popleft()))
+    return pairs
+
+
 def _capture_comment_records(
     comments: list[dict],
     findings: tuple[Finding, ...],
@@ -2128,29 +2222,15 @@ def _capture_comment_records(
     is simply skipped, same as a stale prior-review comment always was.
     Best-effort per comment: a single DDB blip is skipped, never raised.
     Returns count persisted."""
-    queues: dict[tuple[str, str], deque[Finding]] = {}
-    for f in findings:
-        queues.setdefault((f.file, f.rule_name), deque()).append(f)
-
     persisted = 0
-    for c in comments:
-        cid, path = c.get("id"), c.get("path")
-        if cid is None or path is None:
-            continue
-        rule = parse_rule(c.get("body", ""))
-        if rule is None:
-            continue
-        queue = queues.get((path, rule))
-        if not queue:
-            continue
-        finding = queue.popleft()
+    for cid, finding in _pair_comments(comments, findings):
         finding_origins, fallback_span_context = _comment_record_origins(
             finding, review_span_context,
         )
         try:
             put_comment_record(
                 install_id=install_id,
-                comment_id=int(cid),
+                comment_id=cid,
                 repo=repo,
                 pr_number=pr_number,
                 review_span_context=fallback_span_context,
@@ -2528,7 +2608,11 @@ def dispatch_code_review(
     background watcher that re-fetches the PR every few seconds for as long
     as this call is running.
     """
+    # #1350: when this run began, so a clean verdict can tell Elder's own
+    # earlier blocks on this head from one another run posts mid-flight.
+    run_started_at = datetime.now(timezone.utc)
     mode: ReviewMode = "blocking" if blocking else "advisory"
+    started_at = hunt_now()
     action = payload.get("action", "")
     pr = payload["pull_request"]
     repo = payload["repository"]
@@ -2978,7 +3062,9 @@ def dispatch_code_review(
             },
         )
 
-    evaluation = evaluate_diff(hunks, llm_response)
+    evaluation = evaluate_diff(
+        hunks, llm_response, cross_file_contents=cross_file_contents,
+    )
     correctness_only = bool(pr_context.get("review_scope"))
     if correctness_only:
         evaluation = _drop_non_correctness_findings(evaluation)
@@ -3110,12 +3196,18 @@ def dispatch_code_review(
         )
 
     ruff_policy_dropped: list[int] = []
-    ruff_policy = _load_repo_ruff_policy(
-        installation_id, owner, repo_name, str(pr_context.get("base_sha") or ""),
-    )
-    if not correctness_only:
+    analyzer_skips: list[tuple[str, str]] = []
+    policy_base = str(pr_context.get("base_sha") or "")
+    ruff_policy = _load_repo_ruff_policy(installation_id, owner, repo_name, policy_base)
+    analyzer_engines = configured_engines()
+    if not correctness_only and analyzer_engines:
         evaluation = _merge_lint_evidence(
             evaluation, hunks, file_contents, ruff_policy, ruff_policy_dropped,
+            semgrepignore=(
+                _load_repo_semgrepignore(installation_id, owner, repo_name, policy_base)
+                if "opengrep" in analyzer_engines else None
+            ),
+            skipped=analyzer_skips, engines=analyzer_engines,
         )
 
     # Deterministic docs/code claim check: catch comment/env prose that
@@ -3220,6 +3312,7 @@ def dispatch_code_review(
             + " finding(s) were omitted because the repository configuration "
             "ignores or explicitly selects those rules for the affected paths."
         )
+    summary += _analyzer_skip_note(analyzer_skips)
     summary += config_note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
@@ -3241,14 +3334,16 @@ def dispatch_code_review(
         summary=summary,
     )
     check_publish_failed = False
+    check_run_id: int | None = None
     try:
-        with_install_token_retry(
+        check_resp = with_install_token_retry(
             installation_id,
             lambda token: post_check_run(
                 token, owner, repo_name, check_result,
                 external_id=f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}",
             ),
         )
+        check_run_id = (check_resp or {}).get("id")
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.error(
             "code_review_check_run_publish_failed",
@@ -3335,6 +3430,7 @@ def dispatch_code_review(
     ):
         _dismiss_stale_blocks(
             installation_id, owner, repo_name, pull_number, head_sha,
+            run_started_at,
         )
 
     # Capture inline-comment IDs for later reaction polling (#247). BEST-
@@ -3344,8 +3440,9 @@ def dispatch_code_review(
     # maintainer reaction can still teach the repository ledger without DD span
     # attribution.
     review_id = review_resp.get("id") if review_resp else None
+    comment_ids: hunt_link.CommentIds = {}
     if review_id is not None:
-        _capture_review_comments(
+        comment_ids = _capture_review_comments(
             installation_id=installation_id,
             owner=owner,
             repo_name=repo_name,
@@ -3357,6 +3454,20 @@ def dispatch_code_review(
             author_login=author_login,
             failure_log="code_review_comment_capture_failed",
         )
+
+    # Hunt Board (#1207): the canonical session learns this pass, and the
+    # board's `hunt` section is refreshed from it. Before the stack comment so
+    # the two projections read the same record. A delta review (living range)
+    # only speaks for the files it read.
+    _record_hunt_run(
+        installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pull_number=pull_number, head_sha=head_sha, trigger=action,
+        started_at=started_at, llm=llm_response, findings=evaluation.findings,
+        file_contents=file_contents,
+        diff_paths=frozenset(h.file_path for h in hunks),
+        delta=bool(living_range), comment_ids=comment_ids,
+        check_run_id=check_run_id, degraded_reason=evaluation.degraded_reason,
+    )
 
     # Markings v2 review stack: upsert PR-timeline summary (actionable count
     # + consolidated agent prompt). Best-effort — never fails the check/review
@@ -3772,7 +3883,9 @@ def _grade_deep_response(
     repo_name: str,
     pull_number: int,
 ) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
-    deep_eval = evaluate_diff(hunks, deep_llm)
+    deep_eval = evaluate_diff(
+        hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
+    )
     # The reasoner reads the same linked criteria, so its intent-mismatch
     # findings get the same evidence filter and box scope (#1170, #1218).
     deep_eval = _filter_intent_mismatches(
@@ -3855,11 +3968,30 @@ def _publish_deep_check(
         )
 
 
+def _submitted_before(review: dict[str, Any], moment: datetime) -> bool:
+    """True when the review's `submitted_at` parses and precedes `moment`."""
+    raw = review.get("submitted_at")
+    if not isinstance(raw, str):
+        return False
+    try:
+        submitted = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if submitted.tzinfo is None:
+        return False
+    return submitted < moment
+
+
 def _dismiss_stale_blocks(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-    head_sha: str,
+    head_sha: str, run_started_at: datetime,
 ) -> int:
-    """Dismiss Elder's own REQUEST_CHANGES reviews on earlier commits.
+    """Dismiss Elder's own REQUEST_CHANGES reviews this clean run supersedes.
+
+    That is every block on an earlier commit, plus a block on the current
+    head submitted before `run_started_at` (#1350): a same-head block that
+    landed after this run began was never weighed by it and stays. A
+    same-head block with no usable `submitted_at` stays too.
 
     Best-effort: a failure is logged and never changes the review outcome.
     Matches only reviews by the Grug app itself that carry the
@@ -3882,7 +4014,10 @@ def _dismiss_stale_blocks(
                 review.get("state") != "CHANGES_REQUESTED"
                 or not is_grug((review.get("user") or {}).get("login"))
                 or tag not in (review.get("body") or "")
-                or review.get("commit_id") == head_sha
+                or (
+                    review.get("commit_id") == head_sha
+                    and not _submitted_before(review, run_started_at)
+                )
             ):
                 continue
             review_id = review["id"]
@@ -3892,7 +4027,7 @@ def _dismiss_stale_blocks(
                     token, owner, repo_name, pull_number=pull_number,
                     review_id=rid,
                     message=(
-                        f"Superseded: Elder re-reviewed {head_sha[:7]} and "
+                        f"Superseded: a later Elder review of {head_sha[:7]} "
                         "found nothing blocking."
                     ),
                 ),
@@ -3908,6 +4043,46 @@ def _dismiss_stale_blocks(
     return dismissed
 
 
+def _record_hunt_run(
+    *,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    head_sha: str,
+    trigger: str,
+    started_at: str,
+    llm: LlmReviewResponse,
+    findings: tuple[Finding, ...],
+    file_contents: dict[str, str],
+    diff_paths: frozenset[str],
+    delta: bool,
+    comment_ids: hunt_link.CommentIds,
+    check_run_id: int | None,
+    degraded_reason: str | None,
+) -> None:
+    """Record this pass in the PR's canonical review session (#1207) and
+    refresh the Hunt Board. Best-effort: never raises, never changes the
+    review outcome. A benign degradation (`no_diff`) is a clean pass."""
+    real = degraded_reason if is_real_degradation(degraded_reason) else ""
+    hunt_link.record_elder_run(
+        PrRef(installation_id, owner, repo_name, pull_number),
+        head_sha=head_sha,
+        trigger=trigger,
+        started_at=started_at,
+        backend=llm.backend_used.value if llm.backend_used is not None else "",
+        model=llm.model_name or "",
+        findings=findings,
+        file_contents=file_contents,
+        diff_paths=diff_paths,
+        delta=delta,
+        comment_ids=comment_ids,
+        check_run_id=check_run_id,
+        category_of=_category_for_rule,
+        degraded_reason=real,
+    )
+
+
 def _capture_review_comments(
     *,
     installation_id: int,
@@ -3920,7 +4095,7 @@ def _capture_review_comments(
     head_sha: str,
     author_login: str,
     failure_log: str,
-) -> None:
+) -> hunt_link.CommentIds:
     """Fetch a review's inline comments and persist them for reaction polling.
 
     Shared by the synchronous publish path (#247) and the async deep path
@@ -3934,6 +4109,9 @@ def _capture_review_comments(
     `_capture_comment_records` for how it matches them to comments (grug#967:
     no retry here anymore, since a fresh fetch already carries everything
     this function needs).
+
+    Returns the inline comment id each posted finding got, keyed (file, rule,
+    line), for the Hunt Board to link its records to; {} when the fetch failed.
     """
     try:
         comments = with_install_token_retry(
@@ -3965,6 +4143,10 @@ def _capture_review_comments(
                     "fetched": len(comments),
                 },
             )
+        return {
+            (f.file, f.rule_name, f.line): cid
+            for cid, f in _pair_comments(comments, findings)
+        }
     except Exception as error:  # noqa: BLE001 - capture is best-effort
         log.warning(
             failure_log,
@@ -3973,6 +4155,7 @@ def _capture_review_comments(
                 "kind": type(error).__name__,
             },
         )
+        return {}
 
 
 def _publish_deep_review(
@@ -3996,6 +4179,7 @@ def _publish_deep_review(
     base_sha: str = "",
     repo_config: RepoConfig | None = None,
     file_contents: dict[str, str] | None = None,
+    action: str = "review",
 ) -> None:
     """Publish the async deep review's novel findings as a GitHub review.
 
@@ -4048,8 +4232,9 @@ def _publish_deep_review(
     # durable contract the synchronous path uses (#247). Best-effort: a
     # capture failure must never change the deep review outcome.
     review_id = review_resp.get("id") if review_resp else None
+    comment_ids: hunt_link.CommentIds = {}
     if review_id is not None:
-        _capture_review_comments(
+        comment_ids = _capture_review_comments(
             installation_id=installation_id,
             owner=owner,
             repo_name=repo_name,
@@ -4061,6 +4246,18 @@ def _publish_deep_review(
             author_login=author_login,
             failure_log="elder_async_deep_comment_capture_failed",
         )
+
+    # Hunt Board (#1207): the deep pass is a second Elder run on this head.
+    # It reads only what Tier-1 already fetched, so it is recorded as a
+    # delta: it adds findings, it never closes one.
+    _record_hunt_run(
+        installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pull_number=pull_number, head_sha=head_sha, trigger=f"{action}:deep",
+        started_at=hunt_now(), llm=deep_llm, findings=combined_eval.findings,
+        file_contents=file_contents or {}, diff_paths=frozenset(),
+        delta=True, comment_ids=comment_ids, check_run_id=None,
+        degraded_reason=combined_eval.degraded_reason,
+    )
 
     # #730: refresh the PR-timeline stack comment so the deep findings appear
     # in the canonical review projection alongside the Tier-1 findings.
@@ -4217,7 +4414,9 @@ def _async_deep_append_if_needed(
         # `_derive_conclusion` seam #844 established for partial coverage.
         # The deep check-run then completes `neutral`, naming the arm that
         # never ran, in place of the unqualified Tier-1 `success`.
-        deep_eval = evaluate_diff(hunks, deep_llm)
+        deep_eval = evaluate_diff(
+            hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
+        )
         deep_graded: tuple[Finding, ...] = ()
         deep_verdicts: tuple[Any, ...] = ()
         deep_suppressed_count = 0
@@ -4343,6 +4542,7 @@ def _async_deep_append_if_needed(
         base_sha=str(pr_context.get("base_sha") or ""),
         repo_config=repo_config,
         file_contents=evidence.file_contents,
+        action=action,
     )
     _submit_deep_evals(
         deep_graded,

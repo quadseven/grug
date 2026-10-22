@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
 from psycopg.types.json import Jsonb
@@ -231,6 +232,11 @@ _LIST_REPO_FLAGS = frozenset({"guard_hygiene_dead_ref_patterns"})
 _INT_REPO_FLAGS = frozenset({"complexity_cyclomatic_cap", "complexity_cognitive_cap"})
 _INT_REPO_FLAG_MAX = 1000
 
+# Repo-level flags whose value is a non-negative INTEGER SECONDS duration
+# (learning approval delay). Zero means "immediate / active on teach".
+_DURATION_REPO_FLAGS = frozenset({"learning_approval_delay_seconds"})
+_LEARNING_APPROVAL_DELAY_MAX_SECONDS = 30 * 86400  # 30 days cap
+
 _DEFAULT_PERSONA_CONFIG = {
     "tpm_enabled": True,
     "code_reviewer_enabled": True,
@@ -296,6 +302,11 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     cfg["enforcement_ruleset_id"] = int(rid) if rid is not None else None
     cfg["force_disable_enforcement"] = bool(
         item.get("force_disable_enforcement", False)
+    )
+    # Learning approval delay: seconds a newly-taught learning stays pending
+    # before becoming active. Zero (default) = active immediately.
+    cfg["learning_approval_delay_seconds"] = int(
+        item.get("learning_approval_delay_seconds") or 0
     )
     # Derived from _EXTRA_REPO_FLAGS rather than one hand-written line per
     # flag (#655). The old form needed an edit in TWO places to add a flag,
@@ -410,6 +421,25 @@ def _validate_int_repo_flags(persona_flags: dict[str, Any]) -> None:
             )
 
 
+def _validate_duration_repo_flags(persona_flags: dict[str, Any]) -> None:
+    """Each supplied _DURATION_REPO_FLAGS value must be a non-negative int
+    of seconds, capped at _LEARNING_APPROVAL_DELAY_MAX_SECONDS. Zero means
+    "active immediately" (the default)."""
+    for flag in _DURATION_REPO_FLAGS:
+        value = persona_flags.get(flag)
+        if value is None:
+            continue
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= _LEARNING_APPROVAL_DELAY_MAX_SECONDS
+        ):
+            raise ValueError(
+                f"{flag} must be a non-negative integer of seconds "
+                f"<= {_LEARNING_APPROVAL_DELAY_MAX_SECONDS}, got {value!r}"
+            )
+
+
 def set_repo_config(
     *,
     install_id: int,
@@ -435,6 +465,7 @@ def set_repo_config(
         - _STR_REPO_FLAGS
         - _LIST_REPO_FLAGS
         - _INT_REPO_FLAGS
+        - _DURATION_REPO_FLAGS
     )
     if unknown:
         raise TypeError(
@@ -453,6 +484,7 @@ def set_repo_config(
         if flag not in _STR_REPO_FLAGS
         and flag not in _LIST_REPO_FLAGS
         and flag not in _INT_REPO_FLAGS
+        and flag not in _DURATION_REPO_FLAGS
         and value is not None
         and not isinstance(value, bool)
     }
@@ -463,6 +495,7 @@ def set_repo_config(
     _validate_str_repo_flags(persona_flags, install_id)
     _validate_list_repo_flags(persona_flags)
     _validate_int_repo_flags(persona_flags)
+    _validate_duration_repo_flags(persona_flags)
     now = datetime.now(timezone.utc).isoformat()
     updated_fields: dict[str, Any] = {
         flag: value for flag, value in persona_flags.items() if value is not None
@@ -791,6 +824,80 @@ def get_elder_last_reviewed(
     return str(head) if head else None
 
 
+# --- Hunt Board: canonical review session per PR (grug#1207) --------------
+# One row per PR holding `review_session.to_dict` output. Writes are
+# compare-and-swap on the session's `version` so concurrent personas never
+# overwrite each other (`review_session.update_session` re-reads and
+# re-applies on a lost race). Install-scoped like ELDER#LAST.
+
+_REVIEW_SESSION_TTL_DAYS = 90
+
+
+def _review_session_sk(repo: str, pr_number: int) -> str:
+    return f"HUNT#{repo}#{int(pr_number)}"
+
+
+def get_review_session(
+    *, install_id: int, repo: str, pr_number: int,
+) -> dict[str, Any] | None:
+    """The stored session dict (with its `version`), or None for none yet."""
+    item = _get_item(_inst_pk(install_id), _review_session_sk(repo, pr_number))
+    if not item:
+        return None
+    item.pop("PK", None)
+    item.pop("SK", None)
+    item.pop("ttl", None)
+    return item
+
+
+def put_review_session(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    data: dict[str, Any],
+    expected_version: int,
+) -> bool:
+    """Store `data` only if the stored version is still `expected_version`
+    (0 = no live row). Returns False when another writer got there first.
+
+    An expired row counts as absent, the same takeover rule as
+    claim_delivery, since reads already treat it as gone.
+    """
+    ttl = int(datetime.now(timezone.utc).timestamp() + _REVIEW_SESSION_TTL_DAYS * 86400)
+    params = {
+        "pk": _inst_pk(install_id),
+        "sk": _review_session_sk(repo, pr_number),
+        "data": encode_attrs({**data, "ttl": ttl}),
+        "ttl": ttl,
+        "expected": str(int(expected_version)),
+    }
+    with get_pool().connection() as conn:
+        if int(expected_version) == 0:
+            cur = conn.execute(
+                """
+                INSERT INTO grug_kv (pk, sk, data, ttl)
+                VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+                ON CONFLICT (pk, sk) DO UPDATE
+                    SET data = EXCLUDED.data, ttl = EXCLUDED.ttl
+                    WHERE grug_kv.ttl IS NOT NULL
+                      AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+                """,
+                params,
+            )
+        else:
+            cur = conn.execute(
+                f"""
+                UPDATE grug_kv SET data = %(data)s, ttl = %(ttl)s
+                WHERE pk = %(pk)s AND sk = %(sk)s
+                  AND data->>'version' = %(expected)s
+                  AND {TTL_LIVE}
+                """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+                params,
+            )
+        return cur.rowcount == 1
+
+
 # --- Elder auto-pause: push log + pause row per PR (grug#1188) -----------
 # Two rows beside ELDER#LAST. The push log holds the epoch seconds of the
 # PR's recent pushes; the pause row exists while Elder is paused. Both are
@@ -1078,6 +1185,17 @@ class Learning(TypedDict):
     created_at: NotRequired[str]
     usage_count: NotRequired[int]
     last_used_at: NotRequired[str]
+    # Cave Drawings (#1203) lifecycle. Absent on rows written before it.
+    id: NotRequired[str]
+    status: NotRequired[str]
+    version: NotRequired[int]
+    history: NotRequired[list[dict[str, Any]]]
+    supersedes: NotRequired[str]
+    superseded_by: NotRequired[str]
+    conflicts_with: NotRequired[list[str]]
+    approved_by: NotRequired[str]
+    approved_at: NotRequired[str]
+    last_used_review: NotRequired[str]
 
 
 def _learning_pk(repo: str) -> str:
@@ -1087,9 +1205,9 @@ def _learning_pk(repo: str) -> str:
 def _learning_digest(text: str) -> str:
     """Stable 12-hex identity of a learning from its rule text, so the same
     preference taught twice heals in place instead of duplicating."""
-    import hashlib
+    from cave_drawings import learning_id
 
-    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:12]
+    return learning_id(text)
 
 
 def _learning_sk(digest: str) -> str:
@@ -1127,23 +1245,29 @@ def put_learning(
     source_comment_id: int = 0,
     author: str = "",
     created_at: str = "",
+    approval_delay_seconds: int = 0,
+    active: bool | None = None,
 ) -> None:
     """Upsert one durable learning under LEARN#<repo>. Keyed by the rule
     text's content digest. A re-teach of the same text REFRESHES the mutable
     metadata (scope, source, author), the TTL, and `reinforced_at`, but
     PRESERVES the original created_at and usage counters. Listing orders by
     reinforced_at, so a re-taught old rule moves back into the prompt window
-    (matching the 'remembered' ack) while first-taught provenance survives."""
+    (matching the 'remembered' ack) while first-taught provenance survives.
+
+    `approval_delay_seconds` (org-configurable, default 0) is how long a
+    newly-taught learning stays pending before becoming active. Zero =
+    active immediately. When `active` is not given it is derived:
+    active iff `approval_delay_seconds <= 0`. A pending learning is stored
+    but not returned by `list_learnings` until its delay has elapsed."""
     rule = text.strip()
     if not (repo and rule):
         return
-    # Normalize the timestamp to a uniform UTC ISO format: listing orders by
-    # this value AS TEXT, and lexicographic == chronological only when every
-    # stored stamp shares one format/offset. A caller-supplied stamp in
-    # another offset or precision would misorder the newest-first prompt
-    # window (LORE correctness).
     now = _normalize_utc_iso(created_at)
     ttl = int(datetime.now(timezone.utc).timestamp() + _LEARNING_TTL_DAYS * 86400)
+    delay = int(approval_delay_seconds)
+    is_active = (delay <= 0) if active is None else bool(active)
+    activated_at = now if is_active else ""
     with get_pool().connection() as conn:
         conn.execute(
             """
@@ -1159,6 +1283,20 @@ def put_learning(
                         'usage_count', grug_kv.data->'usage_count',
                         'last_used_at', grug_kv.data->'last_used_at'
                     )
+                    -- #1203: an operator's lifecycle decision (disabled,
+                    -- pending, superseded), its history and its links are
+                    -- never undone by the same reply being mined again.
+                    || jsonb_strip_nulls(jsonb_build_object(
+                        'status', grug_kv.data->'status',
+                        'history', grug_kv.data->'history',
+                        'version', grug_kv.data->'version',
+                        'supersedes', grug_kv.data->'supersedes',
+                        'superseded_by', grug_kv.data->'superseded_by',
+                        'conflicts_with', grug_kv.data->'conflicts_with',
+                        'approved_by', grug_kv.data->'approved_by',
+                        'approved_at', grug_kv.data->'approved_at',
+                        'last_used_review', grug_kv.data->'last_used_review'
+                    ))
             """,
             {
                 "pk": _learning_pk(repo),
@@ -1174,6 +1312,9 @@ def put_learning(
                         "author": author,
                         "created_at": now,
                         "reinforced_at": now,
+                        "active": is_active,
+                        "approval_delay_seconds": delay,
+                        "activated_at": activated_at,
                         "usage_count": 0,
                         "last_used_at": "",
                     }
@@ -1182,9 +1323,64 @@ def put_learning(
         )
 
 
-def list_learnings(repo: str, limit: int | None = None) -> list[Learning]:
-    """Every durable learning for a repo, oldest first. Read at review time
-    to steer Elder's prompt (ADR-0020). Empty list when none taught yet."""
+def increment_learning_usage(repo: str, digest: str) -> None:
+    """Mark one learning as used: bump usage_count and stamp last_used_at.
+    Called when a learning is rendered into a review or /grug ask prompt.
+    Best-effort: never blocks a review. TTL and reinforced_at are untouched
+    (re-teaching is what refreshes relevance)."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                """
+                UPDATE grug_kv
+                SET data = jsonb_set(
+                    jsonb_set(data, '{usage_count}',
+                        to_jsonb(COALESCE((data->>'usage_count')::int, 0) + 1)),
+                    '{last_used_at}', to_jsonb(%(now)s)
+                )
+                WHERE pk = %(pk)s AND sk = %(sk)s AND {TTL_LIVE}
+                """,
+                {"now": now, "pk": _learning_pk(repo), "sk": _learning_sk(digest)},
+            )
+    except Exception as e:  # noqa: BLE001 - usage tracking must not fail a review
+        log.warning(
+            "learning_increment_usage_failed",
+            extra={"repo": repo, "digest": digest, "kind": type(e).__name__},
+        )
+
+
+def delete_learning(repo: str, digest: str) -> bool:
+    """Delete one learning by (repo, text-digest). Returns True if a row
+    was removed. Used by the /grug learnings delete command."""
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM grug_kv WHERE pk = %s AND sk = %s",
+                (_learning_pk(repo), _learning_sk(digest)),
+            )
+    except Exception as e:  # noqa: BLE001 - never crash the command path
+        log.warning(
+            "learning_delete_failed",
+            extra={"repo": repo, "digest": digest, "kind": type(e).__name__},
+        )
+        return False
+    return bool(cur.rowcount)
+
+
+def list_learnings(
+    repo: str, limit: int | None = None, *, include_inactive: bool = False,
+) -> list[Learning]:
+    """Every durable learning for a repo that is ACTIVE now, oldest first.
+    Read at review time to steer Elder's prompt (ADR-0020). Empty list when
+    none taught (or none yet active) yet. A learning taught with a positive
+    org approval delay stays pending until `created_at + delay` has elapsed;
+    read-time activation needs no background job.
+
+    `include_inactive=True` returns every live row whatever its status
+    (pending, disabled, superseded): the operator view and redelivery
+    detection need the whole set (#1203).
+    """
     with get_pool().connection() as conn:
         rows = conn.execute(
             f"""
@@ -1198,8 +1394,30 @@ def list_learnings(repo: str, limit: int | None = None) -> list[Learning]:
             """,
             (_learning_pk(repo),),
         ).fetchall()
-    out = [cast("Learning", decode_item(pk, sk, data)) for pk, sk, data in rows]
+    now = datetime.now(timezone.utc)
+    out: list[Learning] = []
+    for pk, sk, data in rows:
+        row = _decode_learning(pk, sk, data)
+        if include_inactive or _learning_is_active(row, now):
+            out.append(row)
     return out if limit is None else out[:limit]
+
+
+def _decode_learning(pk: str, sk: str, data: dict[str, Any]) -> Learning:
+    """A learning row with its id (the SK digest) attached, so callers
+    address it without recomputing the digest from the text."""
+    item = decode_item(pk, sk, data)
+    item["id"] = sk.split("#", 1)[1] if "#" in sk else ""
+    return cast("Learning", item)
+
+
+def _learning_is_active(row: Learning, now: datetime) -> bool:
+    """True when this learning is active at `now`. One rule for every
+    reader, owned by `cave_drawings.effective_status`: an operator's status
+    (#1203) wins; otherwise the approval-delay flag decides."""
+    from cave_drawings import STATUS_ACTIVE, effective_status
+
+    return effective_status(cast("dict[str, Any]", row), now=now) == STATUS_ACTIVE
 
 
 def get_learning_by_source_comment(
@@ -1212,10 +1430,328 @@ def get_learning_by_source_comment(
     possibly storing a second, differently-worded rule (LORE reliability)."""
     if not source_comment_id:
         return None
-    for row in list_learnings(repo):
+    # Every status: a reply whose learning is pending or disabled was still
+    # already classified, and must not be classified again.
+    for row in list_learnings(repo, include_inactive=True):
         if int(row.get("source_comment_id") or 0) == int(source_comment_id):
             return row
     return None
+
+
+# --- Cave Drawings: learnings lifecycle (#1203) -------------------------
+# The operator control plane over the rows above. Every mutation runs in
+# one transaction with the row locked (SELECT ... FOR UPDATE), appends an
+# entry to the row's `history`, and never touches the usage counters. The
+# decisions themselves (which transitions are legal, what an import may
+# create, which rows reach a prompt) live in the pure `cave_drawings`
+# module; this section only persists them.
+
+# Fields a read adds that must never be written back into the jsonb.
+_LEARNING_READ_ONLY = ("PK", "SK", "id")
+
+
+class LearningImportConflict(RuntimeError):
+    """An import collided with a learning that appeared after its dry run.
+    The whole import was rolled back."""
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _learning_ttl() -> int:
+    return int(datetime.now(timezone.utc).timestamp() + _LEARNING_TTL_DAYS * 86400)
+
+
+def _learning_data(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in row.items() if k not in _LEARNING_READ_ONLY}
+
+
+def _lock_learning(conn: Any, repo: str, learning_id: str) -> Optional[Learning]:
+    row = conn.execute(
+        f"SELECT pk, sk, data FROM grug_kv WHERE pk = %s AND sk = %s AND {TTL_LIVE} "  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+        "FOR UPDATE",
+        (_learning_pk(repo), _learning_sk(learning_id)),
+    ).fetchone()
+    return _decode_learning(row[0], row[1], row[2]) if row else None
+
+
+def _write_learning(conn: Any, repo: str, learning_id: str, row: Mapping[str, Any]) -> None:
+    conn.execute(
+        "UPDATE grug_kv SET data = %s WHERE pk = %s AND sk = %s",
+        (encode_attrs(_learning_data(row)), _learning_pk(repo), _learning_sk(learning_id)),
+    )
+
+
+def _history_entry(action: str, actor: str, **extra: Any) -> dict[str, Any]:
+    return {"at": _now_iso(), "action": action, "actor": actor, **extra}
+
+
+def get_learning(repo: str, learning_id: str) -> Optional[Learning]:
+    """One learning by id, or None (missing or TTL-expired)."""
+    item = _get_item(_learning_pk(repo), _learning_sk(learning_id))
+    if not item:
+        return None
+    item["id"] = learning_id
+    return cast("Learning", item)
+
+
+def list_learning_repos() -> list[str]:
+    """Every repository that holds at least one live learning, sorted."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT pk FROM grug_kv
+            WHERE pk LIKE 'LEARN#%%' AND sk LIKE 'LEARNING#%%' AND {TTL_LIVE}
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+        ).fetchall()
+    return sorted(pk.split("#", 1)[1] for (pk,) in rows)
+
+
+def set_learning_status(
+    repo: str, learning_id: str, status: str, *, actor: str,
+) -> Learning:
+    """Approve (-> active) or disable a learning. A superseded learning is
+    history: it cannot be switched back on (edit the successor instead).
+    Raises LookupError when missing, ValueError on an illegal transition."""
+    from cave_drawings import (
+        STATUS_ACTIVE, STATUS_DISABLED, STATUS_SUPERSEDED, effective_status,
+    )
+
+    if status not in (STATUS_ACTIVE, STATUS_DISABLED):
+        raise ValueError(f"status must be {STATUS_ACTIVE} or {STATUS_DISABLED}")
+    with get_pool().connection() as conn, conn.transaction():
+        row = _lock_learning(conn, repo, learning_id)
+        if row is None:
+            raise LookupError(learning_id)
+        current = effective_status(cast("dict[str, Any]", row))
+        if current == STATUS_SUPERSEDED:
+            raise ValueError("a superseded learning cannot change status")
+        if current == status:
+            return row
+        out: dict[str, Any] = dict(row)
+        out["status"] = status
+        # Keep the approval-delay flag in step, so a reader of either field
+        # sees the operator's decision.
+        out["active"] = status == STATUS_ACTIVE
+        action = "approved" if status == STATUS_ACTIVE else "disabled"
+        if status == STATUS_ACTIVE:
+            out["approved_by"] = actor
+            out["approved_at"] = out["activated_at"] = _now_iso()
+        out["history"] = [
+            *(row.get("history") or []),
+            _history_entry(action, actor, previous_status=current),
+        ]
+        _write_learning(conn, repo, learning_id, out)
+    return cast("Learning", out)
+
+
+def _validated_edit_text(text: str | None, scope_path: str | None) -> str | None:
+    """The stripped new text (None = unchanged). Raises ValueError on a
+    scope or text that no learning may carry."""
+    from cave_drawings import MAX_TEXT_CHARS, validate_scope_path
+
+    reason = validate_scope_path(scope_path) if scope_path is not None else None
+    if reason:
+        raise ValueError(reason)
+    new_text = text.strip() if text is not None else None
+    if new_text is not None and not (0 < len(new_text) <= MAX_TEXT_CHARS):
+        raise ValueError(f"text must be 1..{MAX_TEXT_CHARS} characters")
+    return new_text
+
+
+def _in_place_changes(
+    row: Learning, scope_path: str | None, conflicts_with: list[str] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The row with its new scope and conflict links, and a record of what
+    actually changed (for the history entry)."""
+    changes: dict[str, Any] = {}
+    out: dict[str, Any] = dict(row)
+    if scope_path is not None and scope_path != row.get("scope_path", ""):
+        changes["scope_path"] = {"from": row.get("scope_path", ""), "to": scope_path}
+        out["scope_path"] = scope_path
+    if conflicts_with is not None:
+        links = sorted(set(conflicts_with))
+        if links != sorted(row.get("conflicts_with") or []):
+            changes["conflicts_with"] = links
+        out["conflicts_with"] = links
+    return out, changes
+
+
+def _clear_expired_learning(conn: Any, repo: str, learning_id: str) -> None:
+    """An expired row is gone as far as every read is concerned; delete it
+    so it cannot block an insert under the same key."""
+    conn.execute(
+        f"DELETE FROM grug_kv WHERE pk = %s AND sk = %s AND NOT {TTL_LIVE}",  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+        (_learning_pk(repo), _learning_sk(learning_id)),
+    )
+
+
+def _supersede_learning(
+    conn: Any, repo: str, row: Learning, edited: dict[str, Any],
+    *, new_text: str, actor: str, changes: dict[str, Any],
+) -> dict[str, Any]:
+    """Insert the successor of `row` carrying `new_text`, and retire `row`
+    as superseded. Both rows keep the full history."""
+    from cave_drawings import STATUS_SUPERSEDED, effective_status, learning_id as _lid
+
+    old_id = str(row.get("id", ""))
+    new_id = _lid(new_text)
+    if _lock_learning(conn, repo, new_id) is not None:
+        raise ValueError("a learning with that text already exists")
+    history = list(row.get("history") or [])
+    successor: dict[str, Any] = {
+        **_learning_data(edited),
+        "text": new_text,
+        # The successor keeps the predecessor's state: editing a pending
+        # rule does not approve it, editing a disabled one does not switch
+        # it back on.
+        "status": effective_status(cast("dict[str, Any]", row)),
+        "version": int(row.get("version") or 1) + 1,
+        "supersedes": old_id,
+        "reinforced_at": _now_iso(),
+        "usage_count": 0,
+        "last_used_at": "",
+        "last_used_review": "",
+        "history": [*history, _history_entry(
+            "edited", actor, previous_id=old_id,
+            previous_text=row.get("text", ""), changes=changes,
+        )],
+    }
+    successor.pop("superseded_by", None)
+    _clear_expired_learning(conn, repo, new_id)
+    conn.execute(
+        "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s)",
+        (_learning_pk(repo), _learning_sk(new_id), encode_attrs(successor), _learning_ttl()),
+    )
+    retired: dict[str, Any] = {
+        **row,
+        "status": STATUS_SUPERSEDED,
+        "superseded_by": new_id,
+        "history": [*history, _history_entry("superseded", actor, superseded_by=new_id)],
+    }
+    _write_learning(conn, repo, old_id, retired)
+    return {**successor, "id": new_id}
+
+
+def edit_learning(
+    repo: str,
+    learning_id: str,
+    *,
+    actor: str,
+    text: str | None = None,
+    scope_path: str | None = None,
+    conflicts_with: list[str] | None = None,
+) -> Learning:
+    """Edit a learning. Scope and conflict links change in place. A new
+    TEXT is a new rule with a new id: the successor row is created with
+    `supersedes`, a bumped version and the full history, and the old row
+    becomes `superseded` (kept, never injected). One transaction.
+    Raises LookupError when missing, ValueError on invalid input."""
+    from cave_drawings import STATUS_SUPERSEDED, effective_status
+
+    new_text = _validated_edit_text(text, scope_path)
+    with get_pool().connection() as conn, conn.transaction():
+        row = _lock_learning(conn, repo, learning_id)
+        if row is None:
+            raise LookupError(learning_id)
+        if effective_status(cast("dict[str, Any]", row)) == STATUS_SUPERSEDED:
+            raise ValueError("a superseded learning is history; edit its successor")
+        for other in conflicts_with or []:
+            if other == learning_id or _lock_learning(conn, repo, other) is None:
+                raise ValueError(f"conflicts_with names an unknown learning {other!r}")
+        out, changes = _in_place_changes(row, scope_path, conflicts_with)
+        if new_text is not None and new_text != row.get("text"):
+            return cast("Learning", _supersede_learning(
+                conn, repo, row, out, new_text=new_text, actor=actor, changes=changes,
+            ))
+        if changes:
+            out["history"] = [
+                *(row.get("history") or []), _history_entry("edited", actor, changes=changes),
+            ]
+            _write_learning(conn, repo, learning_id, out)
+    return cast("Learning", out)
+
+
+def import_learnings(
+    repo: str, learnings: list[dict[str, Any]], *, actor: str,
+) -> list[str]:
+    """Apply the `to_create` rows of a clean import plan, all or nothing.
+    Every row lands `pending`: nothing an import brings reaches a review
+    until an operator approves it. A row that collides with a learning
+    created since the dry run aborts the whole import
+    (LearningImportConflict) and nothing is written."""
+    import psycopg
+
+    from cave_drawings import STATUS_PENDING, learning_id as _lid
+
+    ids: list[str] = []
+    now = _now_iso()
+    try:
+        with get_pool().connection() as conn, conn.transaction():
+            for item in learnings:
+                text = str(item.get("text", "")).strip()
+                lid = _lid(text)
+                pk, sk = _learning_pk(repo), _learning_sk(lid)
+                _clear_expired_learning(conn, repo, lid)
+                data: dict[str, Any] = {
+                    "text": text,
+                    "repo": repo,
+                    "scope_path": str(item.get("scope_path", "") or ""),
+                    "source_pr": int(item.get("source_pr") or 0),
+                    "source_comment_id": int(item.get("source_comment_id") or 0),
+                    "author": str(item.get("author", "") or ""),
+                    "created_at": _normalize_utc_iso(str(item.get("created_at", "") or "")),
+                    "reinforced_at": now,
+                    "usage_count": 0,
+                    "last_used_at": "",
+                    "status": STATUS_PENDING,
+                    "active": False,
+                    "version": 1,
+                    "history": [_history_entry("imported", actor)],
+                }
+                for link in ("supersedes", "conflicts_with"):
+                    if item.get(link):
+                        data[link] = item[link]
+                conn.execute(
+                    "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s)",
+                    (pk, sk, encode_attrs(data), _learning_ttl()),
+                )
+                ids.append(lid)
+    except psycopg.errors.UniqueViolation as e:
+        raise LearningImportConflict(str(e).splitlines()[0]) from e
+    return ids
+
+
+def record_learning_usage(
+    repo: str, learning_ids: list[str], *, review_key: str,
+) -> int:
+    """Count one use of each learning actually supplied to a review.
+    Idempotent per `review_key` (PR number and head sha): the several prompt
+    builds of one review (chunks, the judge, a backend fallback) count once.
+    Returns how many rows were incremented."""
+    if not (repo and learning_ids and review_key):
+        return 0
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE grug_kv
+            SET data = data || jsonb_build_object(
+                'usage_count', COALESCE((data->>'usage_count')::int, 0) + 1,
+                'last_used_at', %(now)s::text,
+                'last_used_review', %(key)s::text
+            )
+            WHERE pk = %(pk)s AND sk = ANY(%(sks)s) AND {TTL_LIVE}
+              AND COALESCE(data->>'last_used_review', '') <> %(key)s
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+            {
+                "now": _now_iso(),
+                "key": review_key,
+                "pk": _learning_pk(repo),
+                "sks": [_learning_sk(i) for i in learning_ids],
+            },
+        )
+        return cur.rowcount or 0
 
 
 def get_comment_record(

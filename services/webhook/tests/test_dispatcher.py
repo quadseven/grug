@@ -14,6 +14,7 @@ import personas.tpm.persona  # noqa: F401 — register submodule for patch path
 import pytest
 from dispatcher import dispatch
 from dispatcher import _ensure_enforcement_on_pr as _real_ensure_enforcement_on_pr
+from dispatcher import _recheck_chief_for_ticket as _real_recheck_chief_for_ticket
 from personas import registry as persona_registry
 
 
@@ -941,6 +942,172 @@ def test_sub_issues_refreshes_the_issue_whose_membership_changed(action, number,
         out = dispatch("sub_issues", _sub_payload(action))
     assert out["status"] == "ok"
     assert seen == {"number": number, "body": body, "refresh_only": True}
+
+
+# --- a ticket gains or loses an epic: re-run Chief on the PRs naming it ------
+# The `which epic` row is blocking, and its fix (link the ticket to an epic,
+# or write `Part of #N` in it) changes the TICKET, not the PR. Without these
+# triggers the PR keeps its red Chief until its body is edited or someone
+# comments `/grug recheck`.
+
+def _ticket_pr(number, body, sha):
+    return {"number": number, "body": body, "head": {"sha": sha},
+            "user": {"login": "someone"}}
+
+
+def _ticket_recheck(event, payload, *, prs, issue_dor=False):
+    """Dispatch with the open-PR list faked and Chief's recheck mocked.
+
+    Returns (audit dict, run_chief_recheck mock)."""
+    recheck = MagicMock(return_value=(MagicMock(passed=True), {"persona": "tpm", "result": "posted"}))
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config",
+               return_value={"issue_dor_enabled": issue_dor}), \
+         patch("personas.tpm.issue_dor.run_issue_dor",
+               return_value={"status": "ok", "reason": "advisory refreshed"}), \
+         patch("github_app_auth.with_install_token_retry",
+               side_effect=lambda iid, fn: fn("tok")), \
+         patch("chief_self_heal._list_recent_open_prs", return_value=prs), \
+         patch("dispatcher.run_chief_recheck", recheck), \
+         patch("dispatcher._recheck_chief_for_ticket",
+               _real_recheck_chief_for_ticket):
+        out = dispatch(event, payload)
+    return out, recheck
+
+
+def _child_linked_payload(child=42):
+    return {
+        "action": "parent_issue_added",
+        "sub_issue": {"number": child, "body": "child body"},
+        "parent_issue": {"number": 3, "body": "parent body"},
+        "repository": {"id": 5, "name": "r", "owner": {"login": "o"}},
+        "installation": {"id": 1},
+    }
+
+
+def test_sub_issues_rechecks_chief_on_the_pr_naming_the_ticket():
+    prs = [_ticket_pr(7, "Refs #42", "a" * 40), _ticket_pr(8, "Refs #9", "b" * 40)]
+    out, recheck = _ticket_recheck("sub_issues", _child_linked_payload(), prs=prs,
+                                   issue_dor=True)
+    recheck.assert_called_once()
+    kwargs = recheck.call_args.kwargs
+    assert kwargs["pr_number"] == 7 and kwargs["head_sha"] == "a" * 40
+    assert kwargs["owner"] == "o" and kwargs["repo"] == "r"
+    assert kwargs["pr_body"] == "Refs #42"
+    # The advisory's own result is unchanged; the recheck rides alongside.
+    assert out["status"] == "ok" and out["reason"] == "advisory refreshed"
+    assert "rechecked 1" in out["chief_recheck"]
+
+
+def test_sub_issues_parent_side_rechecks_prs_naming_the_new_epic():
+    """`sub_issue_added` is delivered for the PARENT, which becomes an epic
+    by gaining a child: a PR naming the parent now passes `which epic`."""
+    payload = _child_linked_payload()
+    payload["action"] = "sub_issue_added"
+    prs = [_ticket_pr(7, "Refs #42", "a" * 40), _ticket_pr(8, "Part of #3", "b" * 40)]
+    _, recheck = _ticket_recheck("sub_issues", payload, prs=prs)
+    recheck.assert_called_once()
+    assert recheck.call_args.kwargs["pr_number"] == 8
+
+
+def test_sub_issues_rechecks_chief_even_with_issue_dor_off():
+    """The issue-time advisory is off by default; Chief on the PR is not."""
+    prs = [_ticket_pr(7, "Refs #42", "a" * 40)]
+    out, recheck = _ticket_recheck("sub_issues", _child_linked_payload(), prs=prs,
+                                   issue_dor=False)
+    recheck.assert_called_once()
+    assert out["status"] == "no_op" and "issue_dor_enabled off" in out["reason"]
+
+
+def test_sub_issues_recheck_ignores_a_ticket_named_only_in_code():
+    """Same extractor as the check: a `Refs #42` in a code span names nothing."""
+    prs = [_ticket_pr(7, "see `Refs #42` in the docs", "a" * 40)]
+    _, recheck = _ticket_recheck("sub_issues", _child_linked_payload(), prs=prs)
+    recheck.assert_not_called()
+
+
+def test_sub_issues_recheck_respects_tpm_off():
+    prs = [_ticket_pr(7, "Refs #42", "a" * 40)]
+    recheck = MagicMock()
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=False), \
+         patch("dispatcher.get_repo_config", return_value={}), \
+         patch("chief_self_heal._list_recent_open_prs", return_value=prs), \
+         patch("dispatcher.run_chief_recheck", recheck), \
+         patch("dispatcher._recheck_chief_for_ticket",
+               _real_recheck_chief_for_ticket):
+        out = dispatch("sub_issues", _child_linked_payload())
+    recheck.assert_not_called()
+    assert "tpm disabled" in out["chief_recheck"]
+
+
+def test_sub_issues_recheck_caps_prs_and_survives_one_failure():
+    prs = [_ticket_pr(n, "Refs #42", f"{n:040d}") for n in range(1, 9)]
+    calls = []
+
+    def _flaky(**kw):
+        calls.append(kw["pr_number"])
+        if kw["pr_number"] == 2:
+            raise RuntimeError("github said no")
+        return MagicMock(passed=False), {"persona": "tpm", "result": "posted"}
+
+    recheck = MagicMock(side_effect=_flaky)
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={}), \
+         patch("github_app_auth.with_install_token_retry",
+               side_effect=lambda iid, fn: fn("tok")), \
+         patch("chief_self_heal._list_recent_open_prs", return_value=prs), \
+         patch("dispatcher.run_chief_recheck", recheck), \
+         patch("dispatcher._recheck_chief_for_ticket",
+               _real_recheck_chief_for_ticket):
+        out = dispatch("sub_issues", _child_linked_payload())
+    assert calls == [1, 2, 3, 4, 5]
+    assert "rechecked 4" in out["chief_recheck"] and "failed 1" in out["chief_recheck"]
+
+
+def test_sub_issues_recheck_pr_list_failure_never_raises():
+    def _boom(*a, **kw):
+        raise httpx.ConnectError("down")
+
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={}), \
+         patch("github_app_auth.with_install_token_retry",
+               side_effect=lambda iid, fn: fn("tok")), \
+         patch("chief_self_heal._list_recent_open_prs", side_effect=_boom), \
+         patch("dispatcher._recheck_chief_for_ticket",
+               _real_recheck_chief_for_ticket):
+        out = dispatch("sub_issues", _child_linked_payload())
+    assert out["chief_recheck"].startswith("skip")
+
+
+def test_issues_body_edit_rechecks_chief_on_the_pr_naming_the_ticket():
+    payload = _issue_payload(action="edited",
+                             issue={"number": 42, "body": "Part of #3"},
+                             changes={"body": {"from": "bare"}})
+    prs = [_ticket_pr(7, "Refs #42", "a" * 40), _ticket_pr(8, "Refs #9", "b" * 40)]
+    _, recheck = _ticket_recheck("issues", payload, prs=prs)
+    recheck.assert_called_once()
+    assert recheck.call_args.kwargs["pr_number"] == 7
+
+
+def test_issues_edit_without_a_body_change_rechecks_nothing():
+    payload = _issue_payload(action="edited",
+                             issue={"number": 42, "body": "Part of #3"},
+                             changes={"title": {"from": "old"}})
+    prs = [_ticket_pr(7, "Refs #42", "a" * 40)]
+    out, recheck = _ticket_recheck("issues", payload, prs=prs)
+    recheck.assert_not_called()
+    assert "chief_recheck" not in out
+
+
+def test_issues_opened_rechecks_nothing():
+    payload = _issue_payload(issue={"number": 42, "body": "Part of #3"})
+    prs = [_ticket_pr(7, "Refs #42", "a" * 40)]
+    _, recheck = _ticket_recheck("issues", payload, prs=prs)
+    recheck.assert_not_called()
 
 
 def test_sub_issues_other_actions_are_not_gated():

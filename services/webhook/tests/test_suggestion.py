@@ -241,3 +241,61 @@ def test_unencodable_line_offers_no_block_instead_of_raising(text, line, candida
     the tokenizer cannot encode must not crash the review."""
     finding = _finding(suggestion=candidate, line=line, file="app/t.py", rule="x")
     assert checked_suggestion(finding, line, text) is None
+
+
+# mod-overseer PR 1083: the "Fix (one-click, line-exact)" block held this
+# English sentence for a C++ line. Only Python files are parse-checked, so
+# one click would have replaced code with prose.
+_CPP_FILE = (
+    "void GearReadItemSpells(Item const& spell, Resolved& resolved)\n"
+    "{\n"
+    "    GearReadOneEquipSpell(spell.effects, resolved);\n"
+    "}\n"
+)
+_PR_1083_PROSE = (
+    "In GearReadItemSpells, call GearReadOneEquipSpell and set "
+    "resolved.unresolved = true when it returns false; the caller should "
+    "check the result. So speaks Grug."
+)
+
+
+def _cpp_finding(suggestion: str) -> Finding:
+    return _finding(
+        suggestion=suggestion, file="src/overseer_decisions.cpp", line=3,
+        rule="dead-code",
+    )
+
+
+def test_prose_suggestion_on_a_non_python_file_offers_no_block():
+    assert checked_suggestion(_cpp_finding(_PR_1083_PROSE), 3, _CPP_FILE) is None
+
+
+@pytest.mark.parametrize("prose", [
+    "So speaks Grug.",
+    "Check the result and set the flag when it fails",
+    "set it only when the call returns false",
+])
+def test_prose_shapes_on_a_non_python_file_offer_no_block(prose):
+    assert checked_suggestion(_cpp_finding(prose), 3, _CPP_FILE) is None
+
+
+@pytest.mark.parametrize("code", [
+    "if (!ok) resolved.unresolved = true;",
+    # Stopwords inside a string literal or a trailing comment are not prose.
+    'Log("set the flag when it fails and then call it");',
+    "if (!GearReadOneEquipSpell(spell.effects, resolved)) return; // the and when",
+])
+def test_real_code_line_on_a_non_python_file_is_still_offered(code):
+    assert checked_suggestion(_cpp_finding(code), 3, _CPP_FILE) == "    " + code
+
+
+def test_prose_fix_on_a_markdown_file_is_still_offered():
+    """A one-line fix to a document is prose by nature; only the sign-off
+    is refused there."""
+    text = "# Setup\n\nRun the installer and set the path.\n"
+    fix = "Run the installer, then set the path in the shell profile."
+    finding = _finding(suggestion=fix, file="docs/SETUP.md", line=3, rule="typo")
+    assert checked_suggestion(finding, 3, text) == fix
+    signed = _finding(suggestion=fix + " So speaks Grug.", file="docs/SETUP.md",
+                      line=3, rule="typo")
+    assert checked_suggestion(signed, 3, text) is None

@@ -10,6 +10,8 @@ actually supports (or cannot refute).
 
 from __future__ import annotations
 
+import pytest
+
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.verify import verify_findings
 
@@ -670,5 +672,344 @@ def test_lockstep_kill_is_scoped_to_caller_not_updated():
         message=_PR_762_MESSAGE,
     )
     kept, killed = verify_findings((f,), {_ATTESTER_PATH: _ATTESTER_AT_762_HEAD})
+    assert kept == (f,)
+    assert killed == ()
+
+
+# --- return_value_used: a "return value discarded" claim refuted by the
+# file's own call sites (mod-overseer PR 1083: a dead-code marking on the
+# definition said the result "is discarded" while the only caller tested it
+# in an `if (!...)`) ------------------------------------------------------
+
+_CPP_PATH = "src/overseer_decisions.cpp"
+_CPP_DEFINITION_LINE = 2
+
+
+def _gear_source(call_line: str) -> str:
+    return (
+        "// GearReadOneEquipSpell(...) reads one spell; true on success\n"
+        "bool GearReadOneEquipSpell(SpellEffects const& effects, Resolved& resolved)\n"
+        "{\n"
+        "    return effects.valid;\n"
+        "}\n"
+        "\n"
+        "void GearReadItemSpells(Item const& spell, Resolved& resolved)\n"
+        "{\n"
+        f"    {call_line}\n"
+        "}\n"
+    )
+
+
+_GEAR_CONSUMED = _gear_source(
+    "if (!GearReadOneEquipSpell(spell.effects, resolved)) resolved.unresolved = true;"
+)
+_GEAR_BARE = _gear_source("GearReadOneEquipSpell(spell.effects, resolved);")
+_DISCARDED_MESSAGE = (
+    "the return value of `GearReadOneEquipSpell` is discarded, so a failed "
+    "read is never reported"
+)
+
+
+def _discarded_finding(**kw) -> Finding:
+    base = {
+        "file": _CPP_PATH, "line": _CPP_DEFINITION_LINE,
+        "rule_name": "dead-code", "message": _DISCARDED_MESSAGE,
+    }
+    base.update(kw)
+    return _finding(**base)
+
+
+def test_discarded_return_claim_is_killed_when_every_caller_uses_it():
+    f = _discarded_finding()
+    kept, killed = verify_findings((f,), {_CPP_PATH: _GEAR_CONSUMED})
+    assert kept == ()
+    assert [k.reason for k in killed] == ["return_value_used"]
+    assert killed[0].finding is f
+
+
+def test_discarded_return_claim_reads_callers_in_other_fetched_files():
+    """The caller may live in another file the dispatch fetched."""
+    header = "bool GearReadOneEquipSpell(SpellEffects const& e, Resolved& r);\n"
+    caller = "void f() {\n    bool ok = GearReadOneEquipSpell(e, r);\n}\n"
+    f = _discarded_finding(file="src/gear.h", line=1)
+    kept, killed = verify_findings(
+        (f,), {"src/gear.h": header, "src/gear.cpp": caller},
+    )
+    assert kept == ()
+    assert [k.reason for k in killed] == ["return_value_used"]
+
+
+def test_discarded_return_claim_survives_a_bare_call():
+    """A bare statement call really discards the result: keep."""
+    f = _discarded_finding()
+    kept, killed = verify_findings((f,), {_CPP_PATH: _GEAR_BARE})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_discarded_return_claim_survives_when_one_of_two_callers_is_bare():
+    source = _GEAR_CONSUMED + "void g() {\n    GearReadOneEquipSpell(e, r);\n}\n"
+    f = _discarded_finding()
+    kept, killed = verify_findings((f,), {_CPP_PATH: source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+@pytest.mark.parametrize("call_line", [
+    "(void)GearReadOneEquipSpell(spell.effects, resolved);",
+    "if (spell.valid) GearReadOneEquipSpell(spell.effects, resolved);",
+    'Log("GearReadOneEquipSpell(spell) failed");',
+])
+def test_discarded_return_claim_survives_a_discard_or_unreadable_site(call_line):
+    """An explicit discard is evidence for the claim; a call after `)` or
+    inside a string is no evidence either way. Both keep the finding."""
+    source = _GEAR_CONSUMED + "void g() {\n    " + call_line + "\n}\n"
+    f = _discarded_finding()
+    kept, killed = verify_findings((f,), {_CPP_PATH: source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_discarded_return_claim_with_no_call_site_is_kept():
+    """Only the definition and a comment mention it: inconclusive, keep."""
+    source = _gear_source("return;")
+    f = _discarded_finding()
+    kept, killed = verify_findings((f,), {_CPP_PATH: source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_discarded_return_claim_in_python_reads_not_and_assignment():
+    source = (
+        "def save(row):\n"
+        "    return db.write(row)\n"
+        "\n"
+        "def handler(row):\n"
+        "    if not save(row):\n"
+        "        raise RuntimeError('lost')\n"
+        "    ok = save(row)\n"
+    )
+    f = _finding(
+        line=1, rule_name="unused-return-value",
+        message="the result of `save` is ignored by its callers",
+    )
+    kept, killed = verify_findings((f,), {"services/webhook/x.py": source})
+    assert kept == ()
+    assert [k.reason for k in killed] == ["return_value_used"]
+
+
+def test_other_dead_code_claims_are_not_read_as_return_value_claims():
+    """A dead-code marking about an unused function is a different claim."""
+    f = _discarded_finding(
+        message="`GearReadOneEquipSpell` is never called and can be removed",
+    )
+    kept, killed = verify_findings((f,), {_CPP_PATH: _GEAR_CONSUMED})
+    assert kept == (f,)
+    assert killed == ()
+
+
+# --- callee_not_async: a missing-await claim whose callee is a plain `def`
+# in the fetched files (every sampled marking of this class was declined;
+# one PR got the same claim three times). Adding the `await` it asks for
+# would raise TypeError on the returned value. ------------------------------
+
+_LEGS_PATH = "services/probe/legs.py"
+_RUNNER_PATH = "services/probe/runner.py"
+_RUNNER = (
+    "from probe.legs import Legs\n"
+    "\n"
+    "\n"
+    "async def run(a: Legs) -> bool:\n"
+    "    ok = a._probe(a.paths[0])\n"
+    "    return ok\n"
+)
+_RUNNER_LINE = 5
+_AWAIT_MESSAGE = (
+    "`a._probe(a.paths[0])` is a coroutine that is never awaited, so `ok` "
+    "is always a truthy coroutine object"
+)
+
+
+def _legs(prefix: str = "def") -> str:
+    return (
+        "class Legs:\n"
+        "    paths = ()\n"
+        "\n"
+        f"    {prefix} _probe(self, leg):\n"
+        "        return leg.ok\n"
+    )
+
+
+def _await_finding(**kw) -> Finding:
+    base = {
+        "file": _RUNNER_PATH, "line": _RUNNER_LINE,
+        "rule_name": "missing-await", "message": _AWAIT_MESSAGE,
+    }
+    base.update(kw)
+    return _finding(**base)
+
+
+def test_missing_await_on_a_plain_def_callee_is_killed():
+    f = _await_finding()
+    kept, killed = verify_findings(
+        (f,), {_RUNNER_PATH: _RUNNER, _LEGS_PATH: _legs()},
+    )
+    assert kept == ()
+    assert [k.reason for k in killed] == ["callee_not_async"]
+    assert killed[0].finding is f
+
+
+def test_missing_await_claim_in_the_message_alone_is_read():
+    """The slug may be generic; the claim can live in the message only."""
+    f = _await_finding(rule_name="async-correctness")
+    kept, killed = verify_findings(
+        (f,), {_RUNNER_PATH: _RUNNER, _LEGS_PATH: _legs()},
+    )
+    assert kept == ()
+    assert [k.reason for k in killed] == ["callee_not_async"]
+
+
+def test_missing_await_on_an_async_def_callee_survives():
+    f = _await_finding()
+    kept, killed = verify_findings(
+        (f,), {_RUNNER_PATH: _RUNNER, _LEGS_PATH: _legs("async def")},
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_missing_await_on_a_callee_in_no_fetched_file_survives():
+    """The definition was not fetched: inconclusive, keep."""
+    f = _await_finding()
+    kept, killed = verify_findings((f,), {_RUNNER_PATH: _RUNNER})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_missing_await_survives_when_any_same_named_def_is_async():
+    """Two classes share the method name and one is async: keep."""
+    other = "class Other:\n    async def _probe(self, leg):\n        return leg\n"
+    f = _await_finding()
+    kept, killed = verify_findings(
+        (f,),
+        {_RUNNER_PATH: _RUNNER, _LEGS_PATH: _legs(), "services/probe/o.py": other},
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+@pytest.mark.parametrize("legs", [
+    # a plain def that hands back a coroutine still has to be awaited
+    (
+        "async def _real(leg):\n    return leg\n\n"
+        "class Legs:\n    def _probe(self, leg):\n        return _real(leg)\n"
+    ),
+    (
+        "import asyncio\n\nclass Legs:\n    def _probe(self, leg):\n"
+        "        return asyncio.ensure_future(leg)\n"
+    ),
+    (
+        "from typing import Awaitable\n\nclass Legs:\n"
+        "    def _probe(self, leg) -> Awaitable[bool]:\n        return leg\n"
+    ),
+    # rebound to something awaitable elsewhere in the fetched files
+    (
+        "class Legs:\n    def _probe(self, leg):\n        return leg\n\n"
+        "def patch(a):\n    a._probe = make_async(a._probe)\n"
+    ),
+])
+def test_missing_await_survives_a_plain_def_that_may_return_an_awaitable(legs):
+    f = _await_finding()
+    kept, killed = verify_findings(
+        (f,), {_RUNNER_PATH: _RUNNER, _LEGS_PATH: legs},
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_missing_await_on_a_non_python_anchor_survives():
+    f = _await_finding(file="web/src/run.ts", line=1)
+    kept, killed = verify_findings(
+        (f,), {"web/src/run.ts": "const ok = a._probe(a.paths[0]);\n",
+               _LEGS_PATH: _legs()},
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+# --- redaction_artifact: a finding built on Grug's own input redaction.
+# The env-secret pattern rewrote a test lambda's `api_key: fake_achievements`
+# to `api_key: [REDACTED:env-secret]`, and Elder posted two high findings
+# (a NameError, and "str has no .get") against a test that passes. ---------
+
+_TEST_PATH = "tests/test_achievements.py"
+_TEST_SOURCE = (
+    "from unittest import mock\n"
+    "\n"
+    "fake_achievements = {1: ['a']}\n"
+    "\n"
+    "def test_sync():\n"
+    "    client = mock.Mock()\n"
+    "    client.side_effect = lambda steam_id, app_id, api_key: fake_achievements.get(app_id, [])\n"
+    "    assert client(1, 1, 'k') == ['a']\n"
+)
+_TEST_LINE = 7
+
+
+def _redaction_finding(**kw) -> Finding:
+    base = {
+        "file": _TEST_PATH, "line": _TEST_LINE,
+        "rule_name": "test-fidelity",
+        "message": (
+            "`[REDACTED:env-secret].get(app_id, [])` calls .get on a str, "
+            "so the side_effect raises AttributeError"
+        ),
+    }
+    base.update(kw)
+    return _finding(**base)
+
+
+def test_finding_built_on_the_redaction_placeholder_is_killed():
+    f = _redaction_finding()
+    kept, killed = verify_findings((f,), {_TEST_PATH: _TEST_SOURCE})
+    assert kept == ()
+    assert [k.reason for k in killed] == ["redaction_artifact"]
+    assert killed[0].finding is f
+
+
+def test_secret_class_finding_citing_a_placeholder_survives():
+    f = _redaction_finding(
+        rule_name="secret-in-log-or-trace",
+        message="`[REDACTED:github-pat]` is written to the trace output",
+    )
+    kept, killed = verify_findings((f,), {_TEST_PATH: _TEST_SOURCE})
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_placeholder_that_really_is_in_the_head_file_survives():
+    """The code itself carries the placeholder text: not our artifact."""
+    source = _TEST_SOURCE.replace(
+        "fake_achievements.get(app_id, [])", "'[REDACTED:env-secret]'.get(app_id, [])",
+    )
+    f = _redaction_finding()
+    kept, killed = verify_findings((f,), {_TEST_PATH: source})
+    assert kept == (f,)
+    assert killed == ()
+
+
+@pytest.mark.parametrize("line", [
+    # a quoted literal is a real secret, whatever the rule says
+    "    client.side_effect = lambda steam_id, app_id, api_key='hunter2222xy': None\n",
+    # a key=value inside a string is a real secret too
+    "    client.side_effect = 'password=hunter2222xy'\n",
+    # nothing near the anchor matches the redaction pattern at all
+    "    client.side_effect = lambda steam_id, app_id, key: fake.get(app_id, [])\n",
+])
+def test_placeholder_over_a_literal_or_unmatched_line_survives(line):
+    source = _TEST_SOURCE.splitlines(keepends=True)
+    source[_TEST_LINE - 1] = line
+    f = _redaction_finding()
+    kept, killed = verify_findings((f,), {_TEST_PATH: "".join(source)})
     assert kept == (f,)
     assert killed == ()

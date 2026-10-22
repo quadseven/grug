@@ -13,12 +13,14 @@ from personas.tpm.dor_checks import (
     check_acceptance,
     check_estimate,
     check_issue_link,
+    check_in_scope,
     check_linked_issue_completeness,
     check_linked_issue_in_epic,
     check_loom_footer,
     check_scope_fence,
     IssueFacts,
     check_why,
+    named_ticket_numbers,
     run_all,
 )
 from personas.tpm.dor_checks import _scan_checklist
@@ -159,13 +161,91 @@ def test_loom_footer_passes_not_skipped_for_non_loom_pr():
     assert r.passed and not r.skipped
 
 
-def test_run_all_returns_8():
+def test_run_all_returns_9():
     results = run_all("")
-    assert len(results) == 8
+    assert len(results) == 9
     assert {r.name for r in results} == {
         "why", "acceptance", "estimate", "scope-fence", "issue-link",
         "loom-footer", "linked-issue-completeness", "linked-issue-epic",
+        "in-scope",
     }
+
+
+# --- in-scope (#1195) ---
+
+
+def _files(*paths):
+    return lambda: list(paths)
+
+
+def test_in_scope_no_linked_issue_degrades_gracefully():
+    """No issue link in the body -> pass, no fetcher required."""
+    body = "## Why\nreal reason here\n## Acceptance criteria\n- [x] a\n- [x] b\n- [x] c\n**Size:** M\n"
+    r = check_in_scope(body)
+    assert r.passed and not r.skipped
+    assert "no linked issue" in r.detail
+
+
+def test_in_scope_all_changed_files_in_scope_passes():
+    body = "closes #42\n**Size:** M\n"
+    def fetcher(_num: int) -> str:
+        return "Add the foo handler in src/foo.py.\n"
+    r = check_in_scope(body, fetch_issue=fetcher, fetch_changed_files=_files("src/foo.py"))
+    assert r.passed and not r.skipped
+    assert "within linked issue scope" in r.detail
+
+
+def test_in_scope_unrelated_feature_rider_warns_and_names_it():
+    body = "closes #42\n**Size:** M\n"
+    def fetcher(_num: int) -> str:
+        return "Add the foo handler.\n"
+    r = check_in_scope(
+        body, fetch_issue=fetcher,
+        fetch_changed_files=_files("src/foo.py", "src/billing/billing.py"),
+    )
+    assert not r.passed and not r.skipped
+    assert "src/billing/billing.py" in r.detail
+    assert "split to a separate PR or link an issue that covers them" in r.detail
+    # The in-scope file is NOT named as out of scope.
+    assert "src/foo.py" not in r.detail
+
+
+def test_in_scope_no_fetcher_fails_open_skipped():
+    body = "closes #42\n**Size:** M\n"
+    r = check_in_scope(body)
+    assert r.passed and r.skipped
+    assert "fail-open" in r.detail
+
+
+def test_in_scope_issue_fetch_failure_fails_open_skipped():
+    body = "closes #42\n**Size:** M\n"
+    def fetcher(_num: int) -> str:
+        raise RuntimeError("network blip")
+    r = check_in_scope(body, fetch_issue=fetcher, fetch_changed_files=_files("src/foo.py"))
+    assert r.passed and r.skipped
+    assert "fail-open" in r.detail
+
+
+def test_in_scope_changed_files_fetch_failure_fails_open_skipped():
+    body = "closes #42\n**Size:** M\n"
+    def fetcher(_num: int) -> str:
+        return "src/foo.py\n"
+    def boom():
+        raise RuntimeError("diff unavailable")
+    r = check_in_scope(body, fetch_issue=fetcher, fetch_changed_files=boom)
+    assert r.passed and r.skipped
+    assert "fail-open" in r.detail
+
+
+def test_in_scope_multiple_linked_issues_any_match_is_in_scope():
+    body = "closes #10 closes #20\n**Size:** M\n"
+    def fetcher(num: int) -> str:
+        return "the foo handler" if num == 10 else "billing cycle\n"
+    r = check_in_scope(
+        body, fetch_issue=fetcher,
+        fetch_changed_files=_files("src/foo.py", "src/billing/billing.py"),
+    )
+    assert r.passed and not r.skipped
 
 
 # --- Tolerant heading matching (qualifier suffix after the canonical name) ---
@@ -585,3 +665,133 @@ def test_an_orphan_still_blocks_when_another_fetch_failed():
         fetch_issue_facts=_fetcher(i5=_facts(5), i6=RuntimeError("down")),
     )
     assert r.passed is False and "#5" in r.detail
+
+
+def test_named_ticket_numbers_is_the_set_the_epic_check_reads():
+    """The webhook trigger that re-runs Chief on a ticket change matches PRs
+    with this same function, so it must read exactly what the check reads."""
+    body = "Refs #42\nPart of #3\nFixes #42\nBlocked by #9\n`Refs #77`"
+    assert named_ticket_numbers(body) == [3, 42]
+    assert named_ticket_numbers("") == []
+
+
+# --- An unfilled template must not pass through its HTML comments ---
+#
+# The #20 defect (an unfilled template passes) came back through comments:
+# guidance text and example bullets inside `<!-- -->` are invisible on the
+# rendered PR, yet they counted as section content. This fixture is the
+# shape of a real deploy repo's template, left exactly as a PR opens it.
+_UNFILLED_COMMENTED_TEMPLATE = """\
+<!--
+The plan check is BLOCKING on this repo. Keep ALL sections below or the
+PR will not merge.
+-->
+
+Refs #<!-- issue number; never a closing keyword -->
+Part of #<!-- epic number -->
+
+## Why
+<!-- 1-3 sentences. The motivation, not the diff. At least 5 words. -->
+
+## What changed
+<!-- Bulleted list of substantive edits. -->
+-
+
+## Acceptance criteria
+<!--
+At least 3 bullets describing observable post-merge state. DELETE this
+comment AND write real bullets, not empty placeholders.
+
+Example:
+- [x] `git grep` for the old import returns zero matches
+- [ ] Next scheduled run reads its state from the new path
+- [ ] No regressions in the nightly job (verify next 24h)
+-->
+
+## Out of scope
+<!-- Things deliberately not done in this PR. At least 1 bullet. -->
+-
+
+**Size:** <!-- XS | S | M | L | XL -->
+"""
+
+
+def test_why_ignores_html_comment_guidance():
+    r = check_why(_UNFILLED_COMMENTED_TEMPLATE)
+    assert not r.passed, r.detail
+
+
+def test_acceptance_ignores_example_bullets_inside_a_comment():
+    r = check_acceptance(_UNFILLED_COMMENTED_TEMPLATE)
+    assert not r.passed, r.detail
+    assert "0 non-empty bullets" in r.detail
+
+
+def test_scope_fence_ignores_comment_and_bare_dash():
+    r = check_scope_fence(_UNFILLED_COMMENTED_TEMPLATE)
+    assert not r.passed, r.detail
+
+
+def test_scope_fence_bare_dash_is_empty():
+    assert not check_scope_fence("## Out of scope\n\n-").passed
+
+
+@pytest.mark.parametrize("size_line", ["**Size:** S", "Size: M", "**Size:**", "_Size_: xs"])
+def test_scope_fence_does_not_count_a_trailing_size_line(size_line):
+    # Templates put the size label after the last section, inside the fence.
+    assert not check_scope_fence(f"## Out of scope\n-\n\n{size_line}\n").passed
+    assert check_scope_fence(f"## Out of scope\n- Deferred.\n\n{size_line}\n").passed
+
+
+@pytest.mark.parametrize("placeholder", ["-", "*", "- [ ]", "- [x]", "* [X]", "  -  "])
+def test_placeholder_only_lines_count_no_words(placeholder):
+    assert not check_scope_fence(f"## Out of scope\n{placeholder}\n").passed
+    assert not check_why(f"## Why\n{placeholder}\n{placeholder}\n").passed
+
+
+@pytest.mark.parametrize("body", [
+    "Size: <!-- S -->",
+    "<!-- Size: S -->",
+    "<!--\nPick one, e.g. **Size:** M\n-->\n",
+])
+def test_estimate_ignores_size_inside_a_comment(body):
+    assert not check_estimate(body).passed
+
+
+def test_heading_inside_a_comment_is_not_a_section():
+    body = "<!--\n## Why\nthis guidance text is long enough here\n-->\n"
+    assert not check_why(body).passed
+
+
+def test_unterminated_comment_hides_the_rest_of_the_body():
+    # GitHub renders an unclosed `<!--` as hiding everything after it.
+    body = "## Why\n<!-- guidance that never closes\nwe need this for the launch"
+    assert not check_why(body).passed
+
+
+def test_comment_opener_quoted_in_code_is_literal_text():
+    # A real merged body quoted the health marker `<!-- loom:health key=` in
+    # backticks; read as an unclosed comment it hid every later section.
+    body = (
+        "## Why\nTickets carrying `<!-- loom:health key=` get the finding.\n\n"
+        "```\n<!-- an example opener in a fence\n```\n\n"
+        "## Acceptance criteria\n- one\n- two\n- three\n\n"
+        "Size: M\n\n## Out of scope\n- Deferred.\n"
+    )
+    assert check_why(body).passed
+    assert check_acceptance(body).passed
+    assert check_estimate(body).passed
+    assert check_scope_fence(body).passed
+
+
+def test_real_text_next_to_a_comment_still_counts():
+    body = (
+        "## Why\n<!-- guidance -->\nWe need this for the launch tomorrow.\n\n"
+        "## Acceptance criteria\n<!-- 3 bullets -->\n- one\n- [x] two\n- [ ] three\n\n"
+        "## Out of scope\n<!-- what not -->\n- Deferred.\n\n"
+        "Size: <!-- pick one --> S\n"
+    )
+    assert check_why(body).passed
+    assert check_acceptance(body).passed
+    assert check_scope_fence(body).passed
+    assert check_estimate(body).passed

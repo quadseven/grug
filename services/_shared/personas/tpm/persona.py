@@ -18,14 +18,18 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from github_checks_client import CheckConclusion
 from personas.publish_check import PUBLISH_FAILED, publish_persona_check
 from personas.tpm.dor_checks import CheckResult, IssueFactsFetcher, run_all
-from personas.tpm.dor_checks import IssueFetcher, has_loom_footer
+from personas.tpm.dor_checks import (
+    IssueFetcher,
+    has_loom_footer,
+    loom_footer_lane,
+)
 from personas.tribe import CHECK_CHIEF
 
 
@@ -110,6 +114,12 @@ RULE_SKIP_LOOM_LANE = "skip-loom-lane"
 RULE_SKIP_OPT_OUT = "skip-opt-out"
 RULE_SKIP_NOT_OPERATOR = "skip-not-operator"
 
+# The lane an operator session names in its Loom audit footer. Fleet lanes
+# use other names (claude, codex-2, spark-3, ...), so this one marks an
+# operator session, which gets the plan check when its author is trusted
+# (#1318).
+OPERATOR_SESSION_LANE = "operator-session"
+
 _SKIP_TITLES: dict[str, str] = {
     RULE_SKIP_LOOM_LANE: "Hunt Plan skipped - Loom lane PR",
     RULE_SKIP_OPT_OUT: "Hunt Plan skipped - agent opt-out marker",
@@ -120,7 +130,8 @@ _SKIP_TITLES: dict[str, str] = {
 _SKIP_WHY: dict[str, str] = {
     RULE_SKIP_LOOM_LANE: (
         "it is a fleet lane PR (an agent marker plus the Loom audit footer "
-        "`Loom ticket ...`)"
+        "`Loom ticket ...`). A footer naming lane `operator-session` is "
+        "checked only when the author is a trusted operator"
     ),
     RULE_SKIP_OPT_OUT: (
         "the PR body carries the explicit `<!-- grug:agent-authored -->` "
@@ -166,9 +177,12 @@ def is_trusted_operator(pr: Mapping[str, Any] | None) -> bool:
 def chief_rule(pr_body: str, *, author_trusted: bool) -> str:
     """Pure: which Chief rule applies to this PR body and author.
 
-    No agent marker -> checked. With a marker: the explicit opt-out and a
-    Loom lane footer skip for anyone; otherwise a trusted operator's PR is
-    checked and anyone else's is skipped (grug#1251).
+    No agent marker -> checked. With a marker: the explicit opt-out skips
+    for anyone. A Loom footer skips too, except a footer naming lane
+    `operator-session` on a trusted operator's PR, which is checked
+    (#1318); an untrusted author cannot use that lane name to get checked.
+    Otherwise a trusted operator's PR is checked and anyone else's is
+    skipped (grug#1251).
     """
     body = pr_body or ""
     if not is_agent_authored(body):
@@ -176,6 +190,8 @@ def chief_rule(pr_body: str, *, author_trusted: bool) -> str:
     if _OPT_OUT_RE.search(body):
         return RULE_SKIP_OPT_OUT
     if has_loom_footer(body):
+        if author_trusted and loom_footer_lane(body) == OPERATOR_SESSION_LANE:
+            return RULE_OPERATOR_CHECKED
         return RULE_SKIP_LOOM_LANE
     if author_trusted:
         return RULE_OPERATOR_CHECKED
@@ -188,15 +204,19 @@ def _skip_summary(rule: str) -> str:
         "format checks apply to PRs written by people and by operator "
         "sessions. Elder and Guard still review the code."
     )
-_ADVISORY_CHECKS: frozenset[str] = frozenset({"issue-link", "loom-footer"})
+_ADVISORY_CHECKS: frozenset[str] = frozenset({"issue-link", "loom-footer", "in-scope"})
 
 
-def _blocking_failures(results: Sequence[CheckResult]) -> list[CheckResult]:
+def _blocking_failures(
+    results: Sequence[CheckResult], advisory_checks: frozenset[str] = _ADVISORY_CHECKS,
+) -> list[CheckResult]:
     """Failed BLOCKING checks — the one predicate behind title, rollup,
-    and `findings_count`. Advisory checks (issue-link) don't gate, so
-    they never count; keeping the predicate in one place stops the
-    three call sites from drifting (#550 stage-1 audit)."""
-    return [r for r in results if not r.passed and r.name not in _ADVISORY_CHECKS]
+    and `findings_count`. Advisory checks (issue-link, in-scope) don't gate,
+    so they never count; keeping the predicate in one place stops the
+    three call sites from drifting (#550 stage-1 audit). `advisory_checks`
+    lets org/repo config promote an advisory check (in-scope) to blocking.
+    """
+    return [r for r in results if not r.passed and r.name not in advisory_checks]
 
 
 # DISPLAY ONLY - the key stays. `CheckResult.name` is load-bearing:
@@ -211,6 +231,7 @@ _CHECK_DISPLAY: dict[str, str] = {
     "scope-fence": "where stop",
     "issue-link": "which ticket",
     "loom-footer": "loom mark",
+    "in-scope": "in scope",
     "linked-issue-completeness": "ticket done",
     "linked-issue-epic": "which epic",
 }
@@ -238,7 +259,9 @@ def _skipped(results: Sequence[CheckResult]) -> list[CheckResult]:
     return [r for r in results if r.skipped]
 
 
-def _summary(results: list[CheckResult]) -> tuple[str, str]:
+def _summary(
+    results: list[CheckResult], advisory_checks: frozenset[str] = _ADVISORY_CHECKS,
+) -> tuple[str, str]:
     """Build (title, summary) markdown for the check-run output.
 
     A skipped check (fail-open, #782) never blocks, but it is named in the
@@ -287,7 +310,7 @@ def _summary(results: list[CheckResult]) -> tuple[str, str]:
             icon = "skipped"
         elif r.passed:
             icon = "pass"
-        elif r.name in _ADVISORY_CHECKS:
+        elif r.name in advisory_checks:
             icon = "warn"
         else:
             icon = "fail"
@@ -300,27 +323,36 @@ def evaluate_pull_request(
     *,
     fetch_issue: IssueFetcher | None = None,
     fetch_issue_facts: IssueFactsFetcher | None = None,
+    fetch_changed_files: Callable[[], list[str]] | None = None,
     author_trusted: bool = False,
+    advisory_checks: frozenset[str] = _ADVISORY_CHECKS,
 ) -> TpmEvaluation:
-    """Pure: run all 7 DoR rules over pr_body and return the rollup.
+    """Pure: run all 9 DoR rules over pr_body and return the rollup.
 
-    `chief_rule` decides first. A skip rule (Loom lane, explicit opt-out,
-    or an agent marker from an author who is not a trusted operator)
-    short-circuits to a NEUTRAL rollup with one skipped row: no rule runs,
-    no issue fetch. `author_trusted` comes from `is_trusted_operator` on
+    `chief_rule` decides first. A skip rule (a fleet Loom lane footer,
+    explicit opt-out, or an agent marker from an author who is not a
+    trusted operator) short-circuits to a NEUTRAL rollup with one skipped
+    row: no rule runs, no issue fetch. `author_trusted` comes from `is_trusted_operator` on
     the PR object at the impure call site; the default False keeps the
-    pre-#1251 skip for a caller that cannot say.
+    pre-#1251 skip for a caller that cannot say. A trusted operator's
+    footer naming lane `operator-session` is checked, not skipped (#1318).
 
     No network IO, no AWS calls, no logging side-effects. Callers wrap
     the result in `publish_tpm_evaluation(...)` to POST the check-run.
 
-    `fetch_issue` is passed through to check_linked_issue_completeness.
-    When None, that check fails open (pass, marked `skipped` so the
-    rendered title does not count it - #782). Real callers build one via
-    `personas.tpm.issue_fetcher.build_issue_fetcher`. The fetcher is a
-    parameter, not a call target inside this function -- the purity
-    attestation (attest_persona_purity.py) sees only the allowlisted
-    `run_all` call.
+    `fetch_issue` is passed through to check_linked_issue_completeness and
+    check_in_scope; `fetch_issue_facts` to check_linked_issue_in_epic;
+    `fetch_changed_files` to check_in_scope. When either is None, its
+    check fails open (pass, marked `skipped`). Real callers build the
+    fetchers via `personas.tpm.issue_fetcher.build_issue_fetcher`. The
+    fetchers are parameters, not call targets inside this function -- the
+    spec's purity attestation (attest_persona_purity.py) sees only the
+    allowlisted `run_all` call.
+
+    `advisory_checks` decides which failed checks are advisory (warn, never
+    block). Defaults to `_ADVISORY_CHECKS` (issue-link, loom-footer,
+    in-scope); org/repo config can pass a smaller set to promote `in-scope`
+    to blocking alongside the existing strict mode.
     """
     rule = chief_rule(pr_body, author_trusted=author_trusted)
     if rule not in (RULE_CHECKED, RULE_OPERATOR_CHECKED):
@@ -339,9 +371,12 @@ def evaluate_pull_request(
             rule=rule,
         )
     results = run_all(
-        pr_body, fetch_issue=fetch_issue, fetch_issue_facts=fetch_issue_facts,
+        pr_body,
+        fetch_issue=fetch_issue,
+        fetch_issue_facts=fetch_issue_facts,
+        fetch_changed_files=fetch_changed_files,
     )
-    blocking = _blocking_failures(results)
+    blocking = _blocking_failures(results, advisory_checks)
     conclusion: CheckConclusion = "success" if not blocking else "failure"
     return TpmEvaluation(
         passed=not blocking,
@@ -359,6 +394,7 @@ def publish_tpm_evaluation(
     repo: str,
     head_sha: str,
     pr_number: int,
+    advisory_checks: frozenset[str] = _ADVISORY_CHECKS,
 ) -> dict[str, str]:
     """Impure: POST `evaluation` to GitHub's Checks API via the shared seam.
 
@@ -379,7 +415,7 @@ def publish_tpm_evaluation(
         )
         title, summary = _SKIP_TITLES[skip_rule], _skip_summary(skip_rule)
     else:
-        title, summary = _summary(list(evaluation.results))
+        title, summary = _summary(list(evaluation.results), advisory_checks)
         if evaluation.rule == RULE_OPERATOR_CHECKED:
             title += _OPERATOR_CHECKED_SUFFIX
     log.info(
@@ -393,10 +429,12 @@ def publish_tpm_evaluation(
         },
     )
     # Chief's `findings_count` is the number of failed BLOCKING DoR checks
-    # (0 on pass) — advisory checks (issue-link) don't gate, so they don't
-    # count toward the block/pass verdict. TPM never degrades at the eval
-    # layer (conclusion is success|failure), so `degraded_reason` stays
-    # None; only the seam's publish-failure classification can set one.
+    # (0 on pass) — advisory checks (issue-link, loom-footer, in-scope) don't
+    # gate, so they don't count toward the block/pass verdict; org/repo config
+    # can shrink `advisory_checks` to promote `in-scope` to blocking. TPM never
+    # degrades at the eval layer (conclusion is success|failure), so
+    # `degraded_reason` stays None; only the seam's publish-failure
+    # classification can set one.
     result_map = publish_persona_check(
         persona_key="tpm",
         persona_prefix="tpm",
@@ -409,7 +447,7 @@ def publish_tpm_evaluation(
         conclusion=evaluation.conclusion,
         title=title,
         summary=summary,
-        findings_count=len(_blocking_failures(evaluation.results)),
+        findings_count=len(_blocking_failures(evaluation.results, advisory_checks)),
         blocking=True,
         degraded_reason=None,
         success_result="pass" if evaluation.passed else "fail",

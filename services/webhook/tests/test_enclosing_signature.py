@@ -269,6 +269,84 @@ def test_unparseable_source_keeps_finding():
     assert out == (f,) and downgraded == ()
 
 
+
+# --- bindings that do not exist at runtime (#1338) ------------------------
+
+
+_TYPE_CHECKING_SRC = (
+    "from typing import TYPE_CHECKING\n"
+    "import typing\n"
+    "\n"
+    "if TYPE_CHECKING:\n"
+    "    from widgets import Widget\n"
+    "if typing.TYPE_CHECKING:\n"
+    "    from gadgets import Gadget\n"
+    "else:\n"
+    "    Gadget = object\n"
+    "\n"
+    "def f(x):\n"
+    "    return isinstance(x, Widget)\n"
+)
+
+
+def test_type_checking_only_import_used_at_runtime_still_blocks():
+    """`if TYPE_CHECKING:` never runs, so `Widget` is unbound at line 12."""
+    f = _finding(file="m.py", line=12, message="NameError: `Widget` is not defined")
+    out, downgraded = downgrade_bound_names((f,), {"m.py": _TYPE_CHECKING_SRC})
+    assert out == (f,) and downgraded == ()
+    assert out[0].severity == "high"
+
+
+def test_type_checking_else_branch_and_plain_import_still_bind():
+    """No over-correction: the `else` of a TYPE_CHECKING test runs, and the
+    same name imported unconditionally is bound."""
+    f = _finding(file="m.py", line=12, message="`Gadget` is not defined")
+    out, downgraded = downgrade_bound_names((f,), {"m.py": _TYPE_CHECKING_SRC})
+    assert out[0].severity == "low" and downgraded[0].names == ("Gadget",)
+
+    src = "from widgets import Widget\n\ndef f(x):\n    return isinstance(x, Widget)\n"
+    f = _finding(file="m.py", line=4, message="`Widget` is not defined")
+    out, downgraded = downgrade_bound_names((f,), {"m.py": src})
+    assert out[0].severity == "low" and downgraded[0].names == ("Widget",)
+
+
+_EXCEPT_SRC = (
+    "def f():\n"
+    "    try:\n"
+    "        run()\n"
+    "    except OSError as err:\n"
+    "        log(err)\n"
+    "    return err\n"
+)
+
+
+def test_except_name_used_after_its_handler_still_blocks():
+    """Python deletes `err` when the handler ends: line 6 raises."""
+    f = _finding(file="m.py", line=6, message="`err` is not defined after the except block")
+    out, downgraded = downgrade_bound_names((f,), {"m.py": _EXCEPT_SRC})
+    assert out == (f,) and downgraded == ()
+    assert out[0].severity == "high"
+
+
+def test_except_name_used_inside_its_handler_is_downgraded():
+    f = _finding(file="m.py", line=5, message="`err` is not defined")
+    out, downgraded = downgrade_bound_names((f,), {"m.py": _EXCEPT_SRC})
+    assert out[0].severity == "low" and downgraded[0].names == ("err",)
+
+
+def test_with_target_is_bound_after_the_with_line():
+    src = (
+        "def f(path):\n"
+        "    with open(path) as fh, lock() as (a, b):\n"
+        "        return fh.read(), a, b\n"
+    )
+    for name in ("fh", "a", "b"):
+        f = _finding(file="m.py", line=3, message=f"`{name}` is not defined")
+        out, downgraded = downgrade_bound_names((f,), {"m.py": src})
+        assert out[0].severity == "low", name
+        assert downgraded[0].names == (name,)
+
+
 def test_dispatch_downgrade_turns_a_failing_review_into_a_pass():
     """Wiring: the Elder conclusion no longer fails on the live shape."""
     from personas.code_reviewer import dispatch

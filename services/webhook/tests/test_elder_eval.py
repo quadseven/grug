@@ -1906,6 +1906,57 @@ def test_committed_baseline_names_one_concrete_model_per_backend():
         )
 
 
+# Model defaults that have passed the published-findings comparison gate.
+# Update these constants ONLY after running elder_eval --record (or --production
+# when available) with the new model and verifying the published findings
+# (catch rate, noise rate, per-class catch) meet or exceed the previous baseline.
+# See docs/research/laguna-s-2.1-gpu-host-elder-eval-2026-07-21.md for the
+# evaluation that established qwen3.5:122b as the test-gap/security/upstream-semantics
+# specialist (Laguna scored 0.000 on test-gap vs Qwen's 0.250).
+_APPROVED_JUDGE_DEFAULT = "qwen3.5:122b"
+_APPROVED_REASONER_DEFAULT = "qwen3.5:122b"
+
+
+def test_model_defaults_match_approved_or_require_published_findings_comparison():
+    """Guard: model defaults in llm_client.py must not change without a
+    published-findings comparison.
+
+    The research evaluation (docs/research/laguna-s-2.1-gpu-host-elder-eval-2026-07-21.md)
+    shows Laguna scores 0.000 on test-gap (0/12) vs Qwen at 0.250. Changing the
+    default without running the eval and comparing published findings (catch rate,
+    noise rate, per-class catch) would regress Elder's review quality.
+
+    If this test fails because you intentionally changed a model default:
+    1. Run the elder eval with the new model (prefer --production when available):
+       python -m elder_eval --record
+       # or when production mode is wired:
+       # python -m elder_eval --production --record
+    2. Verify the published findings meet or exceed the previous baseline.
+    3. Update _APPROVED_JUDGE_DEFAULT and _APPROVED_REASONER_DEFAULT in this test.
+    4. Commit the updated baseline.json AND this test.
+    """
+    from llm_client import _CAVE_JUDGE_DEFAULT_MODEL, _CAVE_REVIEW_REASONER_DEFAULT_MODEL
+
+    judge_default = _CAVE_JUDGE_DEFAULT_MODEL
+    reasoner_default = _CAVE_REVIEW_REASONER_DEFAULT_MODEL
+
+    assert judge_default == _APPROVED_JUDGE_DEFAULT, (
+        f"Judge model default changed without published-findings comparison.\n"
+        f"  Current default: {judge_default}\n"
+        f"  Approved default: {_APPROVED_JUDGE_DEFAULT}\n"
+        f"Run elder_eval with the new model, verify published findings, then "
+        f"update _APPROVED_JUDGE_DEFAULT in this test and commit baseline.json."
+    )
+
+    assert reasoner_default == _APPROVED_REASONER_DEFAULT, (
+        f"Reasoner model default changed without published-findings comparison.\n"
+        f"  Current default: {reasoner_default}\n"
+        f"  Approved default: {_APPROVED_REASONER_DEFAULT}\n"
+        f"Run elder_eval with the new model, verify published findings, then "
+        f"update _APPROVED_REASONER_DEFAULT in this test and commit baseline.json."
+    )
+
+
 def test_to_baseline_dict_records_configured_and_served_models():
     report = _one_case_report(served_models=["nemotron-x:30b"])
     entry = to_baseline_dict(

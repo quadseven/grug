@@ -33,6 +33,8 @@ class _FakeClient:
 def _clean(monkeypatch):
     call_report._queue.clear()
     monkeypatch.setattr(call_report, "_ensure_thread", lambda: None)
+    monkeypatch.setattr(call_report, "_inflight", {})
+    monkeypatch.setattr(call_report, "_inflight_shown", False)
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
@@ -162,3 +164,73 @@ def test_reporting_never_breaks_a_review(monkeypatch) -> None:
     with patch.object(httpx, "post", return_value=_ok(_FINDING)):
         out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
+
+
+def test_a_direct_call_is_shown_while_it_runs_and_gone_after(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CALL_REPORT", "true")
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_DISABLED_BACKENDS", "opencode-go,openrouter:paid")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", _FREE)
+    seen = []
+
+    def backend(*args, **kwargs):
+        seen.append(call_report._inflight_rows())
+        return _ok(_FINDING)
+
+    ctx = {"repo": "o/r", "pr_number": 7, "repo_private": False}
+    with patch.object(httpx, "post", side_effect=backend):
+        review_diff(assemble_evidence([_hunk()], pr_context=ctx), installation_id=1)
+    assert [(r["target"], r["model"], r["job"]) for r in seen[0]] == [("openrouter", _FREE, "o/r#7")]
+    assert call_report._inflight == {}, "a finished call is still shown"
+
+
+def test_a_call_that_raises_is_still_ended(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CALL_REPORT", "true")
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+
+    def broken(**kwargs):
+        raise RuntimeError("bug in the attempt")
+
+    monkeypatch.setattr(lc, "_call_llm_attempt", broken)
+    config = lc.BackendConfig(backend=Backend.POOLSIDE, url="u", model="m", key_loader=lambda: "k")
+    with pytest.raises(RuntimeError):
+        lc._run_llm_attempt(
+            backend=Backend.POOLSIDE, config=config, messages=[], variant=None, pr_tags={},
+        )
+    assert call_report._inflight == {}
+
+
+def test_inflight_posts_the_running_set_then_one_clear(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CALL_REPORT", "true")
+    monkeypatch.setenv("HOSTNAME", "grug-consumer-7f9c")
+    fake = _FakeClient()
+    monkeypatch.setattr(call_report, "_client", fake)
+    assert call_report.flush_inflight() is False, "nothing ran, nothing to send"
+
+    token = call_report.begin(backend="poolside", model="laguna-s-2.1", job="o/r#7")
+    assert call_report.flush_inflight() is True
+    url, body = fake.posts[-1]
+    assert url == "http://cave.test/ui/inflight"
+    assert (body["reporter"], body["caller"]) == ("grug-consumer-7f9c", "grug-elder")
+    assert [(c["target"], c["model"], c["job"]) for c in body["calls"]] == [
+        ("poolside", "laguna-s-2.1", "o/r#7"),
+    ]
+    call_report.end(token)
+    assert call_report.flush_inflight() is True
+    assert fake.posts[-1][1]["calls"] == []
+    sent = len(fake.posts)
+    assert call_report.flush_inflight() is False
+    assert len(fake.posts) == sent, "an idle pod keeps posting empty sets"
+
+
+def test_a_gateway_that_is_down_never_breaks_the_inflight_report(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CALL_REPORT", "true")
+    monkeypatch.setattr(call_report, "_client", _FakeClient(fail=True))
+    call_report.begin(backend="poolside", model="m", job=None)
+    assert call_report.flush_inflight() is False
+
+
+def test_inflight_is_off_unless_asked(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_CALL_REPORT", raising=False)
+    assert call_report.begin(backend="poolside", model="m", job=None) is None
+    assert call_report._inflight == {}

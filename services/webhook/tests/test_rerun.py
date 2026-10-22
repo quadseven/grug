@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from unittest.mock import ANY, MagicMock, patch
 
 import httpx
@@ -1731,6 +1732,8 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     )
     monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
     monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    monkeypatch.setattr(rerun, "_org_learning_approval_delay",
+                        lambda install_id, repo_full: 0)
 
     result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "we prefer early returns", "teammate")
 
@@ -1738,9 +1741,11 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     assert put_calls and put_calls[0]["text"] == "prefer early returns"
     assert put_calls[0]["author"] == "teammate"  # the teacher, not the PR author
     assert put_calls[0]["scope_path"] == "**/mw/*.py" and put_calls[0]["source_pr"] == 7
-    # A reaction on the teacher's reply, never a comment (no email).
+    # A reaction on the teacher's reply, plus a collapsible acknowledgment.
     assert posted and "/pulls/comments/5001/reactions" in posted[0][0]
     assert posted[0][1] == {"content": rerun.LEARN_REACTION_LEARNED}
+    comments = [b["body"] for (_u, b) in posted if "/pulls/comments/5001/replies" in _u]
+    assert comments and "Markings remembered" in comments[0] and "prefer early returns" in comments[0]
 
 
 def test_run_learn_one_off_declines_without_storing(monkeypatch):
@@ -1768,6 +1773,9 @@ def test_run_learn_one_off_declines_without_storing(monkeypatch):
     assert put_calls == []  # nothing stored
     assert posted and "/pulls/comments/5001/reactions" in posted[0][0]
     assert posted[0][1] == {"content": rerun.LEARN_REACTION_ONE_OFF}
+    # Declining is explicit in the acknowledgment comment (not just a reaction).
+    bodies = [b["body"] for (_u, b) in posted if "/pulls/comments/5001/replies" in _u]
+    assert bodies and "Not remembered" in bodies[0] and "one reply only" in bodies[0]
 
 
 def test_run_learn_classifier_none_raises_for_redrive(monkeypatch):
@@ -1973,6 +1981,8 @@ def test_run_learn_redelivery_skips_classifier_and_reuses_stored_rule(monkeypatc
     # Ack already claimed on the first delivery -> no duplicate ack.
     monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
     monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+    monkeypatch.setattr(rerun, "_org_learning_approval_delay",
+                        lambda install_id, repo_full: 0)
 
     assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "x", "dev") == "learn_duplicate"
     assert posted == []
@@ -2477,11 +2487,16 @@ def test_shutdown_sweep_clears_registered_board_notes(monkeypatch):
     rerun._unregister_board_note(token)  # idempotent, no error
 
 
-def test_learn_outcomes_never_post_a_comment(monkeypatch):
-    """Every learn outcome is a reaction on the reply. A grug comment here is
-    an email to a person who does not read them (operator, 2026-10-05)."""
-    for verdict in ({"durable": True, "learning": "x", "scope_path": ""},
-                    {"durable": False, "learning": "", "scope_path": ""}):
+def test_learn_acks_post_collapsible_comment(monkeypatch):
+    """#1194: every durable/one-off learn outcome posts a collapsible
+    acknowledgment comment on the finding thread (plus a reaction), so the
+    team sees what was or wasn't remembered."""
+    for verdict, expect_summary in (
+        ({"durable": True, "learning": "prefer early returns", "scope_path": "**/mw/*.py"},
+         "Markings remembered"),
+        ({"durable": False, "learning": "", "scope_path": ""},
+         "Not remembered"),
+    ):
         posted = []
         monkeypatch.setattr("adapters.install_store.get_learning_by_source_comment", lambda repo, cid: None)
         monkeypatch.setattr("adapters.install_store.get_comment_record",
@@ -2491,8 +2506,14 @@ def test_learn_outcomes_never_post_a_comment(monkeypatch):
         monkeypatch.setattr("llm_client.classify_learning", lambda *a, v=verdict, **k: v)
         monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
         monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body, sink=posted: sink.append((url, body)))
+        monkeypatch.setattr(rerun, "_org_learning_approval_delay", lambda install_id, repo_full: 0)
         rerun._run_learn(11, "o/r", 7, 5001, 4000, "reply")
-        assert posted and all(url.endswith("/reactions") and set(body) == {"content"} for url, body in posted)
+
+        reactions = [b for (_u, b) in posted if _u.endswith("/reactions")]
+        comments = [b["body"] for (_u, b) in posted if "/pulls/comments/5001/replies" in _u]
+        assert reactions, "expected a reaction ack"
+        assert comments, "expected a collapsible acknowledgment comment"
+        assert expect_summary in comments[0], f"expected {expect_summary!r} in comment"
 
 
 def test_learn_reply_syncs_the_findings_living_review_state(monkeypatch):
@@ -2538,3 +2559,194 @@ def test_review_payload_keeps_the_head_repo_for_the_fork_check():
     assert rerun._review_payload(
         install_id=1, owner="o", repo_name="r", pr_number=2, pr=deleted_fork,
     )["pull_request"]["head"] == {"sha": "h", "repo": None}
+
+
+# --- grug#1270: the `grug:reviewing` label, and the deferred re-run --------
+
+
+@pytest.mark.parametrize("conclusion", ["success", "failure", "neutral"])
+def test_elder_rerun_clears_the_reviewing_label_when_the_check_concludes(
+    monkeypatch, conclusion, _mock_review_label_http,
+):
+    """The sign goes with the review: success, failure and a degraded
+    neutral all END the review, so all three clear the label."""
+    import review_label as rl
+
+    monkeypatch.setattr(
+        rl, "list_check_runs_for_ref",
+        lambda *a, **k: [
+            {"name": "Grug - Elder", "status": "completed", "conclusion": conclusion}
+        ],
+    )
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch("httpx.get", return_value=_pr_response()), \
+         patch.object(rerun, "get_repo_config", return_value={}), \
+         patch.object(rerun, "dispatch_code_review"):
+        rerun.handle_rerun_jobs(_event(_job()))
+    deletes = [c for c in rl.httpx.calls if c[0] == "delete"]
+    assert deletes, f"the label must go once Elder concluded ({conclusion})"
+
+
+def test_elder_rerun_keeps_the_label_while_the_check_is_still_running(
+    monkeypatch, _mock_review_label_http,
+):
+    """A check that has not concluded keeps the sign - the sweep clears it
+    later if the review really is over."""
+    import review_label as rl
+
+    monkeypatch.setattr(
+        rl, "list_check_runs_for_ref",
+        lambda *a, **k: [{"name": "Grug - Elder", "status": "in_progress"}],
+    )
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch("httpx.get", return_value=_pr_response()), \
+         patch.object(rerun, "get_repo_config", return_value={}), \
+         patch.object(rerun, "dispatch_code_review"):
+        rerun.handle_rerun_jobs(_event(_job()))
+    assert [c for c in rl.httpx.calls if c[0] == "delete"] == []
+
+
+def test_deferred_rerun_is_held_until_the_budget_resets(monkeypatch):
+    """A command the exhausted hourly GitHub budget refused is HELD, never
+    dropped: the consumer hides the message until it is due."""
+    from rerun_queue import JobNotDue
+
+    not_before = time.time() + 600
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch("httpx.get") as get:
+        with pytest.raises(JobNotDue):
+            rerun.handle_rerun_jobs(_event(_job(not_before=not_before)))
+    get.assert_not_called()  # not due yet, so nothing was even fetched
+
+
+def test_deferred_rerun_runs_once_it_is_due(monkeypatch):
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch("httpx.get", return_value=_pr_response()), \
+         patch.object(rerun, "get_repo_config", return_value={}), \
+         patch.object(rerun, "dispatch_code_review") as disp:
+        out = rerun.handle_rerun_jobs(_event(_job(not_before=time.time() - 5)))
+    assert out["dispatched"] == 1
+    disp.assert_called_once()
+
+
+def test_deferred_rerun_is_requeued_when_the_hold_did_not_take(monkeypatch):
+    """A repeat early arrival means the visibility call did not take, so the
+    job is replaced by a fresh copy - otherwise the message would burn its
+    receive budget and dead-letter a command that was never dropped."""
+    with patch.object(rerun, "enqueue_rerun") as enq:
+        out = rerun._hold_or_requeue_deferred(
+            {
+                "install_id": 11, "repo": "myorg/myrepo", "pr_number": 7,
+                "persona": "elder", "not_before": time.time() + 600,
+            },
+            600.0, 2, "msg-1",
+        )
+    assert out == "rerun_deferred_requeued"
+    assert enq.call_args.kwargs["requeue_of"] == "msg-1"
+    assert enq.call_args.kwargs["not_before"] > 0
+
+
+def test_deferred_enqueue_gets_its_own_dedup_id(monkeypatch):
+    """The plain (install, repo, pr, persona) dedup id is still inside SQS's
+    5-minute window when the deferral is sent - a collapsed send would lose
+    the command."""
+    sent = {}
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/jobs.fifo")
+    monkeypatch.setattr(
+        rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs),
+    )
+    rerun.enqueue_rerun(
+        install_id=11, repo="myorg/myrepo", pr_number=7, persona="elder",
+        not_before=1791218759.0,
+    )
+    body = json.loads(sent["MessageBody"])
+    assert body["not_before"] == 1791218759.0
+    assert sent["MessageDeduplicationId"] != "11:myorg/myrepo:7:elder"
+    assert len(sent["MessageDeduplicationId"]) <= 128
+
+
+def test_a_plain_rerun_keeps_its_content_dedup_id(monkeypatch):
+    """The deferred id must not change the ordinary one: the api producer
+    sends the same plain id, and the two have to collapse onto each other."""
+    sent = {}
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/jobs.fifo")
+    monkeypatch.setattr(
+        rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs),
+    )
+    rerun.enqueue_rerun(
+        install_id=11, repo="myorg/myrepo", pr_number=7, persona="elder",
+    )
+    assert sent["MessageDeduplicationId"] == "11:myorg/myrepo:7:elder"
+    assert "not_before" not in json.loads(sent["MessageBody"])
+
+
+def test_the_reviewing_label_is_cleared_even_when_the_review_raises(
+    monkeypatch, _mock_review_label_http,
+):
+    """A review that RAISED is a review that is over: the `grug:reviewing`
+    sign must not stay up on a dead review, or every later reader would
+    think Elder is busy (grug#1270)."""
+    import review_label as rl
+
+    monkeypatch.setattr(
+        rl, "list_check_runs_for_ref",
+        lambda *a, **k: [
+            {"name": "Grug - Elder", "status": "completed", "conclusion": "failure"}
+        ],
+    )
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch("httpx.get", return_value=_pr_response()), \
+         patch.object(rerun, "get_repo_config", return_value={}), \
+         patch.object(rerun, "dispatch_code_review", side_effect=RuntimeError("review died")):
+        with pytest.raises(RuntimeError):
+            rerun.handle_rerun_jobs(_event(_job()))
+    deletes = [c for c in rl.httpx.calls if c[0] == "delete"]
+    assert deletes, "the sign must go even when the review raised"
+
+
+def test_a_refused_label_write_is_reported_not_swallowed(monkeypatch, caplog):
+    """A failed label write must not look like a sign that is up: the
+    helper says so, and the log says so (grug#1270)."""
+    import review_label as rl
+
+    monkeypatch.setattr(rl, "add_reviewing_label", lambda **k: False)
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         caplog.at_level("ERROR"):
+        attached = rerun._mark_reviewing_label(
+            install_id=11, owner="myorg", repo_name="myrepo", pr_number=7,
+        )
+    assert attached is False
+    assert "reviewing_label_mark_refused" in caplog.text
+
+
+def test_a_failed_label_clear_is_reported_not_swallowed(monkeypatch, caplog):
+    """A sign that stays up on a head Elder already finished would tell
+    every later reader that Elder is busy - the refusal must be visible."""
+    import review_label as rl
+
+    monkeypatch.setattr(rl, "elder_check_conclusion", lambda **k: "success")
+    monkeypatch.setattr(rl, "remove_reviewing_label", lambda **k: False)
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         caplog.at_level("ERROR"):
+        cleared = rerun._clear_reviewing_label(
+            install_id=11, owner="myorg", repo_name="myrepo", pr_number=7,
+            head_sha="abc123",
+        )
+    assert cleared is False
+    assert "reviewing_label_clear_refused" in caplog.text
+
+
+def test_the_sign_stays_when_the_check_has_not_concluded(monkeypatch, caplog):
+    """A check that is still running keeps the sign, and nothing is
+    reported as a failure: the review is not over."""
+    import review_label as rl
+
+    monkeypatch.setattr(rl, "elder_check_conclusion", lambda **k: "")
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         caplog.at_level("ERROR"):
+        cleared = rerun._clear_reviewing_label(
+            install_id=11, owner="myorg", repo_name="myrepo", pr_number=7,
+            head_sha="abc123",
+        )
+    assert cleared is False
+    assert "reviewing_label_clear_refused" not in caplog.text

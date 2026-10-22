@@ -57,6 +57,9 @@ ALLOWED_PARAM_METHODS_EVALUATE_DIFF: frozenset[tuple[str, str]] = frozenset()
 # Allowlist for `evaluate_diff` body.
 ALLOWED_IN_EVALUATE_DIFF: frozenset[str] = frozenset({
     "_hunk_line_index", "_is_static_declarative_scalar",
+    # #1255: checks whether a line is present in an already-bounded snippet;
+    # this is an in-memory string operation, not repository IO.
+    "_snippet_has_line",
     # grug#813/#707: the conclusion-derivation rule, single-sourced so
     # evaluate_diff/with_extra_findings/with_findings cannot drift into
     # three different answers (severity in -> conclusion out; no IO).

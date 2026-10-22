@@ -77,6 +77,9 @@ from review_types import Severity  # single source (#250)
 # walks the unified diff body and returns new-side ADDED line numbers.
 from personas.code_reviewer.complexity import _changed_by_file
 from personas.code_reviewer.repo_ruff_policy import RepoRuffPolicy
+from personas.code_reviewer.analyzer_sandbox import (
+    AnalyzerSkip, read_only_tree, sandbox_env,
+)
 
 log = logging.getLogger("grug.code_reviewer.lint")
 
@@ -256,14 +259,23 @@ def scan_ruff(
     hunks: tuple[DiffHunk, ...], file_contents: dict[str, str],
     policy: RepoRuffPolicy | None = None,
     policy_dropped: list[int] | None = None,
+    *,
+    enabled: bool | None = None,
+    timeout_s: float | None = None,
+    strict: bool = False,
 ) -> tuple[Finding, ...]:
     """Ruff over the changed Python files, diff-anchored to added lines.
 
     Best-effort by contract: a missing binary, a real ruff error, a timeout or
     unparseable output all return () and log. Lint evidence is additive and
-    must never break a review.
+    must never break a review. `strict` (the analyzers.py runner, #1254)
+    raises `AnalyzerSkip` with the reason instead, so the runner can record a
+    skip rather than mistake a failed run for a clean one.
+
+    `enabled` overrides the GRUG_LINT_EVIDENCE switch (the analyzer set in
+    analyzers.py decides for itself); `timeout_s` lowers the time cap.
     """
-    if not _ENABLED:
+    if not (_ENABLED if enabled is None else enabled):
         return ()
     if not file_contents:
         return ()
@@ -274,15 +286,19 @@ def scan_ruff(
     if not added:
         return ()
 
+    timeout = _TIMEOUT_S if timeout_s is None else min(_TIMEOUT_S, timeout_s)
     try:
         with tempfile.TemporaryDirectory(prefix="grug-lint-") as tmp:
             _write(tmp, kept)
-            proc = subprocess.run(
-                ["ruff", "check", "--select", _SELECT, "--ignore", _IGNORE,
-                 "--output-format", "json", "--no-cache", tmp],
-                capture_output=True, text=True, timeout=_TIMEOUT_S,
-                check=False,
-            )
+            # Read-only tree, scrubbed environment (#1254): ruff only parses
+            # the copied files, and no pod secret reaches the child process.
+            with read_only_tree(tmp):
+                proc = subprocess.run(
+                    ["ruff", "check", "--select", _SELECT, "--ignore", _IGNORE,
+                     "--output-format", "json", "--no-cache", tmp],
+                    capture_output=True, text=True, timeout=timeout,
+                    check=False, env=sandbox_env(tmp),
+                )
             # ONLY >= 2 is an error. Exit 1 means violations were found and
             # stdout carries them - see the module docstring.
             if proc.returncode >= _RUFF_ERROR_EXIT:
@@ -293,7 +309,7 @@ def scan_ruff(
                         "stderr": (proc.stderr or "")[-2000:],
                     },
                 )
-                return ()
+                return _degrade(strict, "error")
             results = json.loads(proc.stdout or "[]")
             prefix = tmp.rstrip("/") + "/"
     except FileNotFoundError:
@@ -303,15 +319,22 @@ def scan_ruff(
         # deliberately enabled a finding source deserves to see why it produced
         # none, rather than reading an info line nobody greps for.
         log.warning("lint_ruff_binary_missing_but_enabled")
-        return ()
+        return _degrade(strict, "missing")
     except subprocess.TimeoutExpired:
-        log.warning("lint_ruff_timeout", extra={"timeout_s": _TIMEOUT_S})
-        return ()
+        log.warning("lint_ruff_timeout", extra={"timeout_s": timeout})
+        return _degrade(strict, "timeout")
     except (json.JSONDecodeError, ValueError) as e:
         log.warning("lint_ruff_unparseable", extra={"kind": type(e).__name__})
-        return ()
+        return _degrade(strict, "unparseable")
 
     return _map_results(results, prefix, added, file_contents, policy, policy_dropped)
+
+
+def _degrade(strict: bool, reason: str) -> tuple[Finding, ...]:
+    """() for the best-effort caller; a recorded skip for the strict one."""
+    if strict:
+        raise AnalyzerSkip(reason)
+    return ()
 
 
 def _is_reportable(

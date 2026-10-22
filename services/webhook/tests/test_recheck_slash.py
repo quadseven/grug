@@ -443,9 +443,10 @@ def test_recheck_fetch_failure_still_fails_open_but_visibly_skipped(_tpm_only):
     assert lic.passed is True and lic.skipped is True
 
     title, summary = tpm_persona._summary(list(recheck_eval.results))
-    assert "all 8 checks" not in title
-    assert "6/8 checks" in title and "ticket done, which epic skipped" in title
+    assert "all 9 checks" not in title
+    assert "6/9 checks" in title and "ticket done, which epic, in scope skipped" in title
     assert "| ticket done | skipped |" in summary
+    assert "| in scope | skipped |" in summary
 
 
 def test_recheck_and_webhook_agree_that_an_orphan_ticket_blocks(_tpm_only):
@@ -519,8 +520,10 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     monkeypatch.setattr(fetchers, "build_issue_fetcher", lambda **kw: "F")
     monkeypatch.setattr(fetchers, "build_issue_facts_fetcher", lambda **kw: "FF")
 
-    def _eval(body, fetch_issue=None, fetch_issue_facts=None, author_trusted=False):
-        seen["eval"] = (body, fetch_issue, fetch_issue_facts)
+    def _eval(body, fetch_issue=None, fetch_issue_facts=None, author_trusted=False,
+              fetch_changed_files=None, advisory_checks=None):
+        seen["eval"] = (body, fetch_issue, fetch_issue_facts, fetch_changed_files,
+                        advisory_checks)
         seen["trusted"] = author_trusted
         return "EVAL"
 
@@ -534,8 +537,141 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
         installation_id=5, owner="o", repo="r", head_sha="abc", pr_number=9, pr_body="B",
     )
     assert evaluation == "EVAL" and result_map["result"] == "pass"
-    assert seen["eval"] == ("B", "F", "FF")
+    body, fi, ff, fcf, ac = seen["eval"]
+    assert body == "B" and fi == "F" and ff == "FF"
+    assert callable(fcf)  # the shared changed-files fetcher is wired through
+    assert "in-scope" in ac  # advisory set passed through
     assert seen["trusted"] is False  # default keeps the pre-#1251 skip
     assert seen["publish"][1] == {
-        "installation_id": 5, "owner": "o", "repo": "r", "head_sha": "abc", "pr_number": 9,
+        "installation_id": 5, "owner": "o", "repo": "r", "head_sha": "abc",
+        "pr_number": 9, "advisory_checks": ac,
     }
+
+
+# --- grug#1270: a rate-limited command is KEPT, never dropped --------------
+
+
+class _InteractiveHttp:
+    """Answers the command's reply post without touching the network."""
+
+    def __init__(self) -> None:
+        self.posts: list[dict] = []
+
+    def post(self, url: str, **kw: object):
+        self.posts.append(kw.get("json") or {})
+        return _Ok()
+
+    def get(self, url: str, **kw: object):
+        return _Ok()
+
+
+class _Ok:
+    status_code = 200
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return {}
+
+
+def _rate_limited_get(*_a: object, **_kw: object):
+    request = httpx.Request("GET", "https://api.github.com/repos/myorg/myrepo/pulls/42")
+    response = httpx.Response(
+        403,
+        headers={
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": "1791218759",
+            "x-ratelimit-resource": "core",
+        },
+        request=request,
+    )
+    raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+
+
+def test_grug_improve_rate_limited_is_kept_not_dropped(_no_install_lookups, monkeypatch):
+    """grug#1270 AC3: the installation's hourly GitHub budget was exhausted,
+    so the PR fetch is refused with a 403. The command must be KEPT - deferred
+    to the budget's reset - and never dropped with no reply and no retry,
+    which is what made the 2026-10-18 burst look like it worked."""
+    import interactive
+
+    payload = _comment_payload(body="/grug improve", sender_login="alice", pr_author="alice")
+    enqueued: list[dict] = []
+    http = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", http)
+    monkeypatch.setattr("adapters.pg_install_store.claim_delivery", lambda key: True)
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=_rate_limited_get), \
+         patch("rerun.enqueue_rerun", side_effect=lambda **kw: enqueued.append(kw)):
+        out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "deferred"
+    assert out["reason"] == "github_rate_limited"
+    assert enqueued, "the command must be kept on the queue, not dropped"
+    assert enqueued[0]["not_before"] == 1791218759.0
+    assert enqueued[0]["persona"] == "code_reviewer"
+    assert http.posts and "budget" in str(http.posts[0].get("body", ""))
+
+
+def test_grug_improve_that_is_not_rate_limited_still_runs(_no_install_lookups, monkeypatch):
+    """A plain permission 403 is NOT a budget problem: it must not be
+    answered by waiting for the window to reset."""
+    import interactive
+
+    payload = _comment_payload(body="/grug improve", sender_login="alice", pr_author="alice")
+    http = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", http)
+    monkeypatch.setattr("adapters.pg_install_store.claim_delivery", lambda key: True)
+
+    def _forbidden(*_a: object, **_kw: object):
+        request = httpx.Request("GET", "https://api.github.com/repos/myorg/myrepo/pulls/42")
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=_forbidden), \
+         patch("rerun.enqueue_rerun") as enq:
+        out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "skip" and out["reason"] == "pr_fetch_failed"
+    enq.assert_not_called()
+
+
+def test_budget_reset_epoch_defers_when_the_budget_is_low(monkeypatch):
+    """grug#1270: below the floor of the installation's hourly budget, a
+    re-run waits for the reset instead of spending what is left."""
+    import github_app_auth
+
+    monkeypatch.setattr(
+        github_app_auth, "core_rate_limit", lambda token: (10, 5000, 1791218759),
+    )
+    monkeypatch.setattr(
+        github_app_auth, "with_install_token_retry", lambda iid, fn: fn("tok"),
+    )
+    assert d._budget_reset_epoch(1) == 1791218759.0
+
+
+def test_budget_reset_epoch_is_zero_while_there_is_budget(monkeypatch):
+    import github_app_auth
+
+    monkeypatch.setattr(
+        github_app_auth, "core_rate_limit", lambda token: (4000, 5000, 1791218759),
+    )
+    monkeypatch.setattr(
+        github_app_auth, "with_install_token_retry", lambda iid, fn: fn("tok"),
+    )
+    assert d._budget_reset_epoch(1) == 0.0
+
+
+def test_budget_reset_epoch_is_zero_when_the_budget_cannot_be_read(monkeypatch):
+    """An unreadable budget must never block a command."""
+    import github_app_auth
+
+    monkeypatch.setattr(github_app_auth, "core_rate_limit", lambda token: None)
+    monkeypatch.setattr(
+        github_app_auth, "with_install_token_retry", lambda iid, fn: fn("tok"),
+    )
+    assert d._budget_reset_epoch(1) == 0.0
+

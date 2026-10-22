@@ -56,6 +56,17 @@ spec:
         # sat at 17%. Two OCI zones still give the zone spread above; soft,
         # so a lan node still takes the pod when both OCI nodes are down.
         nodeAffinity:
+          # Never a memory-constrained node (infra#5502). One required term
+          # carries arch + the DoesNotExist; if more terms are ever added, EACH
+          # needs it (terms are ORed). nodeSelector above stays as-is.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [arm64]
+                  - key: memory-constrained
+                    operator: DoesNotExist
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
               preference:

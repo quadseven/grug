@@ -2,9 +2,11 @@
 
 Ported from scripts/tpm.py with the bullet-count regex tightened per
 quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
->=3 minimum (security: an unfilled template should NOT pass).
+>=3 minimum (security: an unfilled template should NOT pass). Text inside
+HTML comments counts for nothing either (#1330): a template's guidance and
+example bullets live in comments the rendered PR never shows.
 
-8 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
+9 checks (per PRD #21 + memory `feedback_health_endpoint_standard`):
   why          - ## Why >=5 words
   acceptance   - ## Acceptance criteria (or ## Test plan) >=3 NON-EMPTY bullets
   estimate     - Size: XS|S|M|L|XL anywhere in body
@@ -13,6 +15,7 @@ quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
   loom-footer  - a Loom-ticket PR carries the Loom audit footer (advisory)
   linked-issue-completeness - linked issue(s) have all non-exempt checkboxes ticked
   linked-issue-epic - every ticket the PR names is an epic or belongs to one (grug#1034)
+  in-scope     - all changed files trace to the linked issue's scope (advisory)
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from personas.tpm.ticket_compliance import strip_code_spans
+from personas.tpm.in_scope import check_in_scope
 
 
 log = logging.getLogger("grug.persona.tpm.dor_checks")
@@ -58,6 +62,23 @@ _BULLET_PAT = re.compile(
     r"^[ \t]*-[ \t]+(?:\[[ x]\][ \t]+\S|(?!\[)\S)",
     re.MULTILINE,
 )
+# An HTML comment, or an unclosed one running to the end of the body: GitHub
+# hides both on the rendered PR, so neither is content the author wrote (#1330).
+# Code is matched first and kept: a `<!--` quoted in backticks or a fence is
+# literal text, and an unclosed one there must not swallow the rest of the body.
+_HTML_COMMENT_PAT = re.compile(
+    r"(?P<code>```.*?(?:```|\Z)|`[^`\n]+`)|<!--.*?(?:-->|\Z)", re.DOTALL,
+)
+# A line that is only a list marker, optionally with an empty or ticked box:
+# `-`, `*`, `- [ ]`, `- [x]`. The template's placeholder, not a word of text.
+_PLACEHOLDER_LINE_PAT = re.compile(r"^[ \t]*[-*+][ \t]*(?:\[[ xX]\][ \t]*)?$", re.MULTILINE)
+# A line holding only the size label (`**Size:** S`, or bare `Size:` once its
+# comment is gone). Templates put it after the last section, so it lands in
+# `## Out of scope`; it is the estimate, not a fence.
+_SIZE_LINE_PAT = re.compile(
+    r"^[ \t]*[*_]*Size[*_]*:?[*_]*[ \t]*(?:XS|S|M|L|XL)?[*_]*[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 # Match `## Heading` only -- NOT `### Sub`. Earlier `##+` ate H3+
 # headings as section dividers, so any H3 inside `## Acceptance
 # criteria` truncated the section to empty and the bullet check failed
@@ -89,6 +110,12 @@ _ISSUE_LINK_PAT = re.compile(
 # the dashboard can attribute the work later. Advisory only: the footer is
 # an audit nicety, never a merge gate.
 _LOOM_FOOTER_PAT = re.compile(r"^Loom ticket ", re.MULTILINE)
+# The lane the footer names (`Loom ticket #N, lane <name>, model ...`).
+# Chief reads it to tell an operator session (lane `operator-session`)
+# from a fleet lane (#1318).
+_LOOM_FOOTER_LANE_PAT = re.compile(
+    r"^Loom ticket [^\n]*?,\s*lane\s+([\w.-]+)", re.MULTILINE,
+)
 _LOOM_TICKET_REF_PAT = re.compile(
     r"\b(?:refs|part\s+of|fixes|closes)\s+quadseven/loom#\d+",
     re.IGNORECASE,
@@ -138,12 +165,31 @@ def _heading_matches(heading: str, name: str) -> bool:
     return h.startswith(n) and len(h) > len(n) and not h[len(n)].isalnum()
 
 
+def strip_html_comments(body: str) -> str:
+    """`body` without its HTML comments (#1330).
+
+    The Loom footer and agent-marker checks read the RAW body on purpose:
+    their markers live in comments. Only the content checks strip them.
+    """
+    return _HTML_COMMENT_PAT.sub(lambda m: m.group("code") or "", body)
+
+
+def _content_word_count(text: str) -> int:
+    """Words in `text`, not counting placeholder-only lines (`-`, `- [ ]`)
+    or a size-label line."""
+    text = _SIZE_LINE_PAT.sub("", text)
+    return len(_PLACEHOLDER_LINE_PAT.sub("", text).split())
+
+
 def section_text(body: str, *names: str) -> str | None:
     """Return text under the first matching ## section, or None.
 
     Matches case-insensitively and tolerates a trailing qualifier on the heading
-    (see `_heading_matches`); `names` provided in priority order.
+    (see `_heading_matches`); `names` provided in priority order. HTML comments
+    are stripped first, so a `## Heading` inside one is no section and the
+    guidance inside one is no content (#1330).
     """
+    body = strip_html_comments(body)
     sections = list(_SECTION_PAT.finditer(body))
     for name in names:
         for i, m in enumerate(sections):
@@ -158,7 +204,7 @@ def check_why(body: str) -> CheckResult:
     text = section_text(body, "Why", "Summary")
     if text is None:
         return CheckResult("why", False, "missing ## Why (or ## Summary) section")
-    word_count = len(text.split())
+    word_count = _content_word_count(text)
     if word_count < 5:
         return CheckResult(
             "why", False,
@@ -193,7 +239,7 @@ def check_acceptance(body: str) -> CheckResult:
 
 
 def check_estimate(body: str) -> CheckResult:
-    m = _SIZE_PAT.search(body)
+    m = _SIZE_PAT.search(strip_html_comments(body))
     if not m:
         return CheckResult(
             "estimate", False, "no Size: XS/S/M/L/XL in body",
@@ -222,12 +268,13 @@ def check_scope_fence(body: str) -> CheckResult:
     and the existing suite rejected it: `Deferred.` and `Not now.` are real
     answers to "what is out of scope", and a gate that demands padding gets
     padding. `## Why` earns its 5-word floor because a one-word why is never a
-    why; a one-word fence often is a fence.
+    why; a one-word fence often is a fence. A bare `-` placeholder is no word
+    at all (#1330).
     """
     text = section_text(body, "Out of scope")
     if text is None:
         return CheckResult("scope-fence", False, "missing ## Out of scope section")
-    words = len(text.split())
+    words = _content_word_count(text)
     if not words:
         return CheckResult(
             "scope-fence", False,
@@ -253,6 +300,15 @@ def has_loom_footer(body: str) -> bool:
     a fleet lane PR from an operator PR (grug#1251), so the two cannot
     drift."""
     return bool(_LOOM_FOOTER_PAT.search(body or ""))
+
+
+def loom_footer_lane(body: str) -> str | None:
+    """The lane the Loom audit footer names, or None when there is no
+    footer or it names no lane. Lives next to `has_loom_footer` so Chief's
+    persona and the footer check share one parser (#1318)."""
+    match = _LOOM_FOOTER_LANE_PAT.search(body or "")
+    # A sentence-final footer (`..., lane x.`) keeps its dot off the name.
+    return match.group(1).rstrip(".") if match else None
 
 
 def check_loom_footer(body: str) -> CheckResult:
@@ -479,6 +535,18 @@ def belongs_to_epic(facts: IssueFacts) -> bool:
     )
 
 
+def named_ticket_numbers(body: str) -> list[int]:
+    """The ticket numbers a PR body names, sorted and de-duplicated.
+
+    The one extractor behind `which epic` and the webhook trigger that re-runs
+    Chief when a named ticket gains or loses an epic (dispatcher
+    `_recheck_chief_for_ticket`). Shared so the trigger and the check can
+    never disagree on which PRs a ticket change affects. Code spans are
+    stripped first: a `Refs #N` quoted in backticks names nothing.
+    """
+    return sorted({int(n) for n in _TICKET_REF_PAT.findall(strip_code_spans(body or ""))})
+
+
 def check_linked_issue_in_epic(
     body: str,
     *,
@@ -496,7 +564,7 @@ def check_linked_issue_in_epic(
     never read as a pass either. A PR naming no ticket passes here with
     nothing to check - `which ticket` already speaks to that.
     """
-    numbers = sorted({int(n) for n in _TICKET_REF_PAT.findall(strip_code_spans(body))})
+    numbers = named_ticket_numbers(body)
     if not numbers:
         return CheckResult(
             "linked-issue-epic", True, "no ticket named, so no epic to check",
@@ -563,16 +631,24 @@ def run_all(
     *,
     fetch_issue: IssueFetcher | None = None,
     fetch_issue_facts: IssueFactsFetcher | None = None,
+    fetch_changed_files: Callable[[], list[str]] | None = None,
 ) -> list[CheckResult]:
     """Run all DoR checks over the PR body.
 
-    `fetch_issue` is passed through to check_linked_issue_completeness and
-    `fetch_issue_facts` to check_linked_issue_in_epic. When either is None,
-    its check fails open (pass, marked `skipped`).
+    `fetch_issue` is passed through to `check_linked_issue_completeness` and
+    `check_in_scope`; `fetch_issue_facts` to `check_linked_issue_in_epic`;
+    `fetch_changed_files` to `check_in_scope`. When either IO fetcher is
+    None, its check fails open (pass, marked `skipped`).
+
+    The first 5 checks are pure (body -> CheckResult); the last 3 need IO
+    through their injected fetchers.
     """
-    # The first 5 checks are pure (body -> CheckResult); the last two need IO
+    # The first 5 checks are pure (body -> CheckResult); the last 3 need IO
     # through their injected fetchers.
     results = [check(body) for check in _PURE_CHECKS]
     results.append(check_linked_issue_completeness(body, fetch_issue=fetch_issue))
     results.append(check_linked_issue_in_epic(body, fetch_issue_facts=fetch_issue_facts))
+    results.append(
+        check_in_scope(body, fetch_issue=fetch_issue, fetch_changed_files=fetch_changed_files)
+    )
     return results

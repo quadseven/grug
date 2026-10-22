@@ -175,6 +175,8 @@ def test_judge_does_not_reassemble_evidence():
 def test_llm_client_has_no_second_evidence_renderer():
     """Both prompts render evidence through `review_evidence` only."""
     source = inspect.getsource(lc)
-    for needle in ("FULL FILE", "cross-file context", "MAX_FILE_CONTEXT",
-                   "PULL REQUEST INTENT\\n"):
+    # Needles are the rendered block headers, not prose: a comment that
+    # mentions "cross-file context" in passing is not a renderer.
+    for needle in ("FULL FILE (", "cross-file context)", "MAX_FILE_CONTEXT",
+                   "PULL REQUEST INTENT\\n", "ENCLOSING SCOPE ("):
         assert needle not in source, needle

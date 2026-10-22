@@ -20,6 +20,7 @@ from llm_client import (
 from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.review_publish import plan_publish
+from review_evidence import ElderEvidence
 from review_pipeline import ReviewCoverage, ReviewabilityConcern
 
 
@@ -1127,6 +1128,43 @@ def test_dispatch_judge_failure_does_not_change_result(monkeypatch):
     assert out["result"] == "pass"
 
 
+def test_dispatch_judge_grades_against_the_reviewers_own_evidence(monkeypatch):
+    """The production judge caller is migrated to the evidence seam (#1189):
+    `grade_findings` receives the very `ElderEvidence` object the reviewer
+    read, never hunks plus loose kwargs and never a second assembly."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="r", severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "rs1"},
+    )
+    reviewed: list = []
+    graded: list = []
+
+    def _fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
+        reviewed.append(evidence)
+        return llm
+
+    def _fake_grade(evaluation, evidence, installation_id, *a, **kw):
+        graded.append(evidence)
+        return (FindingJudgement(0, True, "real", 0.9),)
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", _fake_review_diff)
+    monkeypatch.setattr(cr_dispatch, "grade_findings", _fake_grade)
+    monkeypatch.setattr(cr_dispatch, "submit_evals", lambda *a, **kw: None)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert len(reviewed) == 1 and len(graded) == 1
+    assert isinstance(graded[0], ElderEvidence)
+    assert graded[0] is reviewed[0]
+
+
 def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
     """The review receives both trace coordinates and author intent."""
     captured = []
@@ -1432,6 +1470,40 @@ def test_dispatch_captures_comment_records_on_publish(monkeypatch):
     assert rec["head_sha"] == "abcd1234efgh"
     assert rec["author_login"] == "alice"
     assert rec["trust_reactors"] is True
+
+
+def test_dispatch_records_the_pass_in_the_canonical_review_session(monkeypatch):
+    """#1207: the pass lands in the PR's review session with the check-run it
+    published and the inline comment each finding got, so every GitHub
+    surface links back to the same record."""
+    recorded = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _llm_with_span())
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 9001})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(
+        cr_dispatch, "get_review_comments",
+        lambda *a, **kw: [{
+            "id": 555, "path": "src/x.py", "line": 2,
+            "body": "m\n<!-- grug-rule:silent-failure -->",
+        }],
+    )
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: None)
+    monkeypatch.setattr(
+        cr_dispatch.hunt_link, "record_elder_run",
+        lambda ref, **kw: recorded.append((ref, kw)),
+    )
+    with patch("httpx.get", return_value=_diff_response()):
+        out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert out["result"] == "pass"
+    [(ref, kw)] = recorded
+    assert (ref.install_id, ref.owner, ref.repo, ref.pr_number) == (11, "myorg", "myrepo", 7)
+    assert kw["head_sha"] == "abcd1234efgh" and kw["trigger"] == "opened"
+    assert kw["check_run_id"] == 9001
+    assert kw["comment_ids"] == {("src/x.py", "silent-failure", 2): 555}
+    assert kw["delta"] is False and "src/x.py" in kw["diff_paths"]
+    assert kw["degraded_reason"] == ""
+    assert [f.rule_name for f in kw["findings"]] == ["silent-failure"]
 
 
 def test_dispatch_captures_all_origin_spans_without_global_span(monkeypatch):
@@ -2184,6 +2256,30 @@ def test_partial_review_stays_advisory_but_publishes_validated_findings():
     # Partial coverage must not borrow the blackout vocabulary: Elder saw
     # most of this diff, so "could not see" would discard real work.
     assert "could not see" not in summary
+
+
+def test_outside_diff_findings_remain_summary_only():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    finding = Finding(
+        file="src/sibling.py", line=42, severity="medium",
+        rule_name="caller-not-updated",
+        message="OUTSIDE DIFF (advisory): sibling call remains stale.",
+        suggestion=None, outside_diff_reason="Changed contract also applies here.",
+    )
+    evaluation = CodeReviewEvaluation(
+        findings=(finding,), conclusion="success",
+    )
+
+    result, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+
+    assert result is None
+    assert posted == ()
+    _, summary = cr_dispatch._summary_markdown(evaluation)
+    assert "src/sibling.py:42" in summary
+    assert "OUTSIDE DIFF (advisory)" in summary
 
 
 def test_complexity_without_split_is_summary_only_and_other_kind_still_threads():
@@ -3734,9 +3830,17 @@ _ELDER_TAG = "<!-- grug:review persona=elder -->"
 
 
 def _review(rid, *, state="CHANGES_REQUESTED", commit="old0000", body=_ELDER_TAG,
-            login="grug-tribe[bot]"):
+            login="grug-tribe[bot]", submitted_at=None):
     return {"id": rid, "state": state, "commit_id": commit, "body": body,
-            "user": {"login": login}}
+            "user": {"login": login}, "submitted_at": submitted_at}
+
+
+# #1350: stand-ins for "before this run started" and "after it started"; the
+# run start is read from the clock inside dispatch, so these are far enough
+# out that no real clock reading can land on the wrong side.
+_BEFORE_RUN = "2000-01-01T00:00:00Z"
+_AFTER_RUN = "2999-01-01T00:00:00Z"
+_HEAD = "abcd1234efgh"
 
 
 def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
@@ -3786,6 +3890,48 @@ def test_clean_rereview_dismisses_only_elders_own_stale_block(monkeypatch):
     ]
     listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
     assert listed == [7]
+    assert dismissed == [1]
+
+
+def test_clean_rereview_dismisses_elders_same_head_block_from_before_the_run(monkeypatch):
+    """#1350: a passing re-review on the same head withdraws Elder's own
+    earlier block on that head, or the PR stays unmergeable."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)]
+    _, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
+    assert dismissed == [1]
+
+
+def test_same_head_block_posted_after_the_run_started_is_kept(monkeypatch):
+    """#1350: a block another run posted while this one was in flight was not
+    judged by this run, so this run must not withdraw it."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [
+        _review(1, commit=_HEAD, submitted_at=_AFTER_RUN),
+        _review(2, commit=_HEAD, submitted_at=None),  # no timestamp: cannot prove it is older
+    ]
+    _, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
+    assert dismissed == []
+
+
+def test_same_head_blocks_of_other_authors_are_kept(monkeypatch):
+    """#1350: the same-head rule keeps the persona and author filters."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [
+        _review(1, commit=_HEAD, submitted_at=_BEFORE_RUN,
+                body="<!-- grug:review persona=guard -->"),
+        _review(2, commit=_HEAD, submitted_at=_BEFORE_RUN, login="a-human"),
+        _review(3, commit=_HEAD, submitted_at=_BEFORE_RUN, state="COMMENTED"),
+    ]
+    _, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
+    assert dismissed == []
+
+
+def test_earlier_commit_block_is_dismissed_even_if_submitted_after_run_start(monkeypatch):
+    """#1350: the earlier-commit rule does not depend on timing."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [_review(1, commit="old0000", submitted_at=_AFTER_RUN)]
+    _, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
     assert dismissed == [1]
 
 

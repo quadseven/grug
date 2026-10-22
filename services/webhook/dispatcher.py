@@ -548,6 +548,37 @@ _RECHECK_PAT = _re.compile(r"^\s*/grug\s+recheck\b", _re.IGNORECASE | _re.MULTIL
 # `permission` field on `GET /repos/{o}/{r}/collaborators/{u}/permission`.
 _AUTHORIZED_ROLES = {"admin", "maintain", "write"}
 
+# grug#1270: below this fraction of the installation's hourly GitHub
+# budget, an Elder re-run is held back until the window resets instead of
+# spending what is left and getting 403'd on the way. A burst of commands
+# (14 PRs in two minutes on 2026-10-18) must not eat the whole budget at
+# once - the commands after the wall were the ones that got dropped.
+_LOW_BUDGET_FRACTION = 0.10
+
+
+def _budget_reset_epoch(install_id: int) -> float:
+    """The epoch second the installation's GitHub budget resets at, when
+    the budget is too low to spend on another re-run.
+
+    0 when there is budget left, and 0 when the budget cannot be read -
+    an unreadable budget must never block a command (grug#1270)."""
+    from github_app_auth import core_rate_limit, with_install_token_retry  # type: ignore
+
+    try:
+        budget = with_install_token_retry(install_id, core_rate_limit)
+    except Exception as e:  # noqa: BLE001 - an unreadable budget is not a full one
+        log.warning(
+            "grug_command_budget_unreadable",
+            extra={"installation_id": install_id, "kind": type(e).__name__},
+        )
+        return 0.0
+    if not budget:
+        return 0.0
+    remaining, limit, reset = budget
+    if limit <= 0 or remaining >= limit * _LOW_BUDGET_FRACTION:
+        return 0.0
+    return float(reset)
+
 
 def _actor_has_write(
     installation_id: int,
@@ -644,10 +675,19 @@ def _handle_issues(payload: dict[str, Any]) -> dict[str, str]:
     if issue.get("pull_request"):
         return {"status": "no_op", "reason": "issues event on a PR"}
 
-    return _run_issue_dor_for(
+    out = _run_issue_dor_for(
         payload.get("installation") or {}, payload.get("repository") or {},
         issue, refresh_only=False,
     )
+    # A body edit can add or drop `Part of #<epic>`, which flips the `which
+    # epic` row on every PR naming this ticket. A title or label edit cannot
+    # change that line, so only a body change re-runs Chief.
+    if action == "edited" and "body" in (payload.get("changes") or {}):
+        out = {**out, **_recheck_chief_for_ticket(
+            payload.get("installation") or {}, payload.get("repository") or {},
+            [issue.get("number")],
+        )}
+    return out
 
 
 def _handle_sub_issues(payload: dict[str, Any]) -> dict[str, str]:
@@ -674,9 +714,146 @@ def _handle_sub_issues(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "no_op", "reason": f"sub_issues action={action} not gated"}
     if issue.get("pull_request"):
         return {"status": "no_op", "reason": "sub_issues event on a PR"}
-    return _run_issue_dor_for(
+    out = _run_issue_dor_for(
         payload.get("installation") or {}, repo, issue, refresh_only=True,
     )
+    # The same membership change flips Chief's `which epic` row on every PR
+    # naming this issue. Separate from the advisory and its flag: Chief on
+    # the PR is on by default, the issue-time advisory is not.
+    return {**out, **_recheck_chief_for_ticket(
+        payload.get("installation") or {}, repo, [issue.get("number")],
+    )}
+
+
+# At most this many open PRs get Chief re-run per ticket event: one ticket is
+# normally named by one PR, and each re-run costs what `/grug recheck` costs.
+_TICKET_RECHECK_MAX_PRS = 5
+
+
+def _ticket_numbers(values: list[Any]) -> set[int]:
+    """The integer issue numbers in `values`, dropping anything unparseable."""
+    numbers: set[int] = set()
+    for value in values:
+        try:
+            numbers.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return numbers
+
+
+def _ticket_recheck_blocked(installation_id: Any, repo_id: Any) -> str | None:
+    """Why the ticket-change Chief re-run must not run here, or None.
+
+    Chief (tpm) on the PR is the gate, not `issue_dor_enabled`: that flag is
+    the issue-time advisory's, and Chief on the PR does not depend on it."""
+    if not is_install_allowlisted(int(installation_id)):
+        return "no_op: installer not allowlisted"
+    if repo_id is None:
+        return "no_op: no repo_id"
+    if not is_persona_enabled(int(installation_id), int(repo_id), "tpm"):
+        return "no_op: tpm disabled for this repo"
+    return None
+
+
+def _open_prs_naming(
+    installation_id: int, owner: str, repo_name: str, numbers: set[int],
+) -> list[dict[str, Any]]:
+    """The open PRs whose body names one of `numbers`: one list call (the 50
+    most recently updated, the self-heal pass's own call), matched with the
+    same extractor the `which epic` check uses. Raises on a list failure."""
+    import chief_self_heal  # local import: module attribute, so tests can fake the list
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from personas.tpm.dor_checks import named_ticket_numbers  # type: ignore
+
+    prs = with_install_token_retry(
+        installation_id,
+        lambda token: chief_self_heal._list_recent_open_prs(token, owner, repo_name),
+    ) or []
+    return [
+        pr for pr in prs
+        if pr.get("number") and (pr.get("head") or {}).get("sha")
+        and numbers.intersection(named_ticket_numbers(pr.get("body") or ""))
+    ]
+
+
+def _recheck_chief_on_pr(
+    installation_id: int, owner: str, repo_name: str, pr: dict[str, Any],
+    coords: dict[str, Any],
+) -> bool:
+    """Re-run Chief on one PR through `run_chief_recheck`. Returns whether it
+    published; never raises, so one PR cannot stop the rest."""
+    from personas.publish_check import PUBLISH_FAILED  # type: ignore
+    from personas.tpm.persona import is_trusted_operator  # type: ignore
+
+    pr_number = int(pr["number"])
+    head_sha = str(pr["head"]["sha"])
+    try:
+        _, result_map = run_chief_recheck(
+            installation_id=installation_id, owner=owner, repo=repo_name,
+            head_sha=head_sha, pr_number=pr_number,
+            pr_body=pr.get("body") or "",
+            author_trusted=is_trusted_operator(pr),
+        )
+        if result_map.get("result") == PUBLISH_FAILED:
+            raise RuntimeError("chief publish failed")
+    except Exception as e:  # noqa: BLE001 - one PR must not stop the rest
+        log.warning("chief_ticket_recheck_failed",
+                    extra={**coords, "pr_number": pr_number,
+                           "head_sha": head_sha[:8], "kind": type(e).__name__})
+        return False
+    return True
+
+
+def _recheck_chief_for_ticket(
+    installation: dict[str, Any],
+    repo: dict[str, Any],
+    issue_numbers: list[Any],
+) -> dict[str, str]:
+    """Re-run Chief on the open PRs whose body names one of `issue_numbers`.
+
+    The `which epic` row is blocking, and its documented fix (make the ticket
+    a sub-issue of an epic, or write `Part of #N` in it) changes the TICKET.
+    Without this the PR keeps its red Chief until its body is edited or
+    someone comments `/grug recheck`, and the self-heal pass does not help
+    because the head SHA already has a Chief run.
+
+    Gated by `_ticket_recheck_blocked`; PRs found by `_open_prs_naming`; at
+    most `_TICKET_RECHECK_MAX_PRS` of them re-run through the same
+    `run_chief_recheck` `/grug recheck` calls, each best-effort. Never
+    raises: the result is one `chief_recheck` audit key the caller merges in.
+    """
+    numbers = _ticket_numbers(issue_numbers)
+    installation_id = installation.get("id")
+    owner = (repo.get("owner") or {}).get("login") or repo.get("full_name", "").split("/")[0]
+    repo_name = repo.get("name")
+    if not numbers or not all([installation_id, owner, repo_name]):
+        return {"chief_recheck": "skip: incomplete payload"}
+
+    coords = {"installation_id": installation_id, "owner": owner,
+              "repo": repo_name, "tickets": sorted(numbers)}
+    try:
+        blocked = _ticket_recheck_blocked(installation_id, repo.get("id"))
+        if blocked:
+            return {"chief_recheck": blocked}
+        matched = _open_prs_naming(int(installation_id), owner, repo_name, numbers)
+    except Exception as e:  # noqa: BLE001 - a webhook 500 is never redelivered
+        log.warning("chief_ticket_recheck_failed",
+                    extra={**coords, "stage": "list_prs", "kind": type(e).__name__})
+        return {"chief_recheck": "skip: open PR list failed"}
+
+    results = [
+        _recheck_chief_on_pr(int(installation_id), owner, repo_name, pr, coords)
+        for pr in matched[:_TICKET_RECHECK_MAX_PRS]
+    ]
+    rechecked = sum(results)
+    failed = len(results) - rechecked
+    log.info("chief_ticket_rechecked",
+             extra={**coords, "matched": len(matched), "rechecked": rechecked,
+                    "failed": failed})
+    return {"chief_recheck": (
+        f"rechecked {rechecked}, failed {failed} of {len(matched)} open PR(s) "
+        f"naming #{sorted(numbers)}"
+    )}
 
 
 def _run_issue_dor_for(
@@ -733,6 +910,61 @@ def _run_issue_dor_for(
     ) or {"status": "skip", "reason": "token acquisition failed"}
 
 
+def _defer_grug_command(
+    *, cmd, installation_id: int, owner: str, repo_name: str, pr_number: int,
+    comment_id: int, token_fn, defer_until: float,
+) -> dict[str, str]:
+    """Hand the command to the interactive lane with a `not_before`.
+
+    The command is KEPT, not dropped: the re-run goes back on the queue for
+    the moment the installation's GitHub budget resets, and the reader is
+    told it is deferred. A command that vanishes looks exactly like a
+    command that worked and did nothing (grug#1270)."""
+    from interactive import run_command  # type: ignore
+
+    return run_command(
+        cmd.verb, cmd.arg, install_id=installation_id, owner=owner,
+        repo=repo_name, pr_number=pr_number, comment_id=comment_id,
+        token_fn=token_fn, defer_until=defer_until,
+    )
+
+
+def _defer_if_budget_spent(
+    *, cmd, installation_id: int, owner: str, repo_name: str, pr_number: int,
+    comment_id: int, token_fn, reset_epoch: float = 0.0,
+) -> dict[str, str] | None:
+    """The deferred command when the installation's GitHub budget is spent,
+    else None.
+
+    `reset_epoch` is when the budget resets - read from the budget itself
+    when it is known, or from a rate-limited response. Elder re-runs are
+    the ones deferred: they are the expensive ones, and a command that
+    cannot run must be KEPT (grug#1270)."""
+    from grug_commands import ELDER_RERUN_VERBS  # type: ignore
+
+    if cmd.verb not in ELDER_RERUN_VERBS:
+        return None
+    if reset_epoch <= 0:
+        reset_epoch = _budget_reset_epoch(installation_id)
+    if reset_epoch <= 0:
+        return None
+    log.warning(
+        "grug_command_deferred_rate_limited",
+        extra={
+            "installation_id": installation_id,
+            "repo": f"{owner}/{repo_name}",
+            "pr": pr_number,
+            "verb": cmd.verb,
+            "reset_epoch": int(reset_epoch),
+        },
+    )
+    return _defer_grug_command(
+        cmd=cmd, installation_id=installation_id, owner=owner,
+        repo_name=repo_name, pr_number=pr_number, comment_id=comment_id,
+        token_fn=token_fn, defer_until=reset_epoch,
+    )
+
+
 def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     action = payload.get("action", "")
     if action != "created":
@@ -783,7 +1015,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # Author OR write+ collaborator only — public-listed App means random
     # commenters can't spam re-evaluations. Lazy imports keep cold-start
     # cheap when only PR events fire.
-    from github_app_auth import with_install_token_retry  # type: ignore
+    from github_app_auth import (  # type: ignore
+        primary_rate_limit_reset_epoch,
+        with_install_token_retry,
+    )
     from personas.publish_check import PUBLISH_FAILED  # type: ignore
     import httpx  # type: ignore
 
@@ -817,6 +1052,21 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         )
         return {"status": "no_op", "reason": "sender lacks write perm"}
 
+    # grug#1270: pace an Elder re-run against the installation's hourly
+    # GitHub budget BEFORE any billable call. A burst of `/grug improve`
+    # commands (14 PRs in two minutes on 2026-10-18) otherwise spends the
+    # whole budget at once, and every command after the wall was dropped
+    # with no reply. `GET /rate_limit` does not count against the limit,
+    # so asking what is left is free.
+    deferred = _defer_if_budget_spent(
+        cmd=cmd, installation_id=int(installation_id), owner=owner,
+        repo_name=repo_name, pr_number=int(pr_number),
+        comment_id=int(comment_id) if comment_id is not None else 0,
+        token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+    )
+    if deferred:
+        return deferred
+
     # Re-fetch PR to get current head_sha + body (issue payload only has
     # the issue mirror, not the PR head). One API call per recheck.
     def _fetch_pr(token: str) -> dict[str, Any]:
@@ -835,6 +1085,20 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     try:
         pr = with_install_token_retry(int(installation_id), _fetch_pr)
     except httpx.HTTPStatusError as e:
+        # grug#1270: a command refused because the hourly budget is spent
+        # must be KEPT, not dropped. It goes back on the queue with a
+        # `not_before` at the reset, and the reader is told it is deferred
+        # - a command that vanishes looks exactly like a command that
+        # worked and did nothing.
+        deferred = _defer_if_budget_spent(
+            cmd=cmd, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
+            comment_id=int(comment_id) if comment_id is not None else 0,
+            token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+            reset_epoch=float(primary_rate_limit_reset_epoch(e.response)),
+        )
+        if deferred:
+            return deferred
         log.warning(
             "recheck_pr_fetch_failed",
             extra={"pr_number": pr_number, "status": e.response.status_code},
@@ -864,6 +1128,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             repo=repo_name, pr_number=int(pr_number),
             comment_id=int(comment_id) if comment_id is not None else 0,
             token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+            head_sha=head_sha,
         )
 
     # Final guard (FLINT on #575): main.py forwards dispatch()
@@ -939,9 +1204,12 @@ def run_chief_recheck(
     the `publish_failed` sentinel in the map, never a raise (since #550).
     Unexpected errors propagate; each caller owns its containment."""
     from personas.tpm.issue_fetcher import (  # type: ignore
-        build_issue_facts_fetcher, build_issue_fetcher,
+        build_changed_files_fetcher, build_issue_facts_fetcher,
+        build_issue_fetcher,
     )
-    from personas.tpm.persona import evaluate_pull_request, publish_tpm_evaluation  # type: ignore
+    from personas.tpm.persona import (  # type: ignore
+        _ADVISORY_CHECKS, evaluate_pull_request, publish_tpm_evaluation,
+    )
 
     # Same fetcher builder as the pull_request webhook path (#782).
     # Pre-#782 this call was bare `evaluate_pull_request(pr_body)`, so
@@ -957,9 +1225,21 @@ def run_chief_recheck(
     facts_fetcher = build_issue_facts_fetcher(
         installation_id=installation_id, owner=owner, repo=repo,
     )
+    # Same shared builder for the PR's changed files, so the in-scope check
+    # evaluates identically on the webhook and `/grug recheck` paths.
+    fetch_changed_files = build_changed_files_fetcher(
+        installation_id=installation_id, owner=owner, repo=repo,
+        pr_number=pr_number,
+    )
+    # in-scope is advisory by default here (no repo config read at this
+    # surface); the pull_request webhook path may promote it to blocking.
+    advisory_checks = _ADVISORY_CHECKS
     evaluation = evaluate_pull_request(
-        pr_body, fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
+        pr_body,
+        fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
+        fetch_changed_files=fetch_changed_files,
         author_trusted=author_trusted,
+        advisory_checks=advisory_checks,
     )
     # publish_tpm_evaluation never raises on a failed publish since #550:
     # the seam classifies ANY publish failure into the "publish_failed"
@@ -972,6 +1252,7 @@ def run_chief_recheck(
         repo=repo,
         head_sha=head_sha,
         pr_number=pr_number,
+        advisory_checks=advisory_checks,
     )
     return evaluation, result_map
 

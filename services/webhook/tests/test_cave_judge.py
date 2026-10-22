@@ -66,7 +66,7 @@ def test_cave_config_defaults_to_permanently_hot_reasoner(monkeypatch):
     cfg = _cave_judge_config()
 
     assert cfg is not None
-    assert cfg.model == "poolside/Laguna-S-2.1-NVFP4"
+    assert cfg.model == "qwen3.5:122b"
 
 
 def test_judge_messages_redact_masks_secret():

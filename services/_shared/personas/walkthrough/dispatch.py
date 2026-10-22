@@ -19,6 +19,7 @@ import httpx
 from activity_log import record_check_verdict
 from github_app_auth import get_app_id, with_install_token_retry
 
+from personas import hunt_recorder
 from personas.walkthrough.effort import estimate_effort
 from personas.walkthrough.render import MARKER, FileStat, walkthrough_body
 
@@ -276,6 +277,7 @@ def dispatch_walkthrough_review(
     pull_number = int(pr["number"])
     head_sha = pr["head"]["sha"]
     installation_id = int(installation["id"])
+    started_at = hunt_recorder.now()
 
     try:
         diff_text = with_install_token_retry(
@@ -434,7 +436,10 @@ def dispatch_walkthrough_review(
         )
         return {"persona": "walkthrough", "result": "skipped_closed"}
 
-    pr_url = f"https://github.com/{owner}/{repo_name}/pull/{pull_number}"
+    # The full review is Elder's check run output on the Checks tab: the
+    # walkthrough is a comment on the PR page, so linking that page only
+    # reloaded it.
+    pr_url = f"https://github.com/{owner}/{repo_name}/pull/{pull_number}/checks"
     body = walkthrough_body(
         summary=summary,
         files=files,
@@ -472,6 +477,19 @@ def dispatch_walkthrough_review(
     # "the AI-authored prose fell back" without lying the OTHER way on the
     # Activity badge.
     _emit_degraded_metric(degraded)
+    # Hunt Board (#1207): the walkthrough and related hunts live in the PR's
+    # canonical review session. The summary call reports no model, so a
+    # fallback summary is named as such rather than leaving a blank.
+    hunt_recorder.record_walkthrough(
+        hunt_recorder.PrRef(installation_id, owner, repo_name, pull_number),
+        head_sha=head_sha,
+        trigger=str(payload.get("action", "")),
+        started_at=started_at,
+        backend="",
+        model="deterministic-fallback" if degraded else "",
+        text=summary,
+        related=tuple(f"#{r.number} {r.title} ({r.reason})" for r in related),
+    )
     record_check_verdict(
         install_id=installation_id,
         persona_key="walkthrough",

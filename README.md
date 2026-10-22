@@ -67,15 +67,27 @@ pulumi up                   # provision AWS infra (SSM refs, SQS, KMS, DD monito
 ## What Chief checks (Hunt Plan)
 
 Before the tribe leave the cave, Chief reads the **Hunt Plan** on the PR body —
-**4 blocking plan checks, 1 advisory:**
+**6 blocking plan checks, 3 advisory:**
 
 | | Plan check | Pass when | Blocks? |
 |---|---|---|---|
-| yes | `why` | Has `## Why` (or `## Summary`) section, enough words to name the hunt | **yes** |
-| yes | `acceptance` | Has `## Acceptance criteria` (or `## Test plan`) with enough bullets | **yes** |
-| yes | `estimate` | Body or label includes `Size: XS/S/M/L` (XL must be split) | **yes** |
-| yes | `scope-fence` | Has `## Out of scope` section | **yes** |
-| soft | `issue-link` | Body links an issue via `closes #N` | advisory |
+| yes | `why` (why hunt) | Has `## Why` (or `## Summary`) with at least 5 words | **yes** |
+| yes | `acceptance` (what good look like) | Has `## Acceptance criteria` (or `## Test plan`) with at least 3 non-empty bullets | **yes** |
+| yes | `estimate` (how big) | Body includes `Size: XS/S/M/L` (XL must be split) | **yes** |
+| yes | `scope-fence` (where stop) | Has a non-empty `## Out of scope` section | **yes** |
+| yes | `linked-issue-completeness` (ticket done) | Every ticket closed by a closing keyword has its checkboxes ticked | **yes** |
+| yes | `linked-issue-epic` (which epic) | Every ticket the body names is an epic or belongs to one (grug#1034) | **yes** |
+| soft | `issue-link` (which ticket) | Body links a ticket, e.g. `Refs #N` or `Part of #N` | advisory |
+| soft | `loom-footer` (loom mark) | A PR naming a loom ticket carries the Loom audit footer | advisory |
+| soft | `in-scope` (in scope) | All changed files trace to the linked issue's scope (grug#1195) | advisory |
+
+Text inside HTML comments counts for nothing, and neither does a bare `-`
+or empty checkbox: a PR body left as the template ships fails the plan.
+Write `Refs #N` and `Part of #N`, not a closing keyword: a ticket closes
+once its boxes are ticked, not when the PR merges.
+
+The `in-scope` check names any rider files the linked issue never asked for
+and is advisory by default; org/repo config can promote it to blocking.
 
 The Hunt Plan is for PRs written by people and by operator sessions. A PR
 body carrying an agent-authored marker (a `claude.ai/code/session_` link or
@@ -86,6 +98,54 @@ is a fleet lane PR (agent marker plus the Loom audit footer), carries the
 explicit `<!-- grug:agent-authored -->` opt-out, or comes from any other
 author. The check-run title names the rule that applied. Elder and Guard
 review every PR as usual.
+
+### Check a Hunt Plan before you open the PR
+
+`gh pr create --body` skips the repo's PR template, so a missing section or a
+ticket with no epic usually shows up as a red `Grug - Chief` after the PR is
+open. `scripts/chief_check.py` runs the same evaluator Chief runs, against
+your `gh` login, and prints the same title and table:
+
+```bash
+make chief-check REPO=owner/name BODY=pr.md      # a body you are about to post
+make chief-check REPO=owner/name PR=123          # an open PR's current body
+gh pr create --body-file pr.md                   # once it exits 0
+```
+
+It exits 0 when Chief would pass (or skip), 1 when Chief would hold the PR,
+and 2 on a usage error. When `which epic` fails it lists the repo's open
+`Epic: ...` issues and the two fixes: add the ticket as a sub-issue of an
+epic, or write `Part of #<epic>` in the ticket's body.
+
+### Verify stated claims after a deploy
+
+`scripts/shepherd_verify.py` reads the PR's `## Acceptance criteria` bullets
+and checks explicitly named `Metric`, `Log event`, `Endpoint`, or `GET`
+signals. Names may be in backticks, and metric names or URLs may be plain
+text. It does not infer a signal from prose elsewhere in the PR. The caller
+runs it after deploy completion and supplies source-specific query commands
+and known-live baselines:
+
+```bash
+python3 scripts/shepherd_verify.py --pr 123 --repo example-org/example-repo \
+  --since-epoch "$DEPLOY_FINISHED_UNIX" \
+  --query-command /path/to/your-query-adapter \
+  --baseline metric=your.known_live.metric
+```
+
+The adapter receives `source signal start_epoch end_epoch criterion` as
+arguments and prints one nonnegative integer count. It must query the named
+source over that window, including both the target and its baseline from the
+same source. For an endpoint, it must count only responses matching the
+criterion's expected status or body. A nonzero exit or invalid count makes
+the result unverifiable.
+Supply a baseline for each source used by the PR. The baseline must be known
+to emit during the post-deploy window; a historical signal is not enough.
+The default is two checks 30 seconds apart. An absent target is `missing`
+only after both checks find its baseline live. An empty baseline, missing
+baseline configuration, failed lookup, or PR with no explicit observable is
+`unverifiable`. The output includes each criterion and the counts from each
+attempt. Exit codes are 0 observed, 1 missing, and 2 unverifiable.
 
 ## What Elder and Guard check
 
@@ -177,7 +237,7 @@ PRD #21 + slice issues #22-#34 track v1.
 
 Issues + PRs welcome. Use the Hunt Plan template — Grug will gate your own PR. Fair is fair.
 
-PR body must have `## Why`, `## Acceptance criteria`, `## Out of scope`, `Size:`, and `closes #N`.
+PR body must have `## Why`, `## Acceptance criteria`, `## Out of scope`, `Size:`, and `Refs #N` (plus `Part of #N` naming the epic).
 
 ## Related docs
 

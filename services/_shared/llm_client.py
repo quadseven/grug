@@ -34,7 +34,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import hashlib
-import fnmatch
 import json
 import logging
 import math
@@ -71,6 +70,7 @@ from review_pipeline import (
 from review_evidence import Hunk, ElderEvidence, seal
 from datadog_switch import datadog_enabled
 import call_report
+import shared_benches
 import deep_shadow
 from secrets_loader import (
     get_opencode_go_api_key,
@@ -383,6 +383,11 @@ _OVERSIZED_COHORT_ERROR = "cohort budget exceeded"
 # re-spelled, so the classifier cannot drift from the reason strings below.
 _SKIPPED_COHORT_PREFIX = "cohort skipped: "
 
+# What `_truncation_error` says about a parseable answer the model stopped at
+# its max_tokens cap (grug#851). Matched, not re-spelled, so a cohort that hit
+# the cap is told apart from any other "partial review:" cause.
+_CAPPED_ANSWER_MARKER = "hit the generation token cap"
+
 # The staged review's deadline (grug#1216), as a `time.monotonic()` value.
 # The scheduler used to reserve one worst-case ladder walk (Cave timeout +
 # two SaaS fallbacks + every cloud tier, 480-575s of a 600-700s budget)
@@ -686,6 +691,10 @@ class Finding:
     # (mirrors suggestion's None-for-absent).
     suggestion: str | None = None
     effort: Effort | None = None
+    # Explicit justification is required to request a cross-file anchor.
+    # `evaluate_diff` additionally verifies that the exact line was supplied
+    # in bounded cross-file context before accepting it.
+    outside_diff_reason: str | None = None
     # A duplicate candidate can be independently produced by both models. Keep
     # every source so judge and human feedback train both originating spans.
     origins: tuple[FindingOrigin, ...] = field(default_factory=tuple, compare=False)
@@ -1016,7 +1025,9 @@ def _opencode_go_chain_config() -> BackendConfig:
 # carried `Retry-After: 105419` and `limitName: monthly`. Calling Go on every
 # review until then bought nothing but a refused request each time, so the
 # first such refusal opens this breaker and Go is skipped until Retry-After
-# has passed. Per process: each pod pays at most one refused call per window.
+# has passed. The open breaker is shared with every pod and survives a
+# restart (`shared_benches`, grug#1286), so the account pays one refused call
+# per window rather than one per pod.
 _OPENCODE_GO_DEFAULT_BLOCK_SECONDS = 3600.0
 _OPENCODE_GO_MAX_BLOCK_SECONDS = 7 * 86400.0
 _opencode_go_breaker_lock = threading.Lock()
@@ -1039,7 +1050,8 @@ def _opencode_go_model_is_free(model: str) -> bool:
 def _opencode_go_available(now: float | None = None) -> bool:
     current = time.time() if now is None else now
     with _opencode_go_breaker_lock:
-        return current >= _opencode_go_blocked_until
+        local = _opencode_go_blocked_until
+    return current >= max(local, shared_benches.blocked_until("go", Backend.OPENCODE_GO.value))
 
 
 def _retry_after_seconds(resp: httpx.Response) -> float:
@@ -1083,6 +1095,8 @@ def _note_opencode_go_response(resp: httpx.Response) -> None:
         pass
     with _opencode_go_breaker_lock:
         _opencode_go_blocked_until = max(_opencode_go_blocked_until, time.time() + seconds)
+        until = _opencode_go_blocked_until
+    shared_benches.publish("go", Backend.OPENCODE_GO.value, "", until)
     log.warning(
         "opencode_go_circuit_open",
         extra={"block_seconds": seconds, "limit_name": limit_name},
@@ -1096,7 +1110,8 @@ def _note_opencode_go_response(resp: httpx.Response) -> None:
 # Transport errors and 5xx are outages, not withdrawal, and never count.
 # Rate limits and usage/quota refusals have their own handling, and a
 # request-specific error (oversized context) says nothing about the model.
-# Per process, like the usage-limit breaker above.
+# Counted per process; an open bench is shared with every pod and survives
+# a restart through `shared_benches` (grug#1286), like both breakers.
 _BENCH_FAILURE_THRESHOLD = 3
 _BENCH_WINDOW_SECONDS = 600.0
 _BENCH_BASE_SECONDS = 3600.0
@@ -1126,7 +1141,8 @@ def _model_is_benched(backend: str, model: str, now: float | None = None) -> boo
     current = time.time() if now is None else now
     with _bench_lock:
         entry = _bench_state.get((backend, model))
-        return entry is not None and current < entry.benched_until
+        local = entry.benched_until if entry is not None else 0.0
+    return current < max(local, shared_benches.blocked_until("bench", backend, model))
 
 
 def _is_benchable_failure(resp: httpx.Response) -> bool:
@@ -1180,11 +1196,15 @@ def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
         with _bench_lock:
             _bench_state.pop(key, None)
             _slow_bench_state.pop(key, None)
+        shared_benches.clear("bench", *key)
+        shared_benches.clear("slow", *key)
         return
     if not _is_benchable_failure(resp):
         return
-    seconds = _record_model_failure(*key, resp.status_code, time.time())
+    now = time.time()
+    seconds = _record_model_failure(*key, resp.status_code, now)
     if seconds is not None:
+        shared_benches.publish("bench", *key, now + seconds)
         _announce_model_benched(*key, resp.status_code, seconds)
 
 
@@ -1210,7 +1230,8 @@ def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
 # never trips it. Per process, like the bench above. Measured before it
 # existed (402 Elder runs, 2026-10-17): 36 OpenCode Go 401s, 11 OpenRouter
 # paid "total limit" refusals and 139 OpenRouter free per-day 429s, each one
-# spent cohort time before a working backend was reached.
+# spent cohort time before a working backend was reached. An open breaker is
+# shared with every pod and survives a restart (`shared_benches`, grug#1286).
 _PROVIDER_POOLS = ("free", "paid")
 _SPENT_LIMIT_MARKERS = (
     "usage limit", "quota", "credit", "key limit", "total limit", "spend limit",
@@ -1272,7 +1293,8 @@ def _provider_available(backend: Backend, model: str, now: float | None = None) 
     current = time.time() if now is None else now
     key = (backend.value, _backend_pool(backend, model))
     with _provider_breaker_lock:
-        return current >= _provider_blocked_until.get(key, 0.0)
+        local = _provider_blocked_until.get(key, 0.0)
+    return current >= max(local, shared_benches.blocked_until("provider", *key))
 
 
 def _backend_usable(backend: Backend, model: str) -> bool:
@@ -1309,6 +1331,8 @@ def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None
         for pool in pools:
             key = (config.backend.value, pool)
             _provider_blocked_until[key] = max(_provider_blocked_until.get(key, 0.0), until)
+    for pool in pools:
+        shared_benches.publish("provider", config.backend.value, pool, until)
     log.warning(
         "llm_provider_circuit_open",
         extra={
@@ -1358,7 +1382,8 @@ def _model_is_slow_benched(backend: str, model: str, now: float | None = None) -
     current = time.time() if now is None else now
     with _bench_lock:
         entry = _slow_bench_state.get((backend, model))
-        return entry is not None and current < entry.benched_until
+        local = entry.benched_until if entry is not None else 0.0
+    return current < max(local, shared_benches.blocked_until("slow", backend, model))
 
 
 def _record_model_timeout(backend: str, model: str, now: float) -> float | None:
@@ -1398,8 +1423,10 @@ def _note_model_timeout(backend: Backend, model: str, exc: BaseException) -> Non
     if backend not in _BENCH_CLOUD_BACKENDS or not isinstance(exc, httpx.TimeoutException):
         return
     key = (backend.value, model)
-    seconds = _record_model_timeout(*key, time.time())
+    now = time.time()
+    seconds = _record_model_timeout(*key, now)
     if seconds is not None:
+        shared_benches.publish("slow", *key, now + seconds)
         _announce_model_slow_benched(*key, seconds)
 
 
@@ -1491,9 +1518,11 @@ def _usable_tiers(
 
 
 def _slow_bench_expiry(tier: BackendConfig) -> float:
+    key = (tier.backend.value, tier.model)
     with _bench_lock:
-        entry = _slow_bench_state.get((tier.backend.value, tier.model))
-        return entry.benched_until if entry is not None else 0.0
+        entry = _slow_bench_state.get(key)
+        local = entry.benched_until if entry is not None else 0.0
+    return max(local, shared_benches.blocked_until("slow", *key))
 
 
 def _tier_is_usable(
@@ -1640,7 +1669,7 @@ _CAVE_THINKING_OFF: dict = {
     "chat_template_kwargs": {"enable_thinking": False},
     "reasoning_effort": "none",
 }
-_CAVE_JUDGE_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
+_CAVE_JUDGE_DEFAULT_MODEL = "qwen3.5:122b"
 
 
 def _cave_judge_config() -> "BackendConfig | None":
@@ -1690,12 +1719,14 @@ def _cave_judge_config() -> "BackendConfig | None":
 # per review that read-timed out every Elder call (llm_backend_transport_failed)
 # and starved the coder Spark.
 #
-# The reasoner default was qwen3.5 when that was written; it is Laguna now
-# (#728). As with the judge above, production does not use this literal -
-# both deployments set GRUG_CAVE_REASONER_MODEL=spark:warm-any - and #843 is
-# open on whether Laguna should be the default at all.
+# The reasoner default was qwen3.5 when that was written; it became Laguna
+# (#728) but reverted back to qwen3.5 per the evaluation in
+# docs/research/laguna-s-2.1-gpu-host-elder-eval-2026-07-21.md which shows
+# Laguna scores 0/12 on test-gap and regresses security/upstream-semantics.
+# Production does not use this literal - both deployments set
+# GRUG_CAVE_REASONER_MODEL=spark:warm-any.
 _CAVE_REVIEW_CODER_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
-_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "poolside/Laguna-S-2.1-NVFP4"
+_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "qwen3.5:122b"
 
 # #609: require-keys response schema for the Cave arms. The gateway's ollama
 # backends map a bare `{"type": "json_object"}` to `format=json`, which
@@ -1764,6 +1795,9 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                                 "maxLength": CAVE_MAX_SUGGESTION_CHARS,
                             },
                             "effort": {"type": "string", "enum": sorted(EFFORTS)},
+                            "outside_diff_reason": {
+                                "type": "string", "maxLength": MAX_FINDING_MESSAGE_CHARS,
+                            },
                         },
                         "required": ["path", "line", "rule", "severity", "message"],
                         "additionalProperties": False,
@@ -2654,6 +2688,12 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         if isinstance(raw_effort, str) and raw_effort in EFFORTS
         else None
     )
+    raw_outside_reason = raw.get("outside_diff_reason")
+    outside_diff_reason = (
+        _redact_secrets(raw_outside_reason[:MAX_FINDING_MESSAGE_CHARS])
+        if isinstance(raw_outside_reason, str) and raw_outside_reason.strip()
+        else None
+    )
     # Output-side redaction at the ONE choke point: the model can ECHO a
     # secret from the diff into message/suggestion, and a posted comment
     # OUTLIVES a force-push that scrubs the diff. Every downstream surface
@@ -2675,6 +2715,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
         suggestion=suggestion, effort=effort,
+        outside_diff_reason=outside_diff_reason,
     ), ""
 
 
@@ -2939,7 +2980,7 @@ def _coerce_findings(raw_findings: list[Any], model_name: str) -> tuple[Finding,
 
 @dataclass(frozen=True, slots=True)
 class ParsedReview:
-    """One parsed review answer (`_parse_review`).
+    """One parsed LLM answer (review or interactive JSON).
 
     `error` is empty when the answer parsed. `truncated_findings` (grug#1231)
     is True when the answer was a findings list cut off before it closed:
@@ -3046,13 +3087,12 @@ def _parse_review(resp: httpx.Response) -> ParsedReview:
         return ParsedReview((), "", "envelope_not_a_dict")
     if "choices" not in body and "output" in body:
         # Responses API reply (BackendConfig.wire == "responses"). Normalise
-        # to the chat-completions shape so everything below - and all six
-        # _call_backend call sites - stay unchanged.
+        # to the chat-completions shape so the parser below can use one shape.
         #
         # Detected by SHAPE rather than threaded through as a flag: the
         # discriminator is unambiguous (`output` and `choices` never co-occur)
         # and _parse_response only receives an httpx.Response, so a flag would
-        # mean touching every call site to carry information the payload
+        # mean touching its call sites to carry information the payload
         # already states.
         body = _responses_envelope_to_chat(body)
     model_name = body.get("model", "")
@@ -3186,6 +3226,36 @@ def _choices_content(body: Any) -> str:
     return ""
 
 
+def _interactive_payload(content: str, field: str) -> dict | None:
+    """Return a usable JSON object for one interactive response."""
+    if not content:
+        return None
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get(field)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return data
+
+
+def _parse_interactive_attempt(resp: httpx.Response, field: str) -> ParsedReview:
+    """Validate interactive JSON within the shared attempt's span."""
+    if not 200 <= resp.status_code < 300:
+        return ParsedReview((), "", f"http_{resp.status_code}")
+    try:
+        body = resp.json()
+    except ValueError:
+        return ParsedReview((), "", "envelope_json_decode_failed")
+    content = _choices_content(body)
+    model = body.get("model", "") if isinstance(body, dict) else ""
+    error = "" if _interactive_payload(content, field) is not None else "interactive_json_invalid"
+    return ParsedReview((), model, error)
+
+
 def _annotate_interactive(
     span: Any,
     *,
@@ -3199,11 +3269,7 @@ def _annotate_interactive(
     status_code: Optional[int] = None,
     error: str = "",
 ) -> None:
-    """One span annotation for an interactive (Teller / /grug ask) attempt.
-
-    `kind` taxonomy: transport_error (no response), http_error (non-2xx -
-    availability, NOT model output), parse_failed (2xx but unusable model
-    output), summarized/answered (success)."""
+    """Annotate the learning classifier's interactive span."""
     metadata: dict[str, Any] = {"backend": backend.value, "kind": kind}
     if status_code is not None:
         metadata["status_code"] = status_code
@@ -3237,8 +3303,6 @@ def summarize_pr(
     Emits one `teller_walkthrough` LLMObs span per backend attempt so DD
     can filter walkthrough latency/quality separately from Elder review.
     Optional `pr_context` attaches repo/pr_number/head_sha tags."""
-    import json as _json
-
     diff_text = _redact_secrets(diff_text)[:24000]
     paths_block = "\n".join(file_paths[:200])
     messages = [
@@ -3261,67 +3325,28 @@ def summarize_pr(
     pr_tags = _interactive_tags(installation_id, pr_context)
     for backend in _interactive_backend_order(installation_id):
         config = _BACKEND_CONFIGS[backend]
-        start_ns = time.monotonic_ns()
-        with _llmobs_llm(
-            model_name=config.model,
-            model_provider=backend.value,
-            name=_LLMOBS_TELLER_NAME,
-        ) as span:
-            try:
-                resp = _call_backend(config, messages)
-            except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
-                _annotate_interactive(
-                    span, backend=backend, kind="transport_error",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    error=type(e).__name__,
-                )
-                continue
-            if not 200 <= resp.status_code < 300:
-                # Availability, not model output: a 429/5xx storm must not
-                # read as parse failures in the DD kind facet.
-                _annotate_interactive(
-                    span, backend=backend, kind="http_error",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    status_code=resp.status_code,
-                )
-                continue
-            try:
-                body = resp.json()
-            except ValueError:
-                body = {}
-            if not isinstance(body, dict):
-                body = {}
-            content = _choices_content(body)
-            summary = ""
-            file_summaries: dict[str, str] = {}
-            effort: str | None = None
-            try:
-                data = _json.loads(content) if content else {}
-                if not isinstance(data, dict):
-                    raise ValueError("summary payload not a dict")
-                summary = str(data.get("summary", "")).strip()
-                raw_files = data.get("file_summaries")
-                if isinstance(raw_files, dict):
-                    file_summaries = {str(k): str(v) for k, v in raw_files.items()}
-                raw_effort = data.get("effort")
-                effort = raw_effort if isinstance(raw_effort, str) else None
-            except (KeyError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
-                summary = ""
-            if not summary:
-                _annotate_interactive(
-                    span, backend=backend, kind="parse_failed",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    content=content, body=body, status_code=resp.status_code,
-                )
-                continue
-            _annotate_interactive(
-                span, backend=backend, kind="summarized",
-                messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                content=content, body=body, status_code=resp.status_code,
-            )
-            return WalkthroughSummary(
-                summary=summary, file_summaries=file_summaries, effort=effort,
-            )
+        attempt = _run_llm_attempt(
+            backend=backend, config=config, messages=messages, variant="default",
+            pr_tags=pr_tags, span_name=_LLMOBS_TELLER_NAME,
+            success_kind="summarized",
+            response_parser=lambda resp: _parse_interactive_attempt(resp, "summary"),
+            report_direct_call=False,
+        )
+        if attempt.error_kind is not None:
+            continue
+        data = _interactive_payload(attempt.content, "summary")
+        if data is None:
+            continue
+        raw_files = data.get("file_summaries")
+        file_summaries = (
+            {str(k): str(v) for k, v in raw_files.items()}
+            if isinstance(raw_files, dict) else {}
+        )
+        raw_effort = data.get("effort")
+        return WalkthroughSummary(
+            summary=data["summary"].strip(), file_summaries=file_summaries,
+            effort=raw_effort if isinstance(raw_effort, str) else None,
+        )
     return None
 
 
@@ -3338,7 +3363,6 @@ def answer_pr_question(
 
     Emits one `grug_ask` LLMObs span per backend attempt. Optional
     `pr_context` attaches repo/pr_number tags for DD filtering."""
-    import json as _json
     diff_text = _redact_secrets(diff_text)[:24000]  # bound the context + scrub secrets
     system = (
         "You are Grug, a terse code-review assistant. Answer the maintainer's "
@@ -3359,61 +3383,18 @@ def answer_pr_question(
     pr_tags = _interactive_tags(installation_id, pr_context)
     for backend in _interactive_backend_order(installation_id):
         config = _BACKEND_CONFIGS[backend]
-        start_ns = time.monotonic_ns()
-        with _llmobs_llm(
-            model_name=config.model,
-            model_provider=backend.value,
-            name=_LLMOBS_ASK_NAME,
-        ) as span:
-            try:
-                resp = _call_backend(config, messages)
-            except (_BackendConfigError, httpx.RequestError, httpx.TimeoutException) as e:
-                _annotate_interactive(
-                    span, backend=backend, kind="transport_error",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    error=type(e).__name__,
-                )
-                continue
-            if not 200 <= resp.status_code < 300:
-                # Availability, not model output: a 429/5xx storm must not
-                # read as parse failures in the DD kind facet.
-                _annotate_interactive(
-                    span, backend=backend, kind="http_error",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    status_code=resp.status_code,
-                )
-                continue
-            try:
-                body = resp.json()
-            except ValueError:
-                body = {}
-            if not isinstance(body, dict):
-                body = {}
-            content = _choices_content(body)
-            answer = ""
-            try:
-                data = _json.loads(content) if content else {}
-                if not isinstance(data, dict):
-                    raise ValueError("ask payload not a dict")
-                raw_answer = data.get("answer", "")
-                # A non-string answer (dict/list) is a parse failure, never
-                # str()-coerced into a Python repr posted on the PR.
-                answer = raw_answer.strip() if isinstance(raw_answer, str) else ""
-            except (KeyError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
-                answer = ""
-            if not answer:
-                _annotate_interactive(
-                    span, backend=backend, kind="parse_failed",
-                    messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                    content=content, body=body, status_code=resp.status_code,
-                )
-                continue
-            _annotate_interactive(
-                span, backend=backend, kind="answered",
-                messages=messages, start_ns=start_ns, pr_tags=pr_tags,
-                content=content, body=body, status_code=resp.status_code,
-            )
-            return answer
+        attempt = _run_llm_attempt(
+            backend=backend, config=config, messages=messages, variant="default",
+            pr_tags=pr_tags, span_name=_LLMOBS_ASK_NAME,
+            success_kind="answered",
+            response_parser=lambda resp: _parse_interactive_attempt(resp, "answer"),
+            report_direct_call=False,
+        )
+        if attempt.error_kind is not None:
+            continue
+        data = _interactive_payload(attempt.content, "answer")
+        if data is not None:
+            return data["answer"].strip()
     return None
 
 
@@ -3539,9 +3520,10 @@ def _scope_covering_finding(scope: str, finding_file: str) -> str:
     even cover its own source file is wrong; repo-wide is the safe fallback."""
     if not scope or not finding_file:
         return scope
-    if fnmatch.fnmatch(finding_file, scope) or fnmatch.fnmatch(
-        finding_file, scope.replace("**/", "")
-    ):
+    # The same deterministic matcher the path preview uses (#1203), so a
+    # scope kept here covers exactly the files the operator is shown.
+    from cave_drawings import path_matches
+    if path_matches(scope, finding_file):
         return scope
     log.info("learning_scope_dropped", extra={"scope": scope[:120], "file": finding_file[:200]})
     return ""
@@ -3568,7 +3550,6 @@ def classify_learning(
     When durable, `learning` is the reply restated as a short self-instructive
     rule Grug can apply verbatim, and `scope_path` is an optional glob (e.g.
     `**/middleware/*.py`) or "" for repo-wide. Emits a `grug_learn` span."""
-    import json as _json
     rule = finding_tags.get("rule_name", "")
     reply = _redact_secrets(reply_text)[:4000]
     finding = _redact_secrets(finding_text)[:2000]
@@ -3676,18 +3657,47 @@ def _repo_learnings_block(pr_context: Optional[PrContext]) -> str:
     text is repo DATA riding the SYSTEM prompt to a third-party backend."""
     if not pr_context or "repo" not in pr_context:
         return ""
+    repo = str(pr_context["repo"])
     try:
         from adapters.pg_install_store import list_learnings  # type: ignore
-        rows = list_learnings(str(pr_context["repo"]))
+        from cave_drawings import select_for_prompt
+        rows = list_learnings(repo)
         if not rows:
             return ""
+        # Cave Drawings (#1203): only ACTIVE learnings, and never both sides
+        # of a declared conflict or supersedes link. A suppression is logged,
+        # so two contradictory rules are never handed over silently.
+        selection = select_for_prompt(cast("list[dict[str, Any]]", rows))
+        for dropped in selection.suppressed:
+            log.info("repo_learning_suppressed", extra={"repo": repo, **dropped})
         # Redaction happens PER ROW inside the renderer (before truncation),
         # so a secret cut at the byte boundary cannot leak a partial value.
-        return _render_learnings_block(cast("list[dict[str, Any]]", rows))
+        block, supplied = _render_learnings_block_with_ids(selection.selected)
     except Exception as e:  # noqa: BLE001 - learnings never break a review, but log
         log.warning("repo_learnings_fetch_failed", extra={
             "repo": str(pr_context.get("repo", "")), "kind": type(e).__name__})
         return ""
+    _record_learnings_supplied(pr_context, repo, supplied)
+    return block
+
+
+def _record_learnings_supplied(
+    pr_context: PrContext, repo: str, supplied: list[str],
+) -> None:
+    """Count a use for exactly the learnings rendered into this prompt
+    (#1203). Keyed by PR number and head sha, so the several prompt builds
+    of one review (chunks, judge, fallback) count once. Best-effort: a
+    failed counter write never costs the review its learnings."""
+    pr_number = pr_context.get("pr_number")
+    head_sha = str(pr_context.get("head_sha", "") or "")
+    if not (supplied and pr_number and head_sha):
+        return
+    try:
+        from adapters.pg_install_store import record_learning_usage  # type: ignore
+        record_learning_usage(repo, sorted(supplied), review_key=f"{pr_number}@{head_sha}")
+    except Exception as e:  # noqa: BLE001 - usage metadata never breaks a review
+        log.warning("repo_learnings_usage_failed", extra={
+            "repo": repo, "kind": type(e).__name__})
 
 
 # Cap the NUMBER of learnings in the prompt, newest first, before the byte
@@ -3711,9 +3721,21 @@ def _render_learnings_block(
     order); this renders NEWEST first and bounds by count then bytes, so a
     flood cannot crowd out the static rules AND the most recent teaching
     always survives truncation."""
+    return _render_learnings_block_with_ids(rows, max_chars=max_chars)[0]
+
+
+def _render_learnings_block_with_ids(
+    rows: list[dict[str, Any]], *, max_chars: int = _LEARNINGS_BLOCK_MAX_CHARS,
+) -> tuple[str, list[str]]:
+    """`_render_learnings_block` plus the ids of the learnings that made it
+    into the block, newest first (#1203). The byte bound drops WHOLE rows
+    (only the newest row is ever cut mid-text, when it alone exceeds the
+    bound), so the id list is exactly what the model was given."""
     from best_practices import _sanitize  # type: ignore
+    from cave_drawings import learning_id
     newest_first = list(reversed(rows))[:_MAX_LEARNINGS_IN_PROMPT]
     lines: list[str] = []
+    ids: list[str] = []
     for row in newest_first:
         text = str(row.get("text", "")).strip()
         if not text:
@@ -3727,16 +3749,31 @@ def _render_learnings_block(
         scope = _sanitize(_redact_secrets(str(row.get("scope_path", "")).strip()))
         prefix = f"({scope}) " if scope else ""
         lines.append(f"- {prefix}{text}")
+        ids.append(str(row.get("id") or learning_id(str(row.get("text", "")))))
     if not lines:
-        return ""
-    body = "\n".join(lines)
+        return "", []
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        cost = len(line) + (1 if kept else 0)
+        if kept and used + cost > max_chars:
+            break
+        kept.append(line)
+        used += cost
+    omitted = len(kept) < len(lines)
+    body = "\n".join(kept)
     if len(body) > max_chars:
-        body = body[:max_chars].rstrip() + "\n- ... (older learnings omitted)"
+        # The newest row alone exceeds the bound: keep its head so a
+        # just-taught rule always reaches the prompt.
+        body = body[:max_chars].rstrip()
+        omitted = True
+    if omitted:
+        body += "\n- ... (older learnings omitted)"
     return (
         "WHAT YOUR TRIBE TOLD GRUG (team-taught preferences from replies to "
         "past findings - apply them, and do not re-flag what they tell you to "
         "allow):\n" + body
-    )
+    ), ids[: len(kept)]
 
 
 def _repo_guidelines_block(pr_context: Optional[PrContext]) -> str:
@@ -4089,6 +4126,20 @@ def _cohort_coverage(
         unwalked_paths=unwalked,
         reviewed_paths=_reviewed_paths(plan, responses, failed_indexes, unwalked),
         failed_models=_failed_models(responses, failed_indexes),
+        capped_cohorts=tuple(
+            index
+            for index, response in enumerate(responses, start=1)
+            if _hit_token_cap(response)
+        ),
+    )
+
+
+def _hit_token_cap(response: LlmReviewResponse) -> bool:
+    """A cohort that answered, but whose answer stopped at the token cap."""
+    return (
+        response.kind == "reviewed"
+        and response.error.startswith("partial review:")
+        and _CAPPED_ANSWER_MARKER in response.error
     )
 
 
@@ -4798,13 +4849,17 @@ def _file_split_targets(
     plan: ReviewPlan, responses: Sequence[LlmReviewResponse],
 ) -> list[int]:
     """0-based cohorts worth re-reviewing one file at a time: they ran, failed
-    in a way a smaller input could fix, and span more than one file."""
+    in a way a smaller input could fix, and span more than one file.
+
+    A cohort whose answer hit the token cap counts too. It is `reviewed`, so
+    the retry predicate treats it as final, but one file asks for a shorter
+    answer and may well finish under the cap."""
     return [
         index
         for index, (cohort, response) in enumerate(zip(plan.cohorts, responses, strict=True))
         if len(cohort.paths) > 1
         and not cohort.oversized
-        and _is_retryable_cohort_failure(response)
+        and (_is_retryable_cohort_failure(response) or _hit_token_cap(response))
         and not (response.error or "").startswith(_SKIPPED_COHORT_PREFIX)
     ]
 
@@ -4837,6 +4892,33 @@ def _with_parent_attempts(
     return replace(response, attempts=labels)
 
 
+def _with_capped_parent(
+    files: tuple[ReviewCohort, ...],
+    results: list[LlmReviewResponse],
+    parent: LlmReviewResponse,
+) -> list[LlmReviewResponse]:
+    """Keep a token-capped parent's findings when its file chunks replace it.
+
+    The capped answer was real, diff-anchored evidence, so a split must never
+    drop it. Each parent finding goes to the chunk holding its file (the first
+    chunk when no chunk does), where `_merge_review_findings` dedups it against
+    what the chunk found. A chunk that did not complete falls back to the
+    parent's capped answer for its files: no worse than before the split, and
+    still named as capped, so the review stays partial."""
+    if not _hit_token_cap(parent):
+        return results
+    owner = {path: slot for slot, chunk in enumerate(files) for path in chunk.paths}
+    carried: list[list[Finding]] = [[] for _ in files]
+    for finding in parent.findings:
+        carried[owner.get(finding.path, 0)].append(finding)
+    return [
+        replace(result, findings=result.findings + tuple(kept))
+        if result.kind == "reviewed"
+        else replace(parent, findings=tuple(kept))
+        for result, kept in zip(results, carried, strict=True)
+    ]
+
+
 def _splice_file_chunks(
     plan: ReviewPlan,
     responses: Sequence[LlmReviewResponse],
@@ -4854,9 +4936,10 @@ def _splice_file_chunks(
             merged.append(response)
             continue
         cohorts.extend(chunks[index])
-        merged.extend(
+        results = [
             _with_parent_attempts(next(pending), response) for _ in chunks[index]
-        )
+        ]
+        merged.extend(_with_capped_parent(chunks[index], results, response))
     added = sum(len(files) for files in chunks.values()) - len(chunks)
     return ReviewPlan(
         cohorts=tuple(cohorts),
@@ -4961,7 +5044,8 @@ class _Tier1Review:
 
     def run_whole_diff(self, plan: ReviewPlan) -> LlmReviewResponse:
         """One chunk. A success returns unchanged, exactly as before staging
-        existed; a failure gets the next-model retry, then the file split."""
+        existed; a failure gets the next-model retry, then the file split. An
+        answer that hit the token cap skips the retry and goes to the split."""
         with self._deadline():
             return self._run_whole_diff(plan)
 
@@ -4983,7 +5067,11 @@ class _Tier1Review:
                 },
             )
             response = ladder.run(0, call)
-        if response.kind == "reviewed" or self._cancelled():
+        # A capped answer is `reviewed` but partial: it goes on to the file
+        # split like a failure does, and through the merge, so coverage names
+        # the cap even when one file leaves nothing to split.
+        clean = response.kind == "reviewed" and not _hit_token_cap(response)
+        if clean or self._cancelled():
             return response
         return self._split_and_merge(plan, [response])
 
@@ -5239,7 +5327,7 @@ def _truncation_error(backends: Sequence["Backend"]) -> str:
         return ""
     names = ", ".join(b.value for b in backends)
     return (
-        f"partial review: {names} hit the generation token cap before "
+        f"partial review: {names} {_CAPPED_ANSWER_MARKER} before "
         f"finishing (finish_reason=length or {TRUNCATED_FINDINGS})"
     )
 
@@ -5301,7 +5389,8 @@ class AttemptOutcome:
     body-reparse → `_extract_usage_metrics` → `_llmobs_annotate` on every
     caught exit path — lives in exactly one place. Callers
     (`_run_review_arm`, the SaaS overload fallback loop) keep only their
-    own outcome mapping. `error_kind` is None on a completed attempt
+    own outcome mapping. Teller and /grug ask also supply their span name
+    and response parser. `error_kind` is None on a completed attempt
     (findings may still be empty when the body did not parse).
     """
 
@@ -5339,11 +5428,12 @@ def _annotate_attempt_error(
     messages: list[dict[str, str]],
     start_ns: int,
     error_label: str,
+    kind: str | None = None,
 ) -> None:
     """Annotate the attempt span for a caught config/transport error.
 
     Small so `_run_llm_attempt` stays under Grug's complexity cap — the
-    two error exits share this shape exactly (Elder, #660 follow-up).
+    two error exits share this shape exactly.
     """
     _llmobs_annotate(
         span=span,
@@ -5352,6 +5442,7 @@ def _annotate_attempt_error(
             "backend": backend.value,
             "variant_id": variant,
             "error": error_label,
+            **({"kind": kind} if kind else {}),
         },
         metrics={"latency_ms": _elapsed_ms(start_ns)},
         tags=pr_tags,
@@ -5368,7 +5459,7 @@ def _reparse_attempt_body(resp: httpx.Response, backend: Backend) -> dict:
     content and undercount DD token-cost dashboards.
     """
     try:
-        body = resp.json() if resp.status_code == 200 else {}
+        body = resp.json() if 200 <= resp.status_code < 300 else {}
     except (ValueError, json.JSONDecodeError):
         # Triggered when the first parse also failed (CF HTML
         # interstitial, truncated body) OR — rarely — when the cache
@@ -5382,7 +5473,11 @@ def _reparse_attempt_body(resp: httpx.Response, backend: Backend) -> dict:
             },
         )
         body = {}
-    return body if isinstance(body, dict) else {}
+    if not isinstance(body, dict):
+        return {}
+    if "choices" not in body and "output" in body:
+        return _responses_envelope_to_chat(body)
+    return body
 
 
 def _extract_attempt_content(body: dict) -> tuple[str, str]:
@@ -5413,6 +5508,21 @@ def _ladder_failure_reason(outcome: AttemptOutcome) -> str | None:
 # pool); these it never sees, so `call_report` posts them to its ledger
 # (grug#1286).
 _DIRECT_BACKENDS = frozenset({Backend.OPENROUTER, Backend.POOLSIDE, Backend.OPENCODE_GO})
+
+
+def _begin_direct_call(backend: Backend, config: BackendConfig) -> int | None:
+    """Show a direct call on the gateway page while it runs (`call_report`).
+    Returns the token `call_report.end` takes, or None. Never raises."""
+    if backend not in _DIRECT_BACKENDS:
+        return None
+    try:
+        job = _SPARK_JOB.get()
+        return call_report.begin(
+            backend=backend.value, model=config.model, job=job.job if job is not None else None,
+        )
+    except Exception as e:  # noqa: BLE001 - the page must never break a review
+        log.debug("call_report_begin_failed", extra={"kind": type(e).__name__})
+        return None
 
 
 def _report_direct_call(
@@ -5448,6 +5558,10 @@ def _run_llm_attempt(
     pr_tags: dict[str, str],
     cancel_event: threading.Event | None = None,
     transport_log_event: str = "llm_backend_transport_failed",
+    span_name: str = _LLMOBS_NAME,
+    success_kind: str = "reviewed",
+    response_parser: Callable[[httpx.Response], ParsedReview] = _parse_review,
+    report_direct_call: bool = True,
 ) -> AttemptOutcome:
     """`_call_llm_attempt` plus the chunk ladder bookkeeping (grug#1196).
 
@@ -5457,7 +5571,8 @@ def _run_llm_attempt(
     as a config miss, which every caller already steps past. Each real
     failure is appended to the chunk's trail so the neutral check can name
     it. Outside a chunk both context variables are empty and this is a plain
-    pass-through."""
+    pass-through. Interactive callers supply a response parser and span name;
+    they skip review-specific direct-call reporting."""
     key = (backend.value, config.model)
     if key in _LADDER_SKIP.get():
         return AttemptOutcome(
@@ -5468,12 +5583,19 @@ def _run_llm_attempt(
             span_context=None, raw_response=None,
         )
     started = time.monotonic()
-    outcome = _call_llm_attempt(
-        backend=backend, config=config, messages=messages, variant=variant,
-        pr_tags=pr_tags, cancel_event=cancel_event,
-        transport_log_event=transport_log_event,
-    )
-    _report_direct_call(backend, config, outcome, time.monotonic() - started)
+    running = _begin_direct_call(backend, config) if report_direct_call else None
+    try:
+        outcome = _call_llm_attempt(
+            backend=backend, config=config, messages=messages, variant=variant,
+            pr_tags=pr_tags, cancel_event=cancel_event,
+            transport_log_event=transport_log_event,
+            span_name=span_name, success_kind=success_kind,
+            response_parser=response_parser,
+        )
+    finally:
+        call_report.end(running)
+    if report_direct_call:
+        _report_direct_call(backend, config, outcome, time.monotonic() - started)
     trail = _LADDER_TRAIL.get()
     reason = _ladder_failure_reason(outcome)
     if trail is not None and reason is not None:
@@ -5490,9 +5612,12 @@ def _call_llm_attempt(
     pr_tags: dict[str, str],
     cancel_event: threading.Event | None = None,
     transport_log_event: str = "llm_backend_transport_failed",
+    span_name: str = _LLMOBS_NAME,
+    success_kind: str = "reviewed",
+    response_parser: Callable[[httpx.Response], ParsedReview] = _parse_review,
 ) -> AttemptOutcome:
-    """Run a single LLM attempt: open one `_llmobs_llm` span
-    (`elder_code_review`), call the backend, classify config/transport/parse
+    """Run a single LLM attempt: open one `_llmobs_llm` span,
+    call the backend, classify config/transport/parse
     errors, re-parse the body, extract usage metrics, and annotate the span
     on EVERY caught exit path (success + config + transport + parse/http).
 
@@ -5508,7 +5633,7 @@ def _call_llm_attempt(
     with _llmobs_llm(
         model_name=config.model,
         model_provider=backend.value,
-        name=_LLMOBS_NAME,
+        name=span_name,
     ) as span:
         try:
             resp = _call_backend(config, messages, cancel_event=cancel_event)
@@ -5527,6 +5652,7 @@ def _call_llm_attempt(
                 messages=messages,
                 start_ns=start_ns,
                 error_label="config",
+                kind="transport_error" if success_kind != "reviewed" else None,
             )
             return AttemptOutcome(
                 backend=backend,
@@ -5555,6 +5681,7 @@ def _call_llm_attempt(
                 messages=messages,
                 start_ns=start_ns,
                 error_label=type(e).__name__,
+                kind="transport_error" if success_kind != "reviewed" else None,
             )
             return AttemptOutcome(
                 backend=backend,
@@ -5569,8 +5696,12 @@ def _call_llm_attempt(
                 span_context=None,
                 raw_response=None,
             )
-        parsed = _parse_review(resp)
+        parsed = response_parser(resp)
         findings, model, err = parsed.findings, parsed.model_name, parsed.error
+        parsed_status = (
+            resp.status_code == 200 if success_kind == "reviewed"
+            else 200 <= resp.status_code < 300
+        )
         # Annotate AFTER the response so we capture the raw content
         # + token counts.
         body = _reparse_attempt_body(resp, backend)
@@ -5584,8 +5715,8 @@ def _call_llm_attempt(
                 "backend": backend.value,
                 "variant_id": variant,  # #191 prompt A/B arm
                 "status_code": resp.status_code,
-                "kind": "reviewed" if not err else (
-                    "parse_failed" if resp.status_code == 200 else "http_error"
+                "kind": success_kind if not err else (
+                    "parse_failed" if parsed_status else "http_error"
                 ),
                 "finish_reason": finish_reason,
                 "findings_truncated": parsed.truncated_findings,
@@ -5607,7 +5738,7 @@ def _call_llm_attempt(
             error_kind=(
                 None
                 if not err
-                else ("parse_failed" if resp.status_code == 200 else "http_error")
+                else ("parse_failed" if parsed_status else "http_error")
             ),
             error_text=err or None,
             status_code=resp.status_code,
@@ -6921,8 +7052,8 @@ def judge_findings(
     # Per call the judge still hits ONE backend and returns () on any
     # error; trying the next backend is `personas/code_reviewer/judge.py`'s
     # job. If the non-review envelopes are ever unified, they share a
-    # helper of their own (Teller/ask/learn already share
-    # `_annotate_interactive`), not the review seam.
+    # helper of their own. Teller and /grug ask use the attempt seam with
+    # a dedicated JSON parser; the judge's other constraints still apply.
     # test_judge_findings_stays_off_the_review_seam pins 1 and 3.
     # `config` override routes this judge call to a specific backend - the
     # exposed-secret class goes to the in-cluster Cave (#439, ADR-0009);

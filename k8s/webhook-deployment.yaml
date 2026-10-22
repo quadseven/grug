@@ -69,6 +69,17 @@ spec:
         # sat at 17%. Two OCI zones still give the zone spread above; soft,
         # so a lan node still takes the pod when both OCI nodes are down.
         nodeAffinity:
+          # Never a memory-constrained node (infra#5502). One required term
+          # carries arch + the DoesNotExist; if more terms are ever added, EACH
+          # needs it (terms are ORed). nodeSelector above stays as-is.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values: [arm64]
+                  - key: memory-constrained
+                    operator: DoesNotExist
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
               preference:
@@ -218,6 +229,7 @@ spec:
             # grug#1286: post Elder's direct calls (OpenRouter, Poolside, OpenCode
             # Go) to the inference gateway's call ledger, beside the calls it routes.
             - {name: GRUG_CALL_REPORT, value: "true"}
+            - {name: GRUG_SHARED_BENCHES, value: "true"}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
             # In-cluster spark-gateway for the evidence-scoped judge. Keep the
@@ -266,6 +278,11 @@ spec:
             # workloads, same shape as GRUG_SAST_ENGINE above. The ruff CLI
             # ships in the image (services/webhook/requirements.txt).
             - {name: GRUG_LINT_EVIDENCE, value: ruff}
+            # Elder's analyzer set (#1254): engines matched by language -
+            # ruff for Python, opengrep over grug's own elder_analyzer_rules/
+            # for JavaScript/TypeScript. Each is time-capped and degrades to a
+            # skip; findings are advisory. Unset runs none.
+            - {name: GRUG_ELDER_ANALYZERS, value: "ruff,opengrep"}
             # Smasher Trial (#469): global master kill switch (default OFF - the
             # SSM param is absent/false until the operator opts in) + the image
             # the sandbox Job runs (the SAME webhook image, so personas.smasher

@@ -98,6 +98,7 @@ def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     whose fake backend answers 401 would block that provider for every later
     test in the session."""
     monkeypatch.delenv("GRUG_DISABLED_BACKENDS", raising=False)
+    monkeypatch.delenv("GRUG_SHARED_BENCHES", raising=False)
     lc = sys.modules.get("llm_client")
     if lc is not None:
         monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
@@ -122,6 +123,23 @@ def _mock_pr_enforcement_ensure(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _mock_chief_ticket_recheck(monkeypatch):
+    """Neutralize the ticket-change Chief re-run by default.
+
+    `sub_issues` and `issues.edited` (body) also re-run Chief on the open PRs
+    naming the ticket, which reads the store (`is_persona_enabled`) and lists
+    open PRs on GitHub - side effects the issue-advisory tests never
+    expected. Tests that verify the re-run patch the real
+    `dispatcher._recheck_chief_for_ticket` back in (innermost patch wins).
+    """
+    from unittest.mock import MagicMock
+
+    import dispatcher
+
+    monkeypatch.setattr(dispatcher, "_recheck_chief_for_ticket", MagicMock(return_value={}))
+
+
+@pytest.fixture(autouse=True)
 def _mock_learn_living_review_sync(monkeypatch):
     """Neutralize the learn lane's living-review sync (#1187) by default.
 
@@ -135,3 +153,54 @@ def _mock_learn_living_review_sync(monkeypatch):
     import rerun
 
     monkeypatch.setattr(rerun, "_sync_living_review", MagicMock(return_value=0))
+
+
+class _LabelHttpResponse:
+    """Minimal httpx.Response stand-in for the label calls."""
+
+    def __init__(self, status_code: int, body: dict | None = None) -> None:
+        self.status_code = status_code
+        self._body = body or {}
+
+    def json(self) -> dict:
+        return self._body
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+class _LabelHttp:
+    """Records the `grug:reviewing` label calls instead of making them."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, object]] = []
+
+    def get(self, url: str, **kw: object) -> _LabelHttpResponse:
+        self.calls.append(("get", url, None))
+        return _LabelHttpResponse(200)
+
+    def post(self, url: str, **kw: object) -> _LabelHttpResponse:
+        self.calls.append(("post", url, kw.get("json")))
+        return _LabelHttpResponse(200)
+
+    def delete(self, url: str, **kw: object) -> _LabelHttpResponse:
+        self.calls.append(("delete", url, None))
+        return _LabelHttpResponse(204)
+
+
+@pytest.fixture(autouse=True)
+def _mock_review_label_http(monkeypatch):
+    """Keep the `grug:reviewing` label writes off the network by default.
+
+    The label is best-effort by design (a missing sign is never a failed
+    command), so its HTTP calls would otherwise be real api.github.com
+    requests from every test that touches a re-run - slow, flaky, and
+    meaningless. The fake is yielded so a test can assert on the calls it
+    recorded; tests that need different answers patch `review_label.httpx`
+    themselves (innermost patch wins).
+    """
+    import review_label
+
+    fake = _LabelHttp()
+    monkeypatch.setattr(review_label, "httpx", fake)
+    return fake
