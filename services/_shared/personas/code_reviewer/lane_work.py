@@ -21,6 +21,10 @@ and the offline corpus runner call exactly the same code:
   cites no output, run link or number.
 - dead on arrival (#1366): a new source file nothing else in the diff
   loads, and scratch or temporary files left in the commit.
+- wrong target (#1369): the criteria name concrete targets and the diff
+  changes none of them, naming them only in comments or tests.
+- measurement only (#1370): a health ticket's fix changes only the code
+  that measures or reports the finding.
 
 Pure: diff text, parsed hunks, file contents and PR text in; findings out.
 """
@@ -39,9 +43,11 @@ from personas.code_reviewer.destructive_edit import scan_destructive_edits
 from personas.code_reviewer.diff_parser import DiffHunk, FileChange, file_changes
 from personas.code_reviewer.fabricated_result import scan_fabricated_results
 from personas.code_reviewer.intent_filter import body_claims_box
+from personas.code_reviewer.measurement_only import scan_measurement_only
 from personas.code_reviewer.persona import Finding
-from personas.code_reviewer.weakened_verification import scan_weakened_verification
 from personas.code_reviewer.unbacked_claim import scan_unbacked_claims
+from personas.code_reviewer.weakened_verification import scan_weakened_verification
+from personas.code_reviewer.wrong_target import scan_wrong_target
 from personas.tpm.ticket_compliance import closes_refs
 
 # The footer a Loom lane writes on every pull request it opens.
@@ -89,6 +95,7 @@ def lane_work_findings(
     pr_title: str,
     pr_body: str,
     changes: tuple[FileChange, ...] | None = None,
+    health_issues: Iterable[int] = (),
 ) -> tuple[Finding, ...]:
     """Every deterministic lane-work finding for one PR.
 
@@ -96,7 +103,9 @@ def lane_work_findings(
     path (the old path for a rename); a file missing from it is skipped by
     the destructive-edit check, never guessed at. `changes` overrides the
     per-file statuses read from `diff_text` (the corpus runner passes the
-    full counts of a diff it stores truncated)."""
+    full counts of a diff it stores truncated). `health_issues`: linked
+    issues that are health findings (`linked_issue.rendered_health_issues`);
+    without it a PR title starting `Health:` marks one."""
     if changes is None:
         changes = file_changes(diff_text)
     criteria = criteria_in_scope(boxes, pr_body)
@@ -114,6 +123,10 @@ def lane_work_findings(
     ))
     findings.extend(scan_fabricated_results(changes, hunks))
     findings.extend(scan_unbacked_claims(pr_body, criteria=criteria, hunks=hunks))
+    findings.extend(scan_wrong_target(changes, hunks, criteria=criteria, pr_title=pr_title))
+    findings.extend(scan_measurement_only(
+        changes, hunks, criteria=criteria, pr_title=pr_title, health_issues=health_issues,
+    ))
     doa = scan_dead_on_arrival(
         changes, hunks, pr_body=pr_body, prior=tuple(findings),
         file_contents=file_contents, lane=is_lane_pr(pr_body),
