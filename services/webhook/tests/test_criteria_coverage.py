@@ -463,7 +463,7 @@ def test_dispatch_checks_a_lane_pr_against_the_ticket_it_refs():
     # #1364: a lane PR links its ticket with Refs, and the station closes
     # that ticket when the PR merges, so its criteria are this PR's to meet.
     hunks, contents = _helper_only_diff()
-    body = "Refs #436\n\n---\nLoom ticket example.repo-436, lane codex, model m.\nRefs owner/repo#436"
+    body = "Refs #436\n\n---\nLoom ticket example.repo-436, lane codex, model m.\nRefs owner/repo#436"  # leak-guard-allow: placeholder repo
     merged = _merge(_evaluation(), hunks, contents, body)
     assert [f.rule_name for f in merged.findings] == ["dead-code", "intent-mismatch"]
     assert merged.conclusion == "failure"

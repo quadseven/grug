@@ -23,7 +23,7 @@ from personas.code_reviewer.lane_work import (
 
 _FOOTER = (
     "\n---\nLoom ticket example.iac-83-r3, lane codex, model gpt-6-luna.\n"
-    "Refs example/iac#83\n"
+    "Refs example/iac#83\n"  # leak-guard-allow: placeholder repo
 )
 _TITLE = "Patch the PHP RCE on both storage hosts and close the GUI to the IoT VLAN"
 _BODY = "## Why\nA critical PHP RCE is fixed in 8.4.27.\n" + _FOOTER

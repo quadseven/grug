@@ -559,30 +559,30 @@ class FileChange:
 _SIMILARITY_RE = re.compile(r"^similarity index (\d+)%$")
 
 
+def _first(lines: list[str], prefix: str) -> str | None:
+    """The rest of the first line starting with `prefix`, or None."""
+    return next((ln[len(prefix):] for ln in lines if ln.startswith(prefix)), None)
+
+
 def _block_header(
     lines: list[str], old: str, new: str,
 ) -> tuple[str, str | None, int | None, str, int]:
     """(status, previous path, similarity, new path, index of the first
     hunk line) from one file block's extended header."""
-    status, previous, similarity = "modified", None, None
-    for i, line in enumerate(lines):
-        if line.startswith("@@"):
-            return status, previous, similarity, new, i
-        if line.startswith("new file mode"):
-            status = "added"
-        elif line.startswith("deleted file mode"):
-            status = "removed"
-        elif line.startswith("rename from "):
-            status, previous = "renamed", line[len("rename from "):]
-        elif line.startswith("+++ "):
-            target = _NEW_FILE_RE.match(line)
-            if target and target.group(1) != "/dev/null":
-                new = target.group(1)
-        elif sim := _SIMILARITY_RE.match(line):
-            similarity = int(sim.group(1))
-    if status == "renamed" and previous is None:
-        previous = old
-    return status, previous, similarity, new, len(lines)
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("@@")), len(lines))
+    header = lines[:start]
+    previous = _first(header, "rename from ")
+    status = (
+        "added" if _first(header, "new file mode") is not None
+        else "removed" if _first(header, "deleted file mode") is not None
+        else "renamed" if previous is not None
+        else "modified"
+    )
+    sim = next((m for m in map(_SIMILARITY_RE.match, header) if m), None)
+    target = _NEW_FILE_RE.match("+++ " + (_first(header, "+++ ") or "/dev/null"))
+    if target and target.group(1) != "/dev/null":
+        new = target.group(1)
+    return status, previous, int(sim.group(1)) if sim else None, new, start
 
 
 def file_changes(unified_diff: str) -> tuple[FileChange, ...]:
