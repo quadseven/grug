@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from llm_client import Hunk, _build_messages  # noqa: PLC2701 - Elder path on purpose
+from review_evidence import assemble_evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,18 +42,15 @@ def _fixture(name: str, paths: list[tuple[str, int]]) -> LatencyFixture:
     hunks = [_hunk(path, n) for path, n in paths]
     added = sum(n for _, n in paths)
     messages = _build_messages(
-        hunks,
-        _PROMPT_VARIANT,
-        file_contents=None,
-        cross_file_contents=None,
-        pr_context={
+        assemble_evidence(hunks, pr_context={
             "title": f"latency fixture {name}",
             "body": "Synthetic PR for review latency harness #648.",
             "repo": "example/fixture",
             "pr_number": 1,
             "head_sha": "abc1234",
             "base_sha": "def5678",
-        },
+        }),
+        _PROMPT_VARIANT,
     )
     # Materialize to tuples of plain dicts for stable hashing / JSON dump.
     frozen = tuple({"role": m["role"], "content": m["content"]} for m in messages)

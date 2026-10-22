@@ -3,7 +3,8 @@
 End-to-end for one `pull_request` event:
   1. Fetch the PR's unified diff via the GitHub API.
   2. parse_diff → DiffHunks.
-  3. review_diff(hunks, installation_id) → LlmReviewResponse.
+  3. assemble_evidence(...) once -> review_diff(evidence, installation_id)
+     -> LlmReviewResponse; the judge grades against the same evidence.
   4. evaluate_diff(hunks, llm_response) → CodeReviewEvaluation.
   5. Build the inline-comment ReviewResult + the summary CheckRunResult.
   6. Publish via post_check_run + (optionally) post_review.
@@ -61,6 +62,7 @@ from llm_client import (
     review_reasoner_diff,
 )
 from voice_pack import VoiceSelection, entitled_voice
+from review_evidence import ElderEvidence, assemble_evidence
 from review_types import EFFORTS, SEVERITIES
 from personas.review_publish import (
     DIFF_FETCH_TIMEOUT, PUBLISHABLE_DEGRADATIONS, ReviewMode, fetch_file_contents,
@@ -3024,17 +3026,23 @@ def dispatch_code_review(
         pr_context, installation_id=installation_id, owner=owner, repo_name=repo_name,
     )
 
-    # PR context supplies both trace identity and author intent. The prompt
-    # treats title/body as untrusted repository data before sending it.
-    llm_response: LlmReviewResponse = review_diff(
+    # The ONE assembled evidence object (#1189): the reviewer, the judge,
+    # the refute gate and the async deep arm all read this, so reviewer and
+    # judge parity holds by construction. PR context supplies both trace
+    # identity and author intent; the prompt treats title/body as untrusted
+    # repository data before sending it.
+    evidence = assemble_evidence(
         _to_llm_hunks(hunks),
-        installation_id=installation_id,
+        pr_context=pr_context,
         file_contents=file_contents,
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
         ci_context=ci_context,
         repo_docs_context=repo_docs_context,
-        pr_context=pr_context,
+    )
+    llm_response: LlmReviewResponse = review_diff(
+        evidence,
+        installation_id=installation_id,
         voice=voice,
         cancel_event=cancel_event,
     )
@@ -3055,7 +3063,7 @@ def dispatch_code_review(
         )
 
     evaluation = evaluate_diff(
-        hunks, llm_response, cross_file_contents=cross_file_contents,
+        hunks, llm_response, cross_file_contents=evidence.cross_file_contents,
     )
     correctness_only = bool(pr_context.get("review_scope"))
     if correctness_only:
@@ -3098,13 +3106,7 @@ def dispatch_code_review(
     # the DD evals below. `graded_findings` keeps the FULL set so the eval
     # denominator counts suppressed rows too.
     graded_findings = evaluation.findings
-    judge_verdicts = grade_findings(
-        evaluation, hunks, installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-    )
+    judge_verdicts = grade_findings(evaluation, evidence, installation_id)
     kept, suppressed = partition_findings(evaluation.findings, judge_verdicts)
     if suppressed:
         evaluation = with_findings(evaluation, kept)
@@ -3139,10 +3141,7 @@ def dispatch_code_review(
         owner=owner, repo_name=repo_name, pull_number=pull_number, arm="tier1",
     )
     surviving = _apply_refute_gate(
-        evaluation.findings, hunks, installation_id,
-        pr_context=pr_context, file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context, owner=owner,
+        evaluation.findings, evidence, installation_id, owner=owner,
         repo_name=repo_name, pull_number=pull_number, arm="tier1",
     )
     if len(surviving) != len(evaluation.findings):
@@ -3637,13 +3636,8 @@ def dispatch_code_review(
             mode=mode,
             blocking=blocking,
             hunks=hunks,
-            llm_hunks=_to_llm_hunks(hunks),
+            evidence=evidence,
             pr_context=pr_context,
-            file_contents=file_contents,
-            cross_file_contents=cross_file_contents,
-            runtime_context=runtime_context,
-            ci_context=ci_context,
-            repo_docs_context=repo_docs_context,
             voice=voice,
             living_range=living_range,
             living_baseline_rejected=living_baseline_rejected,
@@ -3715,8 +3709,7 @@ def dispatch_code_review(
 
 
 def _apply_refute_gate(
-    findings, hunks, installation_id, *, pr_context, file_contents,
-    cross_file_contents, runtime_context, owner, repo_name, pull_number, arm,
+    findings, evidence, installation_id, *, owner, repo_name, pull_number, arm,
 ):
     """Refute gate (#714): adversarial evidence-check for the HIGH/CRITICAL
     findings that survived deterministic verification - the semantic-
@@ -3727,13 +3720,7 @@ def _apply_refute_gate(
     high = tuple(f for f in findings if f.severity in ("high", "critical"))
     if not high:
         return findings
-    verdicts = refute_findings(
-        high, hunks, installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-    )
+    verdicts = refute_findings(high, evidence, installation_id)
     if not verdicts:
         return findings
     _, refuted = partition_refuted(high, verdicts)
@@ -3888,18 +3875,16 @@ def _deep_snapshot_is_stale(
 def _grade_deep_response(
     deep_llm: LlmReviewResponse,
     hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
     installation_id: int,
     *,
     pr_context: PrContext,
-    file_contents: dict[str, str] | None,
-    cross_file_contents: dict[str, str] | None,
-    runtime_context: str | None,
     owner: str,
     repo_name: str,
     pull_number: int,
 ) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
     deep_eval = evaluate_diff(
-        hunks, deep_llm, cross_file_contents=cross_file_contents,
+        hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
     )
     # The reasoner reads the same linked criteria, so its intent-mismatch
     # findings get the same evidence filter and box scope (#1170, #1218).
@@ -3908,21 +3893,13 @@ def _grade_deep_response(
         repo_name=repo_name, pull_number=pull_number, pr_context=pr_context,
     )
     deep_graded = deep_eval.findings
-    deep_verdicts = grade_findings(
-        deep_eval,
-        hunks,
-        installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-    )
+    deep_verdicts = grade_findings(deep_eval, evidence, installation_id)
     deep_kept, deep_suppressed = partition_findings(deep_graded, deep_verdicts)
     if deep_suppressed:
         deep_eval = with_findings(deep_eval, deep_kept)
     deep_verified, deep_killed = verify_findings(
         deep_eval.findings,
-        file_contents or {},
+        evidence.file_contents,
     )
     if deep_killed:
         deep_eval = with_findings(deep_eval, deep_verified)
@@ -3935,17 +3912,13 @@ def _grade_deep_response(
         arm="deep",
     )
     deep_eval = _apply_bound_name_downgrade(
-        deep_eval, file_contents or {}, installation_id=installation_id,
+        deep_eval, evidence.file_contents, installation_id=installation_id,
         owner=owner, repo_name=repo_name, pull_number=pull_number, arm="deep",
     )
     deep_surviving = _apply_refute_gate(
         deep_eval.findings,
-        hunks,
+        evidence,
         installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
         owner=owner,
         repo_name=repo_name,
         pull_number=pull_number,
@@ -4358,13 +4331,8 @@ def _async_deep_append_if_needed(
     mode: ReviewMode,
     blocking: bool,
     hunks: tuple[DiffHunk, ...],
-    llm_hunks: list[LlmHunk],
+    evidence: ElderEvidence,
     pr_context: PrContext,
-    file_contents: dict[str, str] | None,
-    cross_file_contents: dict[str, str] | None,
-    runtime_context: str | None,
-    ci_context: str | None,
-    repo_docs_context: str | None,
     voice: VoiceSelection,
     living_range: str,
     living_baseline_rejected: str,
@@ -4383,7 +4351,7 @@ def _async_deep_append_if_needed(
     """
     decision = _async_deep_decision(
         check_publish_failed=check_publish_failed,
-        llm_hunks=llm_hunks,
+        llm_hunks=list(evidence.hunks),
         pr_context=pr_context,
         evaluation=evaluation,
         cancel_event=cancel_event,
@@ -4415,14 +4383,8 @@ def _async_deep_append_if_needed(
         return
 
     deep_llm = review_reasoner_diff(
-        llm_hunks,
+        evidence,
         installation_id=installation_id,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-        ci_context=ci_context,
-        repo_docs_context=repo_docs_context,
-        pr_context=pr_context,
         voice=voice,
         cancel_event=cancel_event,
     )
@@ -4453,7 +4415,7 @@ def _async_deep_append_if_needed(
         # The deep check-run then completes `neutral`, naming the arm that
         # never ran, in place of the unqualified Tier-1 `success`.
         deep_eval = evaluate_diff(
-            hunks, deep_llm, cross_file_contents=cross_file_contents,
+            hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
         )
         deep_graded: tuple[Finding, ...] = ()
         deep_verdicts: tuple[Any, ...] = ()
@@ -4462,11 +4424,9 @@ def _async_deep_append_if_needed(
         deep_eval, deep_graded, deep_verdicts, deep_suppressed_count = _grade_deep_response(
             deep_llm,
             hunks,
+            evidence,
             installation_id,
             pr_context=pr_context,
-            file_contents=file_contents,
-            cross_file_contents=cross_file_contents,
-            runtime_context=runtime_context,
             owner=owner,
             repo_name=repo_name,
             pull_number=pull_number,
@@ -4581,7 +4541,7 @@ def _async_deep_append_if_needed(
         pr_title=str(pr_context.get("title") or ""),
         base_sha=str(pr_context.get("base_sha") or ""),
         repo_config=repo_config,
-        file_contents=file_contents,
+        file_contents=evidence.file_contents,
         action=action,
     )
     _submit_deep_evals(
