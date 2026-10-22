@@ -85,6 +85,14 @@ def criteria_in_scope(
     )
 
 
+def _open_only(
+    criteria: tuple[LinkedCriterion, ...], boxes: tuple[LinkedBox, ...],
+) -> tuple[LinkedCriterion, ...]:
+    """The criteria whose box is still open on the issue."""
+    ticked = {(b[0], b[1]) for b in boxes if b[2] != "open"}
+    return tuple(c for c in criteria if (c.issue, c.number) not in ticked)
+
+
 def lane_work_findings(
     *,
     diff_text: str,
@@ -108,6 +116,7 @@ def lane_work_findings(
     without it a PR title starting `Health:` marks one."""
     if changes is None:
         changes = file_changes(diff_text)
+    boxes = tuple(boxes)
     criteria = criteria_in_scope(boxes, pr_body)
     findings = list(scan_criteria_coverage(
         hunks, file_contents, criteria=criteria,
@@ -123,7 +132,11 @@ def lane_work_findings(
     ))
     findings.extend(scan_fabricated_results(changes, hunks))
     findings.extend(scan_unbacked_claims(pr_body, criteria=criteria, hunks=hunks))
-    findings.extend(scan_wrong_target(changes, hunks, criteria=criteria, pr_title=pr_title))
+    # A ticked box was delivered by an earlier slice; only open boxes can
+    # name what this diff should have changed.
+    findings.extend(scan_wrong_target(
+        changes, hunks, criteria=_open_only(criteria, boxes), pr_title=pr_title,
+    ))
     findings.extend(scan_measurement_only(
         changes, hunks, criteria=criteria, pr_title=pr_title, health_issues=health_issues,
     ))

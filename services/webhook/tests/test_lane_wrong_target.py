@@ -16,7 +16,7 @@ from personas.code_reviewer.diff_parser import file_changes, parse_diff
 from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.wrong_target import scan_wrong_target, ticket_targets
 
-_FOOTER = "\n---\nLoom ticket example.iac-12-r1, lane codex, model gpt-6-luna.\nRefs example/iac#12\n"
+_FOOTER = "\n---\nLoom ticket example.iac-12-r1, lane codex, model gpt-6-luna.\nRefs example/iac#12\n"  # leak-guard-allow: placeholder repo
 _TITLE = "Keep workloads off the memory-pressured node"
 _BOXES = (
     (12, 1, "open", "shop-api, shop-webhook, and shop-worker exclude the small node while retaining their arm64 requirements."),
@@ -215,3 +215,26 @@ def test_the_scan_is_linear_on_a_large_diff():
     elapsed = time.perf_counter() - start
     assert len(found) == 1
     assert elapsed < 1.0, elapsed
+
+
+# --- held-out good lane PRs (2026-10-22) -----------------------------------------
+
+
+def test_a_dotted_target_is_met_by_a_change_to_its_module():
+    # The criterion names `gather.choose`; the diff edits the body of
+    # `choose` in gather.py, and its hunk never spells the dotted name.
+    diff = _appended(
+        "gather.py", ["def choose(fields):", "    return max(fields)"],
+        ["    # nearer fields first", "    return min(fields, key=distance)"],
+    ) + _added_file("tests/test_gather.py", ["def test_choose():", "    assert gather.choose([]) is None"])
+    assert _scan(diff, ["`gather.choose` prefers a nearer field over a denser one"]) == ()
+
+
+def test_a_ticked_box_names_no_target_for_this_diff():
+    # A box an earlier slice delivered (ticked on the issue) cannot name
+    # what this diff should have changed.
+    boxes = (
+        (12, 1, "ticked", "shop-api, shop-webhook, and shop-worker exclude the small node."),
+        (12, 2, "open", "Deployment configuration validation succeeds."),
+    )
+    assert [f for f in _findings(_recorded_diff(), boxes=boxes) if f.rule_name == "intent-mismatch"] == []

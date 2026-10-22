@@ -66,21 +66,21 @@ def test_flipped_assertions_the_ticket_does_not_name_are_high():
     assert "self.assertTrue(raidrun.CLEARS)" in f.message
 
 
-def test_one_flip_is_medium():
+def test_a_lone_flip_is_left_to_the_model():
+    # One flipped assertion with nothing deleted was as common in good lane
+    # work (a behavior the ticket changed) as in damaging work.
     diff = _diff("tests/test_bags.py", ("", [
         "     def test_a_trip_makes_room(self):",
         "-        self.assertTrue(",
         "+        self.assertFalse(",
         "             makes_room(FAMILY, LOOTED)",
     ]))
-    (f,) = _scan(diff)
-    assert (f.rule_name, f.severity) == ("weakened-test", "medium")
+    assert _scan(diff) == ()
 
 
-def test_flips_the_ticket_names_are_medium():
+def test_flips_the_ticket_names_are_not_flagged():
     title = 'The run line says "does not clear" and "runs back after a wipe" is gone; CLEARS and GATHERS flip'
-    (f,) = _scan(_FLIPPED, title=title)
-    assert f.severity == "medium"
+    assert _scan(_FLIPPED, title=title) == ()
 
 
 def test_a_true_to_false_expected_value_is_a_flip():
@@ -88,9 +88,11 @@ def test_a_true_to_false_expected_value_is_a_flip():
         "     def test_flag(self):",
         "-        self.assertEqual(config.ENABLED, True)",
         "+        self.assertEqual(config.ENABLED, False)",
+        "-        self.assertEqual(config.STRICT, True)",
+        "+        self.assertEqual(config.STRICT, False)",
     ]))
     (f,) = _scan(diff)
-    assert "flips 1 assertion(s)" in f.message
+    assert "flips 2 assertion(s)" in f.message
 
 
 _DELETED = _diff("services/webhook/tests/test_rerun.py", (" def test_shutdown_sweep(monkeypatch):", [
@@ -109,13 +111,38 @@ _DELETED = _diff("services/webhook/tests/test_rerun.py", (" def test_shutdown_sw
 ]))
 
 
-def test_a_deleted_test_the_ticket_does_not_name_is_high():
+def test_one_deleted_test_the_ticket_does_not_name_is_medium():
     # The def goes in one hunk and its assertion in the next, which git
-    # labels with the removed test as its enclosing function.
+    # labels with the removed test as its enclosing function. One deleted
+    # test was as common in good lane work as in damaging work: medium.
     (f,) = _scan(_DELETED, title="Learnings are stored and applied to later reviews")
-    assert (f.rule_name, f.severity) == ("weakened-test", "high")
+    assert (f.rule_name, f.severity) == ("weakened-test", "medium")
     assert "`test_learn_outcomes_never_post_a_comment`" in f.message
     assert "deletes 1 test(s)" in f.message
+
+
+_DELETED_TWO = _diff("tests/test_tokens.py", ("", [
+    "-import tokens",
+    "+import tokens  # the control plane reads the token now",
+    " ",
+    " ",
+    "-def test_the_token_is_never_logged():",
+    "-    assert 'secret' not in tokens.log_line()",
+    "-",
+    "-",
+    "-def test_a_missing_token_fails_the_deploy():",
+    "-    assert tokens.deploy(token=None) == 1",
+    "-",
+    "-",
+    " def test_kept():",
+    "     assert tokens.ok()",
+]))
+
+
+def test_two_deleted_tests_the_ticket_does_not_name_are_high():
+    (f,) = _scan(_DELETED_TWO, title="Settings come from the control plane")
+    assert (f.rule_name, f.severity) == ("weakened-test", "high")
+    assert "deletes 2 test(s)" in f.message
 
 
 def test_a_deleted_test_the_ticket_names_is_medium():
@@ -131,7 +158,7 @@ def test_a_deleted_test_on_a_removal_ticket_is_medium():
 
 
 def test_an_adjective_is_not_a_removal_ticket():
-    (f,) = _scan(_DELETED, title="Learnings are listable and deletable")
+    (f,) = _scan(_DELETED_TWO, title="Settings are listable and deletable")
     assert f.severity == "high"
 
 

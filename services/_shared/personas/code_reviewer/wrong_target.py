@@ -75,6 +75,7 @@ _PREFIX_WORDS = frozenset({
     "out", "over", "per", "post", "pre", "re", "read", "second", "self", "semi",
     "short", "single", "sub", "third", "two", "under", "well", "write",
 })
+_MODULE_SUFFIXES = (".py", ".js", ".ts", ".go", ".rb", ".rs")
 _COMMENT_RE = re.compile(r"^\s*(#|//|/\*|\*|--|;|<!--)")
 _PROSE_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
 _TEST_NAME_RE = re.compile(r"(\.test\.|\.spec\.|Test\.\w+$|_test\.\w+$)")
@@ -139,6 +140,12 @@ def _spellings(target: str) -> set[str]:
     call = re.match(r"([\w.:]+)\(", t)
     if call:
         out.add(call.group(1))
+    # `module.attr`, `module.Class.method()`: changing the module's file
+    # changes its members as far as a substring check can tell, and the
+    # hunk may not spell the dotted name (a body edit inside `def attr`).
+    dotted = re.fullmatch(r"([a-z_][\w]*)\.[\w.]+(?:\(.*\))?", t)
+    if dotted and "/" not in t and len(dotted.group(1)) >= 4:
+        out.update(f"{dotted.group(1)}{ext}" for ext in _MODULE_SUFFIXES)
     return {s for s in out if len(s) >= 3}
 
 

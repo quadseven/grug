@@ -18,8 +18,9 @@ Two rules, each one finding per file, anchored on a new-side line:
   `def` and at least one assertion go, and no test of that name or a close
   rename comes back) or flips an assertion's polarity (`assertTrue` and
   `assertFalse`, `In` and `NotIn`, `assert x` and `assert not x`, `True`
-  and `False` as the expected value). High when a deleted test's name is
-  not mentioned by the title or the linked criteria, or when the PR flips
+  and `False` as the expected value). High when `DELETED_HIGH` or more
+  deleted tests in a file are not mentioned by the title or the linked
+  criteria, or when the PR flips
   `FLIPS_HIGH` or more assertions none of whose strings or names the
   ticket mentions. Medium otherwise: the ticket names the test, asks to
   remove or retire something, or the PR flips fewer assertions.
@@ -58,6 +59,11 @@ RULE_CATEGORIES = {RULE_TEST: "test fidelity", RULE_LAYER: "security"}
 # flip can follow a behavior the ticket changed, a test file's truth
 # rewritten wholesale cannot.
 FLIPS_HIGH = 3
+# Unnamed deleted tests in one file at or above which deleting is high.
+# Measured on held-out good lane PRs: a single deleted test was as common in
+# good work (a behavior the ticket changed on purpose) as in damaging work,
+# so one deleted test is medium; two or more unnamed ones were damaging only.
+DELETED_HIGH = 2
 # Share of a renamed test's name words a replacement must keep to count as
 # the same test under a new name.
 RENAME_KEEP = 0.6
@@ -344,11 +350,14 @@ def _test_findings(
         if tf.incomplete:
             continue
         deleted = _deleted_tests(tf)
-        if not deleted and not tf.flips:
+        # A lone flip with nothing deleted most often follows a behavior the
+        # ticket changed on purpose: on the lane corpus it was as common in
+        # good work as in damaging work, so it is left to the model.
+        if not deleted and unasked_flips < 2:
             continue
         unnamed = [d for d in deleted if not _mentioned(d.name, ticket_stems)]
         file_unasked = [f for f in tf.flips if not _flip_asked(f, ticket_lower)]
-        high = (bool(unnamed) and not removal_ticket) or (
+        high = (len(unnamed) >= DELETED_HIGH and not removal_ticket) or (
             bool(file_unasked) and unasked_flips >= FLIPS_HIGH
         )
         anchor = _anchor(tf.hunks, hunks)

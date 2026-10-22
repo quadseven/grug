@@ -21,7 +21,7 @@ from personas.code_reviewer.measurement_only import (
     scan_measurement_only,
 )
 
-_FOOTER = "\n---\nLoom ticket example.game-27-r1, lane codex, model gpt-6-luna.\nRefs example/game#27\n"
+_FOOTER = "\n---\nLoom ticket example.game-27-r1, lane codex, model gpt-6-luna.\nRefs example/game#27\n"  # leak-guard-allow: placeholder repo
 _TITLE = "Health: The guild bank holds under a gold"
 _INTAKE_BOXES = (
     (27, 1, "open", "The pull request names the cause with the numbers that show it."),

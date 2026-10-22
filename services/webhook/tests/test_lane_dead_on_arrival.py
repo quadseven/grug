@@ -24,7 +24,7 @@ from personas.code_reviewer.persona import Finding
 _LANE_BODY = (
     "## Summary\nDismiss the dialog when it persists.\n"
     "---\nLoom ticket example.app-125, lane spark, model example-model.\n"
-    "Refs example/app#125\n"
+    "Refs example/app#125\n"  # leak-guard-allow: placeholder repo
 )
 
 _DECISION = [

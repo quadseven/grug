@@ -72,6 +72,12 @@ _DOC_CRITERION_RE = re.compile(
     r"|runbooks?|guide|guidance|playbooks?|docstrings?)\b",
     re.IGNORECASE,
 )
+# A criterion about the pull request itself (it lands, its checks pass, its
+# threads are answered, an older one is closed): the review process meets
+# it, not a hunk.
+_PROCESS_CRITERION_RE = re.compile(
+    r"\bpull requests?\b|\breview threads?\b|\bchecks? pass", re.IGNORECASE,
+)
 # A criterion about the state of a running system: a host, a network, a
 # deploy. Only a change to what manages that state (config, IaC, the code
 # the deploy runs) or an operator action can make it true (#1364).
@@ -487,6 +493,7 @@ def _is_runtime_criterion(text: str) -> bool:
         _LIVE_RE.match(text)
         or _TEST_CRITERION_RE.search(text)
         or _DOC_CRITERION_RE.search(text)
+        or _PROCESS_CRITERION_RE.search(text)
     )
 
 

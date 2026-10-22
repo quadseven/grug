@@ -479,3 +479,17 @@ def test_dispatch_correctness_scope_drops_dead_code_and_llm_rows_win():
     )
     merged = _merge(_evaluation([llm]), hunks, contents, _BODY, correctness_only=True)
     assert merged.findings == (llm,)
+
+
+def test_criteria_about_the_pull_request_itself_need_no_hunk():
+    # A ticket to land or supersede an older pull request: the review
+    # process meets these, a docs-only diff is fine.
+    criteria = (
+        LinkedCriterion(436, 1, "The change reaches the default branch through a pull request"),
+        LinkedCriterion(436, 2, "The new pull request's checks pass and every review thread is answered"),
+    )
+    hunks = (_hunk("skills/verify/SKILL.md", 1, ["# Verify", "Check before you claim."]),)
+    findings = scan_criteria_coverage(
+        hunks, {}, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert not _by_rule(findings, "intent-mismatch")
