@@ -73,6 +73,8 @@ RULE_CATEGORIES = {
     "symptom-only": "requirements",
     # Deterministic lane-work rules (#1367).
     **_WEAKENED_RULE_CATEGORIES,
+    "fabricated-result": "requirements",
+    "unbacked-claim": "requirements",
 }
 
 IssueDetailsFetcher = Callable[[int], str | dict[str, str]]

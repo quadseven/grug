@@ -14,6 +14,11 @@ and the offline corpus runner call exactly the same code:
   that neither the title nor the linked criteria name.
 - weakened verification (#1367): the diff deletes or flips the tests that
   pinned the old behavior, or drops a verification layer from CI.
+- fabricated results (#1368): a rate impossible for its sample size, a
+  results file from a simulate path, an audit with no output behind it, a
+  percentage set from a count.
+- unbacked claims (#1371): the body ticks a live or measurement box and
+  cites no output, run link or number.
 
 Pure: diff text, parsed hunks, file contents and PR text in; findings out.
 """
@@ -29,9 +34,11 @@ from personas.code_reviewer.criteria_coverage import (
 )
 from personas.code_reviewer.destructive_edit import scan_destructive_edits
 from personas.code_reviewer.diff_parser import DiffHunk, FileChange, file_changes
+from personas.code_reviewer.fabricated_result import scan_fabricated_results
 from personas.code_reviewer.intent_filter import body_claims_box
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.weakened_verification import scan_weakened_verification
+from personas.code_reviewer.unbacked_claim import scan_unbacked_claims
 from personas.tpm.ticket_compliance import closes_refs
 
 # The footer a Loom lane writes on every pull request it opens.
@@ -102,4 +109,6 @@ def lane_work_findings(
     findings.extend(scan_weakened_verification(
         changes, hunks, criteria=criteria, pr_title=pr_title,
     ))
+    findings.extend(scan_fabricated_results(changes, hunks))
+    findings.extend(scan_unbacked_claims(pr_body, criteria=criteria, hunks=hunks))
     return tuple(findings)
