@@ -361,10 +361,19 @@ def sweep_stale_labels(*, install_id: int, max_removals: int = 50) -> int:
             owner, _, name = full.partition("/")
             if not owner or not name:
                 continue
+            try:
+                pr_numbers = _labeled_prs_for_repo(token, owner, name)
+            except Exception as error:  # noqa: BLE001 - one repo must not abort the pass
+                log.warning(
+                    "reviewing_label_sweep_repo_failed",
+                    extra={"repo": full, "kind": type(error).__name__},
+                )
+                continue
+            # sweep_repo_labels never removes more than it is given, so the
+            # remainder stays >= 0; the clamp keeps that true by construction.
             removed += sweep_repo_labels(
-                token=token, owner=owner, repo=name,
-                pr_numbers=_labeled_prs_for_repo(token, owner, name),
-                max_removals=max_removals - removed,
+                token=token, owner=owner, repo=name, pr_numbers=pr_numbers,
+                max_removals=max(0, max_removals - removed),
             )
         return removed
 

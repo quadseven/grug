@@ -298,3 +298,54 @@ def test_the_sweep_stops_at_its_cap(monkeypatch):
     )
     assert removed == 1
     assert len([c for c in fake.calls if c[0] == "delete"]) == 1
+
+
+def _two_repo_sweep(monkeypatch, *, broken_repo: str = "") -> _FakeHttp:
+    """Two repos of one installation, each with three labeled PRs whose
+    Elder check concluded. `broken_repo` answers its PR listing with an
+    error, the way a repo the App lost access to would."""
+    fake = _FakeHttp()
+
+    def _get(url: str, **kw: object) -> _Resp:
+        if url.endswith("/issues"):
+            if broken_repo and f"/{broken_repo}/" in url:
+                raise httpx.ConnectError("listing unreadable")
+            return _Resp(200, [{"number": n} for n in (7, 8, 9)])
+        return _Resp(200, {"head": {"sha": "b" * 40}})
+
+    monkeypatch.setattr(review_label, "httpx", fake)
+    monkeypatch.setattr(review_label.httpx, "get", _get)
+    monkeypatch.setattr(
+        review_label, "list_check_runs_for_ref",
+        lambda *a, **k: _runs("completed", "success"),
+    )
+    monkeypatch.setattr(
+        review_label, "with_install_token_retry", lambda iid, fn: fn("tok"),
+    )
+    monkeypatch.setattr(
+        "github_rulesets_client.list_installation_repos",
+        lambda token: [{"full_name": "myorg/first"}, {"full_name": "myorg/second"}],
+    )
+    return fake
+
+
+def test_the_cap_holds_across_the_repos_of_one_pass(monkeypatch):
+    """The cap is per pass, not per repo: the second repo gets only what the
+    first left of it, and the pass never removes more than the cap."""
+    fake = _two_repo_sweep(monkeypatch)
+    removed = review_label.sweep_stale_labels(install_id=11, max_removals=4)
+    deletes = [c[1] for c in fake.calls if c[0] == "delete"]
+    assert removed == 4
+    assert len(deletes) == 4
+    assert len([u for u in deletes if "/myorg/first/" in u]) == 3
+    assert len([u for u in deletes if "/myorg/second/" in u]) == 1
+
+
+def test_one_unreadable_repo_does_not_stop_the_sweep(monkeypatch):
+    """Best-effort per repo: a repo whose labeled-PR listing fails is
+    skipped, and the installation's other repos are still swept."""
+    fake = _two_repo_sweep(monkeypatch, broken_repo="first")
+    removed = review_label.sweep_stale_labels(install_id=11)
+    deletes = [c[1] for c in fake.calls if c[0] == "delete"]
+    assert removed == 3
+    assert all("/myorg/second/" in u for u in deletes)
