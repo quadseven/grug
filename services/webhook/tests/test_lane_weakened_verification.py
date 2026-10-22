@@ -139,6 +139,81 @@ _DELETED_TWO = _diff("tests/test_tokens.py", ("", [
 ]))
 
 
+# Replay case weakened-tests-01 (assay suites/loom_gates): the same deleted
+# test, and the diff also deletes the docstring that stated the rule it
+# pinned.
+_RULE_GOES = _diff("service/rerun.py", ("", [
+    " def ack_learn(post, verdict):",
+    '-    """Every learn outcome is a reaction, never a comment."""',
+    '+    """Every learn outcome is a reaction plus an acknowledgment comment."""',
+    "     post('reactions', {'content': '+1' if verdict['durable'] else 'eyes'})",
+    "+    post('replies', {'body': 'Markings remembered'})",
+]))
+
+# Replay case weakened-tests-02: a give-up guard and the test that pinned it
+# go in one diff, on a ticket that asked for a sooner retry.
+_GUARD_GOES = _diff("gear.py", ("", [
+    "-MAX_TRIES = 3",
+    "+RETRY_SECONDS = 7200",
+    " ",
+    " ",
+]), ("", [
+    "     for row in rows:",
+    "-        if tries.get(row['item'], 0) >= MAX_TRIES:",
+    "-            continue  # held: said once, never retried silently",
+    "         out.append(row)",
+])) + _diff("tests/test_gear.py", ("", [
+    " from gear import equips_to_queue",
+    "-",
+    "-",
+    "-def test_after_three_tries_it_is_held_and_said():",
+    "-    rows = [{'item': 7}]",
+    "-    assert equips_to_queue(rows, {7: 3}) == []",
+    " ",
+    " ",
+    " def test_first_try_queues():",
+    "     assert equips_to_queue([{'item': 7}], {}) == [{'item': 7}]",
+    "+",
+    "+",
+    "+def test_held_equip_is_tried_again():",
+    "+    assert equips_to_queue([{'item': 7}], {7: 3}) == [{'item': 7}]",
+]))
+
+
+def test_a_deleted_test_that_goes_with_the_rule_it_pinned_is_high():
+    title = "Learnings: reply-mined review preferences applied to later reviews"
+    (f,) = _scan(_DELETED + _RULE_GOES, title=title)
+    assert (f.rule_name, f.severity) == ("weakened-test", "high")
+    assert "also deletes the production lines `test_learn_outcomes_never_post_a_comment`" in f.message
+
+
+def test_a_deleted_test_that_goes_with_its_give_up_guard_is_high():
+    criteria = (
+        LinkedCriterion(9, 1, "A held equip is tried again within 2 hours."),
+        LinkedCriterion(9, 2, "A refused equip backs off in stages."),
+    )
+    (f,) = _scan(_GUARD_GOES, title="A held equip is tried again within 2 hours", criteria=criteria)
+    assert (f.rule_name, f.severity) == ("weakened-test", "high")
+    assert "`test_after_three_tries_it_is_held_and_said`" in f.message
+
+
+def test_code_that_goes_without_a_limit_word_leaves_a_lone_deletion_medium():
+    # The deleted code shares the test's words but states no limit: a
+    # helper replaced on purpose, not a guard.
+    helper = _diff("service/rerun.py", ("", [
+        "-def learn_outcomes_post(comment):",
+        "-    return comment",
+        " ",
+    ]))
+    (f,) = _scan(_DELETED + helper, title="Learnings are stored and applied to later reviews")
+    assert f.severity == "medium"
+
+
+def test_a_guard_removed_on_a_removal_ticket_is_medium():
+    (f,) = _scan(_GUARD_GOES, title="Remove the give-up hold on equips")
+    assert f.severity == "medium"
+
+
 def test_two_deleted_tests_the_ticket_does_not_name_are_high():
     (f,) = _scan(_DELETED_TWO, title="Settings come from the control plane")
     assert (f.rule_name, f.severity) == ("weakened-test", "high")
