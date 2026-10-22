@@ -538,3 +538,71 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
         i += 1
 
     return tuple(hunks)
+
+
+@dataclass(frozen=True, slots=True)
+class FileChange:
+    """One file's place in a diff: its status and how many lines moved.
+
+    `status` is "added", "removed", "renamed" or "modified". `similarity`
+    is git's rename similarity (0-100), None when the diff gives none.
+    `added`/`removed` count content lines, not headers."""
+
+    path: str
+    status: str
+    previous_path: str | None
+    similarity: int | None
+    added: int
+    removed: int
+
+
+_SIMILARITY_RE = re.compile(r"^similarity index (\d+)%$")
+
+
+def file_changes(unified_diff: str) -> tuple[FileChange, ...]:
+    """Per-file status and line counts, in diff order.
+
+    Unlike `parse_diff`, deleted files and pure renames are kept: a check
+    that asks what a diff removed has to see them. Pure; a block without a
+    `diff --git` header is skipped, never raised on, since `parse_diff`
+    already refuses malformed input on the same text."""
+    out: list[FileChange] = []
+    for block in re.split(r"(?m)^(?=diff --git )", unified_diff or ""):
+        lines = block.splitlines()
+        if not lines:
+            continue
+        m = _DIFF_GIT_RE.match(lines[0])
+        if not m:
+            continue
+        old, new = m.group(1), m.group(2)
+        status, previous, similarity = "modified", None, None
+        added = removed = 0
+        in_hunk = False
+        for line in lines[1:]:
+            if not in_hunk:
+                if line.startswith("new file mode"):
+                    status = "added"
+                elif line.startswith("deleted file mode"):
+                    status = "removed"
+                elif line.startswith("rename from "):
+                    status, previous = "renamed", line[len("rename from "):]
+                elif line.startswith("+++ "):
+                    target = _NEW_FILE_RE.match(line)
+                    if target and target.group(1) != "/dev/null":
+                        new = target.group(1)
+                else:
+                    sim = _SIMILARITY_RE.match(line)
+                    if sim:
+                        similarity = int(sim.group(1))
+                if line.startswith("@@"):
+                    in_hunk = True
+                continue
+            if line.startswith("+"):
+                added += 1
+            elif line.startswith("-"):
+                removed += 1
+        if status == "renamed" and previous is None:
+            previous = old
+        path = old if status == "removed" else new
+        out.append(FileChange(path, status, previous, similarity, added, removed))
+    return tuple(out)

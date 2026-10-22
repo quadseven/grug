@@ -73,7 +73,7 @@ from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, rule_marker,
 )
 from personas.code_reviewer.diff_parser import (
-    DiffHunk, DiffParseError, is_tree_copy_candidate, new_file_blob_ids,
+    DiffHunk, DiffParseError, file_changes, is_tree_copy_candidate, new_file_blob_ids,
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
@@ -87,9 +87,6 @@ from personas.code_reviewer.claim_check import (
 from personas.code_reviewer.model_metrics import emit_finding_posted
 from personas import board
 from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
-from personas.code_reviewer.criteria_coverage import (
-    LinkedCriterion, scan_criteria_coverage,
-)
 from personas.code_reviewer.analyzers import (
     RepoAnalyzerConfig, configured_engines, merge_analyzer_findings,
     run_analyzers,
@@ -110,6 +107,7 @@ from personas.code_reviewer.repo_config import (
     split_ignored_hunks,
     with_instructions,
 )
+from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
@@ -2487,28 +2485,31 @@ def _drop_non_correctness_findings(
     )
 
 
-def _merge_criteria_coverage(
+def _merge_lane_work(
     evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
-    file_contents: dict[str, str], pr_context: PrContext, *,
+    diff_text: str, file_contents: dict[str, str],
+    base_contents: dict[str, str], pr_context: PrContext, *,
     correctness_only: bool,
 ) -> CodeReviewEvaluation:
-    """Merge the deterministic criteria-coverage findings (#1179).
+    """Merge the deterministic lane-work findings (#1179, #1363).
 
-    Only criteria of issues the PR CLOSES count: a `Refs`/`Part of` link
-    may be one slice of several and is not expected to meet them all.
-    Dead-code findings follow the correctness-only scope the LLM's do."""
+    The criteria in scope are those of an issue the PR closes, every linked
+    criterion of a lane PR (the station closes its ticket on merge), and a
+    box the body claims (`lane_work.criteria_in_scope`). Dead-code findings
+    follow the correctness-only scope the LLM's do."""
     body = str(pr_context.get("body") or "")
-    closed = set(closes_refs(body))
-    criteria = tuple(
-        LinkedCriterion(issue, number, text)
-        for issue, number, text in rendered_criteria(
+    found = lane_work_findings(
+        diff_text=diff_text,
+        hunks=hunks,
+        file_contents=file_contents,
+        base_line_counts={
+            path: len(text.splitlines()) for path, text in base_contents.items()
+        },
+        boxes=rendered_criteria_with_state(
             str(pr_context.get("linked_issue_context") or ""),
-        )
-        if issue in closed
-    )
-    found = scan_criteria_coverage(
-        hunks, file_contents, criteria=criteria,
-        pr_title=str(pr_context.get("title") or ""), pr_body=body,
+        ),
+        pr_title=str(pr_context.get("title") or ""),
+        pr_body=body,
     )
     if correctness_only:
         found = tuple(f for f in found if f.rule_name != "dead-code")
@@ -2752,9 +2753,10 @@ def dispatch_code_review(
             living_range = ""
         pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
-        # Criteria coverage (#1179) judges the WHOLE diff; any hunk dropped
-        # below (excluded, ignored, oversized, duplicate) voids that.
-        parsed_hunk_count = len(hunks)
+        # The lane-work checks (#1179, #1363) judge the WHOLE diff, so they
+        # keep every parsed hunk, including those dropped below (excluded,
+        # ignored, oversized, duplicate) from the model's plate.
+        parsed_hunks = hunks
         review_scope = _correctness_only_scope(
             tuple(hunk.file_path for hunk in hunks), labels,
         )
@@ -2908,9 +2910,15 @@ def dispatch_code_review(
     # and falls back to the old absolute behaviour. That direction is
     # deliberate: going SILENT on a fetch error would hide real regressions,
     # whereas falling back only restores the previous noise level.
+    # A renamed file's base text lives at its old path (#1365).
+    rename_sources = tuple(
+        c.previous_path for c in file_changes(diff_text)
+        if c.status == "renamed" and c.previous_path
+    )
     base_file_contents = _fetch_base_contents(
         installation_id, owner, repo_name, pull_number,
-        changed_paths, str(pr_context.get("base_sha") or ""),
+        tuple(dict.fromkeys(changed_paths + rename_sources)),
+        str(pr_context.get("base_sha") or ""),
     )
 
     # Cross-file context (#468): resolve the diff's changed defs + external
@@ -3239,14 +3247,16 @@ def dispatch_code_review(
             },
         )
 
-    # Deterministic criteria coverage (#1179): a new function nothing calls,
-    # and closing-issue criteria no hunk can satisfy. Pure; never aborts.
-    # A living delta or a narrowed hunk set hides callers and runtime
-    # hunks, so the check runs only when Elder saw the whole diff.
+    # Deterministic lane-work checks (#1179, #1363): a new function nothing
+    # calls, linked criteria no hunk can satisfy, a file mostly deleted that
+    # nobody named. Pure; never aborts. A living delta hides callers and
+    # runtime hunks, so the checks run only on a full-diff review, over
+    # every parsed hunk.
     try:
-        if not living_range and len(hunks) == parsed_hunk_count:
-            evaluation = _merge_criteria_coverage(
-                evaluation, hunks, file_contents, pr_context,
+        if not living_range:
+            evaluation = _merge_lane_work(
+                evaluation, parsed_hunks, diff_text, file_contents,
+                base_file_contents, pr_context,
                 correctness_only=correctness_only,
             )
     except Exception as e:  # noqa: BLE001 - enrichment must never abort a review

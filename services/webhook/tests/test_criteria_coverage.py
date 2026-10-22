@@ -246,13 +246,26 @@ def test_mutually_recursive_uncalled_defs_still_get_a_marking():
 # --- exemptions --------------------------------------------------------------
 
 
-def test_live_criteria_are_exempt_from_the_hunk_mapping():
-    hunks, contents = _helper_only_diff()
+def test_live_criteria_are_exempt_when_the_diff_changes_runtime():
+    hunks, contents = _wired_diff()
     criteria = (LinkedCriterion(436, 1, "Live: a shipped ticket gets a verify run within an hour"),)
     findings = scan_criteria_coverage(
         hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
     )
     assert not _by_rule(findings, "intent-mismatch")
+
+
+def test_live_criteria_are_unmet_when_nothing_in_the_diff_runs():
+    # #1364: a deploy can make a Live: criterion true only if the diff
+    # changes something that runs. An uncalled helper deploys nothing.
+    hunks, contents = _helper_only_diff()
+    criteria = (LinkedCriterion(436, 1, "Live: a shipped ticket gets a verify run within an hour"),)
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    mismatch = _by_rule(findings, "intent-mismatch")
+    assert len(mismatch) == 1 and mismatch[0].severity == "high"
+    assert "Live: a shipped ticket" in mismatch[0].message
 
 
 def test_test_and_doc_criteria_can_be_met_without_runtime_hunks():
@@ -424,29 +437,39 @@ def _pr_context(body: str) -> dict:
     return {"title": _TITLE, "body": body, "linked_issue_context": block}
 
 
-def test_dispatch_merges_a_high_mismatch_for_a_closed_issue():
+def _merge(evaluation, hunks, contents, body, *, correctness_only=False):
     from personas.code_reviewer import dispatch
 
-    hunks, contents = _helper_only_diff()
-    merged = dispatch._merge_criteria_coverage(
-        _evaluation(), hunks, contents, _pr_context(_BODY), correctness_only=False,
+    return dispatch._merge_lane_work(
+        evaluation, hunks, "", contents, {}, _pr_context(body),
+        correctness_only=correctness_only,
     )
+
+
+def test_dispatch_merges_a_high_mismatch_for_a_closed_issue():
+    hunks, contents = _helper_only_diff()
+    merged = _merge(_evaluation(), hunks, contents, _BODY)
     assert [f.rule_name for f in merged.findings] == ["dead-code", "intent-mismatch"]
     assert merged.conclusion == "failure"
 
 
 def test_dispatch_ignores_criteria_of_issues_the_pr_only_refs():
-    from personas.code_reviewer import dispatch
-
     hunks, contents = _helper_only_diff()
-    merged = dispatch._merge_criteria_coverage(
-        _evaluation(), hunks, contents, _pr_context("Refs #436"), correctness_only=False,
-    )
+    merged = _merge(_evaluation(), hunks, contents, "Refs #436")
     assert [f.rule_name for f in merged.findings] == ["dead-code"]
 
 
+def test_dispatch_checks_a_lane_pr_against_the_ticket_it_refs():
+    # #1364: a lane PR links its ticket with Refs, and the station closes
+    # that ticket when the PR merges, so its criteria are this PR's to meet.
+    hunks, contents = _helper_only_diff()
+    body = "Refs #436\n\n---\nLoom ticket example.repo-436, lane codex, model m.\nRefs owner/repo#436"
+    merged = _merge(_evaluation(), hunks, contents, body)
+    assert [f.rule_name for f in merged.findings] == ["dead-code", "intent-mismatch"]
+    assert merged.conclusion == "failure"
+
+
 def test_dispatch_correctness_scope_drops_dead_code_and_llm_rows_win():
-    from personas.code_reviewer import dispatch
     from personas.code_reviewer.persona import Finding
 
     hunks, contents = _helper_only_diff()
@@ -454,7 +477,5 @@ def test_dispatch_correctness_scope_drops_dead_code_and_llm_rows_win():
         file="station/verify.py", line=_VERIFY_DEF_LINE, severity="high",
         rule_name="intent-mismatch", message="model row", suggestion=None,
     )
-    merged = dispatch._merge_criteria_coverage(
-        _evaluation([llm]), hunks, contents, _pr_context(_BODY), correctness_only=True,
-    )
+    merged = _merge(_evaluation([llm]), hunks, contents, _BODY, correctness_only=True)
     assert merged.findings == (llm,)

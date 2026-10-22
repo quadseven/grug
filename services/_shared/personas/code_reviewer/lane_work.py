@@ -1,0 +1,99 @@
+"""Deterministic checks for lane work that cannot do what it claims (#1363).
+
+An audit of the lane pull requests merged from 2026-10-11 to 2026-10-22
+found about 73 that did damage, and Elder passed every one. Most had a
+shape visible in the diff and the PR body alone. This module is the one
+seam the deterministic checks for those shapes run through, so dispatch
+and the offline corpus runner call exactly the same code:
+
+- criteria coverage (#1179, #1364): the diff cannot meet the linked
+  criteria. A lane PR links its ticket with `Refs owner/name#N`, but the
+  station closes that ticket when the PR merges, so its criteria count as
+  if the PR closed it.
+- destructive edits (#1365): the diff deletes or replaces most of a file
+  that neither the title nor the linked criteria name.
+
+Pure: diff text, parsed hunks, file contents and PR text in; findings out.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable
+
+from personas.code_reviewer.criteria_coverage import (
+    LinkedCriterion,
+    scan_criteria_coverage,
+)
+from personas.code_reviewer.destructive_edit import scan_destructive_edits
+from personas.code_reviewer.diff_parser import DiffHunk, FileChange, file_changes
+from personas.code_reviewer.intent_filter import body_claims_box
+from personas.code_reviewer.persona import Finding
+from personas.tpm.ticket_compliance import closes_refs
+
+# The footer a Loom lane writes on every pull request it opens.
+_LANE_FOOTER_RE = re.compile(r"^Loom ticket \S+, lane \S+", re.MULTILINE)
+
+# (issue, criterion number, "open" | "ticked", text): the shape
+# `linked_issue.rendered_criteria_with_state` returns.
+LinkedBox = tuple[int, int, str, str]
+
+
+def is_lane_pr(pr_body: str) -> bool:
+    """The body carries a Loom lane footer."""
+    return bool(_LANE_FOOTER_RE.search(pr_body or ""))
+
+
+def criteria_in_scope(
+    boxes: Iterable[LinkedBox], pr_body: str,
+) -> tuple[LinkedCriterion, ...]:
+    """The linked criteria this PR must meet.
+
+    Those of an issue the PR closes; every linked criterion of a lane PR,
+    whose ticket the station closes on merge; and, on any other PR, an open
+    box whose text the body repeats or names by number (a claim)."""
+    body = pr_body or ""
+    boxes = tuple(boxes)
+    closed = set(closes_refs(body))
+    lane = is_lane_pr(body)
+    issues = {b[0] for b in boxes}
+    single = next(iter(issues)) if len(issues) == 1 else None
+    return tuple(
+        LinkedCriterion(issue, number, text)
+        for issue, number, state, text in boxes
+        if issue in closed or lane
+        or (state == "open" and body_claims_box((issue, number, state, text), body, single))
+    )
+
+
+def lane_work_findings(
+    *,
+    diff_text: str,
+    hunks: tuple[DiffHunk, ...],
+    file_contents: dict[str, str],
+    base_line_counts: dict[str, int],
+    boxes: Iterable[LinkedBox],
+    pr_title: str,
+    pr_body: str,
+    changes: tuple[FileChange, ...] | None = None,
+) -> tuple[Finding, ...]:
+    """Every deterministic lane-work finding for one PR.
+
+    `base_line_counts`: line count of each changed file at the base, by
+    path (the old path for a rename); a file missing from it is skipped by
+    the destructive-edit check, never guessed at. `changes` overrides the
+    per-file statuses read from `diff_text` (the corpus runner passes the
+    full counts of a diff it stores truncated)."""
+    if changes is None:
+        changes = file_changes(diff_text)
+    criteria = criteria_in_scope(boxes, pr_body)
+    findings = list(scan_criteria_coverage(
+        hunks, file_contents, criteria=criteria,
+        pr_title=pr_title, pr_body=pr_body,
+        new_files=frozenset(c.path for c in changes if c.status == "added"),
+    ))
+    findings.extend(scan_destructive_edits(
+        changes, base_line_counts, criteria=criteria,
+        pr_title=pr_title, hunks=hunks,
+    ))
+    return tuple(findings)
