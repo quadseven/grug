@@ -19,6 +19,8 @@ and the offline corpus runner call exactly the same code:
   percentage set from a count.
 - unbacked claims (#1371): the body ticks a live or measurement box and
   cites no output, run link or number.
+- dead on arrival (#1366): a new source file nothing else in the diff
+  loads, and scratch or temporary files left in the commit.
 
 Pure: diff text, parsed hunks, file contents and PR text in; findings out.
 """
@@ -32,6 +34,7 @@ from personas.code_reviewer.criteria_coverage import (
     LinkedCriterion,
     scan_criteria_coverage,
 )
+from personas.code_reviewer.dead_on_arrival import drop_superseded, scan_dead_on_arrival
 from personas.code_reviewer.destructive_edit import scan_destructive_edits
 from personas.code_reviewer.diff_parser import DiffHunk, FileChange, file_changes
 from personas.code_reviewer.fabricated_result import scan_fabricated_results
@@ -111,4 +114,8 @@ def lane_work_findings(
     ))
     findings.extend(scan_fabricated_results(changes, hunks))
     findings.extend(scan_unbacked_claims(pr_body, criteria=criteria, hunks=hunks))
-    return tuple(findings)
+    doa = scan_dead_on_arrival(
+        changes, hunks, pr_body=pr_body, prior=tuple(findings),
+        file_contents=file_contents, lane=is_lane_pr(pr_body),
+    )
+    return (*drop_superseded(findings, doa), *doa)

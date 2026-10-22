@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from personas.code_reviewer.diff_parser import DiffHunk, added_lines
@@ -152,7 +152,7 @@ def _is_doc_path(path: str) -> bool:
     return path.lower().endswith(_DOC_SUFFIXES)
 
 
-def _is_production(path: str) -> bool:
+def is_production_path(path: str) -> bool:
     return (
         not is_test_file(path) and not _is_doc_path(path)
         and path.rsplit("/", 1)[-1] not in _INERT_NAMES
@@ -347,10 +347,11 @@ _PATH_WORD_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
 
 def _word_keys(word: str) -> set[str]:
     """The spellings of a file one path-like word can name: the word, its
-    last path segment, and that segment without its extension."""
+    last path segment, that segment without its extension, and the last
+    part of a dotted Python import (`pkg.mod.name` names `name.py`)."""
     word = word.rstrip(".-/")
     tail = word.rsplit("/", 1)[-1]
-    return {word, word.lstrip("./"), tail, tail.rsplit(".", 1)[0]}
+    return {word, word.lstrip("./"), tail, tail.rsplit(".", 1)[0], tail.rsplit(".", 1)[-1]}
 
 
 def _mentions(text: str, index: dict[str, set[str]]) -> set[str]:
@@ -367,21 +368,25 @@ def _reference_candidates(new_files: frozenset[str]) -> set[str]:
     with a stem specific enough to prove a mention."""
     return {
         path for path in new_files
-        if _is_production(path)
+        if is_production_path(path)
         and path.endswith(_SCRIPT_SUFFIXES)
         and not _is_discovered(path)
         and path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower() not in _GENERIC_STEMS
     }
 
 
-def _added_text_by_file(hunks: tuple[DiffHunk, ...]) -> dict[str, str] | None:
-    """Each file's added text, or None past `MAX_REFERENCE_SCAN_CHARS`."""
+def _added_text_by_file(
+    hunks: tuple[DiffHunk, ...], counts: Callable[[str, str], bool] | None = None,
+) -> dict[str, str] | None:
+    """Each file's added text (only the lines `counts` accepts, when given),
+    or None past `MAX_REFERENCE_SCAN_CHARS`."""
     lines_by_file: dict[str, list[str]] = {}
     size = 0
     for hunk in hunks:
         for _, text in added_lines(hunk):
             size += len(text) + 1
-            lines_by_file.setdefault(hunk.file_path, []).append(text)
+            if counts is None or counts(hunk.file_path, text):
+                lines_by_file.setdefault(hunk.file_path, []).append(text)
         if size > MAX_REFERENCE_SCAN_CHARS:
             return None
     return {path: "\n".join(lines) for path, lines in lines_by_file.items()}
@@ -399,8 +404,9 @@ def _reached_candidates(candidates: set[str], edges: dict[str, set[str]]) -> set
     return candidates & seen
 
 
-def _unreferenced_new_files(
+def unreferenced_new_files(
     new_files: frozenset[str], hunks: tuple[DiffHunk, ...], pr_body: str,
+    *, counts: Callable[[str, str], bool] | None = None,
 ) -> frozenset[str] | None:
     """New production scripts and modules no other file in the diff names,
     or None when the diff is past the scan bounds (not evaluated).
@@ -411,6 +417,10 @@ def _unreferenced_new_files(
     reference: a tested or documented tool is meant to be run, and whether
     running it can meet a criterion is the live-state check's question.
 
+    `counts(path, line)`: when given, only the added lines it accepts can
+    name a file, so a stricter caller can leave out test files or lines
+    that only package a file (`dead_on_arrival`).
+
     Cost: one index of candidate spellings, one linear word scan of each
     file's added text, one graph traversal."""
     candidates = _reference_candidates(new_files)
@@ -418,7 +428,7 @@ def _unreferenced_new_files(
         return frozenset()
     if len(candidates) > MAX_REFERENCE_CANDIDATES:
         return None
-    added = _added_text_by_file(hunks)
+    added = _added_text_by_file(hunks, counts)
     if added is None:
         return None
     index: dict[str, set[str]] = {}
@@ -601,7 +611,7 @@ def _anchor(hunks: tuple[DiffHunk, ...], dead: list[_NewDef]) -> tuple[str, int]
     """The first dead def, else the first added production line, else any."""
     if dead:
         return dead[0].file, dead[0].line
-    ordered = sorted(hunks, key=lambda h: not _is_production(h.file_path))
+    ordered = sorted(hunks, key=lambda h: not is_production_path(h.file_path))
     for hunk in ordered:
         for lineno, _ in added_lines(hunk):
             return hunk.file_path, lineno
@@ -684,7 +694,7 @@ def scan_criteria_coverage(
     `new_files`: paths the diff adds (`diff_parser.file_changes`), so a new
     script nothing names can count as inert. Empty keeps the #1179
     behavior."""
-    production = [h for h in hunks if _is_production(h.file_path)]
+    production = [h for h in hunks if is_production_path(h.file_path)]
     parsed, other_text = _parse_production(production, file_contents)
     py_refs = {path: list(_references(p.tree)) for path, p in parsed.items()}
     dead = sorted(
@@ -696,7 +706,7 @@ def scan_criteria_coverage(
         for root, stranded in _call_trees(dead, py_refs)
     ]
     # None (past the scan bounds) means not evaluated: nothing is inert.
-    inert = _unreferenced_new_files(new_files, hunks, pr_body or "") or frozenset()
+    inert = unreferenced_new_files(new_files, hunks, pr_body or "") or frozenset()
     unmet = _unmet_criteria_finding(
         criteria, hunks, production, parsed, dead, inert, new_files, pr_title,
     )

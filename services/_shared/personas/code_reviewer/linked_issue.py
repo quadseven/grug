@@ -75,6 +75,8 @@ RULE_CATEGORIES = {
     **_WEAKENED_RULE_CATEGORIES,
     "fabricated-result": "requirements",
     "unbacked-claim": "requirements",
+    # A scratch or temporary file left in a lane commit (#1366).
+    "stray-file": "maintainability",
 }
 
 IssueDetailsFetcher = Callable[[int], str | dict[str, str]]
