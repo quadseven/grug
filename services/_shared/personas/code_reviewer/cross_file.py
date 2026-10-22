@@ -6,7 +6,7 @@ the repo. The highest-value review questions are cross-file: "does the
 CALLER of this changed function handle the new signature?". This module
 resolves the diff's interesting symbols to the UNCHANGED files that
 define or call them, so those files ride into the review prompt as extra
-context (rendered by `llm_client._build_messages`, flagged never - the
+context (rendered by `review_evidence`'s reviewer and judge views, flagged never - the
 paired `caller-not-updated` rule anchors findings on the DIFF line).
 
 PREMISE NOTE (recorded in DESIGN.md): GitHub's `/search/code` indexes the

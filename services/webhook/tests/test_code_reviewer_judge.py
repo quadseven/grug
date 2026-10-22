@@ -7,10 +7,11 @@ Best-effort — a judge failure never affects the (already-published)
 review."""
 from __future__ import annotations
 
-from llm_client import Backend, FindingJudgement, FindingOrigin, LlmReviewResponse
+from llm_client import Backend, FindingJudgement, Hunk, FindingOrigin, LlmReviewResponse
 from personas.code_reviewer import judge as cr_judge
 from personas.code_reviewer.diff_parser import parse_diff
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+from review_evidence import assemble_evidence
 
 
 _DIFF = """diff --git a/src/x.py b/src/x.py
@@ -22,6 +23,11 @@ _DIFF = """diff --git a/src/x.py b/src/x.py
 +new1
 +new2
 """
+
+
+def _wire(diff_hunks) -> list[Hunk]:
+    """Parser DiffHunks -> the wire hunks dispatch assembles into evidence."""
+    return [Hunk(path=h.file_path, body=h.body) for h in diff_hunks]
 
 
 def _finding(
@@ -63,9 +69,10 @@ def test_run_judge_submits_one_eval_per_finding(monkeypatch):
     )
 
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF)), pr_context={"repo": "o/r"}),
+        installation_id=1,
         review_span_context=review.review_span_context,
-        pr_context={"repo": "o/r"},
     )
 
     assert len(submitted) == 2
@@ -109,7 +116,7 @@ def test_run_judge_fans_out_eval_to_every_finding_origin(monkeypatch):
 
     cr_judge.run_judge(
         evaluation,
-        parse_diff(_DIFF),
+        assemble_evidence(_wire(parse_diff(_DIFF))),
         installation_id=1,
         review_span_context=None,
     )
@@ -193,9 +200,13 @@ def test_run_judge_redacts_exposed_secret_reasoning(monkeypatch):
     monkeypatch.setattr(cr_judge, "submit_finding_evaluation", lambda **kw: submitted.append(kw))
 
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(
+            _wire(parse_diff(_DIFF)),
+            file_contents={"src/x.py": "AKIAIOSFODNN7EXAMPLE"},
+        ),
+        installation_id=1,
         review_span_context=review.review_span_context,
-        file_contents={"src/x.py": "AKIAIOSFODNN7EXAMPLE"},
     )
 
     assert submitted[0]["tags"]["rule_name"] == EXPOSED_SECRET
@@ -204,26 +215,30 @@ def test_run_judge_redacts_exposed_secret_reasoning(monkeypatch):
     assert submitted[1]["reasoning"] == "real null deref"  # normal finding untouched
 
 
-def test_run_judge_converts_diffhunks_to_wire_hunks(monkeypatch):
-    """Regression: run_judge must convert parser DiffHunks → wire `Hunk`s
-    (field `path`) before judge_findings, which reads `.path`. Passing raw
-    DiffHunks (field `file_path`) crashed the judge with AttributeError on
-    EVERY review with findings — silently killing all is_real_bug LLM-Obs
-    evals — while the fully-mocked judge_findings tests stayed green."""
+def test_run_judge_hands_the_judge_wire_hunks(monkeypatch):
+    """Regression: judge_findings reads wire `Hunk`s (field `path`). Passing
+    raw parser DiffHunks (field `file_path`) once crashed the judge with
+    AttributeError on EVERY review with findings - silently killing all
+    is_real_bug LLM-Obs evals - while the fully-mocked judge_findings tests
+    stayed green. The conversion now happens once, where dispatch assembles
+    the review evidence (#1189); run_judge passes that evidence through."""
     evaluation = CodeReviewEvaluation(findings=(_finding(),), conclusion="success")
     review = _reviewed(evaluation.findings)
     captured: dict = {}
     monkeypatch.setattr(
         cr_judge, "judge_findings",
-        lambda fr, h, installation_id, **kwargs: (
-            captured.update(hunks=list(h)) or (FindingJudgement(0, True, "real"),)
+        lambda fr, evidence, installation_id, **kwargs: (
+            captured.update(hunks=list(evidence.hunks))
+            or (FindingJudgement(0, True, "real"),)
         ),
     )
     monkeypatch.setattr(cr_judge, "submit_finding_evaluation", lambda **kw: None)
 
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
-        review_span_context=review.review_span_context, pr_context={"repo": "o/r"},
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF)), pr_context={"repo": "o/r"}),
+        installation_id=1,
+        review_span_context=review.review_span_context,
     )
 
     hunks = captured.get("hunks")
@@ -245,7 +260,9 @@ def test_run_judge_skips_when_no_findings(monkeypatch):
     monkeypatch.setattr(cr_judge, "submit_finding_evaluation", lambda **kw: None)
 
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context={"span_id": "s"},
     )
     assert called["judge"] is False
@@ -266,7 +283,9 @@ def test_run_judge_skips_when_no_review_span_context(monkeypatch):
     monkeypatch.setattr(cr_judge, "submit_finding_evaluation", lambda **kw: None)
 
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context=None,
     )
     assert called["judge"] is False
@@ -293,7 +312,9 @@ def test_run_judge_tolerates_verdict_index_gaps(monkeypatch):
     )
 
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context={"span_id": "s"},
     )
     assert len(submitted) == 1
@@ -316,7 +337,9 @@ def test_run_judge_ignores_out_of_range_verdict_index(monkeypatch):
         lambda **kw: submitted.append(kw),
     )
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context={"span_id": "s"},
     )
     assert submitted == []
@@ -344,7 +367,9 @@ def test_run_judge_dedupes_duplicate_verdict_indices(monkeypatch):
         lambda **kw: submitted.append(kw),
     )
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context={"span_id": "s"},
     )
     # 2 evals (one per finding index), not 3 — the duplicate index-0
@@ -373,7 +398,9 @@ def test_run_judge_never_raises_on_submit_failure(monkeypatch):
 
     # Must not raise.
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context={"span_id": "s"},
     )
 
@@ -460,7 +487,9 @@ def test_grade_findings_fail_open_on_llm_error(monkeypatch):
 
     monkeypatch.setattr(cr_judge, "judge_findings", _boom)
     verdicts = cr_judge.grade_findings(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
     )
     assert verdicts == ()
 
@@ -468,7 +497,9 @@ def test_grade_findings_fail_open_on_llm_error(monkeypatch):
 def test_grade_findings_empty_when_no_findings():
     evaluation = CodeReviewEvaluation(findings=(), conclusion="success")
     assert cr_judge.grade_findings(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
     ) == ()
 
 
@@ -490,7 +521,9 @@ def test_grade_findings_batches_large_ensemble_output(monkeypatch):
     monkeypatch.setattr(cr_judge, "judge_findings", judge_batch)
 
     verdicts = cr_judge.grade_findings(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
     )
 
     assert batch_sizes == [cr_judge.JUDGE_BATCH_SIZE, 2]
@@ -517,7 +550,9 @@ def test_grade_findings_caps_total_batches_and_leaves_remainder_ungraded(
     monkeypatch.setattr(cr_judge, "judge_findings", judge_batch)
 
     verdicts = cr_judge.grade_findings(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
     )
     kept, suppressed = cr_judge.partition_findings(
         evaluation.findings, verdicts,
@@ -552,8 +587,8 @@ diff --git a/tests/test_y.py b/tests/test_y.py
     )
     captured: dict = {}
 
-    def judge_batch(reprs, hunks, *args, **kwargs):
-        captured["hunks"] = hunks
+    def judge_batch(reprs, evidence, *args, **kwargs):
+        captured["evidence"] = evidence
         captured.update(kwargs)
         return (FindingJudgement(0, True, "real"),)
 
@@ -561,22 +596,22 @@ diff --git a/tests/test_y.py b/tests/test_y.py
 
     verdicts = cr_judge.grade_findings(
         evaluation,
-        parse_diff(diff),
+        assemble_evidence(
+            _wire(parse_diff(diff)),
+            pr_context={"title": "contract"},
+            file_contents={"src/x.py": "changed", "tests/test_y.py": "unrelated"},
+            cross_file_contents={"src/caller.py": "old_call()"},
+            runtime_context="10 errors",
+        ),
         installation_id=1,
-        pr_context={"title": "contract"},
-        file_contents={
-            "src/x.py": "changed",
-            "tests/test_y.py": "unrelated",
-        },
-        cross_file_contents={"src/caller.py": "old_call()"},
-        runtime_context="10 errors",
     )
 
     assert len(verdicts) == 1
-    assert [h.path for h in captured["hunks"]] == ["src/x.py"]
-    assert captured["file_contents"] == {"src/x.py": "changed"}
-    assert captured["cross_file_contents"] == {"src/caller.py": "old_call()"}
-    assert captured["runtime_context"] == "10 errors"
+    evidence = captured["evidence"]
+    assert [h.path for h in evidence.hunks] == ["src/x.py"]
+    assert evidence.file_contents == {"src/x.py": "changed"}
+    assert evidence.cross_file_contents == {"src/caller.py": "old_call()"}
+    assert evidence.runtime_context == "10 errors"
     assert captured["redact"] is True
 
 
@@ -597,7 +632,9 @@ def test_grade_findings_uses_owned_reasoner_then_redacted_fallback(monkeypatch):
     monkeypatch.setattr(cr_judge, "judge_findings", judge_batch)
 
     verdicts = cr_judge.grade_findings(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
     )
 
     assert len(verdicts) == 1
@@ -627,7 +664,9 @@ def test_grade_findings_falls_back_when_owned_reasoner_is_partial(monkeypatch):
     monkeypatch.setattr(cr_judge, "judge_findings", judge_batch)
 
     verdicts = cr_judge.grade_findings(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
     )
 
     assert calls == ["owned", "fallback"]
@@ -645,8 +684,8 @@ def test_refute_findings_scopes_review_evidence_to_candidate_files(monkeypatch):
 """
     captured: dict = {}
 
-    def judge_batch(reprs, hunks, *args, **kwargs):
-        captured["hunks"] = hunks
+    def judge_batch(reprs, evidence, *args, **kwargs):
+        captured["evidence"] = evidence
         captured.update(kwargs)
         return (FindingJudgement(0, True, "confirmed"),)
 
@@ -654,12 +693,15 @@ def test_refute_findings_scopes_review_evidence_to_candidate_files(monkeypatch):
 
     verdicts = cr_judge.refute_findings(
         (_finding(severity="high"),),
-        parse_diff(diff),
+        assemble_evidence(
+            _wire(parse_diff(diff)),
+            file_contents={"src/x.py": "changed", "src/y.py": "unrelated"},
+        ),
         installation_id=1,
-        file_contents={"src/x.py": "changed", "src/y.py": "unrelated"},
     )
 
     assert len(verdicts) == 1
-    assert [h.path for h in captured["hunks"]] == ["src/x.py"]
-    assert captured["file_contents"] == {"src/x.py": "changed"}
+    evidence = captured["evidence"]
+    assert [h.path for h in evidence.hunks] == ["src/x.py"]
+    assert evidence.file_contents == {"src/x.py": "changed"}
     assert captured["refute"] is True
