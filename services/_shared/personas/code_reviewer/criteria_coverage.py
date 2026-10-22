@@ -236,6 +236,12 @@ def _declared_entry_points(pr_body: str, names: set[str]) -> set[str]:
     return {n for n in names if re.search(rf"\b{re.escape(n)}\b", pr_body)}
 
 
+def _entry_point_text(pr_body: str) -> str:
+    """The PR body when it uses entry-point language, else nothing: a
+    file it then names is declared an entry point."""
+    return pr_body if _ENTRY_POINT_RE.search(pr_body or "") else ""
+
+
 def _reached(
     candidate: _NewDef, dead: set[_NewDef],
     py_refs: dict[str, list[tuple[str, int]]], other_text: str,
@@ -329,14 +335,47 @@ def _name_tokens(path: str) -> set[str]:
     return tokens
 
 
+# Bounds on the reference scan, so a huge or adversarial diff cannot make
+# a review hang: past either, the scan is NOT EVALUATED and no file is
+# called inert, which leaves the #1179 behavior (the check can then only
+# stay silent about inert files, never call a diff clean because of them).
+MAX_REFERENCE_CANDIDATES = 200
+MAX_REFERENCE_SCAN_CHARS = 4_000_000
+# Path-like words in added text: one linear pass splits a file into these.
+_PATH_WORD_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+
+
+def _word_keys(word: str) -> set[str]:
+    """The spellings of a file one path-like word can name: the word, its
+    last path segment, and that segment without its extension."""
+    word = word.rstrip(".-/")
+    tail = word.rsplit("/", 1)[-1]
+    return {word, word.lstrip("./"), tail, tail.rsplit(".", 1)[0]}
+
+
+def _mentions(text: str, index: dict[str, set[str]]) -> set[str]:
+    """Candidate files the text names, by one pass over its words."""
+    found: set[str] = set()
+    for match in _PATH_WORD_RE.finditer(text):
+        for key in _word_keys(match.group(0)):
+            found |= index.get(key, set())
+    return found
+
+
 def _unreferenced_new_files(
     new_files: frozenset[str], hunks: tuple[DiffHunk, ...], pr_body: str,
-) -> frozenset[str]:
+) -> frozenset[str] | None:
     """New production scripts and modules no other file in the diff names,
-    to a fixpoint: a file named only by another such file is unreferenced
-    too. A test or doc that names it counts as a reference: a tested or
-    documented tool is meant to be run, and whether running it can meet a
-    criterion is the live-state check's question, not this one's."""
+    or None when the diff is past the scan bounds (not evaluated).
+
+    A file named only by other unreferenced files is unreferenced too: the
+    names form a graph, and a candidate is referenced when some file that
+    is not a candidate reaches it. A test or doc that names it counts as a
+    reference: a tested or documented tool is meant to be run, and whether
+    running it can meet a criterion is the live-state check's question.
+
+    Cost: one index of candidate spellings, one linear word scan of each
+    file's added text, one graph traversal."""
     candidates = {
         path for path in new_files
         if _is_production(path)
@@ -346,28 +385,38 @@ def _unreferenced_new_files(
     }
     if not candidates:
         return frozenset()
-    declared = _declared_entry_points(
-        pr_body, {t for p in candidates for t in _name_tokens(p)},
-    )
-    candidates = {p for p in candidates if not (_name_tokens(p) & declared)}
-    added_by_file: dict[str, str] = {}
+    if len(candidates) > MAX_REFERENCE_CANDIDATES:
+        return None
+    added_by_file: dict[str, list[str]] = {}
+    size = 0
     for hunk in hunks:
-        text = "\n".join(t for _, t in added_lines(hunk))
-        added_by_file[hunk.file_path] = added_by_file.get(hunk.file_path, "") + "\n" + text
-    unreferenced = set(candidates)
-    while True:
-        referenced = {
-            path for path in unreferenced
-            if any(
-                re.search(rf"(?<![\w.-]){re.escape(token)}(?![\w-])", text)
-                for other, text in added_by_file.items()
-                if other != path and other not in unreferenced
-                for token in _name_tokens(path)
-            )
-        }
-        if not referenced:
-            return frozenset(unreferenced)
-        unreferenced -= referenced
+        for _, text in added_lines(hunk):
+            size += len(text) + 1
+            added_by_file.setdefault(hunk.file_path, []).append(text)
+        if size > MAX_REFERENCE_SCAN_CHARS:
+            return None
+    index: dict[str, set[str]] = {}
+    for path in candidates:
+        for token in _name_tokens(path):
+            index.setdefault(token, set()).add(path)
+    declared = _mentions(_entry_point_text(pr_body), index)
+    candidates -= declared
+    # Edges: file -> candidates its added text names (never itself).
+    edges = {
+        path: _mentions("\n".join(lines), index) - {path}
+        for path, lines in added_by_file.items()
+    }
+    referenced: set[str] = set()
+    stack = [p for p in edges if p not in candidates]
+    seen = set(stack)
+    while stack:
+        for target in edges.get(stack.pop(), ()):
+            if target in candidates and target not in referenced:
+                referenced.add(target)
+            if target not in seen:
+                seen.add(target)
+                stack.append(target)
+    return frozenset(candidates - referenced)
 
 
 def _statement_lines(stmt: ast.stmt) -> range:
@@ -605,7 +654,8 @@ def scan_criteria_coverage(
         _dead_code_finding(root, stranded)
         for root, stranded in _call_trees(dead, py_refs)
     ]
-    inert = _unreferenced_new_files(new_files, hunks, pr_body or "")
+    # None (past the scan bounds) means not evaluated: nothing is inert.
+    inert = _unreferenced_new_files(new_files, hunks, pr_body or "") or frozenset()
     runtime_criteria = [c for c in criteria if _is_runtime_criterion(c.text)]
     live_criteria = [c for c in criteria if _is_live_criterion(c.text)]
     anchor = _anchor(hunks, dead)

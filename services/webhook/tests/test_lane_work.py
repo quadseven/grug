@@ -261,3 +261,55 @@ def test_file_changes_reads_status_rename_and_counts():
         FileChange("new.md", "renamed", "old.md", 40, 1, 2),
         FileChange("gone.txt", "removed", None, None, 0, 2),
     )
+
+
+# --- reference scan cost (#1364 review) -------------------------------------------
+
+
+def test_reference_chain_resolves_through_a_referenced_new_file():
+    from personas.code_reviewer.criteria_coverage import _unreferenced_new_files
+
+    diff = (
+        _added_file("ops/a_tool.sh", ["#!/bin/sh", "ops/b_tool.sh"])
+        + _added_file("ops/b_tool.sh", ["#!/bin/sh", "echo b"])
+        + _added_file("ops/c_tool.sh", ["#!/bin/sh", "ops/d_tool.sh"])
+        + _added_file("ops/d_tool.sh", ["#!/bin/sh", "ops/c_tool.sh"])
+        + _added_file(".github/workflows/run.yml", ["steps:", "  - run: ops/a_tool.sh"])
+    )
+    new = frozenset(c.path for c in file_changes(diff) if c.status == "added")
+    # a is run by the workflow and runs b; c and d only name each other.
+    assert _unreferenced_new_files(new, parse_diff(diff), "") == {"ops/c_tool.sh", "ops/d_tool.sh"}
+
+
+def test_reference_scan_is_linear_on_a_large_diff():
+    import time
+
+    from personas.code_reviewer.criteria_coverage import _unreferenced_new_files
+
+    # 150 new scripts, each naming the next, 300 lines apiece: 45,000 added
+    # lines. The old rescan was one regex per token per file per pass.
+    parts = []
+    for i in range(150):
+        body = ["#!/bin/sh", f"ops/tool_{i + 1:03d}.sh"] + [f"echo line {n} of tool {i}" for n in range(300)]
+        parts.append(_added_file(f"ops/tool_{i:03d}.sh", body))
+    diff = "".join(parts)
+    hunks = parse_diff(diff)
+    new = frozenset(c.path for c in file_changes(diff) if c.status == "added")
+    start = time.perf_counter()
+    inert = _unreferenced_new_files(new, hunks, "")
+    elapsed = time.perf_counter() - start
+    # Only tool_000 has no caller; every later tool is reached from it, but
+    # tool_000 is itself a candidate, so the whole chain stays unreferenced.
+    assert inert == new
+    assert elapsed < 1.0, elapsed
+
+
+def test_reference_scan_past_its_bounds_is_not_evaluated_and_calls_nothing_inert():
+    from personas.code_reviewer import criteria_coverage as cc
+
+    many = "".join(_added_file(f"ops/tool_{i:03d}.sh", ["#!/bin/sh"]) for i in range(cc.MAX_REFERENCE_CANDIDATES + 1))
+    new = frozenset(c.path for c in file_changes(many) if c.status == "added")
+    assert cc._unreferenced_new_files(new, parse_diff(many), "") is None
+    # Not evaluated never becomes a finding: no file counts as inert.
+    boxes = ((83, 1, "open", "The nightly sync retries a failed upload three times"),)
+    assert _findings(many, boxes=boxes, base={}) == ()
