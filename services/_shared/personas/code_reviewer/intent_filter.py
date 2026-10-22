@@ -203,6 +203,12 @@ def _body_claims(box: LinkedBox, pr_body: str, single_issue: int | None) -> bool
     return len(text) >= _MIN_TEXT_MATCH and text in _normalized(pr_body)
 
 
+def body_claims_box(box: LinkedBox, pr_body: str, single_issue: int | None) -> bool:
+    """Public form of the claim test, for the lane-work criteria scope
+    (#1364): the PR body names this box by number or repeats its text."""
+    return _body_claims(box, pr_body, single_issue)
+
+
 def _box_label(box: LinkedBox) -> str:
     return f"#{box[0]} criterion {box[1]} ({box[2]} on the issue)"
 
