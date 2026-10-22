@@ -75,6 +75,8 @@ RULE_CATEGORIES = {
     **_WEAKENED_RULE_CATEGORIES,
     "fabricated-result": "requirements",
     "unbacked-claim": "requirements",
+    # A linked criterion with no evidence in the diff (#1389).
+    "partial-delivery": "requirements",
     # A scratch or temporary file left in a lane commit (#1366).
     "stray-file": "maintainability",
 }

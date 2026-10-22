@@ -25,6 +25,9 @@ and the offline corpus runner call exactly the same code:
   changes none of them, naming them only in comments or tests.
 - measurement only (#1370): a health ticket's fix changes only the code
   that measures or reports the finding.
+- partial delivery (#1389): an open in-scope criterion with no evidence
+  in the diff. Dispatch passes a model `criteria_judge` for the criteria
+  the deterministic mapping cannot decide; the corpus runner does not.
 
 Pure: diff text, parsed hunks, file contents and PR text in; findings out.
 """
@@ -44,6 +47,7 @@ from personas.code_reviewer.diff_parser import DiffHunk, FileChange, file_change
 from personas.code_reviewer.fabricated_result import scan_fabricated_results
 from personas.code_reviewer.intent_filter import body_claims_box
 from personas.code_reviewer.measurement_only import scan_measurement_only
+from personas.code_reviewer.partial_delivery import CriteriaJudge, scan_partial_delivery
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.unbacked_claim import scan_unbacked_claims
 from personas.code_reviewer.weakened_verification import scan_weakened_verification
@@ -104,6 +108,7 @@ def lane_work_findings(
     pr_body: str,
     changes: tuple[FileChange, ...] | None = None,
     health_issues: Iterable[int] = (),
+    criteria_judge: CriteriaJudge | None = None,
 ) -> tuple[Finding, ...]:
     """Every deterministic lane-work finding for one PR.
 
@@ -113,7 +118,8 @@ def lane_work_findings(
     per-file statuses read from `diff_text` (the corpus runner passes the
     full counts of a diff it stores truncated). `health_issues`: linked
     issues that are health findings (`linked_issue.rendered_health_issues`);
-    without it a PR title starting `Health:` marks one."""
+    without it a PR title starting `Health:` marks one. `criteria_judge`
+    decides the criteria the partial-delivery mapping cannot (#1389)."""
     if changes is None:
         changes = file_changes(diff_text)
     boxes = tuple(boxes)
@@ -141,6 +147,12 @@ def lane_work_findings(
     findings.extend(scan_measurement_only(
         changes, hunks, criteria=criteria, pr_title=pr_title, health_issues=health_issues,
     ))
+    # Criteria coverage already reports every runtime criterion unmet when
+    # nothing in the diff runs; partial delivery would say it again.
+    if not any(f.rule_name == "intent-mismatch" and f.severity == "high" for f in findings):
+        findings.extend(scan_partial_delivery(
+            _open_only(criteria, boxes), changes, hunks, judge=criteria_judge,
+        ))
     doa = scan_dead_on_arrival(
         changes, hunks, pr_body=pr_body, prior=tuple(findings),
         file_contents=file_contents, lane=is_lane_pr(pr_body),
