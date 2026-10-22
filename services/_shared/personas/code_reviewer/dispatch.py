@@ -2583,6 +2583,40 @@ def _full_pr_lane_work_inputs(
     return _LaneWorkInputs(diff_text, hunks, contents, base_contents)
 
 
+def _merge_lane_work_for_pass(
+    evaluation: CodeReviewEvaluation, this_pass: _LaneWorkInputs,
+    pr_context: PrContext, *, living_range: str, base_sha: str,
+    correctness_only: bool,
+) -> CodeReviewEvaluation:
+    """Merge the lane-work findings for one review pass. A full review
+    judges the diff it reviewed; a living delta hides callers and the
+    commits that met a criterion, so a delta review judges the full PR diff
+    instead (#1343). Never aborts the review."""
+    owner, _, repo_name = str(pr_context.get("repo") or "").partition("/")
+    pull_number = int(pr_context.get("pr_number") or 0)
+    try:
+        inputs: _LaneWorkInputs | None = this_pass
+        if living_range:
+            inputs = _full_pr_lane_work_inputs(
+                int(pr_context.get("installation_id") or 0), owner, repo_name,
+                pull_number, base_sha=base_sha,
+                head_sha=str(pr_context.get("head_sha") or ""),
+                known_contents=this_pass.file_contents,
+            )
+        if inputs is None:
+            return evaluation
+        return _merge_lane_work(
+            evaluation, inputs.hunks, inputs.diff_text, inputs.file_contents,
+            inputs.base_contents, pr_context, correctness_only=correctness_only,
+        )
+    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
+        log.info(
+            "code_review_criteria_coverage_failed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        return evaluation
+
+
 def _filter_checked_shell_commands(
     evaluation: CodeReviewEvaluation, file_contents: dict[str, str], *,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
@@ -3314,33 +3348,13 @@ def dispatch_code_review(
 
     # Deterministic lane-work checks (#1179, #1363): a new function nothing
     # calls, linked criteria no hunk can satisfy, a file mostly deleted that
-    # nobody named. Pure; never aborts. They judge the WHOLE pull request on
-    # every pass (#1343): a living delta hides callers and the commits that
-    # met a criterion, so a delta review runs them on the full PR diff.
-    try:
-        if living_range:
-            full = _full_pr_lane_work_inputs(
-                installation_id, owner, repo_name, pull_number,
-                base_sha=base_sha, head_sha=head_sha,
-                known_contents=file_contents,
-            )
-            if full is not None:
-                evaluation = _merge_lane_work(
-                    evaluation, full.hunks, full.diff_text, full.file_contents,
-                    full.base_contents, pr_context,
-                    correctness_only=correctness_only,
-                )
-        else:
-            evaluation = _merge_lane_work(
-                evaluation, parsed_hunks, diff_text, file_contents,
-                base_file_contents, pr_context,
-                correctness_only=correctness_only,
-            )
-    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
-        log.info(
-            "code_review_criteria_coverage_failed",
-            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
-        )
+    # nobody named. They judge the WHOLE pull request on every pass (#1343).
+    evaluation = _merge_lane_work_for_pass(
+        evaluation,
+        _LaneWorkInputs(diff_text, parsed_hunks, file_contents, base_file_contents),
+        pr_context, living_range=living_range, base_sha=base_sha,
+        correctness_only=correctness_only,
+    )
 
     # Durable reviews can spend several minutes in inference. Re-check the
     # complete input after reasoning so changes to code, base, or intent cannot
