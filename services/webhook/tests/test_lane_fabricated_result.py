@@ -90,6 +90,31 @@ def test_rates_a_whole_count_gives_are_fine():
         assert _scan(_benchmark_diff(sentence)) == (), sentence
 
 
+# Replay case fabricated-01 (assay suites/loom_gates): the same rates as a
+# scoreboard row, with no percent sign, beside the row's own sample size.
+_SCOREBOARD = "suites/nutrition/results/scoreboard.json"
+_ROW_B = '    {"model": "model-b", "n": 30, "pass": [43.3, 40.0, 36.7, 20.0]},'
+
+
+def test_a_rate_key_in_a_data_file_is_read_without_a_percent_sign():
+    row = ('    {"model": "model-a", "n": 30, "pass": [47.0, 43.0, 40.0, 20.0], '
+           '"mape": [28.4, 30.9, 29.1, 48.7]}')
+    (f,) = _scan(_edited_file(_SCOREBOARD, ["{", '  "nutrition": [', _ROW_B], [row]))
+    assert (f.rule_name, f.severity, f.file) == (RULE, "high", _SCOREBOARD)
+    assert "47.0%, 43.0% cannot come from the sample sizes this file states (30)" in f.message
+    assert "28.4" not in f.message  # an error, not a rate
+
+
+def test_bare_rates_a_whole_count_gives_a_fraction_or_a_doc_line_are_fine():
+    good = '    {"model": "model-c", "n": 30, "pass": [46.7, 43.3, 40.0, 23.3]}'
+    fraction = '    {"model": "model-c", "n": 30, "accuracy": 0.47}'
+    for row in (good, fraction):
+        assert _scan(_edited_file(_SCOREBOARD, ["{", _ROW_B], [row])) == (), row
+    # A Markdown line names no key: without a percent sign it is not read.
+    readme = _edited_file("suites/nutrition/README.md", ["30 rows."], ["pass 47.0 on model-a"])
+    assert _scan(readme) == ()
+
+
 def test_a_percentage_that_is_not_a_rate_or_has_no_stated_size_is_fine():
     # MAPE and other means are not counts out of N.
     assert _scan(_benchmark_diff("Mean error for model-b was 47.0% energy.")) == ()

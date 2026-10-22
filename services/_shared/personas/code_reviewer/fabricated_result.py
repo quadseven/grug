@@ -17,7 +17,10 @@ line that states the result:
 - impossible rate: a percentage stated to at least one decimal place, on a
   line that names it a rate (pass, accuracy, agreement, success...), in a
   doc or data file whose hunks state a sample size, when no whole count out
-  of any stated size rounds or truncates to it;
+  of any stated size rounds or truncates to it. In a data file the value
+  may carry no percent sign: a rate key (`"pass": [47.0, 43.0]`) whose
+  values are on the percent scale (one above 1, none above 100) is read
+  the same way (#1377);
 - simulated result: a results, report, verdict or benchmark doc or data
   file whose added text says its numbers come from a simulate, mock, stub
   or stand-in path and that states a figure or a verdict;
@@ -70,6 +73,15 @@ _RATE_WORD_RE = re.compile(
     r"|\bhit[- ]rate\b|\bwin[- ]rate\b|\bfail(?:ed|ure|ures|s)?[- ]?(?:rate)?\b",
     re.IGNORECASE,
 )
+# A rate key in a data file and its value: one number or a flat list.
+_RATE_KEY_RE = re.compile(
+    r"[\"']?\b(?:pass(?:[_-]?rates?)?|accuracy|agreement|success(?:[_-]?rates?)?|solved"
+    r"|resolved|correct|hit[_-]?rate|win[_-]?rate)\b[\"']?\s*[:=]\s*"
+    r"(\[[^\]\[]{0,400}\]|-?\d{1,3}(?:\.\d{1,3})?(?![\d.]))",
+    re.IGNORECASE,
+)
+_NUMBER_RE = re.compile(r"(?<![\w.])(-?\d{1,6})(?:\.(\d{1,3}))?(?![\w.])")
+_DATA_SUFFIXES = (".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml")
 # Ways a doc states its sample size.
 _SIZE_RES = (
     re.compile(r"(?<![\w])[\"']?[nN][\"']?\s*[=:]\s*(\d+)"),
@@ -186,19 +198,37 @@ def _stated_sizes(lines: list[tuple[str, int, str]]) -> set[int]:
     return sizes
 
 
-def _impossible_in(text: str, sizes: set[int], budget: list[int]) -> list[str] | None:
+def _keyed_rates(text: str) -> list[tuple[str, str]]:
+    """(whole, decimals) of each rate a data line states with no percent
+    sign: the values of a rate key, when they are on the percent scale (one
+    above 1, none above 100 or below 0). A 0-1 fraction is not read."""
+    out: list[tuple[str, str]] = []
+    for m in _RATE_KEY_RE.finditer(text):
+        values = [(w, f or "") for w, f in _NUMBER_RE.findall(m.group(1))]
+        numbers = [float(f"{w}.{f}" if f else w) for w, f in values]
+        if not numbers or max(numbers) <= 1 or max(numbers) > 100 or min(numbers) < 0:
+            continue
+        out += [(w, f) for w, f in values if f]
+    return out
+
+
+def _impossible_in(
+    text: str, sizes: set[int], budget: list[int], data: bool = False,
+) -> list[str] | None:
     """The line's percentages no stated size can give, or None once the
-    shared check budget runs out (not evaluated)."""
+    shared check budget runs out (not evaluated). `data`: the line is in a
+    data file, so a rate key's bare values count too."""
+    stated = [(m.group(1), m.group(2)) for m in _DECIMAL_PCT_RE.finditer(text)]
+    if data:
+        stated += _keyed_rates(text)
     bad = []
-    for m in _DECIMAL_PCT_RE.finditer(text):
+    for whole, frac in stated:
         budget[0] -= len(sizes)
         if budget[0] < 0:
             return None
-        if float(f"{m.group(1)}.{m.group(2)}") <= 100 and not _possible(
-            m.group(1), m.group(2), sizes,
-        ):
-            bad.append(f"{m.group(1)}.{m.group(2)}%")
-    return bad
+        if float(f"{whole}.{frac}") <= 100 and not _possible(whole, frac, sizes):
+            bad.append(f"{whole}.{frac}%")
+    return list(dict.fromkeys(bad))
 
 
 def _impossible_rate(
@@ -211,7 +241,7 @@ def _impossible_rate(
     for kind, line, text in lines:
         if kind != "+" or not _RATE_WORD_RE.search(text):
             continue
-        bad = _impossible_in(text, sizes, budget)
+        bad = _impossible_in(text, sizes, budget, _suffix(path, _DATA_SUFFIXES))
         if bad is None:
             return None
         if bad:
