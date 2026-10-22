@@ -344,3 +344,62 @@ def test_a_doc_ticket_named_in_the_title_is_not_held_to_runtime():
     assert _findings(diff, boxes=boxes, title=title, base={}) == ()
     # The same criterion against an unnamed doc is still unmet.
     assert _rules(_findings(diff, boxes=boxes, title="Keep principles honest", base={})) == ["intent-mismatch"]
+
+
+# --- a production rename meets a criterion that asks for the same behavior (#1379)
+
+
+def _pure_rename(old: str, new: str) -> str:
+    return (
+        f"diff --git a/{old} b/{new}\nsimilarity index 100%\n"
+        f"rename from {old}\nrename to {new}\n"
+    )
+
+
+def _rename_diff() -> str:
+    # Replay case good-refactor-01 (assay suites/loom_gates): util.py moves
+    # to text_util.py and its test moves with it, the import updated.
+    test_old, test_new = "tests/test_util.py", "tests/test_text_util.py"
+    return _pure_rename("util.py", "text_util.py") + (
+        f"diff --git a/{test_old} b/{test_new}\nsimilarity index 80%\n"
+        f"rename from {test_old}\nrename to {test_new}\nindex 4444444..5555555 100644\n"
+        f"--- a/{test_old}\n+++ b/{test_new}\n@@ -1,3 +1,3 @@\n"
+        "-from util import slug\n+from text_util import slug\n \n \n"
+    )
+
+
+_RENAME_BOXES = (
+    (63, 1, "open", "text_util.slug behaves as util.slug did."),
+    (63, 2, "open", "The test moves with the module, unchanged."),
+)
+
+
+def test_a_pure_rename_meets_a_criterion_asking_for_the_same_behavior():
+    found = _findings(
+        _rename_diff(), boxes=_RENAME_BOXES, title="util moves to text_util", base={},
+    )
+    assert "intent-mismatch" not in _rules(found), found
+
+
+def test_a_rename_does_not_meet_a_criterion_asking_for_new_behavior():
+    for text in (
+        "text_util.slug lowercases unicode that util.slug kept.",
+        "slug strips emoji.",
+        "text_util.slug behaves as other.slug did.",
+    ):
+        boxes = ((63, 1, "open", text),)
+        found = _findings(_rename_diff(), boxes=boxes, title="util moves to text_util", base={})
+        assert _rules(found) == ["intent-mismatch"], (text, found)
+
+
+def test_a_renamed_doc_or_test_meets_no_runtime_criterion():
+    diff = _pure_rename("docs/util.md", "docs/text_util.md").replace(
+        "similarity index 100%", "similarity index 90%",
+    ) + (
+        "index 6666666..7777777 100644\n--- a/docs/util.md\n+++ b/docs/text_util.md\n"
+        "@@ -1,1 +1,1 @@\n-# util\n+# text_util\n"
+    )
+    boxes = ((63, 1, "open", "text_util.slug behaves as util.slug did."),)
+    assert _rules(_findings(diff, boxes=boxes, title="Rename the util page", base={})) == [
+        "intent-mismatch"
+    ]

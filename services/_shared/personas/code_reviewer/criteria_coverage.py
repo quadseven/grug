@@ -40,6 +40,13 @@ an entry point.
 runs: a deploy can then make them true. When nothing in the diff runs,
 no deploy can, and they are unmet like the rest.
 
+A rename of a production module meets a criterion that asks for the same
+behavior under the new name (#1379): one that names the module's old and
+new names and says the behavior is kept ("text_util.slug behaves as
+util.slug did"). A pure rename has no hunk that runs, so without this the
+check read such a refactor as docs and imports. A criterion asking for
+anything else stays unmet.
+
 Pure: hunks, head file contents, criteria and PR text in; findings out.
 Fail-open: a production file whose head text is missing or does not
 parse counts as able to change runtime behavior, so it can never cause
@@ -62,6 +69,12 @@ _DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
 # never what runs (#1364).
 _INERT_NAMES = frozenset({".gitignore", ".gitattributes", ".dockerignore", ".editorconfig"})
 _LIVE_RE = re.compile(r"^\s*live\s*:", re.IGNORECASE)
+# A criterion that asks for behavior kept as it was (#1379).
+_KEPT_RE = re.compile(
+    r"\bas\b[^;\n]{0,80}?\bdid\b|\bas before\b|\bunchanged\b|\bthe same\b"
+    r"|\bidentical(?:ly)?\b|\bno behaviou?r change\b|\bstill\b",
+    re.IGNORECASE,
+)
 _TEST_CRITERION_RE = re.compile(
     r"\btest(?:s|ed|ing)?\b|\btest_\w+|\bassert(?:s|ion|ions)?\b|\bcoverage\b"
     r"|\bpytest\b|\bflak(?:y|e|es|iness)\b|\bCI\b|\b(?:full|test) suite\b",
@@ -497,6 +510,31 @@ def _is_runtime_criterion(text: str) -> bool:
     )
 
 
+def _module_name(path: str) -> str:
+    name = path.rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[0] if "." in name else name
+
+
+def _names_word(text: str, word: str) -> bool:
+    return bool(re.search(rf"(?<![\w-]){re.escape(word)}(?![\w-])", text, re.IGNORECASE))
+
+
+def _met_by_rename(text: str, renamed: tuple[tuple[str, str], ...]) -> bool:
+    """A criterion a production rename in this diff meets: it names the
+    module's old and new names and asks that the behavior be kept."""
+    if not _KEPT_RE.search(text):
+        return False
+    for old, new in renamed:
+        if not (is_production_path(old) or is_production_path(new)):
+            continue
+        before, after = _module_name(old), _module_name(new)
+        if before and after and before.lower() != after.lower() and (
+            _names_word(text, before) and _names_word(text, after)
+        ):
+            return True
+    return False
+
+
 def _is_live_criterion(text: str) -> bool:
     """A `Live:` criterion: met by a deploy, so only when something runs."""
     return bool(_LIVE_RE.match(text)) and not _TEST_CRITERION_RE.search(text)
@@ -668,11 +706,24 @@ def _names_changed_doc(hunks: tuple[DiffHunk, ...], pr_title: str) -> bool:
     )
 
 
+def _state_criteria(
+    criteria: tuple[LinkedCriterion, ...], renamed: tuple[tuple[str, str], ...],
+) -> list[LinkedCriterion]:
+    """The runtime and `Live:` criteria a change must make true, less those
+    a production rename in the diff meets (#1379)."""
+    return [
+        c for c in criteria
+        if (_is_runtime_criterion(c.text) or _is_live_criterion(c.text))
+        and not _met_by_rename(c.text, renamed)
+    ]
+
+
 def _unmet_criteria_finding(
     criteria: tuple[LinkedCriterion, ...], hunks: tuple[DiffHunk, ...],
     production: list[DiffHunk], parsed: dict[str, _ParsedFile],
     dead: list[_NewDef], inert: frozenset[str], new_files: frozenset[str],
     pr_title: str, removed_files: frozenset[str] = frozenset(),
+    renamed: tuple[tuple[str, str], ...] = (),
 ) -> Finding | None:
     """One high `intent-mismatch` for the criteria no hunk can meet, or None.
 
@@ -687,10 +738,7 @@ def _unmet_criteria_finding(
     if any(is_production_path(p) for p in removed_files) or _names_changed_doc(hunks, pr_title):
         return None
     anchor = _anchor(hunks, dead)
-    state = [
-        c for c in criteria
-        if _is_runtime_criterion(c.text) or _is_live_criterion(c.text)
-    ]
+    state = _state_criteria(criteria, renamed)
     if not (state and anchor):
         return None
     if not _diff_changes_runtime(production, parsed, dead, inert):
@@ -713,12 +761,15 @@ def scan_criteria_coverage(
     pr_body: str,
     new_files: frozenset[str] = frozenset(),
     removed_files: frozenset[str] = frozenset(),
+    renamed: tuple[tuple[str, str], ...] = (),
 ) -> tuple[Finding, ...]:
     """Dead new functions, and runtime criteria no hunk can satisfy.
 
     `new_files` / `removed_files`: paths the diff adds or deletes
     (`diff_parser.file_changes`), so a new script nothing names can count
-    as inert, and a deletion counts as a change. Empty keeps the #1179
+    as inert, and a deletion counts as a change. `renamed`: the (old, new)
+    paths the diff renames, so a criterion that asks for a renamed
+    module's behavior kept is met (#1379). Empty keeps the #1179
     behavior."""
     production = [h for h in hunks if is_production_path(h.file_path)]
     parsed, other_text = _parse_production(production, file_contents)
@@ -735,6 +786,6 @@ def scan_criteria_coverage(
     inert = unreferenced_new_files(new_files, hunks, pr_body or "") or frozenset()
     unmet = _unmet_criteria_finding(
         criteria, hunks, production, parsed, dead, inert, new_files, pr_title,
-        removed_files,
+        removed_files, renamed,
     )
     return tuple(findings + ([unmet] if unmet else []))
