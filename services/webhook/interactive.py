@@ -12,6 +12,11 @@ comment_id so a re-delivered webhook doesn't double-act.
 - review    -> enqueue one Elder re-run; an auto-pause stays
 - learnings list  -> list the repo's remembered markings (read-only reply)
 - learnings delete <digest>  -> forget one remembered marking by digest
+
+grug#1270 - an Elder re-run now (a) is refused while one is already running
+on the same head, (b) puts the `grug:reviewing` label on the PR while it
+runs, and (c) is KEPT (deferred to the GitHub budget's reset) instead of
+being dropped when the installation's hourly budget is exhausted.
 """
 
 from __future__ import annotations
@@ -43,6 +48,147 @@ def _escape_html(s: str) -> str:
     """Escape HTML-significant chars in a displayed learning so a taught
     rule can't break out of the comment markup or inject tags."""
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _reply(token_fn, owner: str, repo: str, pr_number: int, body: str) -> None:
+    """Post one reply. Best-effort: the command's effect (the enqueue)
+    already happened, so a failed reply must not raise out of the command."""
+    try:
+        token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
+    except Exception as e:  # noqa: BLE001 - the ack reply is cosmetic
+        log.warning("interactive_reply_failed", extra={"kind": type(e).__name__})
+
+
+def _elder_review_state(*, token_fn, owner: str, repo: str, head_sha: str) -> str:
+    """"running" | "idle" | "unknown" - is Elder reviewing this head right now?
+
+    The Elder CHECK RUN is the source of truth - the same ground truth
+    `rerun._elder_check_already_terminal_or_pending` reads. Without this a
+    second `/grug improve` queues a SECOND review of the same commit, which
+    is how one burst of 14 PRs spent an hour of the installation's GitHub
+    budget on 2026-10-18 (grug#1270).
+
+    "unknown" is a real answer, not a failure: the check-run listing could
+    not be read. It must not be read as "idle" (that would queue a second
+    review of a commit Elder is already on), and it must not be reported as
+    "Elder is reviewing" either (it may not be)."""
+    if not head_sha:
+        return "idle"
+    from review_label import elder_check_state  # type: ignore
+
+    try:
+        state = token_fn(
+            lambda tok: elder_check_state(
+                token=tok, owner=owner, repo=repo, head_sha=head_sha,
+            )
+        )
+    except Exception as e:  # noqa: BLE001 - an unreadable state is not "idle"
+        log.warning(
+            "interactive_elder_state_failed",
+            extra={"kind": type(e).__name__, "head_sha": head_sha[:8]},
+        )
+        return "unknown"
+    return "running" if state == "running" else "idle"
+
+
+def _mark_reviewing(*, token_fn, owner: str, repo: str, pr_number: int) -> None:
+    """Add the `grug:reviewing` label - the visible sign that Elder is
+    re-reviewing this PR.
+
+    Best-effort by design: the CHECK RUN is the truth and the label is only
+    the sign, so a failed label write must never fail the command (the
+    consumer's sweep clears the label when no review is running)."""
+    from review_label import add_reviewing_label  # type: ignore
+
+    try:
+        token_fn(
+            lambda tok: add_reviewing_label(
+                token=tok, owner=owner, repo=repo, pr_number=pr_number,
+            )
+        )
+    except Exception as e:  # noqa: BLE001 - a missing sign is not a failure
+        log.warning(
+            "interactive_reviewing_label_failed",
+            extra={"kind": type(e).__name__, "pr": pr_number},
+        )
+
+
+def _defer_elder_review(
+    *, verb: str, install_id: int, owner: str, repo: str, pr_number: int,
+    comment_id: int, token_fn, enqueue, claim, defer_until: float,
+) -> dict[str, str]:
+    """Keep an Elder re-run instead of dropping it.
+
+    The installation's hourly GitHub budget was exhausted, so the review
+    cannot run yet. The job goes back on the queue with a `not_before` at
+    the budget's reset, and the reply says so: a command dropped with no
+    reply looks exactly like a command that worked and did nothing, which
+    is how the 2026-10-18 burst lost a dozen re-runs (grug#1270)."""
+    repo_full = f"{owner}/{repo}"
+    try:
+        enqueue(
+            install_id=install_id, repo=repo_full, pr_number=pr_number,
+            persona="code_reviewer", not_before=float(defer_until),
+        )
+    except Exception as e:  # noqa: BLE001 - the queue is the keep-path
+        log.error(
+            "interactive_defer_enqueue_failed",
+            extra={"verb": verb, "kind": type(e).__name__},
+        )
+        return {"status": "skip", "reason": "defer_enqueue_failed", "verb": verb}
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
+    log.warning(
+        "interactive_elder_rerun_deferred",
+        extra={
+            "verb": verb,
+            "repo": repo_full,
+            "pr": pr_number,
+            "defer_until": int(defer_until),
+        },
+    )
+    _reply(
+        token_fn, owner, repo, pr_number,
+        "Grug's GitHub budget is spent. Elder will re-review this PR when "
+        "the budget resets.",
+    )
+    return {"status": "deferred", "reason": "github_rate_limited", "verb": verb}
+
+
+def _already_reviewing(
+    *, verb: str, owner: str, repo: str, pr_number: int, comment_id: int,
+    token_fn, claim, head_sha: str, state: str = "running",
+) -> dict[str, str]:
+    """Answer a second `/grug improve` instead of queueing a second review.
+
+    The reply names the head Elder is already on, so the reader can see
+    that the command was heard and deliberately not queued - a silent
+    no-op is what made people fire the command again (grug#1270). An
+    unreadable check-run listing says exactly that, instead of claiming a
+    review that may not be running."""
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
+    log.info(
+        "interactive_elder_rerun_skipped_already_running",
+        extra={
+            "verb": verb,
+            "repo": f"{owner}/{repo}",
+            "pr": pr_number,
+            "head_sha": head_sha[:8],
+            "state": state,
+        },
+    )
+    body = (
+        f"Elder is already reviewing {head_sha[:8]}."
+        if state == "running"
+        else (
+            "Grug could not tell whether Elder is already reviewing this "
+            "PR, so the re-review was not queued. Comment `/grug improve` "
+            "again."
+        )
+    )
+    _reply(token_fn, owner, repo, pr_number, body)
+    return {"status": "no_op", "reason": "already_reviewing", "verb": verb}
 
 
 def _pause_after_wake(
@@ -80,6 +226,7 @@ def _pause_after_wake(
 def _wake_elder(
     verb: str, *, install_id: int, owner: str, repo: str, pr_number: int,
     comment_id: int, token_fn, enqueue, claim, resume, is_paused,
+    head_sha: str = "", defer_until: float = 0.0,
 ) -> dict[str, str]:
     """`/grug resume` and `/grug review` (grug#1188): both enqueue an Elder
     review of the current head, which the consumer scopes to the delta since
@@ -90,11 +237,29 @@ def _wake_elder(
         from rerun import enqueue_rerun  # type: ignore
         enqueue = enqueue_rerun
     coords = {"install_id": install_id, "repo": f"{owner}/{repo}", "pr_number": pr_number}
+    if defer_until:
+        return _defer_elder_review(
+            verb=verb, install_id=install_id, owner=owner, repo=repo,
+            pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
+            enqueue=enqueue, claim=claim, defer_until=defer_until,
+        )
+    elder_state = _elder_review_state(
+        token_fn=token_fn, owner=owner, repo=repo, head_sha=head_sha,
+    )
+    if elder_state != "idle":
+        return _already_reviewing(
+            verb=verb, owner=owner, repo=repo, pr_number=pr_number,
+            comment_id=comment_id, token_fn=token_fn, claim=claim,
+            head_sha=head_sha, state=elder_state,
+        )
     try:
         enqueue(**coords, persona="code_reviewer")
     except Exception as e:  # noqa: BLE001 - enqueue best-effort; NOT claimed on failure
         log.warning("interactive_enqueue_failed", extra={"verb": verb, "kind": type(e).__name__})
         return {"status": "skip", "reason": "enqueue_failed", "verb": verb}
+    _mark_reviewing(
+        token_fn=token_fn, owner=owner, repo=repo, pr_number=pr_number,
+    )
     if not claim(f"grugcmd:{comment_id}"):
         return {"status": "no_op", "reason": "comment already handled", "verb": verb}
     paused, note = _pause_after_wake(verb, coords, resume, is_paused)
@@ -105,16 +270,74 @@ def _wake_elder(
     return {"status": "dispatched", "verb": verb, "persona": "code_reviewer", "paused": paused}
 
 
+def _run_persona_rerun(
+    verb: str, *, install_id: int, owner: str, repo: str, pr_number: int,
+    comment_id: int, token_fn, enqueue, claim, head_sha: str = "",
+    defer_until: float = 0.0,
+) -> dict[str, str]:
+    """`/grug improve` (Elder) and `/grug test-gaps` (Smasher): enqueue the
+    persona's re-run, label it (Elder only), and answer.
+
+    Elder's re-run is the one that must not overlap, must carry the
+    `grug:reviewing` label, and must be kept when the installation's GitHub
+    budget is spent (grug#1270)."""
+    persona = "code_reviewer" if verb == "improve" else "smasher"
+    if enqueue is None:
+        from rerun import enqueue_rerun  # type: ignore
+        enqueue = enqueue_rerun
+    repo_full = f"{owner}/{repo}"
+    if verb == "improve":
+        if defer_until:
+            return _defer_elder_review(
+                verb=verb, install_id=install_id, owner=owner, repo=repo,
+                pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
+                enqueue=enqueue, claim=claim, defer_until=defer_until,
+            )
+        elder_state = _elder_review_state(
+            token_fn=token_fn, owner=owner, repo=repo, head_sha=head_sha,
+        )
+        if elder_state != "idle":
+            return _already_reviewing(
+                verb=verb, owner=owner, repo=repo, pr_number=pr_number,
+                comment_id=comment_id, token_fn=token_fn, claim=claim,
+                head_sha=head_sha, state=elder_state,
+            )
+    try:
+        enqueue(install_id=install_id, repo=repo_full, pr_number=pr_number, persona=persona)
+    except Exception as e:  # noqa: BLE001 - enqueue best-effort; NOT claimed on failure
+        log.warning("interactive_enqueue_failed", extra={"verb": verb, "kind": type(e).__name__})
+        return {"status": "skip", "reason": "enqueue_failed", "verb": verb}
+    if verb == "improve":
+        _mark_reviewing(
+            token_fn=token_fn, owner=owner, repo=repo, pr_number=pr_number,
+        )
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
+    note = ("Elder is re-reviewing this PR." if verb == "improve"
+            else "Smasher is checking for test gaps.")
+    try:
+        token_fn(lambda t: _post_reply(t, owner, repo, pr_number, f"{note} So speaks Grug."))
+    except Exception as e:  # noqa: BLE001 - the rerun is enqueued; the ack reply is cosmetic
+        log.warning("interactive_ack_failed", extra={"verb": verb, "kind": type(e).__name__})
+    return {"status": "dispatched", "verb": verb, "persona": persona}
+
+
 def run_command(
     verb: str, arg: str, *, install_id: int, owner: str, repo: str,
     pr_number: int, comment_id: int, token_fn, enqueue=None, enqueue_ask=None,
-    claim=None, resume=None, is_paused=None,
+    claim=None, resume=None, is_paused=None, head_sha: str = "",
+    defer_until: float = 0.0,
 ) -> dict[str, str]:
     """Execute a gated command. All heavy work is ASYNC via the rerun lane -
     the webhook only enqueues (fast) so the delivery ACK never blocks on an
     LLM call (#528 LORE). `enqueue`/`enqueue_ask`/`claim`/`resume`/
     `is_paused` are injectable for tests. Claim happens AFTER a successful
-    enqueue, so a claim-then-crash can't silently swallow the command."""
+    enqueue, so a claim-then-crash can't silently swallow the command.
+
+    `head_sha` is the PR's current head - the ground truth for "is Elder
+    already reviewing this?". `defer_until` is the epoch second the
+    installation's GitHub budget resets at: a non-zero value keeps the
+    command instead of dropping it (grug#1270)."""
     if claim is None:
         from adapters.pg_install_store import claim_delivery  # type: ignore
         claim = claim_delivery
@@ -124,28 +347,17 @@ def run_command(
             verb, install_id=install_id, owner=owner, repo=repo,
             pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
             enqueue=enqueue, claim=claim, resume=resume, is_paused=is_paused,
+            head_sha=head_sha, defer_until=defer_until,
         )
 
     repo_full = f"{owner}/{repo}"
     if verb in ("improve", "test-gaps"):
-        persona = "code_reviewer" if verb == "improve" else "smasher"
-        if enqueue is None:
-            from rerun import enqueue_rerun  # type: ignore
-            enqueue = enqueue_rerun
-        try:
-            enqueue(install_id=install_id, repo=repo_full, pr_number=pr_number, persona=persona)
-        except Exception as e:  # noqa: BLE001 - enqueue best-effort; NOT claimed on failure
-            log.warning("interactive_enqueue_failed", extra={"verb": verb, "kind": type(e).__name__})
-            return {"status": "skip", "reason": "enqueue_failed", "verb": verb}
-        if not claim(f"grugcmd:{comment_id}"):
-            return {"status": "no_op", "reason": "comment already handled", "verb": verb}
-        note = ("Elder is re-reviewing this PR." if verb == "improve"
-                else "Smasher is checking for test gaps.")
-        try:
-            token_fn(lambda t: _post_reply(t, owner, repo, pr_number, f"{note} So speaks Grug."))
-        except Exception as e:  # noqa: BLE001 - the rerun is enqueued; the ack reply is cosmetic
-            log.warning("interactive_ack_failed", extra={"verb": verb, "kind": type(e).__name__})
-        return {"status": "dispatched", "verb": verb, "persona": persona}
+        return _run_persona_rerun(
+            verb, install_id=install_id, owner=owner, repo=repo,
+            pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
+            enqueue=enqueue, claim=claim, head_sha=head_sha,
+            defer_until=defer_until,
+        )
 
     if verb == "ask":
         if not arg:

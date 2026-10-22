@@ -1221,6 +1221,57 @@ def test_main_starts_daemon_telemetry_thread_outside_watchdog(monkeypatch):
     assert telemetry and telemetry[0].get("daemon") is True
 
 
+# --- grug#1270: the `grug:reviewing` label sweep ---------------------------
+
+
+def test_label_sweep_clears_stale_labels_for_every_installation(monkeypatch):
+    """One sweep removes the labels whose head has no in-progress Elder
+    check - the backstop for a removal path that was missed."""
+    import review_label
+
+    swept: list[int] = []
+    monkeypatch.setattr(
+        "adapters.install_store.list_allowlisted_installs", lambda: [11, 12],
+    )
+    monkeypatch.setattr(
+        review_label, "sweep_stale_labels",
+        lambda *, install_id: swept.append(install_id) or 1,
+    )
+    assert consumer._label_sweep_once() == 2
+    assert swept == [11, 12]
+
+
+def test_label_sweep_survives_an_unreadable_install_list(monkeypatch):
+    """The store must not be able to break the sweep."""
+    def _boom() -> list[int]:
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(
+        "adapters.install_store.list_allowlisted_installs", _boom,
+    )
+    assert consumer._label_sweep_once() == 0
+
+
+def test_label_sweep_loop_exits_on_stop_and_survives_a_failed_cycle(monkeypatch):
+    """The loop is belt-and-suspenders never-raise, and honors _stop."""
+    calls = {"n": 0}
+
+    def _cycle():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("first cycle blows up")
+        consumer._stop.set()
+
+    monkeypatch.setattr(consumer, "_label_sweep_once", _cycle)
+    monkeypatch.setattr(consumer, "_LABEL_SWEEP_INTERVAL_S", 0.01)
+    consumer._stop.clear()
+    try:
+        consumer._label_sweep_loop()   # returns only via _stop
+    finally:
+        consumer._stop.clear()
+    assert calls["n"] == 2
+
+
 # --- grug#891: a dead-lettered review job must not vanish silently ----------
 
 

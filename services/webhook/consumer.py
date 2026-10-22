@@ -596,6 +596,58 @@ def _telemetry_loop() -> None:
         _stop.wait(_TELEMETRY_INTERVAL_S)
 
 
+# --- the `grug:reviewing` label sweep (grug#1270) -------------------------
+# The `grug:reviewing` label is the visible sign that Elder is re-reviewing
+# a PR. Every write has a removal, but a removal CAN be missed: the run
+# crashed, the head moved, the pod was killed between the two calls. A
+# label that outlives its review tells every later reader - and the command
+# path - that Elder is busy, which is exactly what this ticket exists to
+# stop. The sweep is the backstop: it removes the labels whose head has no
+# in-progress Elder check. It costs one listing call per repo of the
+# installation per sweep, and nothing at all for a repo with no label on it.
+
+
+_LABEL_SWEEP_INTERVAL_S = 600.0
+
+
+def _label_sweep_once() -> int:
+    """One sweep over every allowlisted installation. Returns the number of
+    stale labels removed."""
+    from adapters.install_store import list_allowlisted_installs
+    from review_label import sweep_stale_labels
+
+    try:
+        installs = list_allowlisted_installs()
+    except Exception as e:  # noqa: BLE001 - the store must not break the sweep
+        log.warning(
+            "reviewing_label_sweep_installs_failed",
+            extra={"kind": type(e).__name__},
+        )
+        return 0
+    removed = 0
+    for install_id in installs:
+        removed += sweep_stale_labels(install_id=install_id)
+    return removed
+
+
+def _label_sweep_loop() -> None:
+    """Thread body: one sweep per interval until shutdown. Never raises -
+    a sweep failure must never take the consumer pod down (the watchdog
+    excludes this thread, exactly like the telemetry one)."""
+    log.info("reviewing_label_sweep_started", extra={"interval_s": _LABEL_SWEEP_INTERVAL_S})
+    while not _stop.is_set():
+        try:
+            removed = _label_sweep_once()
+        except Exception as e:  # noqa: BLE001 - belt-and-suspenders
+            log.warning(
+                "reviewing_label_sweep_failed", extra={"kind": type(e).__name__},
+            )
+            removed = 0
+        if removed:
+            log.info("reviewing_label_sweep_done", extra={"removed": removed})
+        _stop.wait(_LABEL_SWEEP_INTERVAL_S)
+
+
 def _poll_once(spec: QueueSpec, queue_url: str, arn: str) -> int:
     """One receive → dispatch → delete cycle. Returns the number of
     messages handled (0 or 1). Never raises: receive errors back off,
@@ -1009,6 +1061,13 @@ def main() -> None:
     # message flow.
     threading.Thread(
         target=_telemetry_loop, name="queue-telemetry", daemon=True,
+    ).start()
+    # The `grug:reviewing` label sweep (grug#1270). Daemon + OUTSIDE the
+    # watchdog list for the same reason as the telemetry thread: a stale
+    # label is a cosmetic problem, a consumer that stops draining its
+    # queue is not.
+    threading.Thread(
+        target=_label_sweep_loop, name="reviewing-label-sweep", daemon=True,
     ).start()
     # Watchdog: there is no HTTP probe on this pod, so a consumer thread
     # that dies (missing env, ARN resolve failure, anything escaping

@@ -100,6 +100,9 @@ certificate - see the Roles Anywhere section below.
 | 5xx through Cloudflare | tunnel down or pods not ready | check the tunnel + `kubectl -n grug get pods`; the workload-not-ready monitor pages (#406) |
 | `cf_shared_secret_mismatch` burst | CF shared-secret drifted vs SSM, or a direct-to-origin probe | the CF auth-boundary monitor pages; reconcile the secret |
 | A required PR check stuck/missing after a brief outage | the inline DoR/TPM delivery errored and GitHub does not auto-redeliver (infra #1254) | self-heals: the `grug-poller` CronJob replays errored deliveries every 15m (#407); force it with the manual replay below |
+| A PR still carries the `grug:reviewing` label hours after the review ended | a removal path was missed (the run crashed, the head moved) | self-heals: the consumer's sweep removes any `grug:reviewing` label whose head has no in-progress Elder check, every ~10 min; the label is only a sign - the Elder check run is the truth |
+| `/grug improve` answered "Grug's GitHub budget is spent" | the installation's hourly GitHub budget was exhausted | the command was KEPT: it re-runs when the budget resets (`not_before` = the reset epoch). Nothing is dropped - check `interactive_elder_rerun_deferred` in the webhook log for the reset time |
+| `/grug improve` answered "Elder is already reviewing <sha>" | a review was already in flight on that head | nothing was queued - that is the no-overlap rule (#1270). The `grug:reviewing` label on the PR says the same thing |
 
 ### GitHub API error rate
 

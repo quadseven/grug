@@ -1,8 +1,14 @@
-"""#528: interactive command actions - idempotency, routing, default-safe."""
+"""#528: interactive command actions - idempotency, routing, default-safe.
+
+grug#1270: an Elder re-run is refused while one is already running, is
+labelled `grug:reviewing` while it runs, and is KEPT (deferred to the
+GitHub budget's reset) instead of dropped when the budget is spent.
+"""
 
 from __future__ import annotations
 
 import interactive
+import review_label
 
 
 def _tok(fn):
@@ -258,3 +264,132 @@ def test_learnings_delete_missing_arg_posts_usage(monkeypatch):
     )
     assert res["status"] == "no_op" and "missing" in res["reason"]
     assert any("Usage" in str(c[2]) for c in fake.calls if c[0] == "post")
+
+
+# --- grug#1270: label the PR, never overlap, never drop -------------------
+
+
+def test_improve_labels_the_pr_while_elder_re_reviews(
+    monkeypatch, _mock_review_label_http,
+):
+    """The visible sign that Elder is re-reviewing this PR."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    enq = []
+    res = interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: enq.append(k), head_sha="a" * 40,
+    )
+    assert res["status"] == "dispatched" and enq
+    attaches = [
+        c for c in _mock_review_label_http.calls
+        if c[0] == "post" and c[1].endswith("/issues/2/labels")
+    ]
+    assert len(attaches) == 1
+    assert attaches[0][2] == {"labels": ["grug:reviewing"]}
+
+
+def test_second_improve_while_elder_runs_replies_and_enqueues_nothing(monkeypatch):
+    """The check run is the source of truth: a review already in flight
+    means the command is answered, not queued twice."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    monkeypatch.setattr(review_label, "elder_check_state", lambda **k: "running")
+    enq = []
+    res = interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: enq.append(k), head_sha="abc12345" + "0" * 32,
+    )
+    assert res["status"] == "no_op" and res["reason"] == "already_reviewing"
+    assert enq == []
+    bodies = [c[2]["body"] for c in fake.calls if c[0] == "post"]
+    assert bodies == ["Elder is already reviewing abc12345."]
+
+
+def test_improve_still_runs_when_the_elder_check_concluded(monkeypatch):
+    """A FINISHED review is exactly what `/grug improve` is for - only an
+    in-flight one blocks the command."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    monkeypatch.setattr(review_label, "elder_check_state", lambda **k: "concluded")
+    enq = []
+    res = interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: enq.append(k), head_sha="a" * 40,
+    )
+    assert res["status"] == "dispatched" and len(enq) == 1
+
+
+def test_improve_is_not_queued_when_the_check_state_cannot_be_read(monkeypatch):
+    """An unreadable check-run listing is not "idle": queueing a second
+    review of a commit Elder may be on is exactly the overlap this ticket
+    exists to stop. The reply says so instead of claiming a review that may
+    not be running."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+
+    def _boom(**_k):
+        raise RuntimeError("github down")
+
+    monkeypatch.setattr(review_label, "elder_check_state", _boom)
+    enq = []
+    res = interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: enq.append(k), head_sha="a" * 40,
+    )
+    assert res["status"] == "no_op" and res["reason"] == "already_reviewing"
+    assert enq == []
+    bodies = [c[2]["body"] for c in fake.calls if c[0] == "post"]
+    assert any("could not tell" in str(b) for b in bodies)
+
+
+def test_improve_is_kept_not_dropped_when_the_github_budget_is_spent(monkeypatch):
+    """grug#1270: a command the exhausted hourly budget refused goes back on
+    the queue with a `not_before`, and says so. Dropping it silently is what
+    made the 2026-10-18 burst look like it worked."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    enq = []
+    res = interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: enq.append(k), defer_until=1791218759.0,
+    )
+    assert res["status"] == "deferred" and res["reason"] == "github_rate_limited"
+    assert enq[0]["not_before"] == 1791218759.0
+    assert enq[0]["persona"] == "code_reviewer"
+    bodies = [c[2]["body"] for c in fake.calls if c[0] == "post"]
+    assert any("budget" in str(b) for b in bodies)
+
+
+def test_deferred_improve_is_not_claimed_when_the_queue_refuses_it(monkeypatch):
+    """A command that could not even be queued stays unclaimed, so a retry
+    can pick it up - the same rule as a failed enqueue."""
+    monkeypatch.setattr(interactive, "httpx", _FakeHttp())
+    claimed = []
+
+    def _boom(**_k):
+        raise RuntimeError("queue down")
+
+    res = interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: claimed.append(k) or True,
+        enqueue=_boom, defer_until=1791218759.0,
+    )
+    assert res["status"] == "skip" and res["reason"] == "defer_enqueue_failed"
+    assert claimed == []
+
+
+def test_resume_while_elder_runs_does_not_queue_a_second_review(monkeypatch):
+    """/grug resume starts an Elder re-run too, so it obeys the same
+    no-overlap rule."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    monkeypatch.setattr(review_label, "elder_check_state", lambda **k: "running")
+    enq = []
+    res = interactive.run_command(
+        "resume", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: enq.append(k), head_sha="abc12345" + "0" * 32,
+    )
+    assert res["status"] == "no_op" and res["reason"] == "already_reviewing"
+    assert enq == []
+

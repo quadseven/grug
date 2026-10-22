@@ -353,6 +353,52 @@ def _log_if_primary_rate_limit(installation_id: int, response: httpx.Response) -
         log.debug("rate_limit_log_failed", extra={"kind": type(e).__name__})
 
 
+def primary_rate_limit_reset_epoch(response: httpx.Response) -> int:
+    """The epoch second at which the installation's hourly GitHub budget
+    resets, or 0 when this response is not a primary rate-limit refusal.
+
+    The primary limit is the per-installation hourly quota: a 403/429 that
+    carries `X-RateLimit-Remaining: 0` plus an `X-RateLimit-Reset` stamp.
+    A plain permission 403 carries neither, so it is NOT a budget problem
+    and must never be answered by waiting for the window to reset
+    (grug#1270): the command it refused has to be KEPT and re-run at the
+    reset, not dropped and not retried into the same wall."""
+    if response.status_code not in (403, 429):
+        return 0
+    if response.headers.get("X-RateLimit-Remaining") != "0":
+        return 0
+    reset = response.headers.get("X-RateLimit-Reset", "")
+    return int(reset) if reset.isdigit() else 0
+
+
+def core_rate_limit(token: str) -> tuple[int, int, int] | None:
+    """(remaining, limit, reset_epoch) of the installation's core REST
+    budget, or None when it cannot be read.
+
+    `GET /rate_limit` does NOT count against the limit, so asking is free -
+    which is what makes it usable as a PACING gate: a burst of re-runs can
+    be held back while there is budget left, instead of discovering the wall
+    by getting 403'd (grug#1270)."""
+    try:
+        resp = httpx.get(
+            f"{_GH_API}/rate_limit",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        core = (resp.json() or {})["resources"]["core"]
+        return (
+            int(core["remaining"]),
+            int(core["limit"]),
+            int(core.get("reset") or 0),
+        )
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        return None
+
+
 def with_install_token_retry(installation_id: int, fn):
     """Run `fn(token)`, retrying transient failures.
 
