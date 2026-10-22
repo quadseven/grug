@@ -113,6 +113,7 @@ from personas.code_reviewer.linked_issue import (
 )
 from personas.code_reviewer.linked_issue import (
     build_linked_issue_context, rendered_criteria, rendered_criteria_with_state,
+    rendered_health_issues,
 )
 from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
@@ -2510,6 +2511,9 @@ def _merge_lane_work(
         ),
         pr_title=str(pr_context.get("title") or ""),
         pr_body=body,
+        health_issues=rendered_health_issues(
+            str(pr_context.get("linked_issue_context") or ""),
+        ),
     )
     if correctness_only:
         found = tuple(f for f in found if f.rule_name != "dead-code")

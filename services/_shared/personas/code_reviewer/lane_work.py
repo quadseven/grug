@@ -12,6 +12,19 @@ and the offline corpus runner call exactly the same code:
   if the PR closed it.
 - destructive edits (#1365): the diff deletes or replaces most of a file
   that neither the title nor the linked criteria name.
+- weakened verification (#1367): the diff deletes or flips the tests that
+  pinned the old behavior, or drops a verification layer from CI.
+- fabricated results (#1368): a rate impossible for its sample size, a
+  results file from a simulate path, an audit with no output behind it, a
+  percentage set from a count.
+- unbacked claims (#1371): the body ticks a live or measurement box and
+  cites no output, run link or number.
+- dead on arrival (#1366): a new source file nothing else in the diff
+  loads, and scratch or temporary files left in the commit.
+- wrong target (#1369): the criteria name concrete targets and the diff
+  changes none of them, naming them only in comments or tests.
+- measurement only (#1370): a health ticket's fix changes only the code
+  that measures or reports the finding.
 
 Pure: diff text, parsed hunks, file contents and PR text in; findings out.
 """
@@ -25,10 +38,16 @@ from personas.code_reviewer.criteria_coverage import (
     LinkedCriterion,
     scan_criteria_coverage,
 )
+from personas.code_reviewer.dead_on_arrival import drop_superseded, scan_dead_on_arrival
 from personas.code_reviewer.destructive_edit import scan_destructive_edits
 from personas.code_reviewer.diff_parser import DiffHunk, FileChange, file_changes
+from personas.code_reviewer.fabricated_result import scan_fabricated_results
 from personas.code_reviewer.intent_filter import body_claims_box
+from personas.code_reviewer.measurement_only import scan_measurement_only
 from personas.code_reviewer.persona import Finding
+from personas.code_reviewer.unbacked_claim import scan_unbacked_claims
+from personas.code_reviewer.weakened_verification import scan_weakened_verification
+from personas.code_reviewer.wrong_target import scan_wrong_target
 from personas.tpm.ticket_compliance import closes_refs
 
 # The footer a Loom lane writes on every pull request it opens.
@@ -66,6 +85,14 @@ def criteria_in_scope(
     )
 
 
+def _open_only(
+    criteria: tuple[LinkedCriterion, ...], boxes: tuple[LinkedBox, ...],
+) -> tuple[LinkedCriterion, ...]:
+    """The criteria whose box is still open on the issue."""
+    ticked = {(b[0], b[1]) for b in boxes if b[2] != "open"}
+    return tuple(c for c in criteria if (c.issue, c.number) not in ticked)
+
+
 def lane_work_findings(
     *,
     diff_text: str,
@@ -76,6 +103,7 @@ def lane_work_findings(
     pr_title: str,
     pr_body: str,
     changes: tuple[FileChange, ...] | None = None,
+    health_issues: Iterable[int] = (),
 ) -> tuple[Finding, ...]:
     """Every deterministic lane-work finding for one PR.
 
@@ -83,17 +111,38 @@ def lane_work_findings(
     path (the old path for a rename); a file missing from it is skipped by
     the destructive-edit check, never guessed at. `changes` overrides the
     per-file statuses read from `diff_text` (the corpus runner passes the
-    full counts of a diff it stores truncated)."""
+    full counts of a diff it stores truncated). `health_issues`: linked
+    issues that are health findings (`linked_issue.rendered_health_issues`);
+    without it a PR title starting `Health:` marks one."""
     if changes is None:
         changes = file_changes(diff_text)
+    boxes = tuple(boxes)
     criteria = criteria_in_scope(boxes, pr_body)
     findings = list(scan_criteria_coverage(
         hunks, file_contents, criteria=criteria,
         pr_title=pr_title, pr_body=pr_body,
         new_files=frozenset(c.path for c in changes if c.status == "added"),
+        removed_files=frozenset(c.path for c in changes if c.status == "removed"),
     ))
     findings.extend(scan_destructive_edits(
         changes, base_line_counts, criteria=criteria,
         pr_title=pr_title, hunks=hunks,
     ))
-    return tuple(findings)
+    findings.extend(scan_weakened_verification(
+        changes, hunks, criteria=criteria, pr_title=pr_title,
+    ))
+    findings.extend(scan_fabricated_results(changes, hunks))
+    findings.extend(scan_unbacked_claims(pr_body, criteria=criteria, hunks=hunks))
+    # A ticked box was delivered by an earlier slice; only open boxes can
+    # name what this diff should have changed.
+    findings.extend(scan_wrong_target(
+        changes, hunks, criteria=_open_only(criteria, boxes), pr_title=pr_title,
+    ))
+    findings.extend(scan_measurement_only(
+        changes, hunks, criteria=criteria, pr_title=pr_title, health_issues=health_issues,
+    ))
+    doa = scan_dead_on_arrival(
+        changes, hunks, pr_body=pr_body, prior=tuple(findings),
+        file_contents=file_contents, lane=is_lane_pr(pr_body),
+    )
+    return (*drop_superseded(findings, doa), *doa)

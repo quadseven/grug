@@ -138,13 +138,16 @@ def test_a_tested_script_with_criteria_about_what_it_does_is_not_a_mismatch():
     diff = _added_file("production/scripts/verify_php_fix.py", _SCRIPT) + _added_file(
         "tests/test_verify_php_fix.py", test,
     )
-    assert _findings(diff, boxes=boxes) == ()
+    # Only the dead-on-arrival check (#1366) speaks: nothing but its test
+    # loads the script.
+    assert _rules(_findings(diff, boxes=boxes)) == ["dead-code"]
 
 
 def test_a_human_pr_that_only_refs_the_ticket_is_not_held_to_it():
     body = "## Why\nFirst slice of the patch work.\n\nRefs #83\n"
     diff = _added_file("production/scripts/verify-php-fix.py", _SCRIPT)
-    assert _findings(diff, body=body) == ()
+    # No criterion is in scope; the unloaded script is a medium (#1366).
+    assert [(f.rule_name, f.severity) for f in _findings(diff, body=body)] == [("dead-code", "medium")]
 
 
 def test_a_script_nothing_names_is_inert_against_runtime_criteria():
@@ -267,7 +270,7 @@ def test_file_changes_reads_status_rename_and_counts():
 
 
 def test_reference_chain_resolves_through_a_referenced_new_file():
-    from personas.code_reviewer.criteria_coverage import _unreferenced_new_files
+    from personas.code_reviewer.criteria_coverage import unreferenced_new_files
 
     diff = (
         _added_file("ops/a_tool.sh", ["#!/bin/sh", "ops/b_tool.sh"])
@@ -278,13 +281,13 @@ def test_reference_chain_resolves_through_a_referenced_new_file():
     )
     new = frozenset(c.path for c in file_changes(diff) if c.status == "added")
     # a is run by the workflow and runs b; c and d only name each other.
-    assert _unreferenced_new_files(new, parse_diff(diff), "") == {"ops/c_tool.sh", "ops/d_tool.sh"}
+    assert unreferenced_new_files(new, parse_diff(diff), "") == {"ops/c_tool.sh", "ops/d_tool.sh"}
 
 
 def test_reference_scan_is_linear_on_a_large_diff():
     import time
 
-    from personas.code_reviewer.criteria_coverage import _unreferenced_new_files
+    from personas.code_reviewer.criteria_coverage import unreferenced_new_files
 
     # 150 new scripts, each naming the next, 300 lines apiece: 45,000 added
     # lines. The old rescan was one regex per token per file per pass.
@@ -296,7 +299,7 @@ def test_reference_scan_is_linear_on_a_large_diff():
     hunks = parse_diff(diff)
     new = frozenset(c.path for c in file_changes(diff) if c.status == "added")
     start = time.perf_counter()
-    inert = _unreferenced_new_files(new, hunks, "")
+    inert = unreferenced_new_files(new, hunks, "")
     elapsed = time.perf_counter() - start
     # Only tool_000 has no caller; every later tool is reached from it, but
     # tool_000 is itself a candidate, so the whole chain stays unreferenced.
@@ -309,7 +312,35 @@ def test_reference_scan_past_its_bounds_is_not_evaluated_and_calls_nothing_inert
 
     many = "".join(_added_file(f"ops/tool_{i:03d}.sh", ["#!/bin/sh"]) for i in range(cc.MAX_REFERENCE_CANDIDATES + 1))
     new = frozenset(c.path for c in file_changes(many) if c.status == "added")
-    assert cc._unreferenced_new_files(new, parse_diff(many), "") is None
+    assert cc.unreferenced_new_files(new, parse_diff(many), "") is None
     # Not evaluated never becomes a finding: no file counts as inert.
     boxes = ((83, 1, "open", "The nightly sync retries a failed upload three times"),)
     assert _findings(many, boxes=boxes, base={}) == ()
+
+
+# --- a fresh held-out sample of good lane PRs (2026-10-22) ------------------------
+
+
+def _scratch_removal_diff() -> str:
+    gone = (
+        "diff --git a/test_sandbox.tmp b/test_sandbox.tmp\ndeleted file mode 100644\n"
+        "index 1111111..0000000\n--- a/test_sandbox.tmp\n+++ /dev/null\n@@ -1 +0,0 @@\n-scratch\n"
+    )
+    ignore = _replaced_file(".gitignore", ["build/"], ["build/", "*.tmp"], keep=1)
+    return gone + ignore
+
+
+def test_a_deleted_file_counts_as_a_change_for_live_criteria():
+    # The lane removed a scratch file and ignored its kind: the Live check
+    # on what the repository tracks is met by the deletion itself.
+    boxes = ((24, 1, "open", "Live: after merge, `git ls-files '*.tmp'` on main prints nothing"),)
+    assert _findings(_scratch_removal_diff(), boxes=boxes, base={}) == ()
+
+
+def test_a_doc_ticket_named_in_the_title_is_not_held_to_runtime():
+    boxes = ((26, 1, "open", "Every principle names the module that implements it"),)
+    diff = _replaced_file("docs/SDLC.md", ["# SDLC", "old"], ["# SDLC", "new"], keep=1)
+    title = "docs/SDLC.md is kept honest, and its marks are current"
+    assert _findings(diff, boxes=boxes, title=title, base={}) == ()
+    # The same criterion against an unnamed doc is still unmet.
+    assert _rules(_findings(diff, boxes=boxes, title="Keep principles honest", base={})) == ["intent-mismatch"]
