@@ -123,6 +123,10 @@ def lane_work_findings(
         pr_title=pr_title, pr_body=pr_body,
         new_files=frozenset(c.path for c in changes if c.status == "added"),
         removed_files=frozenset(c.path for c in changes if c.status == "removed"),
+        renamed=tuple(
+            (c.previous_path, c.path) for c in changes
+            if c.status == "renamed" and c.previous_path
+        ),
     ))
     findings.extend(scan_destructive_edits(
         changes, base_line_counts, criteria=criteria,
