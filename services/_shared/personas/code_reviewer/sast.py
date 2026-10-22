@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from llm_client import _cave_judge_config, FindingJudgement, Hunk, JudgeFindingRepr, PrContext, judge_findings
+from review_evidence import assemble_evidence
 
 from .diff_parser import DiffHunk
 from .persona import Finding
@@ -570,12 +571,13 @@ def _judge_batch(
     if not candidates:
         return (), True
     reprs = [_candidate_to_repr(c) for c in candidates]
-    llm_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
+    evidence = assemble_evidence(
+        (Hunk(path=h.file_path, body=h.body) for h in hunks),
+        pr_context=pr_context, file_contents=file_contents,
+    )
     try:
         judgements = judge_findings(
-            reprs, llm_hunks, installation_id,
-            pr_context=pr_context, file_contents=file_contents,
-            config=config, redact=redact,
+            reprs, evidence, installation_id, config=config, redact=redact,
         )
     except Exception as e:  # noqa: BLE001 — judge failure must not crash the review
         log.warning(

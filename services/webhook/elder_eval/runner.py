@@ -86,6 +86,7 @@ from personas.code_reviewer.persona import (
     evaluate_diff,
 )
 from personas.code_reviewer.verify import verify_findings
+from review_evidence import ElderEvidence, assemble_evidence
 from review_pipeline import ReviewPlan, plan_review, render_review_map
 from sast_benchmark.backends import BenchBackend
 from sast_benchmark.runner import _post
@@ -129,7 +130,7 @@ def classes_for_findings(
 def _published_findings(
     response: LlmReviewResponse,
     hunks,
-    pr_context,
+    evidence: ElderEvidence,
     *,
     grade: Callable[..., tuple[FindingJudgement, ...]] = grade_findings,
     refute: Callable[..., tuple[FindingJudgement, ...]] = refute_findings,
@@ -138,33 +139,16 @@ def _published_findings(
 
     Full-file-dependent verifier rules remain inconclusive until the evaluator
     fetches immutable head contents; the judge and refute gates still receive
-    the exact scoped diff evidence used by this replay.
+    the exact evidence the replay's review read.
     """
-    diff_hunks = tuple(hunks)
-    evaluation = evaluate_diff(diff_hunks, response)
-    verdicts = grade(
-        evaluation,
-        diff_hunks,
-        0,
-        pr_context=pr_context,
-        file_contents={},
-        cross_file_contents={},
-        runtime_context=None,
-    )
+    evaluation = evaluate_diff(tuple(hunks), response)
+    verdicts = grade(evaluation, evidence, 0)
     kept, _ = partition_findings(evaluation.findings, verdicts)
     verified, _ = verify_findings(kept, {})
     high = tuple(
         finding for finding in verified if finding.severity in ("high", "critical")
     )
-    refuted_verdicts = refute(
-        high,
-        diff_hunks,
-        0,
-        pr_context=pr_context,
-        file_contents={},
-        cross_file_contents={},
-        runtime_context=None,
-    )
+    refuted_verdicts = refute(high, evidence, 0)
     _, refuted = partition_refuted(high, refuted_verdicts)
     refuted_ids = {id(finding) for finding in refuted}
     return tuple(finding for finding in verified if id(finding) not in refuted_ids)
@@ -429,7 +413,7 @@ def run_case(
         for cohort in plan.cohorts:
             cohort_hunks = [hunks[index] for index in cohort.hunk_indexes]
             messages = _build_messages(
-                cohort_hunks, _PROMPT_VARIANT, None, None, None,
+                assemble_evidence(cohort_hunks), _PROMPT_VARIANT,
                 team_practices=team_practices,
                 few_shot_examples=few_shot,
                 review_map=review_map,
@@ -551,16 +535,12 @@ def run_production_case(
         hunks = [Hunk(path=hunk.file_path, body=hunk.body) for hunk in diff_hunks]
         if not diff_hunks:
             return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
-        pr_context = {
+        evidence = assemble_evidence(hunks, pr_context={
             "repo": case.repo,
             "pr_number": case.pr,
             "review_phase": "eval-production",
-        }
-        response = review(
-            hunks,
-            installation_id=0,
-            pr_context=pr_context,
-        )
+        })
+        response = review(evidence, installation_id=0)
     except Exception as e:  # noqa: BLE001 - one case must not abort the sweep
         log.warning(
             "eval_production_case_errored case=%s kind=%s",
@@ -585,7 +565,7 @@ def run_production_case(
         findings = _published_findings(
             response,
             diff_hunks,
-            pr_context,
+            evidence,
             grade=grade,
             refute=refute,
         )

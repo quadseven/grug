@@ -548,6 +548,37 @@ _RECHECK_PAT = _re.compile(r"^\s*/grug\s+recheck\b", _re.IGNORECASE | _re.MULTIL
 # `permission` field on `GET /repos/{o}/{r}/collaborators/{u}/permission`.
 _AUTHORIZED_ROLES = {"admin", "maintain", "write"}
 
+# grug#1270: below this fraction of the installation's hourly GitHub
+# budget, an Elder re-run is held back until the window resets instead of
+# spending what is left and getting 403'd on the way. A burst of commands
+# (14 PRs in two minutes on 2026-10-18) must not eat the whole budget at
+# once - the commands after the wall were the ones that got dropped.
+_LOW_BUDGET_FRACTION = 0.10
+
+
+def _budget_reset_epoch(install_id: int) -> float:
+    """The epoch second the installation's GitHub budget resets at, when
+    the budget is too low to spend on another re-run.
+
+    0 when there is budget left, and 0 when the budget cannot be read -
+    an unreadable budget must never block a command (grug#1270)."""
+    from github_app_auth import core_rate_limit, with_install_token_retry  # type: ignore
+
+    try:
+        budget = with_install_token_retry(install_id, core_rate_limit)
+    except Exception as e:  # noqa: BLE001 - an unreadable budget is not a full one
+        log.warning(
+            "grug_command_budget_unreadable",
+            extra={"installation_id": install_id, "kind": type(e).__name__},
+        )
+        return 0.0
+    if not budget:
+        return 0.0
+    remaining, limit, reset = budget
+    if limit <= 0 or remaining >= limit * _LOW_BUDGET_FRACTION:
+        return 0.0
+    return float(reset)
+
 
 def _actor_has_write(
     installation_id: int,
@@ -879,6 +910,61 @@ def _run_issue_dor_for(
     ) or {"status": "skip", "reason": "token acquisition failed"}
 
 
+def _defer_grug_command(
+    *, cmd, installation_id: int, owner: str, repo_name: str, pr_number: int,
+    comment_id: int, token_fn, defer_until: float,
+) -> dict[str, str]:
+    """Hand the command to the interactive lane with a `not_before`.
+
+    The command is KEPT, not dropped: the re-run goes back on the queue for
+    the moment the installation's GitHub budget resets, and the reader is
+    told it is deferred. A command that vanishes looks exactly like a
+    command that worked and did nothing (grug#1270)."""
+    from interactive import run_command  # type: ignore
+
+    return run_command(
+        cmd.verb, cmd.arg, install_id=installation_id, owner=owner,
+        repo=repo_name, pr_number=pr_number, comment_id=comment_id,
+        token_fn=token_fn, defer_until=defer_until,
+    )
+
+
+def _defer_if_budget_spent(
+    *, cmd, installation_id: int, owner: str, repo_name: str, pr_number: int,
+    comment_id: int, token_fn, reset_epoch: float = 0.0,
+) -> dict[str, str] | None:
+    """The deferred command when the installation's GitHub budget is spent,
+    else None.
+
+    `reset_epoch` is when the budget resets - read from the budget itself
+    when it is known, or from a rate-limited response. Elder re-runs are
+    the ones deferred: they are the expensive ones, and a command that
+    cannot run must be KEPT (grug#1270)."""
+    from grug_commands import ELDER_RERUN_VERBS  # type: ignore
+
+    if cmd.verb not in ELDER_RERUN_VERBS:
+        return None
+    if reset_epoch <= 0:
+        reset_epoch = _budget_reset_epoch(installation_id)
+    if reset_epoch <= 0:
+        return None
+    log.warning(
+        "grug_command_deferred_rate_limited",
+        extra={
+            "installation_id": installation_id,
+            "repo": f"{owner}/{repo_name}",
+            "pr": pr_number,
+            "verb": cmd.verb,
+            "reset_epoch": int(reset_epoch),
+        },
+    )
+    return _defer_grug_command(
+        cmd=cmd, installation_id=installation_id, owner=owner,
+        repo_name=repo_name, pr_number=pr_number, comment_id=comment_id,
+        token_fn=token_fn, defer_until=reset_epoch,
+    )
+
+
 def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     action = payload.get("action", "")
     if action != "created":
@@ -929,7 +1015,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # Author OR write+ collaborator only — public-listed App means random
     # commenters can't spam re-evaluations. Lazy imports keep cold-start
     # cheap when only PR events fire.
-    from github_app_auth import with_install_token_retry  # type: ignore
+    from github_app_auth import (  # type: ignore
+        primary_rate_limit_reset_epoch,
+        with_install_token_retry,
+    )
     from personas.publish_check import PUBLISH_FAILED  # type: ignore
     import httpx  # type: ignore
 
@@ -963,6 +1052,21 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         )
         return {"status": "no_op", "reason": "sender lacks write perm"}
 
+    # grug#1270: pace an Elder re-run against the installation's hourly
+    # GitHub budget BEFORE any billable call. A burst of `/grug improve`
+    # commands (14 PRs in two minutes on 2026-10-18) otherwise spends the
+    # whole budget at once, and every command after the wall was dropped
+    # with no reply. `GET /rate_limit` does not count against the limit,
+    # so asking what is left is free.
+    deferred = _defer_if_budget_spent(
+        cmd=cmd, installation_id=int(installation_id), owner=owner,
+        repo_name=repo_name, pr_number=int(pr_number),
+        comment_id=int(comment_id) if comment_id is not None else 0,
+        token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+    )
+    if deferred:
+        return deferred
+
     # Re-fetch PR to get current head_sha + body (issue payload only has
     # the issue mirror, not the PR head). One API call per recheck.
     def _fetch_pr(token: str) -> dict[str, Any]:
@@ -981,6 +1085,20 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     try:
         pr = with_install_token_retry(int(installation_id), _fetch_pr)
     except httpx.HTTPStatusError as e:
+        # grug#1270: a command refused because the hourly budget is spent
+        # must be KEPT, not dropped. It goes back on the queue with a
+        # `not_before` at the reset, and the reader is told it is deferred
+        # - a command that vanishes looks exactly like a command that
+        # worked and did nothing.
+        deferred = _defer_if_budget_spent(
+            cmd=cmd, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
+            comment_id=int(comment_id) if comment_id is not None else 0,
+            token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+            reset_epoch=float(primary_rate_limit_reset_epoch(e.response)),
+        )
+        if deferred:
+            return deferred
         log.warning(
             "recheck_pr_fetch_failed",
             extra={"pr_number": pr_number, "status": e.response.status_code},
@@ -1010,6 +1128,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             repo=repo_name, pr_number=int(pr_number),
             comment_id=int(comment_id) if comment_id is not None else 0,
             token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+            head_sha=head_sha,
         )
 
     # Final guard (FLINT on #575): main.py forwards dispatch()

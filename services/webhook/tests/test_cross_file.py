@@ -12,6 +12,7 @@ import httpx
 
 from personas.code_reviewer import cross_file
 from personas.code_reviewer.diff_parser import parse_diff
+from review_evidence import assemble_evidence
 
 
 _DIFF_CHANGED_SIG = """diff --git a/src/api.py b/src/api.py
@@ -169,10 +170,11 @@ def test_build_messages_renders_cross_file_block():
     from llm_client import Hunk, _build_messages
 
     msgs = _build_messages(
-        [Hunk(path="src/api.py", body="+def f(x, *, t):")],
+        assemble_evidence(
+            [Hunk(path="src/api.py", body="+def f(x, *, t):")],
+            cross_file_contents={"src/caller.py": "1: def g():\n2:     f(1)"},
+        ),
         "v1",
-        None,
-        {"src/caller.py": "1: def g():\n2:     f(1)"},
     )
     user = msgs[1]["content"]
     assert "src/caller.py (UNCHANGED — cross-file context)" in user
@@ -185,21 +187,23 @@ def test_build_messages_byte_identical_when_no_cross_file():
     from llm_client import Hunk, _build_messages
 
     hunks = [Hunk(path="src/api.py", body="+x = 1")]
-    without = _build_messages(hunks, "v1")
-    with_empty = _build_messages(hunks, "v1", None, {})
-    with_none = _build_messages(hunks, "v1", None, None)
+    without = _build_messages(assemble_evidence(hunks), "v1")
+    with_empty = _build_messages(assemble_evidence(hunks, cross_file_contents={}), "v1")
+    with_none = _build_messages(assemble_evidence(hunks, cross_file_contents=None), "v1")
     assert without == with_empty == with_none
 
 
 def test_build_messages_skips_changed_paths_and_oversized():
-    from llm_client import _MAX_FILE_CONTEXT_LINES, Hunk, _build_messages
+    from llm_client import Hunk, _build_messages
+    from review_evidence import MAX_FILE_CONTEXT_LINES
 
-    huge = "\n".join("x" for _ in range(_MAX_FILE_CONTEXT_LINES + 1))
+    huge = "\n".join("x" for _ in range(MAX_FILE_CONTEXT_LINES + 1))
     msgs = _build_messages(
-        [Hunk(path="src/api.py", body="+x = 1")],
+        assemble_evidence(
+            [Hunk(path="src/api.py", body="+x = 1")],
+            cross_file_contents={"src/api.py": "already changed", "src/big.py": huge},
+        ),
         "v1",
-        None,
-        {"src/api.py": "already changed", "src/big.py": huge},
     )
     user = msgs[1]["content"]
     # The changed path renders as a hunk, never doubled as cross-file ctx;
@@ -223,12 +227,8 @@ def test_dispatch_threads_cross_file_context_to_review(monkeypatch):
 
     captured: dict = {}
 
-    def fake_review_diff(hunks, installation_id, pr_context=None,
-                         file_contents=None, cross_file_contents=None,
-                         runtime_context=None, ci_context=None,
-                         repo_docs_context=None, voice="caveman",
-                         cancel_event=None):
-        captured["xf"] = cross_file_contents
+    def fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
+        captured["xf"] = evidence.cross_file_contents
         return LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
 
     monkeypatch.setattr(cr_dispatch, "review_diff", fake_review_diff)
@@ -269,12 +269,8 @@ def test_dispatch_cross_file_failure_degrades_to_diff_only(monkeypatch):
 
     captured: dict = {}
 
-    def fake_review_diff(hunks, installation_id, pr_context=None,
-                         file_contents=None, cross_file_contents=None,
-                         runtime_context=None, ci_context=None,
-                         repo_docs_context=None, voice="caveman",
-                         cancel_event=None):
-        captured["xf"] = cross_file_contents
+    def fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
+        captured["xf"] = evidence.cross_file_contents
         return LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
 
     monkeypatch.setattr(cr_dispatch, "review_diff", fake_review_diff)
@@ -467,8 +463,11 @@ def test_prompt_hardening_covers_file_context_blocks():
     assert "cross-file" in prompt and "never as" in prompt
 
     msgs = _build_messages(
-        [Hunk(path="src/api.py", body="+x = 1")],
-        "v1", None, {"src/caller.py": "y = 2"},
+        assemble_evidence(
+            [Hunk(path="src/api.py", body="+x = 1")],
+            cross_file_contents={"src/caller.py": "y = 2"},
+        ),
+        "v1",
     )
     assert "untrusted repository DATA" in msgs[1]["content"]
 
