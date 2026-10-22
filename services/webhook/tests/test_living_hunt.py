@@ -532,9 +532,10 @@ def test_living_hunt_delta_done_log_on_successful_persist(monkeypatch, caplog):
 
 
 def test_push_after_first_review_is_a_scoped_delta_review(monkeypatch):
-    """grug#1188 AC: a push after the first review fetches the diff from the
-    last reviewed head, never the full PR diff, and the check names the
-    commit range it reviewed."""
+    """grug#1188 AC: a push after the first review gives the model the diff
+    from the last reviewed head, and the check names the commit range it
+    reviewed. The full PR diff is fetched only for the deterministic
+    lane-work checks (#1343), never handed to the model."""
     from github_checks_client import CheckRunResult
     from llm_client import Backend, LlmReviewResponse
 
@@ -548,8 +549,16 @@ def test_push_after_first_review_is_a_scoped_delta_review(monkeypatch):
         scoped_calls.append(k)
         return ("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n", True, False)
 
-    def _full(*_a, **_k):
-        raise AssertionError("full PR diff fetched on a push after a review")
+    full_calls: list[dict] = []
+    reviewed_paths: list[set[str]] = []
+
+    def _full(*_a, **k):
+        full_calls.append(k)
+        return "diff --git a/earlier.py b/earlier.py\n--- a/earlier.py\n+++ b/earlier.py\n@@ -1 +1 @@\n-a\n+b\n"
+
+    def _review(evidence, *_a, **_k):
+        reviewed_paths.append({h.path for h in evidence.hunks})
+        return llm
 
     def _check(*a, **k):
         result = k.get("result") or next(x for x in a if isinstance(x, CheckRunResult))
@@ -558,7 +567,7 @@ def test_push_after_first_review_is_a_scoped_delta_review(monkeypatch):
 
     monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda _i, fn: fn("t"))
     monkeypatch.setattr(review_publish, "with_install_token_retry", lambda _i, fn: fn("t"))
-    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **k: llm)
+    monkeypatch.setattr(cr_dispatch, "review_diff", _review)
     monkeypatch.setattr(cr_dispatch, "post_check_run", _check)
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 2})
     monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
@@ -594,3 +603,100 @@ def test_push_after_first_review_is_a_scoped_delta_review(monkeypatch):
     assert scoped_calls[0]["base_sha"] == "prior0001head"
     assert scoped_calls[0]["head_sha"] == "abcd1234efgh"
     assert titles and titles[-1].startswith("Living Hunt prior000..abcd1234")
+    assert reviewed_paths == [{"x.py"}]
+    assert [(c["base_sha"], c["head_sha"]) for c in full_calls] == [
+        ("base5678ijkl", "abcd1234efgh"),
+    ]
+
+
+# --- #1343: the lane-work checks judge the whole PR on every pass ------------
+
+_LANE_BODY = (
+    "## Why\nRetry the nightly upload.\n\n---\n"
+    "Loom ticket example.ops-83-r1, lane codex, model coder.\nRefs #83\n"
+)
+_LINKED = "#83 criterion 1 [open]: The nightly sync retries a failed upload three times\n"
+_SCRIPT = ["#!/bin/sh", "set -eu", "for i in 1 2 3; do upload && break; done"]
+_WORKFLOW = ["on: schedule", "jobs:", "  sync:", "    steps:", "      - run: ops/retry-upload.sh"]
+
+
+def _added(path: str, lines: list[str]) -> str:
+    return (
+        f"diff --git a/{path} b/{path}\nnew file mode 100644\nindex 0000000..1111111\n"
+        f"--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n"
+        + "".join(f"+{ln}\n" for ln in lines)
+    )
+
+
+def _lane_work_on_delta(monkeypatch, *, delta: str, full: str) -> list[tuple]:
+    """Run a delta review (a prior head is stored) of a lane PR and return
+    the (diff, findings) of every lane-work call."""
+    from llm_client import Backend, LlmReviewResponse
+
+    llm = LlmReviewResponse(
+        kind="reviewed", findings=(), backend_used=Backend.CAVE, model_name="coder",
+    )
+    calls: list[tuple] = []
+    real = cr_dispatch.lane_work_findings
+
+    def _spy(**kw):
+        found = real(**kw)
+        calls.append((kw["diff_text"], tuple((f.rule_name, f.severity) for f in found)))
+        return found
+
+    monkeypatch.setattr(cr_dispatch, "lane_work_findings", _spy)
+    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda _i, fn: fn("t"))
+    monkeypatch.setattr(review_publish, "with_install_token_retry", lambda _i, fn: fn("t"))
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **k: llm)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **k: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 2})
+    monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
+    monkeypatch.setattr(cr_dispatch, "fetch_file_contents", lambda *a, **k: {})
+    monkeypatch.setattr(cr_dispatch, "build_linked_issue_context", lambda *a, **k: _LINKED)
+    monkeypatch.setattr(
+        cr_dispatch, "fetch_pr_diff_with_scope", lambda *a, **k: (delta, True, False),
+    )
+    monkeypatch.setattr(cr_dispatch, "fetch_pr_diff", lambda *a, **k: full)
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_current_review_snapshot",
+        lambda *a, **k: ("base5678ijkl", "abcd1234efgh", "t", _LANE_BODY),
+    )
+    with patch(
+        "adapters.install_store.get_elder_last_reviewed", return_value="prior0001head",
+    ), patch("adapters.install_store.put_elder_last_reviewed", lambda **k: None):
+        cr_dispatch.dispatch_code_review(
+            {
+                "action": "synchronize",
+                "installation": {"id": 11},
+                "repository": {"id": 22, "name": "myrepo", "owner": {"login": "myorg"}},
+                "pull_request": {
+                    "number": 7,
+                    "head": {"sha": "abcd1234efgh"},
+                    "base": {"sha": "base5678ijkl"},
+                    "title": "t",
+                    "body": _LANE_BODY,
+                    "user": {"login": "alice"},
+                },
+            },
+            blocking=False,
+        )
+    return calls
+
+
+def test_a_delta_review_judges_criteria_on_the_whole_pr(monkeypatch):
+    """The earlier commit wired the script into the nightly workflow; the
+    delta only adds the script. Judged alone the delta's script is inert
+    against the runtime criterion; judged as the PR it meets it."""
+    delta = _added("ops/retry-upload.sh", _SCRIPT)
+    full = delta + _added(".github/workflows/nightly.yml", _WORKFLOW)
+    calls = _lane_work_on_delta(monkeypatch, delta=delta, full=full)
+    assert [diff for diff, _ in calls] == [full]
+    assert calls[0][1] == ()
+
+
+def test_a_delta_review_still_reports_a_criterion_no_commit_meets(monkeypatch):
+    delta = _added("ops/retry-upload.sh", _SCRIPT)
+    full = delta + _added("docs/notes.md", ["Upload notes."])
+    calls = _lane_work_on_delta(monkeypatch, delta=delta, full=full)
+    assert len(calls) == 1
+    assert ("intent-mismatch", "high") in calls[0][1]

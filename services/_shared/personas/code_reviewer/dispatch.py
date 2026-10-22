@@ -29,7 +29,7 @@ import re
 import threading
 from collections import deque
 from datetime import datetime, timezone
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -2522,6 +2522,101 @@ def _merge_lane_work(
     )
 
 
+@dataclass(frozen=True)
+class _LaneWorkInputs:
+    """The whole pull request, as the lane-work checks read it."""
+
+    diff_text: str
+    hunks: tuple[DiffHunk, ...]
+    file_contents: dict[str, str]
+    base_contents: dict[str, str]
+
+
+def _full_pr_lane_work_inputs(
+    installation_id: int, owner: str, repo_name: str, pull_number: int, *,
+    base_sha: str, head_sha: str, known_contents: dict[str, str],
+) -> _LaneWorkInputs | None:
+    """The full PR diff (merge base..head) and its file texts, for a delta
+    review's lane-work checks (#1343). The model still reviews only the
+    delta. Head texts the delta already fetched are reused. None when the
+    full diff cannot be fetched: the checks then skip this pass, logged,
+    as they did before."""
+    try:
+        diff_text = with_install_token_retry(
+            installation_id,
+            lambda token: fetch_pr_diff(
+                token, owner, repo_name, pull_number,
+                base_sha=base_sha, head_sha=head_sha,
+            ),
+        )
+        hunks = parse_diff(diff_text)
+    except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
+        log.info(
+            "code_review_lane_work_full_diff_unavailable",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        return None
+    paths = tuple(dict.fromkeys(h.file_path for h in hunks))
+    missing = tuple(p for p in paths if p not in known_contents)
+    contents = {p: known_contents[p] for p in paths if p in known_contents}
+    if missing:
+        try:
+            contents.update(with_install_token_retry(
+                installation_id,
+                lambda token: fetch_file_contents(
+                    token, owner, repo_name, missing, head_sha,
+                ),
+            ) or {})
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            log.info(
+                "code_review_file_contents_unavailable",
+                extra={"pr": f"{owner}/{repo_name}#{pull_number}", "error": str(e)},
+            )
+    rename_sources = tuple(
+        c.previous_path for c in file_changes(diff_text)
+        if c.status == "renamed" and c.previous_path
+    )
+    base_contents = _fetch_base_contents(
+        installation_id, owner, repo_name, pull_number,
+        tuple(dict.fromkeys(paths + rename_sources)), base_sha,
+    )
+    return _LaneWorkInputs(diff_text, hunks, contents, base_contents)
+
+
+def _merge_lane_work_for_pass(
+    evaluation: CodeReviewEvaluation, this_pass: _LaneWorkInputs,
+    pr_context: PrContext, *, living_range: str, base_sha: str,
+    correctness_only: bool,
+) -> CodeReviewEvaluation:
+    """Merge the lane-work findings for one review pass. A full review
+    judges the diff it reviewed; a living delta hides callers and the
+    commits that met a criterion, so a delta review judges the full PR diff
+    instead (#1343). Never aborts the review."""
+    owner, _, repo_name = str(pr_context.get("repo") or "").partition("/")
+    pull_number = int(pr_context.get("pr_number") or 0)
+    try:
+        inputs: _LaneWorkInputs | None = this_pass
+        if living_range:
+            inputs = _full_pr_lane_work_inputs(
+                int(pr_context.get("installation_id") or 0), owner, repo_name,
+                pull_number, base_sha=base_sha,
+                head_sha=str(pr_context.get("head_sha") or ""),
+                known_contents=this_pass.file_contents,
+            )
+        if inputs is None:
+            return evaluation
+        return _merge_lane_work(
+            evaluation, inputs.hunks, inputs.diff_text, inputs.file_contents,
+            inputs.base_contents, pr_context, correctness_only=correctness_only,
+        )
+    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
+        log.info(
+            "code_review_criteria_coverage_failed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        return evaluation
+
+
 def _filter_checked_shell_commands(
     evaluation: CodeReviewEvaluation, file_contents: dict[str, str], *,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
@@ -3253,21 +3348,13 @@ def dispatch_code_review(
 
     # Deterministic lane-work checks (#1179, #1363): a new function nothing
     # calls, linked criteria no hunk can satisfy, a file mostly deleted that
-    # nobody named. Pure; never aborts. A living delta hides callers and
-    # runtime hunks, so the checks run only on a full-diff review, over
-    # every parsed hunk.
-    try:
-        if not living_range:
-            evaluation = _merge_lane_work(
-                evaluation, parsed_hunks, diff_text, file_contents,
-                base_file_contents, pr_context,
-                correctness_only=correctness_only,
-            )
-    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
-        log.info(
-            "code_review_criteria_coverage_failed",
-            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
-        )
+    # nobody named. They judge the WHOLE pull request on every pass (#1343).
+    evaluation = _merge_lane_work_for_pass(
+        evaluation,
+        _LaneWorkInputs(diff_text, parsed_hunks, file_contents, base_file_contents),
+        pr_context, living_range=living_range, base_sha=base_sha,
+        correctness_only=correctness_only,
+    )
 
     # Durable reviews can spend several minutes in inference. Re-check the
     # complete input after reasoning so changes to code, base, or intent cannot
