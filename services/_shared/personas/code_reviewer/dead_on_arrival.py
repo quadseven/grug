@@ -34,9 +34,12 @@ Four findings, each anchored on a line the diff adds:
   every non-test line outside its own body uses only as an import or a
   type annotation. Medium. Needs the file's head text.
 - `stray-file` (medium): a new scratch or temporary file (`*.tmp`,
-  `*.bak`, `test*.txt`, `scratch*`, a `tmp`/`temp` path component, a
-  non-config file under `.loom/`). Test and fixture directories are
+  `*.bak`, `test*.txt`, `scratch*`, a `tmp`/`temp` path component),
+  judged by name in dot-directories too. Test and fixture directories are
   exempt: a sample file there is test data.
+
+A new file the PR body says another system reads ("Loom's watch reads
+`.loom/deploy-signal`") is referenced: neither stray nor dead.
 
 Not double-reported: a file an `intent-mismatch` finding already names
 gets no file finding; the #1179 per-function `dead-code` findings in a
@@ -120,7 +123,14 @@ _STRAY_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 _STRAY_DIR_RE = re.compile(r"^(?:tmp|temp)(?:[_-].*)?$|^scratch", re.IGNORECASE)
-_LOOM_CONFIG_RE = re.compile(r"\.(?:conf|toml|ya?ml|json|ini|cfg)$", re.IGNORECASE)
+# A sentence that says something reads a file: "Loom's watch reads
+# `.loom/deploy-signal`", "loaded by the station", "parses it".
+_READ_BY_RE = re.compile(
+    r"\b(?:reads?|read by|loads?|loaded by|parses?|parsed by|consum\w+|watch\w*"
+    r"|picks? up|looks? for|sourced by|sources)\b",
+    re.IGNORECASE,
+)
+_SENTENCE_RE = re.compile(r"(?<=[.;:!?])\s+|\n+")
 _DATA_DIRS = frozenset({
     "tests", "test", "testing", "testdata", "fixtures", "__fixtures__",
     "__tests__", "spec", "specs", "examples", "samples",
@@ -417,22 +427,41 @@ def _stray_finding(anchor: tuple[str, int]) -> Finding:
 
 
 def is_stray_path(path: str) -> bool:
-    """A scratch or temporary file outside test and fixture directories."""
+    """A scratch or temporary file outside test and fixture directories.
+
+    Judged by name alone, in a dot-directory too: `.loom/`, `.github/` and
+    the like hold configuration other systems read by path (a
+    `.loom/deploy-signal` with no extension is a signal another repo reads),
+    so only a scratch name (`.loom/test.txt`) marks one stray."""
     parts = path.split("/")
     if any(p.lower() in _DATA_DIRS for p in parts[:-1]):
         return False
-    if parts[0] == ".loom" and len(parts) > 1:
-        return not _LOOM_CONFIG_RE.search(parts[-1])
     return bool(_STRAY_NAME_RE.search(parts[-1])) or any(
         _STRAY_DIR_RE.match(p) for p in parts[:-1]
     )
 
 
+def named_as_read(path: str, pr_body: str) -> bool:
+    """The PR body names `path` (or its file name) in a sentence that says
+    something reads it: another system loads it, so it is referenced."""
+    name = path.rsplit("/", 1)[-1]
+    spellings = {path, name} if len(name) >= 4 else {path}
+    for sentence in _SENTENCE_RE.split(pr_body or ""):
+        if _READ_BY_RE.search(sentence) and any(
+            re.search(rf"(?<![\w./-]){re.escape(s)}(?![\w/-])", sentence) for s in spellings
+        ):
+            return True
+    return False
+
+
 def _stray_findings(
-    new_files: frozenset[str], by_file: dict[str, list[DiffHunk]],
+    new_files: frozenset[str], by_file: dict[str, list[DiffHunk]], pr_body: str,
 ) -> tuple[set[str], list[Finding]]:
-    """The new scratch files, and a finding for each one the diff anchors."""
-    stray = {p for p in new_files if is_stray_path(p)}
+    """The new scratch files, and a finding for each one the diff anchors.
+    A file the PR body says another system reads is not stray."""
+    stray = {
+        p for p in new_files if is_stray_path(p) and not named_as_read(p, pr_body)
+    }
     findings: list[Finding] = []
     for path in sorted(stray):
         anchor = _anchor(path, by_file.get(path, []))
@@ -460,9 +489,14 @@ def _dead_and_unread(
     dead = {
         p for p in strict & loaded
         if not is_review_excluded_path(p) and not _is_test_like(p)
+        and not named_as_read(p, pr_body)
     }
     unread = _unread_scripts(
-        {p for p in strict - loaded if p.endswith(_JS_SUFFIXES)}, by_file,
+        {
+            p for p in strict - loaded
+            if p.endswith(_JS_SUFFIXES) and not named_as_read(p, pr_body)
+        },
+        by_file,
     )
     return dead, unread
 
@@ -550,7 +584,7 @@ def scan_dead_on_arrival(
     changes = tuple(changes)
     by_file = _by_file(hunks)
     new_files = frozenset(c.path for c in changes if c.status == "added")
-    stray, findings = _stray_findings(new_files, by_file)
+    stray, findings = _stray_findings(new_files, by_file, pr_body or "")
     found = _dead_and_unread(new_files, hunks, pr_body or "", by_file)
     if found is None:
         return tuple(findings)

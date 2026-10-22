@@ -318,8 +318,33 @@ def test_config_fixtures_and_ordinary_files_are_not_stray():
     for path in (
         ".loom/validation.conf", "tests/fixtures/test_input.txt", "templates/page.html",
         "docs/testing.md", "src/temperature.py", "requirements.txt",
+        ".loom/deploy-signal", ".loom/sensitive-paths", ".github/CODEOWNERS",
     ):
         assert not is_stray_path(path), path
+
+
+def test_recorded_deploy_signal_another_repo_reads_is_not_stray():
+    # Recorded (anonymized): a one-line `.loom/deploy-signal` next to an
+    # existing `.loom/validation.conf`, which the factory's post-merge watch
+    # reads from the default branch. Elder marked it a stray file.
+    body = (
+        "## Why\nLoom's post-merge watch reads each repo's deploy outcome from "
+        "`.loom/deploy-signal`; a repo without that file is never watched.\n"
+    )
+    diff = _added(".loom/deploy-signal", [
+        "# Deploy outcome signals for the post-merge watch.",
+        "workflow sync.k8s-manifests.yml production/manifests/**",
+    ])
+    assert scan_dead_on_arrival(file_changes(diff), parse_diff(diff), pr_body=body) == ()
+
+
+def test_a_scratch_name_the_body_says_is_read_is_not_stray_and_one_it_only_mentions_is():
+    diff = _added("tmp_handoff.txt", ["state"])
+    read = "The deploy job reads `tmp_handoff.txt` before it starts."
+    mention = "Adds `tmp_handoff.txt`."
+    scan = scan_dead_on_arrival
+    assert scan(file_changes(diff), parse_diff(diff), pr_body=read) == ()
+    assert [f.rule_name for f in scan(file_changes(diff), parse_diff(diff), pr_body=mention)] == ["stray-file"]
 
 
 def test_stray_files_get_one_medium_finding_each():
