@@ -12,6 +12,8 @@ and the offline corpus runner call exactly the same code:
   if the PR closed it.
 - destructive edits (#1365): the diff deletes or replaces most of a file
   that neither the title nor the linked criteria name.
+- weakened verification (#1367): the diff deletes or flips the tests that
+  pinned the old behavior, or drops a verification layer from CI.
 
 Pure: diff text, parsed hunks, file contents and PR text in; findings out.
 """
@@ -29,6 +31,7 @@ from personas.code_reviewer.destructive_edit import scan_destructive_edits
 from personas.code_reviewer.diff_parser import DiffHunk, FileChange, file_changes
 from personas.code_reviewer.intent_filter import body_claims_box
 from personas.code_reviewer.persona import Finding
+from personas.code_reviewer.weakened_verification import scan_weakened_verification
 from personas.tpm.ticket_compliance import closes_refs
 
 # The footer a Loom lane writes on every pull request it opens.
@@ -95,5 +98,8 @@ def lane_work_findings(
     findings.extend(scan_destructive_edits(
         changes, base_line_counts, criteria=criteria,
         pr_title=pr_title, hunks=hunks,
+    ))
+    findings.extend(scan_weakened_verification(
+        changes, hunks, criteria=criteria, pr_title=pr_title,
     ))
     return tuple(findings)
