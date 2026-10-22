@@ -103,37 +103,31 @@ def _anchor(path: str, hunks: Iterable[DiffHunk]) -> tuple[str, int] | None:
     return None
 
 
-def scan_measurement_only(
-    changes: Iterable[FileChange],
-    hunks: tuple[DiffHunk, ...],
-    *,
-    criteria: tuple[LinkedCriterion, ...],
-    pr_title: str,
-    health_issues: Iterable[int] = (),
-) -> tuple[Finding, ...]:
-    """One finding when a health ticket's fix changes only measurement code."""
-    if not criteria:
-        return ()
-    health = set(health_issues)
+def _answers_health(
+    criteria: tuple[LinkedCriterion, ...], pr_title: str, health: set[int],
+) -> bool:
+    """A linked ticket is health evidence, or the PR title says so."""
     in_scope = {c.issue for c in criteria}
-    if not (health & in_scope or _HEALTH_TITLE_RE.search(pr_title or "")):
-        return ()
+    return bool(health & in_scope or _HEALTH_TITLE_RE.search(pr_title or ""))
+
+
+def _measurement_code(changes: Iterable[FileChange]) -> list[str]:
+    """The changed code files when every one is measurement code, else []."""
     changes = tuple(changes)
     if len(changes) > MAX_FILES:
-        return ()
+        return []
     code = [c.path for c in changes if c.status != "removed" and _counts_as_code(c.path)]
-    if not code or not all(is_measurement_path(p) for p in code):
-        return ()
-    title = _HEALTH_TITLE_RE.sub("", pr_title or "")
-    if _asks_for_measurement([title, *(c.text for c in criteria)], code):
-        return ()
-    anchor = next((a for a in (_anchor(p, hunks) for p in code) if a), None)
-    if anchor is None:
-        return ()
-    issues = sorted(health & in_scope) or sorted(in_scope)
+    if not all(is_measurement_path(p) for p in code):
+        return []
+    return code
+
+
+def _measurement_finding(
+    anchor: tuple[str, int], issues: list[int], code: list[str],
+) -> Finding:
     refs = ", ".join(f"#{n}" for n in issues)
     files = ", ".join(f"`{p}`" for p in code[:4])
-    return (Finding(
+    return Finding(
         file=anchor[0],
         line=anchor[1],
         severity="high",
@@ -147,4 +141,32 @@ def scan_measurement_only(
         ),
         suggestion=None,
         effort="heavy-lift",
-    ),)
+    )
+
+
+def scan_measurement_only(
+    changes: Iterable[FileChange],
+    hunks: tuple[DiffHunk, ...],
+    *,
+    criteria: tuple[LinkedCriterion, ...],
+    pr_title: str,
+    health_issues: Iterable[int] = (),
+) -> tuple[Finding, ...]:
+    """One finding when a health ticket's fix changes only measurement code."""
+    if not criteria:
+        return ()
+    health = set(health_issues)
+    if not _answers_health(criteria, pr_title, health):
+        return ()
+    code = _measurement_code(changes)
+    if not code:
+        return ()
+    title = _HEALTH_TITLE_RE.sub("", pr_title or "")
+    if _asks_for_measurement([title, *(c.text for c in criteria)], code):
+        return ()
+    anchor = next((a for a in (_anchor(p, hunks) for p in code) if a), None)
+    if anchor is None:
+        return ()
+    in_scope = {c.issue for c in criteria}
+    issues = sorted(health & in_scope) or sorted(in_scope)
+    return (_measurement_finding(anchor, issues, code),)

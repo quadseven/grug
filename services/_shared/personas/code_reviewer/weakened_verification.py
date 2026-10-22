@@ -213,7 +213,7 @@ def _read_test_file(path: str, hunks: list[DiffHunk], budget: list[int]) -> _Tes
                 d = _DEF_RE.match(raw[1:])
                 if d:
                     tf.added_defs.add(d.group(1))
-    for hunk, lines in zip(hunks, bodies):
+    for hunk, lines in zip(hunks, bodies, strict=True):
         _walk_hunk(tf, lines, _enclosing_removed(tf, hunk))
     return tf
 
@@ -229,54 +229,82 @@ def _enclosing_removed(tf: _TestFile, hunk: DiffHunk) -> _Deleted | None:
     return next((r for r in reversed(tf.removed) if r.name == d.group(1)), None)
 
 
+@dataclass
+class _HunkWalk:
+    """State of one pass over a hunk (see `_walk_hunk`)."""
+
+    tf: _TestFile
+    current: _Deleted | None
+    run_removed: list[str] = field(default_factory=list)
+    run_added: list[str] = field(default_factory=list)
+    added_pol: dict[str, set[int]] = field(default_factory=dict)
+    removed_pol: list[tuple[str, str, int]] = field(default_factory=list)
+
+    def close_run(self) -> None:
+        """Pair the tests a change run removed with those it added, in order."""
+        # strict=False: a run can remove more tests than it adds, or the
+        # reverse; the unpaired ones are plain deletions or additions.
+        for old, new in zip(self.run_removed, self.run_added, strict=False):
+            self.tf.replaced_by[old] = new
+        self.run_removed.clear()
+        self.run_added.clear()
+
+    def added_line(self, text: str) -> None:
+        d = _DEF_RE.match(text)
+        if d and d.group(1).startswith("test"):
+            self.run_added.append(d.group(1))
+        if _ASSERT_RE.search(text):
+            p = _polarity(text)
+            if p:
+                self.added_pol.setdefault(p[0], set()).add(p[1])
+
+    def old_line(self, kind: str, text: str) -> None:
+        """A removed or context line."""
+        if kind != "-":
+            self.close_run()
+        d = _DEF_RE.match(text)
+        if d or _CLASS_RE.match(text):
+            self._open(kind, d)
+        elif kind == "-" and _ASSERT_RE.search(text):
+            self._removed_assert(text)
+
+    def _open(self, kind: str, d: re.Match[str] | None) -> None:
+        """A def or class line ends the current test; a removed test def
+        starts a new one."""
+        self.current = None
+        if d and kind == "-" and d.group(1).startswith("test"):
+            self.current = _Deleted(d.group(1))
+            self.tf.removed.append(self.current)
+            self.run_removed.append(self.current.name)
+
+    def _removed_assert(self, text: str) -> None:
+        if self.current is not None and text.strip() not in self.tf.added:
+            self.current.asserts += 1
+        p = _polarity(text)
+        if p:
+            self.removed_pol.append((text.strip(), p[0], p[1]))
+
+    def finish(self) -> None:
+        self.close_run()
+        for shown, key, pol in self.removed_pol:
+            if self.added_pol.get(key) == {1 - pol}:
+                self.tf.flips.append(shown)
+
+
 def _walk_hunk(tf: _TestFile, lines: list[str], current: _Deleted | None) -> None:
     """One pass over a hunk: removed test functions on the old side, the
     test added in place of each, and assertion polarity flips. `current` is
     a removed test whose body this hunk starts inside."""
-    run_removed: list[str] = []
-    run_added: list[str] = []
-    added_pol: dict[str, set[int]] = {}
-    removed_pol: list[tuple[str, str, int]] = []
-
-    def close_run() -> None:
-        for old, new in zip(run_removed, run_added):
-            tf.replaced_by[old] = new
-        run_removed.clear()
-        run_added.clear()
-
+    walk = _HunkWalk(tf, current)
     for raw in lines:
         if len(raw) > _MAX_LINE or _incomplete(raw):
             continue
         kind, text = raw[:1], raw[1:]
         if kind == "+":
-            d = _DEF_RE.match(text)
-            if d and d.group(1).startswith("test"):
-                run_added.append(d.group(1))
-            if _ASSERT_RE.search(text):
-                p = _polarity(text)
-                if p:
-                    added_pol.setdefault(p[0], set()).add(p[1])
-            continue
-        if kind != "-":
-            close_run()
-        d = _DEF_RE.match(text)
-        if d or _CLASS_RE.match(text):
-            current = None
-            if d and kind == "-" and d.group(1).startswith("test"):
-                current = _Deleted(d.group(1))
-                tf.removed.append(current)
-                run_removed.append(current.name)
-            continue
-        if kind == "-" and _ASSERT_RE.search(text):
-            if current is not None and text.strip() not in tf.added:
-                current.asserts += 1
-            p = _polarity(text)
-            if p:
-                removed_pol.append((text.strip(), p[0], p[1]))
-    close_run()
-    for shown, key, pol in removed_pol:
-        if added_pol.get(key) == {1 - pol}:
-            tf.flips.append(shown)
+            walk.added_line(text)
+        else:
+            walk.old_line(kind, text)
+    walk.finish()
 
 
 def _renamed(old: str, new: str | None) -> bool:
@@ -299,7 +327,7 @@ def _deleted_tests(tf: _TestFile) -> list[_Deleted]:
     ]
 
 
-def _mentioned(name: str, ticket_stems: set[str]) -> bool:
+def _mentioned(name: str, ticket_stems: frozenset[str]) -> bool:
     words = _name_words(name)
     if not words:
         return True
@@ -334,87 +362,125 @@ def _named_list(items: list[str]) -> str:
     return shown + (f" and {more} more" if more > 0 else "")
 
 
-def _test_findings(
-    files: list[_TestFile], removed_files: list[str], hunks: tuple[DiffHunk, ...],
-    ticket: str,
-) -> list[Finding]:
-    ticket_lower = ticket.lower()
-    ticket_stems = {_stem(w) for w in re.findall(r"[a-z0-9]+", ticket_lower)}
-    removal_ticket = bool(_REMOVAL_RE.search(ticket))
-    unasked_flips = sum(
-        1 for tf in files if not tf.incomplete
-        for f in tf.flips if not _flip_asked(f, ticket_lower)
-    )
-    findings: list[Finding] = []
-    for tf in files:
-        if tf.incomplete:
-            continue
-        deleted = _deleted_tests(tf)
-        # A lone flip with nothing deleted most often follows a behavior the
-        # ticket changed on purpose: on the lane corpus it was as common in
-        # good work as in damaging work, so it is left to the model.
-        if not deleted and unasked_flips < 2:
-            continue
-        unnamed = [d for d in deleted if not _mentioned(d.name, ticket_stems)]
-        file_unasked = [f for f in tf.flips if not _flip_asked(f, ticket_lower)]
-        high = (len(unnamed) >= DELETED_HIGH and not removal_ticket) or (
-            bool(file_unasked) and unasked_flips >= FLIPS_HIGH
+@dataclass(frozen=True)
+class _Ticket:
+    """The PR title and linked criteria, in the forms the test rule reads."""
+
+    lower: str
+    stems: frozenset[str]
+    removal: bool
+
+    @classmethod
+    def of(cls, ticket: str) -> _Ticket:
+        lower = ticket.lower()
+        return cls(
+            lower=lower,
+            stems=frozenset(_stem(w) for w in re.findall(r"[a-z0-9]+", lower)),
+            removal=bool(_REMOVAL_RE.search(ticket)),
         )
-        anchor = _anchor(tf.hunks, hunks)
-        if anchor is None:
-            continue
-        parts = []
-        if deleted:
-            gone = sum(d.asserts for d in deleted)
-            parts.append(
-                f"deletes {len(deleted)} test(s) ({_named_list([d.name for d in deleted])}) "
-                f"with {gone} assertion(s) the diff does not add back"
-            )
-        if tf.flips:
-            parts.append(
-                f"flips {len(tf.flips)} assertion(s) to the opposite expectation "
-                f"({_named_list(tf.flips)})"
-            )
-        if high:
-            why = (
-                "Neither the PR title nor the linked criteria name these tests or "
-                "the behavior they pinned, so the change passes by rewriting what "
-                "the tests checked."
-            )
-        elif unnamed:
-            why = (
-                "The ticket asks for a removal, so this may be intended; confirm "
-                "each test pinned something the ticket removes."
-            )
-        else:
-            why = (
-                "The ticket mentions this behavior, so this may be intended; "
-                "confirm each one pinned something the ticket changes."
-            )
-        findings.append(Finding(
-            file=anchor[0], line=anchor[1],
-            severity="high" if high else "medium",
-            rule_name=RULE_TEST,
-            message=(
-                f"In `{tf.path}`, this diff " + " and ".join(parts) + ". " + why
-                + " Restore the tests that pinned behavior the ticket did not "
-                "change, or name the change in the ticket."
-            ),
-            suggestion=None, effort="quick-win",
-        ))
-    for path in removed_files:
-        anchor = _anchor((), hunks)
-        if anchor is None:
-            break
-        findings.append(Finding(
+
+
+def _unasked(flips: list[str], ticket: _Ticket) -> list[str]:
+    return [f for f in flips if not _flip_asked(f, ticket.lower)]
+
+
+def _change_parts(tf: _TestFile, deleted: list[_Deleted]) -> list[str]:
+    """What the diff does to the file's tests, as message clauses."""
+    parts = []
+    if deleted:
+        gone = sum(d.asserts for d in deleted)
+        parts.append(
+            f"deletes {len(deleted)} test(s) ({_named_list([d.name for d in deleted])}) "
+            f"with {gone} assertion(s) the diff does not add back"
+        )
+    if tf.flips:
+        parts.append(
+            f"flips {len(tf.flips)} assertion(s) to the opposite expectation "
+            f"({_named_list(tf.flips)})"
+        )
+    return parts
+
+
+def _why(*, high: bool, unnamed: bool) -> str:
+    if high:
+        return (
+            "Neither the PR title nor the linked criteria name these tests or "
+            "the behavior they pinned, so the change passes by rewriting what "
+            "the tests checked."
+        )
+    if unnamed:
+        return (
+            "The ticket asks for a removal, so this may be intended; confirm "
+            "each test pinned something the ticket removes."
+        )
+    return (
+        "The ticket mentions this behavior, so this may be intended; "
+        "confirm each one pinned something the ticket changes."
+    )
+
+
+def _test_file_finding(
+    tf: _TestFile, hunks: tuple[DiffHunk, ...], ticket: _Ticket, unasked_flips: int,
+) -> Finding | None:
+    """The `weakened-test` finding for one test file, or None."""
+    deleted = _deleted_tests(tf)
+    # A lone flip with nothing deleted most often follows a behavior the
+    # ticket changed on purpose: on the lane corpus it was as common in
+    # good work as in damaging work, so it is left to the model.
+    if not deleted and unasked_flips < 2:
+        return None
+    unnamed = [d for d in deleted if not _mentioned(d.name, ticket.stems)]
+    high = (len(unnamed) >= DELETED_HIGH and not ticket.removal) or (
+        bool(_unasked(tf.flips, ticket)) and unasked_flips >= FLIPS_HIGH
+    )
+    anchor = _anchor(tf.hunks, hunks)
+    if anchor is None:
+        return None
+    return Finding(
+        file=anchor[0], line=anchor[1],
+        severity="high" if high else "medium",
+        rule_name=RULE_TEST,
+        message=(
+            f"In `{tf.path}`, this diff " + " and ".join(_change_parts(tf, deleted))
+            + ". " + _why(high=high, unnamed=bool(unnamed))
+            + " Restore the tests that pinned behavior the ticket did not "
+            "change, or name the change in the ticket."
+        ),
+        suggestion=None, effort="quick-win",
+    )
+
+
+def _removed_file_findings(
+    removed_files: list[str], hunks: tuple[DiffHunk, ...],
+) -> list[Finding]:
+    anchor = _anchor((), hunks)
+    if anchor is None:
+        return []
+    return [
+        Finding(
             file=anchor[0], line=anchor[1], severity="medium", rule_name=RULE_TEST,
             message=(
                 f"This diff deletes the test file `{path}`. Confirm its tests "
                 "moved elsewhere or pinned behavior the ticket removes."
             ),
             suggestion=None, effort="quick-win",
-        ))
-    return findings
+        )
+        for path in removed_files
+    ]
+
+
+def _test_findings(
+    files: list[_TestFile], removed_files: list[str], hunks: tuple[DiffHunk, ...],
+    ticket: str,
+) -> list[Finding]:
+    asked = _Ticket.of(ticket)
+    complete = [tf for tf in files if not tf.incomplete]
+    unasked_flips = sum(len(_unasked(tf.flips, asked)) for tf in complete)
+    findings = [
+        f for f in (_test_file_finding(tf, hunks, asked, unasked_flips) for tf in complete)
+        if f is not None
+    ]
+    return findings + _removed_file_findings(removed_files, hunks)
 
 
 def _identity(line: str) -> str:
@@ -427,33 +493,69 @@ def _identity(line: str) -> str:
     return text
 
 
+def _asks_layer_removal(ticket: str) -> bool:
+    return any(
+        _REMOVAL_RE.search(line) and _LAYER_RE.search(line)
+        for line in ticket.splitlines()
+    )
+
+
+def _ci_changes(
+    own: list[DiffHunk], budget: list[int],
+) -> tuple[list[str], set[str]] | None:
+    """(removed lines, identities of added lines) of one CI file, or None
+    past the line budget. Blank, comment and overlong lines are skipped."""
+    removed: list[str] = []
+    added: set[str] = set()
+    for hunk in own:
+        lines = hunk.body.splitlines()[1:]
+        budget[0] -= len(lines)
+        if budget[0] < 0:
+            return None
+        for raw in lines:
+            text = raw[1:].strip()
+            if len(raw) > _MAX_LINE or not text or text.startswith("#"):
+                continue
+            if raw.startswith("+"):
+                added.add(_identity(text))
+            elif raw.startswith("-"):
+                removed.append(text)
+    return removed, added
+
+
+def _layer_finding(
+    anchor: tuple[str, int], path: str, gone: list[str], *, asked: bool,
+) -> Finding:
+    return Finding(
+        file=anchor[0], line=anchor[1],
+        severity="medium" if asked else "high",
+        rule_name=RULE_LAYER,
+        message=(
+            f"This diff removes a verification layer from `{path}`: "
+            f"{_named_list(gone)} go and nothing in the diff "
+            "replaces them. A check that no longer runs passes everything. "
+            + ("The ticket asks for a removal; confirm it names this layer."
+               if asked else
+               "Neither the PR title nor the linked criteria ask to remove it; "
+               "restore the layer.")
+        ),
+        suggestion=None, effort="quick-win",
+    )
+
+
 def _layer_findings(
     by_file: dict[str, list[DiffHunk]], hunks: tuple[DiffHunk, ...], ticket: str,
     budget: list[int],
 ) -> list[Finding] | None:
-    asked = any(
-        _REMOVAL_RE.search(line) and _LAYER_RE.search(line)
-        for line in ticket.splitlines()
-    )
+    asked = _asks_layer_removal(ticket)
     findings: list[Finding] = []
     for path, own in by_file.items():
         if not _CI_PATH_RE.search(path):
             continue
-        removed: list[str] = []
-        added: set[str] = set()
-        for hunk in own:
-            lines = hunk.body.splitlines()[1:]
-            budget[0] -= len(lines)
-            if budget[0] < 0:
-                return None
-            for raw in lines:
-                text = raw[1:].strip()
-                if len(raw) > _MAX_LINE or not text or text.startswith("#"):
-                    continue
-                if raw.startswith("+"):
-                    added.add(_identity(text))
-                elif raw.startswith("-"):
-                    removed.append(text)
+        changed = _ci_changes(own, budget)
+        if changed is None:
+            return None
+        removed, added = changed
         lost = [t for t in removed if _identity(t) not in added]
         layer = [t for t in lost if _LAYER_RE.search(t)]
         if not layer:
@@ -462,21 +564,7 @@ def _layer_findings(
         anchor = _anchor(own, hunks)
         if anchor is None:
             continue
-        findings.append(Finding(
-            file=anchor[0], line=anchor[1],
-            severity="medium" if asked else "high",
-            rule_name=RULE_LAYER,
-            message=(
-                f"This diff removes a verification layer from `{path}`: "
-                f"{_named_list(layer + support)} go and nothing in the diff "
-                "replaces them. A check that no longer runs passes everything. "
-                + ("The ticket asks for a removal; confirm it names this layer."
-                   if asked else
-                   "Neither the PR title nor the linked criteria ask to remove it; "
-                   "restore the layer.")
-            ),
-            suggestion=None, effort="quick-win",
-        ))
+        findings.append(_layer_finding(anchor, path, layer + support, asked=asked))
     return findings
 
 

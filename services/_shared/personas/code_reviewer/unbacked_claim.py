@@ -123,46 +123,36 @@ def _anchor(hunks: tuple[DiffHunk, ...]) -> tuple[str, int] | None:
     return fallback
 
 
-def scan_unbacked_claims(
-    pr_body: str,
-    *,
-    criteria: tuple[LinkedCriterion, ...],
-    hunks: tuple[DiffHunk, ...],
-) -> tuple[Finding, ...]:
-    """One medium finding naming every unbacked live box the body ticks."""
-    body = pr_body or ""
-    if len(body) > MAX_BODY_CHARS:
-        return ()
-    if len(criteria) > MAX_CRITERIA:
-        return ()
+def _ticked_boxes(body: str, criteria: tuple[LinkedCriterion, ...]) -> list[str] | None:
+    """The ticked boxes in `body`; None when the check is not evaluated
+    (past a bound, or the body cites a run or pastes output)."""
+    if len(body) > MAX_BODY_CHARS or len(criteria) > MAX_CRITERIA:
+        return None
     if _RUN_LINK_RE.search(body) or _FENCE_RE.search(body):
-        return ()
+        return None
     ticked = [m.group(1).strip() for m in map(_TICKED_RE.match, body.splitlines()) if m]
     if len(ticked) > MAX_BOXES:
-        return ()
-    known = [(c, _words(c.text)) for c in criteria]
-    unbacked: list[str] = []
-    seen: set[str] = set()
-    for text in ticked:
-        match = _criterion_for(text, known)
-        criterion = match[0] if match else None
-        claim, evidence = _split(text, match)
-        if not _LIVE_CLAIM_RE.search(claim) or _TEST_RE.search(claim):
-            continue
-        if _backed(evidence) or (criterion is None and _backed(claim)):
-            continue
-        label = f"#{criterion.issue} criterion {criterion.number}: " if criterion else ""
-        named = f'{label}"{claim.strip()[:160]}"'
-        if named not in seen:
-            seen.add(named)
-            unbacked.append(named)
-    if not unbacked:
-        return ()
-    anchor = _anchor(hunks)
-    if anchor is None:
-        return ()
+        return None
+    return ticked
+
+
+def _unbacked_name(text: str, known: list[_Known]) -> str | None:
+    """How the finding names this box when it claims an unbacked live
+    check, else None."""
+    match = _criterion_for(text, known)
+    criterion = match[0] if match else None
+    claim, evidence = _split(text, match)
+    if not _LIVE_CLAIM_RE.search(claim) or _TEST_RE.search(claim):
+        return None
+    if _backed(evidence) or (criterion is None and _backed(claim)):
+        return None
+    label = f"#{criterion.issue} criterion {criterion.number}: " if criterion else ""
+    return f'{label}"{claim.strip()[:160]}"'
+
+
+def _unbacked_finding(anchor: tuple[str, int], unbacked: list[str]) -> Finding:
     noun = "box" if len(unbacked) == 1 else "boxes"
-    return (Finding(
+    return Finding(
         file=anchor[0],
         line=anchor[1],
         severity="medium",
@@ -176,4 +166,26 @@ def scan_unbacked_claims(
         ),
         suggestion=None,
         effort="quick-win",
-    ),)
+    )
+
+
+def scan_unbacked_claims(
+    pr_body: str,
+    *,
+    criteria: tuple[LinkedCriterion, ...],
+    hunks: tuple[DiffHunk, ...],
+) -> tuple[Finding, ...]:
+    """One medium finding naming every unbacked live box the body ticks."""
+    ticked = _ticked_boxes(pr_body or "", criteria)
+    if ticked is None:
+        return ()
+    known = [(c, _words(c.text)) for c in criteria]
+    names = (_unbacked_name(text, known) for text in ticked)
+    # dict.fromkeys keeps the first occurrence of each name, in order.
+    unbacked = list(dict.fromkeys(n for n in names if n is not None))
+    if not unbacked:
+        return ()
+    anchor = _anchor(hunks)
+    if anchor is None:
+        return ()
+    return (_unbacked_finding(anchor, unbacked),)

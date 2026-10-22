@@ -420,6 +420,104 @@ def is_stray_path(path: str) -> bool:
     )
 
 
+def _stray_findings(
+    new_files: frozenset[str], by_file: dict[str, list[DiffHunk]],
+) -> tuple[set[str], list[Finding]]:
+    """The new scratch files, and a finding for each one the diff anchors."""
+    stray = {p for p in new_files if is_stray_path(p)}
+    findings: list[Finding] = []
+    for path in sorted(stray):
+        anchor = _anchor(path, by_file.get(path, []))
+        if anchor is not None:
+            findings.append(_stray_finding(anchor))
+    return stray, findings
+
+
+def _dead_and_unread(
+    new_files: frozenset[str],
+    hunks: tuple[DiffHunk, ...],
+    pr_body: str,
+    by_file: dict[str, list[DiffHunk]],
+) -> tuple[set[str], set[str]] | None:
+    """New files nothing runs, and new scripts a page loads but nothing
+    reads; None past the scan bounds of `unreferenced_new_files`."""
+    strict = unreferenced_new_files(
+        new_files, hunks, pr_body, counts=_strict_reference,
+    )
+    if strict is None:
+        return None
+    loaded = unreferenced_new_files(
+        new_files, hunks, pr_body, counts=_loading_reference,
+    ) or frozenset()
+    dead = {
+        p for p in strict & loaded
+        if not is_review_excluded_path(p) and not _is_test_like(p)
+    }
+    unread = _unread_scripts(
+        {p for p in strict - loaded if p.endswith(_JS_SUFFIXES)}, by_file,
+    )
+    return dead, unread
+
+
+def _is_other_production_change(
+    change: FileChange, skip: set[str], by_file: dict[str, list[DiffHunk]],
+) -> bool:
+    """`change` is a production change outside `skip` that does more than
+    package a file."""
+    path = change.path
+    if not is_production_path(path) or is_review_excluded_path(path):
+        return False
+    if path in skip:
+        return False
+    return change.status == "removed" or not _packaging_only(path, by_file.get(path, []))
+
+
+def _dead_file_findings(
+    dead: set[str],
+    unread: set[str],
+    by_file: dict[str, list[DiffHunk]],
+    prior: tuple[Finding, ...],
+    *,
+    only: bool,
+) -> list[Finding]:
+    """A finding for each dead file and unread script no prior finding names."""
+    findings: list[Finding] = []
+    for path in sorted(dead):
+        anchor = _anchor(path, by_file.get(path, []))
+        if anchor is not None and not _already_named(path, prior):
+            findings.append(_dead_file_finding(anchor, only=only))
+    for path in sorted(unread):
+        anchor = _anchor(path, by_file.get(path, []))
+        if anchor is not None and not _already_named(path, prior):
+            findings.append(_unread_script_finding(anchor))
+    return findings
+
+
+def _is_live_new_module(path: str) -> bool:
+    """A new production Python file worth the class check."""
+    return (
+        path.endswith(".py") and is_production_path(path)
+        and not _is_test_like(path) and not is_review_excluded_path(path)
+    )
+
+
+def _class_findings(
+    live_new: list[str],
+    by_file: dict[str, list[DiffHunk]],
+    contents: dict[str, str],
+    prior: tuple[Finding, ...],
+) -> list[Finding]:
+    """A finding for each unconstructed new class whose body holds no
+    per-function `dead-code` finding."""
+    marked = {(f.file, f.line) for f in prior if f.rule_name == DEAD_RULE}
+    classes = _new_classes(live_new, contents)
+    return [
+        _unconstructed_finding(cls)
+        for cls in _unconstructed_classes(classes, by_file, contents)
+        if not any(f == cls.file and cls.line <= n <= cls.end for f, n in marked)
+    ]
+
+
 def scan_dead_on_arrival(
     changes: Iterable[FileChange],
     hunks: tuple[DiffHunk, ...],
@@ -444,52 +542,19 @@ def scan_dead_on_arrival(
     changes = tuple(changes)
     by_file = _by_file(hunks)
     new_files = frozenset(c.path for c in changes if c.status == "added")
-    findings: list[Finding] = []
-    stray = {p for p in new_files if is_stray_path(p)}
-    for path in sorted(stray):
-        anchor = _anchor(path, by_file.get(path, []))
-        if anchor is not None:
-            findings.append(_stray_finding(anchor))
-    strict = unreferenced_new_files(
-        new_files, hunks, pr_body or "", counts=_strict_reference,
-    )
-    if strict is None:
+    stray, findings = _stray_findings(new_files, by_file)
+    found = _dead_and_unread(new_files, hunks, pr_body or "", by_file)
+    if found is None:
         return tuple(findings)
-    loaded = unreferenced_new_files(
-        new_files, hunks, pr_body or "", counts=_loading_reference,
-    ) or frozenset()
-    dead = {
-        p for p in strict & loaded
-        if not is_review_excluded_path(p) and not _is_test_like(p)
-    }
-    unread = _unread_scripts(
-        {p for p in strict - loaded if p.endswith(_JS_SUFFIXES)}, by_file,
+    dead, unread = found
+    others = any(
+        _is_other_production_change(c, dead | stray, by_file) for c in changes
     )
-    others = {
-        c.path for c in changes
-        if is_production_path(c.path) and not is_review_excluded_path(c.path)
-        and c.path not in dead and c.path not in stray
-        and not (c.status != "removed" and _packaging_only(c.path, by_file.get(c.path, [])))
-    }
-    for path in sorted(dead):
-        anchor = _anchor(path, by_file.get(path, []))
-        if anchor is not None and not _already_named(path, prior):
-            findings.append(_dead_file_finding(anchor, only=lane and not others))
-    for path in sorted(unread):
-        anchor = _anchor(path, by_file.get(path, []))
-        if anchor is not None and not _already_named(path, prior):
-            findings.append(_unread_script_finding(anchor))
-    live_new = sorted(
-        p for p in new_files - dead
-        if p.endswith(".py") and is_production_path(p) and not _is_test_like(p)
-        and not is_review_excluded_path(p)
+    findings += _dead_file_findings(
+        dead, unread, by_file, prior, only=lane and not others,
     )
-    marked = {(f.file, f.line) for f in prior if f.rule_name == DEAD_RULE}
-    contents = file_contents or {}
-    classes = _new_classes(live_new, contents)
-    for cls in _unconstructed_classes(classes, by_file, contents):
-        if not any(f == cls.file and cls.line <= n <= cls.end for f, n in marked):
-            findings.append(_unconstructed_finding(cls))
+    live_new = sorted(p for p in new_files - dead if _is_live_new_module(p))
+    findings += _class_findings(live_new, by_file, file_contents or {}, prior)
     return tuple(findings)
 
 
