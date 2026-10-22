@@ -122,6 +122,7 @@ def lane_work_findings(
         hunks, file_contents, criteria=criteria,
         pr_title=pr_title, pr_body=pr_body,
         new_files=frozenset(c.path for c in changes if c.status == "added"),
+        removed_files=frozenset(c.path for c in changes if c.status == "removed"),
     ))
     findings.extend(scan_destructive_edits(
         changes, base_line_counts, criteria=criteria,

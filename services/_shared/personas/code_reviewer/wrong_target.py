@@ -6,7 +6,7 @@ instead. Its comments and its new test named the three workloads, so the
 diff read as on target, but no line that runs changed for any of them.
 Elder read the criteria and passed it.
 
-One high `intent-mismatch` finding when the in-scope criteria and the title
+One medium `intent-mismatch` finding when the in-scope criteria and the title
 name concrete targets, the diff changes none of them (in a changed path or
 a changed line of code), names at least one of them only in comments or
 tests, and changes other code. Naming a target in a comment or a test while
@@ -46,6 +46,10 @@ from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.test_paths import is_test_file
 
 RULE = "intent-mismatch"
+# Medium, not high: on a fresh sample of 100 good lane PRs the target match
+# still misread one good fix (a table and a function the C++ change used
+# under other spellings), so the finding asks the lane rather than blocks.
+SEVERITY = "medium"
 # Past either bound the check is not evaluated (no finding).
 MAX_SCAN_CHARS = 4_000_000
 MAX_TARGETS = 40
@@ -241,7 +245,7 @@ def scan_wrong_target(
     return (Finding(
         file=anchor[0],
         line=anchor[1],
-        severity="high",
+        severity=SEVERITY,
         rule_name=RULE,
         message=(
             f"The linked criteria ({refs}) name {listed}{more}, and this diff changes "

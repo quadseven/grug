@@ -64,7 +64,7 @@ _INERT_NAMES = frozenset({".gitignore", ".gitattributes", ".dockerignore", ".edi
 _LIVE_RE = re.compile(r"^\s*live\s*:", re.IGNORECASE)
 _TEST_CRITERION_RE = re.compile(
     r"\btest(?:s|ed|ing)?\b|\btest_\w+|\bassert(?:s|ion|ions)?\b|\bcoverage\b"
-    r"|\bpytest\b|\bflak(?:y|e|es|iness)\b",
+    r"|\bpytest\b|\bflak(?:y|e|es|iness)\b|\bCI\b|\b(?:full|test) suite\b",
     re.IGNORECASE,
 )
 _DOC_CRITERION_RE = re.compile(
@@ -658,17 +658,34 @@ def _diff_changes_runtime(
     )
 
 
+def _names_changed_doc(hunks: tuple[DiffHunk, ...], pr_title: str) -> bool:
+    """The title names a doc file this diff changes, by path or basename."""
+    title = (pr_title or "").lower()
+    return any(
+        _is_doc_path(h.file_path)
+        and (h.file_path.lower() in title or h.file_path.rsplit("/", 1)[-1].lower() in title)
+        for h in hunks
+    )
+
+
 def _unmet_criteria_finding(
     criteria: tuple[LinkedCriterion, ...], hunks: tuple[DiffHunk, ...],
     production: list[DiffHunk], parsed: dict[str, _ParsedFile],
     dead: list[_NewDef], inert: frozenset[str], new_files: frozenset[str],
-    pr_title: str,
+    pr_title: str, removed_files: frozenset[str] = frozenset(),
 ) -> Finding | None:
     """One high `intent-mismatch` for the criteria no hunk can meet, or None.
 
     First: nothing in the diff runs, so every runtime and `Live:` criterion
     is unmet. Else: every such criterion is a live-state check, and nothing
-    in the diff manages that state."""
+    in the diff manages that state.
+
+    Never when the diff deletes a production file (a deletion changes what
+    ships, and deleted files have no hunk to judge), or when the title
+    names a doc the diff changes (a doc ticket: its criteria describe the
+    doc, whatever words they use)."""
+    if any(is_production_path(p) for p in removed_files) or _names_changed_doc(hunks, pr_title):
+        return None
     anchor = _anchor(hunks, dead)
     state = [
         c for c in criteria
@@ -695,11 +712,13 @@ def scan_criteria_coverage(
     pr_title: str,
     pr_body: str,
     new_files: frozenset[str] = frozenset(),
+    removed_files: frozenset[str] = frozenset(),
 ) -> tuple[Finding, ...]:
     """Dead new functions, and runtime criteria no hunk can satisfy.
 
-    `new_files`: paths the diff adds (`diff_parser.file_changes`), so a new
-    script nothing names can count as inert. Empty keeps the #1179
+    `new_files` / `removed_files`: paths the diff adds or deletes
+    (`diff_parser.file_changes`), so a new script nothing names can count
+    as inert, and a deletion counts as a change. Empty keeps the #1179
     behavior."""
     production = [h for h in hunks if is_production_path(h.file_path)]
     parsed, other_text = _parse_production(production, file_contents)
@@ -716,5 +735,6 @@ def scan_criteria_coverage(
     inert = unreferenced_new_files(new_files, hunks, pr_body or "") or frozenset()
     unmet = _unmet_criteria_finding(
         criteria, hunks, production, parsed, dead, inert, new_files, pr_title,
+        removed_files,
     )
     return tuple(findings + ([unmet] if unmet else []))

@@ -316,3 +316,31 @@ def test_reference_scan_past_its_bounds_is_not_evaluated_and_calls_nothing_inert
     # Not evaluated never becomes a finding: no file counts as inert.
     boxes = ((83, 1, "open", "The nightly sync retries a failed upload three times"),)
     assert _findings(many, boxes=boxes, base={}) == ()
+
+
+# --- a fresh held-out sample of good lane PRs (2026-10-22) ------------------------
+
+
+def _scratch_removal_diff() -> str:
+    gone = (
+        "diff --git a/test_sandbox.tmp b/test_sandbox.tmp\ndeleted file mode 100644\n"
+        "index 1111111..0000000\n--- a/test_sandbox.tmp\n+++ /dev/null\n@@ -1 +0,0 @@\n-scratch\n"
+    )
+    ignore = _replaced_file(".gitignore", ["build/"], ["build/", "*.tmp"], keep=1)
+    return gone + ignore
+
+
+def test_a_deleted_file_counts_as_a_change_for_live_criteria():
+    # The lane removed a scratch file and ignored its kind: the Live check
+    # on what the repository tracks is met by the deletion itself.
+    boxes = ((24, 1, "open", "Live: after merge, `git ls-files '*.tmp'` on main prints nothing"),)
+    assert _findings(_scratch_removal_diff(), boxes=boxes, base={}) == ()
+
+
+def test_a_doc_ticket_named_in_the_title_is_not_held_to_runtime():
+    boxes = ((26, 1, "open", "Every principle names the module that implements it"),)
+    diff = _replaced_file("docs/SDLC.md", ["# SDLC", "old"], ["# SDLC", "new"], keep=1)
+    title = "docs/SDLC.md is kept honest, and its marks are current"
+    assert _findings(diff, boxes=boxes, title=title, base={}) == ()
+    # The same criterion against an unnamed doc is still unmet.
+    assert _rules(_findings(diff, boxes=boxes, title="Keep principles honest", base={})) == ["intent-mismatch"]

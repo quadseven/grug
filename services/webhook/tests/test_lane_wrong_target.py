@@ -82,11 +82,11 @@ def _scan(diff: str, texts: list[str], title: str = _TITLE):
 # --- the recorded pull request ------------------------------------------------
 
 
-def test_recorded_lane_pr_gets_a_high_intent_mismatch_naming_the_missed_targets():
+def test_recorded_lane_pr_gets_a_medium_intent_mismatch_naming_the_missed_targets():
     found = [f for f in _findings(_recorded_diff()) if f.rule_name == "intent-mismatch"]
     assert len(found) == 1, found
     finding = found[0]
-    assert finding.severity == "high"
+    assert finding.severity == "medium"
     assert finding.file == "manifests/arc-runners/values.yaml"
     assert finding.line in {h for h in parse_diff(_recorded_diff())[0].new_lines}
     for name in ("shop-api", "shop-webhook", "shop-worker"):
