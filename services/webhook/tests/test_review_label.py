@@ -276,3 +276,25 @@ def test_sweep_finds_the_labeled_prs_of_every_repo(monkeypatch):
     assert removed == 1
     assert seen and seen[0].get("labels") == "grug:reviewing"
     assert seen[0].get("state") == "all"
+
+
+def test_the_sweep_stops_at_its_cap(monkeypatch):
+    """One pass is bounded: a repo with hundreds of stale labels must not
+    turn one sweep into an unbounded crawl. What the cap leaves behind is
+    swept by the next pass."""
+    fake = _FakeHttp()
+    monkeypatch.setattr(review_label, "httpx", fake)
+    monkeypatch.setattr(
+        review_label, "list_check_runs_for_ref",
+        lambda *a, **k: _runs("completed", "success"),
+    )
+    monkeypatch.setattr(
+        review_label.httpx, "get",
+        lambda url, **kw: _Resp(200, {"head": {"sha": "b" * 40}}),
+    )
+    removed = review_label.sweep_repo_labels(
+        token="tok", owner="myorg", repo="myrepo", pr_numbers=[7, 8, 9],
+        max_removals=1,
+    )
+    assert removed == 1
+    assert len([c for c in fake.calls if c[0] == "delete"]) == 1

@@ -289,11 +289,18 @@ def _pr_head_sha(token: str, owner: str, repo: str, pr_number: int) -> str:
 
 def sweep_repo_labels(
     *, token: str, owner: str, repo: str, pr_numbers: list[int],
+    max_removals: int = 50,
 ) -> int:
     """Remove the label from every one of these PRs whose head has no
-    in-progress Elder check. Returns how many labels were removed."""
+    in-progress Elder check. Returns how many labels were removed.
+
+    `max_removals` bounds the work of one pass: a repo with hundreds of
+    stale labels would otherwise turn one sweep into an unbounded crawl.
+    What the cap leaves behind is swept by the next pass."""
     removed = 0
     for pr_number in pr_numbers:
+        if removed >= max_removals:
+            break
         try:
             head_sha = _pr_head_sha(token, owner, repo, pr_number)
             state = elder_check_state(
@@ -328,7 +335,7 @@ def sweep_repo_labels(
     return removed
 
 
-def sweep_stale_labels(*, install_id: int) -> int:
+def sweep_stale_labels(*, install_id: int, max_removals: int = 50) -> int:
     """Remove every `grug:reviewing` label whose head has no in-progress
     Elder check.
 
@@ -340,13 +347,16 @@ def sweep_stale_labels(*, install_id: int) -> int:
 
     The installation's repos are the ground truth for "repos grug acts on"
     (`list_installation_repos`), scanned one call per repo - the same
-    per-repo shape the enforcement pass already uses. Best-effort per repo
-    and per PR; never raises."""
+    per-repo shape the enforcement pass already uses. `max_removals` bounds
+    the removals of one pass (the rest wait for the next one).
+    Best-effort per repo and per PR; never raises."""
     from github_rulesets_client import list_installation_repos
 
     def _do(token: str) -> int:
         removed = 0
         for repo in list_installation_repos(token):
+            if removed >= max_removals:
+                break
             full = str(repo.get("full_name") or "")
             owner, _, name = full.partition("/")
             if not owner or not name:
@@ -354,6 +364,7 @@ def sweep_stale_labels(*, install_id: int) -> int:
             removed += sweep_repo_labels(
                 token=token, owner=owner, repo=name,
                 pr_numbers=_labeled_prs_for_repo(token, owner, name),
+                max_removals=max_removals - removed,
             )
         return removed
 

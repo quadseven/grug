@@ -1235,10 +1235,50 @@ def test_label_sweep_clears_stale_labels_for_every_installation(monkeypatch):
     )
     monkeypatch.setattr(
         review_label, "sweep_stale_labels",
-        lambda *, install_id: swept.append(install_id) or 1,
+        lambda *, install_id, max_removals: swept.append(install_id) or 1,
     )
     assert consumer._label_sweep_once() == 2
     assert swept == [11, 12]
+
+
+def test_the_label_sweep_bounds_the_removals_of_one_installation(monkeypatch):
+    """A busy installation must not be able to make one pass grow without
+    limit: the removals per installation are capped."""
+    import review_label
+
+    caps: list[int] = []
+    monkeypatch.setattr(
+        "adapters.install_store.list_allowlisted_installs", lambda: [11],
+    )
+
+    def _sweep(*, install_id, max_removals):
+        caps.append(max_removals)
+        return 0
+
+    monkeypatch.setattr(review_label, "sweep_stale_labels", _sweep)
+    consumer._label_sweep_once()
+    assert caps == [consumer._LABEL_SWEEP_MAX_REMOVALS_PER_INSTALL]
+
+
+def test_the_label_sweep_reaches_every_installation_over_successive_passes(
+    monkeypatch,
+):
+    """The pass is capped, so the installations are walked from a rotating
+    cursor: no installation may be starved by the cap."""
+    import review_label
+
+    swept: list[int] = []
+    installs = list(range(100, 100 + consumer._LABEL_SWEEP_MAX_INSTALLS + 3))
+    monkeypatch.setattr(
+        "adapters.install_store.list_allowlisted_installs", lambda: list(installs),
+    )
+    monkeypatch.setattr(
+        review_label, "sweep_stale_labels",
+        lambda *, install_id, max_removals: swept.append(install_id) or 0,
+    )
+    consumer._label_sweep_once()
+    consumer._label_sweep_once()
+    assert sorted(set(swept)) == sorted(installs)
 
 
 def test_label_sweep_survives_an_unreadable_install_list(monkeypatch):

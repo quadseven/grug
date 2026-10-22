@@ -50,13 +50,19 @@ def _escape_html(s: str) -> str:
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _reply(token_fn, owner: str, repo: str, pr_number: int, body: str) -> None:
-    """Post one reply. Best-effort: the command's effect (the enqueue)
-    already happened, so a failed reply must not raise out of the command."""
+def _reply(token_fn, owner: str, repo: str, pr_number: int, body: str) -> bool:
+    """Post one reply. True when the answer landed.
+
+    Best-effort: the command's effect (the enqueue) already happened, so a
+    reply GitHub refuses must not raise out of the command. The caller is
+    told whether the answer landed, though - a command that was heard and
+    never answered must stay answerable (grug#1270)."""
     try:
         token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
-    except Exception as e:  # noqa: BLE001 - the ack reply is cosmetic
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.warning("interactive_reply_failed", extra={"kind": type(e).__name__})
+        return False
+    return True
 
 
 def _elder_review_state(*, token_fn, owner: str, repo: str, head_sha: str) -> str:
@@ -73,7 +79,10 @@ def _elder_review_state(*, token_fn, owner: str, repo: str, head_sha: str) -> st
     review of a commit Elder is already on), and it must not be reported as
     "Elder is reviewing" either (it may not be)."""
     if not head_sha:
-        return "idle"
+        # An empty head is not a review that finished: it is a head nobody
+        # knows. "idle" would read it as "Elder is not reviewing" and let a
+        # second review queue on nothing (grug#1270).
+        return "unknown"
     from review_label import elder_check_state  # type: ignore
 
     try:
@@ -82,35 +91,51 @@ def _elder_review_state(*, token_fn, owner: str, repo: str, head_sha: str) -> st
                 token=tok, owner=owner, repo=repo, head_sha=head_sha,
             )
         )
-    except Exception as e:  # noqa: BLE001 - an unreadable state is not "idle"
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.warning(
             "interactive_elder_state_failed",
             extra={"kind": type(e).__name__, "head_sha": head_sha[:8]},
         )
         return "unknown"
-    return "running" if state == "running" else "idle"
+    if state == "running":
+        return "running"
+    if state == "unknown":
+        # `elder_check_state` answers "unknown" when GitHub could not be
+        # read. That is NOT "idle": queueing a second review of a commit
+        # Elder may already be on is the overlap this ticket exists to stop.
+        return "unknown"
+    return "idle"
 
 
-def _mark_reviewing(*, token_fn, owner: str, repo: str, pr_number: int) -> None:
+def _mark_reviewing(*, token_fn, owner: str, repo: str, pr_number: int) -> bool:
     """Add the `grug:reviewing` label - the visible sign that Elder is
     re-reviewing this PR.
 
     Best-effort by design: the CHECK RUN is the truth and the label is only
-    the sign, so a failed label write must never fail the command (the
-    consumer's sweep clears the label when no review is running)."""
+    the sign, so a write GitHub refuses must never fail the command (the
+    consumer's sweep clears the label when no review is running). True when
+    the PR carries the label afterwards - a refused write is logged as an
+    error, because a missing sign and a raised sign must not look alike."""
     from review_label import add_reviewing_label  # type: ignore
 
     try:
-        token_fn(
+        attached = bool(token_fn(
             lambda tok: add_reviewing_label(
                 token=tok, owner=owner, repo=repo, pr_number=pr_number,
             )
-        )
-    except Exception as e:  # noqa: BLE001 - a missing sign is not a failure
+        ))
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.warning(
             "interactive_reviewing_label_failed",
             extra={"kind": type(e).__name__, "pr": pr_number},
         )
+        return False
+    if not attached:
+        log.error(
+            "interactive_reviewing_label_refused",
+            extra={"pr": pr_number, "repo": f"{owner}/{repo}"},
+        )
+    return attached
 
 
 def _defer_elder_review(
@@ -123,8 +148,17 @@ def _defer_elder_review(
     cannot run yet. The job goes back on the queue with a `not_before` at
     the budget's reset, and the reply says so: a command dropped with no
     reply looks exactly like a command that worked and did nothing, which
-    is how the 2026-10-18 burst lost a dozen re-runs (grug#1270)."""
+    is how the 2026-10-18 burst lost a dozen re-runs (grug#1270).
+
+    The CLAIM is taken BEFORE the job is queued. A deferred job that sits
+    on the queue is a review that WILL run later, so a redelivered comment
+    must not queue the same command a second time - two Elder reviews of
+    one head is the overlap this ticket exists to stop. A command that
+    cannot even be queued is ANSWERED (the reader is told to comment
+    again), so it is never dropped without a trace."""
     repo_full = f"{owner}/{repo}"
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
     try:
         enqueue(
             install_id=install_id, repo=repo_full, pr_number=pr_number,
@@ -134,10 +168,14 @@ def _defer_elder_review(
         log.error(
             "interactive_defer_enqueue_failed",
             extra={"verb": verb, "kind": type(e).__name__},
+            exc_info=True,
+        )
+        _reply(
+            token_fn, owner, repo, pr_number,
+            "Grug could not queue the deferred review. Comment "
+            "`/grug improve` again.",
         )
         return {"status": "skip", "reason": "defer_enqueue_failed", "verb": verb}
-    if not claim(f"grugcmd:{comment_id}"):
-        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
     log.warning(
         "interactive_elder_rerun_deferred",
         extra={
@@ -165,9 +203,12 @@ def _already_reviewing(
     that the command was heard and deliberately not queued - a silent
     no-op is what made people fire the command again (grug#1270). An
     unreadable check-run listing says exactly that, instead of claiming a
-    review that may not be running."""
-    if not claim(f"grugcmd:{comment_id}"):
-        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
+    review that may not be running.
+
+    The answer is posted BEFORE the claim is taken. A claim taken first
+    turns a failed reply into a command that was heard and never answered,
+    which is the silent drop this ticket exists to stop: the command stays
+    answerable until the answer has actually landed."""
     log.info(
         "interactive_elder_rerun_skipped_already_running",
         extra={
@@ -187,7 +228,12 @@ def _already_reviewing(
             "again."
         )
     )
-    _reply(token_fn, owner, repo, pr_number, body)
+    if not _reply(token_fn, owner, repo, pr_number, body):
+        # The answer did not land: leave the command unclaimed so a
+        # redelivery can answer it.
+        return {"status": "skip", "reason": "reply_failed", "verb": verb}
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
     return {"status": "no_op", "reason": "already_reviewing", "verb": verb}
 
 
@@ -257,11 +303,14 @@ def _wake_elder(
     except Exception as e:  # noqa: BLE001 - enqueue best-effort; NOT claimed on failure
         log.warning("interactive_enqueue_failed", extra={"verb": verb, "kind": type(e).__name__})
         return {"status": "skip", "reason": "enqueue_failed", "verb": verb}
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
+    # The sign goes up only on the path that owns the command: a comment
+    # that was already handled must not leave a `grug:reviewing` label
+    # behind for a review this delivery did not start (grug#1270).
     _mark_reviewing(
         token_fn=token_fn, owner=owner, repo=repo, pr_number=pr_number,
     )
-    if not claim(f"grugcmd:{comment_id}"):
-        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
     paused, note = _pause_after_wake(verb, coords, resume, is_paused)
     try:
         token_fn(lambda t: _post_reply(t, owner, repo, pr_number, f"{note} So speaks Grug."))
@@ -307,12 +356,16 @@ def _run_persona_rerun(
     except Exception as e:  # noqa: BLE001 - enqueue best-effort; NOT claimed on failure
         log.warning("interactive_enqueue_failed", extra={"verb": verb, "kind": type(e).__name__})
         return {"status": "skip", "reason": "enqueue_failed", "verb": verb}
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
     if verb == "improve":
+        # The sign goes up only on the path that owns the command: a
+        # comment that was already handled must not leave a
+        # `grug:reviewing` label behind for a review this delivery did
+        # not start (grug#1270).
         _mark_reviewing(
             token_fn=token_fn, owner=owner, repo=repo, pr_number=pr_number,
         )
-    if not claim(f"grugcmd:{comment_id}"):
-        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
     note = ("Elder is re-reviewing this PR." if verb == "improve"
             else "Smasher is checking for test gaps.")
     try:
@@ -333,6 +386,12 @@ def run_command(
     LLM call (#528 LORE). `enqueue`/`enqueue_ask`/`claim`/`resume`/
     `is_paused` are injectable for tests. Claim happens AFTER a successful
     enqueue, so a claim-then-crash can't silently swallow the command.
+
+    The DEFERRED path is the one exception: there the enqueue is a KEEP (a
+    job that will run later, not the work itself), so the claim comes
+    first - a redelivered comment must not queue the same command twice.
+    A command that cannot even be queued is answered instead, so it is
+    never dropped without a trace (grug#1270).
 
     `head_sha` is the PR's current head - the ground truth for "is Elder
     already reviewing this?". `defer_until` is the epoch second the

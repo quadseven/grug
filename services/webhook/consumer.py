@@ -609,10 +609,43 @@ def _telemetry_loop() -> None:
 
 _LABEL_SWEEP_INTERVAL_S = 600.0
 
+# The sweep's work is bounded on purpose. A busy installation (many repos,
+# many labeled PRs) must not be able to make one pass grow without limit:
+# the sweep would then take longer than the interval between two sweeps and
+# the backstop would stop being one. The bounds are generous - they are a
+# runaway backstop, not a real ceiling - and the installations are walked
+# from a rotating cursor, so a capped pass still reaches every one of them.
+_LABEL_SWEEP_MAX_INSTALLS = 25
+_LABEL_SWEEP_MAX_REMOVALS_PER_INSTALL = 50
+
+# Where the next sweep starts. Module state on purpose: the sweep is the
+# only writer, and it runs in one thread.
+_label_sweep_cursor = 0
+
+
+def _sweep_window(installs: list[int]) -> list[int]:
+    """The installations this pass visits.
+
+    The list is walked from the rotating cursor, so a pass that is capped
+    by `_LABEL_SWEEP_MAX_INSTALLS` still reaches every installation over
+    successive passes - no installation is starved by the cap."""
+    global _label_sweep_cursor
+    if not installs:
+        return []
+    start = _label_sweep_cursor % len(installs)
+    _label_sweep_cursor = (start + _LABEL_SWEEP_MAX_INSTALLS) % len(installs)
+    rotated = installs[start:] + installs[:start]
+    return rotated[:_LABEL_SWEEP_MAX_INSTALLS]
+
 
 def _label_sweep_once() -> int:
-    """One sweep over every allowlisted installation. Returns the number of
-    stale labels removed."""
+    """One sweep over the allowlisted installations. Returns the number of
+    stale labels removed.
+
+    Bounded on purpose: at most `_LABEL_SWEEP_MAX_INSTALLS` installations
+    are visited per pass and at most `_LABEL_SWEEP_MAX_REMOVALS_PER_INSTALL`
+    labels are removed per installation. What a cap leaves behind is swept
+    by the next pass (grug#1270)."""
     from adapters.install_store import list_allowlisted_installs
     from review_label import sweep_stale_labels
 
@@ -625,8 +658,11 @@ def _label_sweep_once() -> int:
         )
         return 0
     removed = 0
-    for install_id in installs:
-        removed += sweep_stale_labels(install_id=install_id)
+    for install_id in _sweep_window(list(installs)):
+        removed += sweep_stale_labels(
+            install_id=install_id,
+            max_removals=_LABEL_SWEEP_MAX_REMOVALS_PER_INSTALL,
+        )
     return removed
 
 

@@ -1234,11 +1234,16 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
 
 def _mark_reviewing_label(
     *, install_id: int, owner: str, repo_name: str, pr_number: int,
-) -> None:
+) -> bool:
     """Put the `grug:reviewing` label on the PR while Elder re-reviews it.
 
-    Best-effort and never raises: the label is the visible sign, the Elder
-    CHECK RUN is the truth (grug#1270)."""
+    True when the PR carries the label afterwards.
+
+    The label is the visible sign, the Elder CHECK RUN is the truth
+    (grug#1270), so a failed write must not fail the review - but it must
+    not look like a sign that is up either: a refused write is logged as an
+    ERROR and reported as False, so the reader of the log can tell a
+    missing sign from a raised one."""
     from review_label import add_reviewing_label
 
     def _do(token: str) -> bool:
@@ -1247,55 +1252,56 @@ def _mark_reviewing_label(
         )
 
     try:
-        with_install_token_retry(install_id, _do)
-    except Exception as error:  # noqa: BLE001 - a missing sign is not a failure
-        log.warning(
+        attached = bool(with_install_token_retry(install_id, _do))
+    except httpx.HTTPError as error:
+        log.error(
             "reviewing_label_mark_failed",
             extra={
                 "repo": f"{owner}/{repo_name}",
                 "pr": pr_number,
                 "kind": type(error).__name__,
             },
+            exc_info=True,
         )
+        return False
+    if not attached:
+        log.error(
+            "reviewing_label_mark_refused",
+            extra={"repo": f"{owner}/{repo_name}", "pr": pr_number},
+        )
+    return attached
 
 
 def _clear_reviewing_label(
     *, install_id: int, owner: str, repo_name: str, pr_number: int, head_sha: str,
-) -> None:
+) -> bool:
     """Take the `grug:reviewing` label off the PR now that Elder concluded.
 
     The CHECK RUN is the source of truth: the label goes only when the Elder
     check on this head reached a terminal conclusion - success, failure and a
     degraded neutral all end the review. A check that is still running, or a
     GitHub that cannot be read, keeps the label; the consumer's sweep clears
-    it later if the review really is over (grug#1270)."""
+    it later if the review really is over (grug#1270).
+
+    True when the PR does not carry the label afterwards. A refused removal
+    is logged as an ERROR: a sign that stays up on a head Elder already
+    finished would tell every later reader that Elder is busy."""
     from review_label import elder_check_conclusion, remove_reviewing_label
 
-    def _do(token: str) -> bool:
-        conclusion = elder_check_conclusion(
+    def _conclusion(token: str) -> str:
+        return elder_check_conclusion(
             token=token, owner=owner, repo=repo_name, head_sha=head_sha,
         )
-        if not conclusion:
-            return False
-        removed = remove_reviewing_label(
+
+    def _remove(token: str) -> bool:
+        return remove_reviewing_label(
             token=token, owner=owner, repo=repo_name, pr_number=pr_number,
         )
-        log.info(
-            "reviewing_label_cleared",
-            extra={
-                "repo": f"{owner}/{repo_name}",
-                "pr": pr_number,
-                "head_sha": head_sha[:8],
-                "conclusion": conclusion,
-                "removed": removed,
-            },
-        )
-        return removed
 
     try:
-        with_install_token_retry(install_id, _do)
-    except Exception as error:  # noqa: BLE001 - a missing sign is not a failure
-        log.warning(
+        conclusion = str(with_install_token_retry(install_id, _conclusion) or "")
+    except httpx.HTTPError as error:
+        log.error(
             "reviewing_label_clear_failed",
             extra={
                 "repo": f"{owner}/{repo_name}",
@@ -1303,7 +1309,48 @@ def _clear_reviewing_label(
                 "head_sha": head_sha[:8],
                 "kind": type(error).__name__,
             },
+            exc_info=True,
         )
+        return False
+    if not conclusion:
+        # The check has not concluded (or could not be read): the sign
+        # stays, and the sweep clears it if the review really is over.
+        return False
+    try:
+        removed = bool(with_install_token_retry(install_id, _remove))
+    except httpx.HTTPError as error:
+        log.error(
+            "reviewing_label_clear_failed",
+            extra={
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "kind": type(error).__name__,
+            },
+            exc_info=True,
+        )
+        return False
+    log.info(
+        "reviewing_label_cleared",
+        extra={
+            "repo": f"{owner}/{repo_name}",
+            "pr": pr_number,
+            "head_sha": head_sha[:8],
+            "conclusion": conclusion,
+            "removed": removed,
+        },
+    )
+    if not removed:
+        log.error(
+            "reviewing_label_clear_refused",
+            extra={
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "conclusion": conclusion,
+            },
+        )
+    return removed
 
 
 def _deferred_rerun_status(
@@ -1366,21 +1413,28 @@ def _dispatch_elder_rerun(
     The `grug:reviewing` label goes on as the re-run STARTS, not only when
     it was queued: a command held back by the GitHub budget carries no sign
     until it finally runs, and the sign must be there while Elder works
-    (grug#1270)."""
+    (grug#1270).
+
+    The label comes off in a `finally`: a review that RAISED is a review
+    that is over, and a `grug:reviewing` label left on it would tell every
+    later reader - and the command path - that Elder is still busy."""
     head_sha = str((pr.get("head") or {}).get("sha") or "")
     _mark_reviewing_label(
         install_id=install_id, owner=owner, repo_name=repo_name,
         pr_number=pr_number,
     )
-    dispatch_code_review(
-        payload, blocking=bool(cfg.get("code_reviewer_blocking", False)),
-    )
-    # Elder concluded: the sign goes with it. The CHECK RUN is the source
-    # of truth - success, failure and a degraded neutral all end the review.
-    _clear_reviewing_label(
-        install_id=install_id, owner=owner, repo_name=repo_name,
-        pr_number=pr_number, head_sha=head_sha,
-    )
+    try:
+        dispatch_code_review(
+            payload, blocking=bool(cfg.get("code_reviewer_blocking", False)),
+        )
+    finally:
+        # Elder concluded: the sign goes with it. The CHECK RUN is the source
+        # of truth - success, failure and a degraded neutral all end the
+        # review.
+        _clear_reviewing_label(
+            install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number, head_sha=head_sha,
+        )
 
 
 def _fetch_current_pr(

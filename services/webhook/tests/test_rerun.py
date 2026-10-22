@@ -2678,3 +2678,75 @@ def test_a_plain_rerun_keeps_its_content_dedup_id(monkeypatch):
     )
     assert sent["MessageDeduplicationId"] == "11:myorg/myrepo:7:elder"
     assert "not_before" not in json.loads(sent["MessageBody"])
+
+
+def test_the_reviewing_label_is_cleared_even_when_the_review_raises(
+    monkeypatch, _mock_review_label_http,
+):
+    """A review that RAISED is a review that is over: the `grug:reviewing`
+    sign must not stay up on a dead review, or every later reader would
+    think Elder is busy (grug#1270)."""
+    import review_label as rl
+
+    monkeypatch.setattr(
+        rl, "list_check_runs_for_ref",
+        lambda *a, **k: [
+            {"name": "Grug - Elder", "status": "completed", "conclusion": "failure"}
+        ],
+    )
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch("httpx.get", return_value=_pr_response()), \
+         patch.object(rerun, "get_repo_config", return_value={}), \
+         patch.object(rerun, "dispatch_code_review", side_effect=RuntimeError("review died")):
+        with pytest.raises(RuntimeError):
+            rerun.handle_rerun_jobs(_event(_job()))
+    deletes = [c for c in rl.httpx.calls if c[0] == "delete"]
+    assert deletes, "the sign must go even when the review raised"
+
+
+def test_a_refused_label_write_is_reported_not_swallowed(monkeypatch, caplog):
+    """A failed label write must not look like a sign that is up: the
+    helper says so, and the log says so (grug#1270)."""
+    import review_label as rl
+
+    monkeypatch.setattr(rl, "add_reviewing_label", lambda **k: False)
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         caplog.at_level("ERROR"):
+        attached = rerun._mark_reviewing_label(
+            install_id=11, owner="myorg", repo_name="myrepo", pr_number=7,
+        )
+    assert attached is False
+    assert "reviewing_label_mark_refused" in caplog.text
+
+
+def test_a_failed_label_clear_is_reported_not_swallowed(monkeypatch, caplog):
+    """A sign that stays up on a head Elder already finished would tell
+    every later reader that Elder is busy - the refusal must be visible."""
+    import review_label as rl
+
+    monkeypatch.setattr(rl, "elder_check_conclusion", lambda **k: "success")
+    monkeypatch.setattr(rl, "remove_reviewing_label", lambda **k: False)
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         caplog.at_level("ERROR"):
+        cleared = rerun._clear_reviewing_label(
+            install_id=11, owner="myorg", repo_name="myrepo", pr_number=7,
+            head_sha="abc123",
+        )
+    assert cleared is False
+    assert "reviewing_label_clear_refused" in caplog.text
+
+
+def test_the_sign_stays_when_the_check_has_not_concluded(monkeypatch, caplog):
+    """A check that is still running keeps the sign, and nothing is
+    reported as a failure: the review is not over."""
+    import review_label as rl
+
+    monkeypatch.setattr(rl, "elder_check_conclusion", lambda **k: "")
+    with patch.object(rerun, "with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         caplog.at_level("ERROR"):
+        cleared = rerun._clear_reviewing_label(
+            install_id=11, owner="myorg", repo_name="myrepo", pr_number=7,
+            head_sha="abc123",
+        )
+    assert cleared is False
+    assert "reviewing_label_clear_refused" not in caplog.text
