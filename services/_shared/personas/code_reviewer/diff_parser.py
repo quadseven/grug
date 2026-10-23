@@ -538,3 +538,71 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
         i += 1
 
     return tuple(hunks)
+
+
+@dataclass(frozen=True, slots=True)
+class FileChange:
+    """One file's place in a diff: its status and how many lines moved.
+
+    `status` is "added", "removed", "renamed" or "modified". `similarity`
+    is git's rename similarity (0-100), None when the diff gives none.
+    `added`/`removed` count content lines, not headers."""
+
+    path: str
+    status: str
+    previous_path: str | None
+    similarity: int | None
+    added: int
+    removed: int
+
+
+_SIMILARITY_RE = re.compile(r"^similarity index (\d+)%$")
+
+
+def _first(lines: list[str], prefix: str) -> str | None:
+    """The rest of the first line starting with `prefix`, or None."""
+    return next((ln[len(prefix):] for ln in lines if ln.startswith(prefix)), None)
+
+
+def _block_header(
+    lines: list[str], old: str, new: str,
+) -> tuple[str, str | None, int | None, str, int]:
+    """(status, previous path, similarity, new path, index of the first
+    hunk line) from one file block's extended header."""
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("@@")), len(lines))
+    header = lines[:start]
+    previous = _first(header, "rename from ")
+    status = (
+        "added" if _first(header, "new file mode") is not None
+        else "removed" if _first(header, "deleted file mode") is not None
+        else "renamed" if previous is not None
+        else "modified"
+    )
+    sim = next((m for m in map(_SIMILARITY_RE.match, header) if m), None)
+    target = _NEW_FILE_RE.match("+++ " + (_first(header, "+++ ") or "/dev/null"))
+    if target and target.group(1) != "/dev/null":
+        new = target.group(1)
+    return status, previous, int(sim.group(1)) if sim else None, new, start
+
+
+def file_changes(unified_diff: str) -> tuple[FileChange, ...]:
+    """Per-file status and line counts, in diff order.
+
+    Unlike `parse_diff`, deleted files and pure renames are kept: a check
+    that asks what a diff removed has to see them. Pure; a block without a
+    `diff --git` header is skipped, never raised on, since `parse_diff`
+    already refuses malformed input on the same text."""
+    out: list[FileChange] = []
+    for block in re.split(r"(?m)^(?=diff --git )", unified_diff or ""):
+        lines = block.splitlines()
+        m = _DIFF_GIT_RE.match(lines[0]) if lines else None
+        if not m:
+            continue
+        old = m.group(1)
+        status, previous, similarity, new, start = _block_header(lines[1:], old, m.group(2))
+        body = lines[1 + start:]
+        added = sum(1 for line in body if line.startswith("+"))
+        removed = sum(1 for line in body if line.startswith("-"))
+        path = old if status == "removed" else new
+        out.append(FileChange(path, status, previous, similarity, added, removed))
+    return tuple(out)

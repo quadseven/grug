@@ -15,6 +15,7 @@ from few_shot import (
     exemplars_to_dicts,
 )
 from ledger import LedgerRow, accepted_findings_by_class
+from review_evidence import assemble_evidence
 
 
 def _row(
@@ -127,11 +128,8 @@ def test_examples_append_after_practices_in_system_prompt():
 
     hunks = [Hunk(path="x.py", body="@@ -1 +1 @@\n+a = 1\n")]
     messages = _build_messages(
-        hunks,
+        assemble_evidence(hunks),
         "v1",
-        None,
-        None,
-        None,
         team_practices="TEAM-LEARNED PRACTICES:\n- [c x1] rule (e.g. #1)",
         few_shot_examples="EXAMPLES OF ACCEPTED FINDINGS:\n- [c/HIGH] f (PR #1)",
     )
@@ -148,10 +146,8 @@ def test_empty_examples_leave_prompt_byte_identical():
     from llm_client import Hunk, _build_messages
 
     hunks = [Hunk(path="x.py", body="@@ -1 +1 @@\n+a = 1\n")]
-    base = _build_messages(hunks, "v1", None, None, None)
-    with_empty = _build_messages(
-        hunks, "v1", None, None, None, few_shot_examples=""
-    )
+    base = _build_messages(assemble_evidence(hunks), "v1")
+    with_empty = _build_messages(assemble_evidence(hunks), "v1", few_shot_examples="")
     assert base[0]["content"] == with_empty[0]["content"]
 
 

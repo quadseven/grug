@@ -22,6 +22,7 @@ from llm_client import Backend, Hunk, LlmReviewResponse, review_diff
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer.persona import CodeReviewEvaluation, evaluate_diff
 from review_pipeline import ReviewCoverage
+from review_evidence import assemble_evidence
 
 
 @pytest.fixture(autouse=True)
@@ -82,7 +83,7 @@ def test_a_failed_two_file_diff_is_reviewed_one_file_at_a_time() -> None:
         return _completion(json.dumps({"findings": [_finding("src/b.py", "b-bug")]}))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff(hunks, installation_id=2)
+        out = review_diff(assemble_evidence(hunks), installation_id=2)
 
     assert out.kind == "reviewed", out.error
     assert {finding.rule for finding in out.findings} == {"a-bug", "b-bug"}
@@ -107,7 +108,7 @@ def test_a_file_chunk_that_still_fails_is_named_as_not_reviewed() -> None:
         return _completion(json.dumps({"findings": [_finding("src/a.py", "a-bug")]}))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff(hunks, installation_id=2)
+        out = review_diff(assemble_evidence(hunks), installation_id=2)
 
     assert out.kind == "reviewed"
     assert [finding.rule for finding in out.findings] == ["a-bug"]
@@ -137,7 +138,10 @@ def test_retry_moves_to_the_next_model_and_the_title_names_every_failure() -> No
         raise httpx.ConnectError("down")
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([Hunk(path="infra/x.tf", body="@@ -1 +1 @@\n+x")], installation_id=2)
+        out = review_diff(
+            assemble_evidence([Hunk(path="infra/x.tf", body="@@ -1 +1 @@\n+x")]),
+            installation_id=2,
+        )
 
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.CAVE, "the first unparseable answer keeps attribution"
@@ -171,7 +175,10 @@ def test_a_retry_with_no_untried_model_makes_no_network_call() -> None:
         raise httpx.ConnectError("down")
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([Hunk(path="src/x.py", body="@@ -1 +1 @@\n+x")], installation_id=2)
+        out = review_diff(
+            assemble_evidence([Hunk(path="src/x.py", body="@@ -1 +1 @@\n+x")]),
+            installation_id=2,
+        )
 
     assert out.kind == "all_failed"
     assert len(calls) == len(set(calls)), f"a model was asked twice: {calls}"
@@ -293,7 +300,7 @@ def test_a_token_capped_two_file_cohort_is_reviewed_one_file_at_a_time() -> None
         return _completion(json.dumps({"findings": []}))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff(hunks, installation_id=2)
+        out = review_diff(assemble_evidence(hunks), installation_id=2)
 
     assert out.kind == "reviewed", out.error
     assert out.error == ""
