@@ -10,9 +10,11 @@ import httpx
 import pytest
 
 import llm_client as lc
+import review_evidence as ev
 from llm_client import Backend, Finding, Hunk, LlmReviewResponse, review_diff
 from personas.code_reviewer.persona import evaluate_diff
 from review_pipeline import ReviewCohort, ReviewPlan
+from review_evidence import assemble_evidence
 
 
 @pytest.fixture(autouse=True)
@@ -62,8 +64,7 @@ def _one_ladder_walk(hunks: list[Hunk], installation_id: int) -> LlmReviewRespon
     model the first walk did not reach. Tests that pin what ONE walk does
     (where it stops, what it attributes) call this instead."""
     return lc._review_diff_dispatch(
-        hunks, installation_id, None, None, None, None, None, None,
-        "caveman", None,
+        assemble_evidence(hunks), installation_id, "caveman", None,
     )
 
 
@@ -93,7 +94,7 @@ def test_empty_hunks_returns_no_diff_kind_without_llm_call() -> None:
     Distinct `kind="no_diff"` so the caller can distinguish from
     `all_failed` (also has empty findings)."""
     with patch.object(httpx, "post") as mock_post:
-        out = review_diff([], installation_id=1)
+        out = review_diff(assemble_evidence([]), installation_id=1)
     assert out.kind == "no_diff"
     assert out.findings == ()
     assert out.backend_used is None
@@ -109,7 +110,7 @@ def test_review_diff_via_cave_coder_returns_structured_response() -> None:
     response = httpx.Response(200, json=_openai_json_response(findings_json))
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=2)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=2)
 
     assert isinstance(out, LlmReviewResponse)
     assert out.kind == "reviewed"
@@ -127,7 +128,7 @@ def test_review_diff_empty_findings_returns_reviewed() -> None:
     response = httpx.Response(200, json=_openai_json_response(findings_json))
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
@@ -163,12 +164,11 @@ def test_large_review_runs_bounded_cohorts_and_merges_findings(monkeypatch) -> N
 
     with patch.object(httpx, "post", side_effect=respond):
         out = review_diff(
-            hunks,
-            installation_id=2,
-            file_contents={
+            assemble_evidence(hunks, file_contents={
                 "src/x.py": "SOURCE_FULL_FILE",
                 "tests/test_x.py": "TEST_FULL_FILE",
-            },
+            }),
+            installation_id=2,
         )
 
     assert out.kind == "reviewed"
@@ -212,7 +212,7 @@ def test_large_review_keeps_success_when_one_cohort_is_unparseable(monkeypatch) 
         )
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff(hunks, installation_id=2)
+        out = review_diff(assemble_evidence(hunks), installation_id=2)
 
     assert out.kind == "reviewed"
     assert [finding.rule for finding in out.findings] == ["test-bug"]
@@ -528,7 +528,7 @@ def test_single_oversized_hunk_degrades_without_calling_model(monkeypatch) -> No
 
     with patch.object(httpx, "post") as mock_post:
         out = review_diff(
-            [_hunk("src/generated.py", "@@ -1 +1 @@\n+x\n" + "x" * 8100)],
+            assemble_evidence([_hunk("src/generated.py", "@@ -1 +1 @@\n+x\n" + "x" * 8100)]),
             installation_id=2,
         )
 
@@ -553,7 +553,7 @@ def test_429_triggers_retry_with_backoff(monkeypatch) -> None:
         return seq[i]
 
     with patch.object(httpx, "post", side_effect=staged_post):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert idx["n"] == 3, "should have made 3 attempts (2 retries after 429)"
     assert out.backend_used == Backend.CAVE
@@ -581,7 +581,7 @@ def test_coder_arm_failure_falls_back_to_reasoner_arm(monkeypatch) -> None:
         return seq[i]
 
     with patch.object(httpx, "post", side_effect=staged_post):
-        out = review_diff([_hunk()], installation_id=2)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=2)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE_REASONER
@@ -602,7 +602,7 @@ def test_cave_arms_carry_require_keys_json_schema(monkeypatch) -> None:
         return httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", side_effect=respond):
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert len(seen) == 2
     for model, rf in seen:
@@ -650,7 +650,7 @@ def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None
         return httpx.Response(200, json=body)
 
     with patch.object(httpx, "post", side_effect=respond) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert mock_post.call_count == 2
     assert out.kind == "reviewed"
@@ -685,7 +685,7 @@ def test_deep_review_runs_both_arms_concurrently_not_sequentially(monkeypatch) -
 
     with patch.object(httpx, "post", side_effect=respond) as mock_post:
         start = time.monotonic()
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
         elapsed = time.monotonic() - start
 
     assert mock_post.call_count == 2
@@ -782,7 +782,7 @@ def test_deep_review_deduplicates_same_candidate_across_arms(monkeypatch) -> Non
     response = httpx.Response(200, json=_openai_json_response(content))
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert len(out.findings) == 1
     assert tuple(origin.backend for origin in out.findings[0].origins) == (
@@ -807,7 +807,7 @@ def test_deep_review_uses_stronger_duplicate_explanation(monkeypatch) -> None:
         return httpx.Response(200, json=_openai_json_response(content))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.findings[0].severity == "high"
     assert out.findings[0].message == (
@@ -833,7 +833,7 @@ def test_deep_review_one_arm_reply_is_a_complete_review(monkeypatch) -> None:
         )
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     # grug#848: this used to assert `not out.error` ("one arm answering is
@@ -869,7 +869,7 @@ def test_deep_review_one_arm_failure_routes_through_derive_conclusion(monkeypatc
         return httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backends_used == (Backend.CAVE,)
@@ -894,7 +894,7 @@ def test_deep_review_both_arms_answering_is_not_partial(monkeypatch) -> None:
     response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.backends_used == (Backend.CAVE, Backend.CAVE_REASONER)
     assert out.error == ""
@@ -915,7 +915,7 @@ def test_fast_review_reasoner_fallback_is_not_partial(monkeypatch) -> None:
         return httpx.Response(500, json={"error": "upstream"})
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backends_used == (Backend.CAVE_REASONER,)
@@ -930,7 +930,7 @@ def test_review_depth_defaults_to_tiered_single_arm(monkeypatch) -> None:
     response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", return_value=response) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert post.call_count == 1
     assert out.backends_used == (Backend.CAVE,)
@@ -941,7 +941,7 @@ def test_review_depth_deep_still_runs_both_arms(monkeypatch) -> None:
     response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", return_value=response) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert post.call_count == 2
     assert out.backends_used == (Backend.CAVE, Backend.CAVE_REASONER)
@@ -1024,7 +1024,7 @@ def test_tiered_risky_path_stays_coder_only_for_required_path(monkeypatch) -> No
 
     with patch.object(httpx, "post", return_value=response) as post:
         out = review_diff(
-            [_hunk(path="pkg/crypto/keys.py")],
+            assemble_evidence([_hunk(path="pkg/crypto/keys.py")]),
             installation_id=1,
         )
 
@@ -1037,7 +1037,7 @@ def test_review_reasoner_diff_runs_only_reasoner_arm(monkeypatch) -> None:
     response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", return_value=response) as post:
-        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+        out = lc.review_reasoner_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert post.call_count == 1
     assert out.kind == "reviewed"
@@ -1104,7 +1104,7 @@ def test_review_reasoner_diff_truncated_generation_is_not_a_clean_pass(monkeypat
     response = httpx.Response(200, json=body)
 
     with patch.object(httpx, "post", return_value=response):
-        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+        out = lc.review_reasoner_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.findings == ()
@@ -1148,7 +1148,7 @@ def test_both_backends_fail_returns_all_failed_kind() -> None:
 
     with patch.object(httpx, "post", return_value=response), \
          patch.object(lc, "_RETRY_SLEEP", lambda s: None):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "all_failed"
     assert out.findings == ()
@@ -1173,7 +1173,7 @@ def test_timeout_treated_as_failure(monkeypatch) -> None:
         raise httpx.ReadTimeout("timeout")
 
     with patch.object(httpx, "post", side_effect=staged):
-        out = review_diff([_hunk()], installation_id=2)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=2)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE_REASONER
@@ -1188,7 +1188,7 @@ def test_request_uses_openai_chat_completions_shape() -> None:
         return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
 
     with patch.object(httpx, "post", side_effect=capture):
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert len(captured) == 1
     body = captured[0]["json"]
@@ -1256,7 +1256,7 @@ def test_cave_calls_are_tagged_interactive_priority(monkeypatch) -> None:
         return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
 
     with patch.object(httpx, "post", side_effect=capture):
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert len(captured) == 2
     assert all(h.get("X-Spark-Priority") == "interactive" for h in captured)
@@ -1276,7 +1276,7 @@ def test_cave_calls_carry_per_arm_caller_attribution(monkeypatch) -> None:
         return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
 
     with patch.object(httpx, "post", side_effect=capture):
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert len(captured) == 2
     callers_by_model = dict(captured)
@@ -1309,7 +1309,7 @@ def test_malformed_llm_json_returns_parse_failed_kind() -> None:
     response = httpx.Response(200, json=_openai_json_response("sorry, I cannot do that"))
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "parse_failed"
     assert out.findings == ()
@@ -1331,7 +1331,7 @@ def test_findings_with_bogus_severity_are_dropped() -> None:
     response = httpx.Response(200, json=_openai_json_response(findings_json))
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     # Bogus-severity entry dropped; valid two remain.
@@ -1350,7 +1350,7 @@ def test_findings_with_missing_fields_are_dropped() -> None:
     response = httpx.Response(200, json=_openai_json_response(findings_json))
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert len(out.findings) == 1
@@ -1366,7 +1366,7 @@ def test_unconfigured_cave_gateway_falls_back_to_saas(monkeypatch) -> None:
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     success = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
     with patch.object(httpx, "post", return_value=success) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.POOLSIDE
     mock_post.assert_called_once()  # Cave never dialed; only the fallback
@@ -1378,7 +1378,7 @@ def test_unconfigured_cave_gateway_and_saas_down_returns_all_failed(monkeypatch)
     monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL", raising=False)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "all_failed"
     # last_error reflects the LAST attempt (OpenRouter's transport failure) -
     # Cave's earlier misconfiguration is superseded, not lost (both are
@@ -1405,7 +1405,7 @@ def test_503_retried_alongside_429(monkeypatch) -> None:
         return seq[i]
 
     with patch.object(httpx, "post", side_effect=staged_post):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
@@ -1424,7 +1424,7 @@ def test_transport_failure_on_both_backends_returns_all_failed(monkeypatch) -> N
         raise httpx.ReadTimeout("timeout")
 
     with patch.object(httpx, "post", side_effect=always_timeout):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "all_failed"
     assert out.backend_used is None
@@ -1458,7 +1458,11 @@ def test_review_diff_skips_saas_fallback_when_cancelled(monkeypatch) -> None:
     cancel_event.set()
 
     with patch.object(httpx, "post") as mock_post:
-        out = review_diff([_hunk()], installation_id=1, cancel_event=cancel_event)
+        out = review_diff(
+            assemble_evidence([_hunk()]),
+            installation_id=1,
+            cancel_event=cancel_event,
+        )
 
     mock_post.assert_not_called()
     assert out.kind == "all_failed"
@@ -1487,7 +1491,7 @@ def test_saas_overload_fallback_rescues_review_when_cave_fully_down(monkeypatch)
         )
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.POOLSIDE
@@ -1506,7 +1510,7 @@ def test_saas_overload_fallback_tries_openrouter_after_poolside_fails(monkeypatc
         raise httpx.ConnectTimeout("down")
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.OPENROUTER
@@ -1528,7 +1532,7 @@ def test_saas_overload_fallback_uses_fast_default_model_not_review_opus(monkeypa
         return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
 
     with patch.object(httpx, "post", side_effect=respond):
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert captured[0]["json"]["model"] == lc._POOLSIDE_MODEL
     assert captured[0]["json"]["model"] != lc._OPENROUTER_REVIEW_MODEL
@@ -1547,7 +1551,7 @@ def test_saas_overload_fallback_never_engages_when_a_cave_arm_succeeds(monkeypat
         return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
@@ -1686,7 +1690,7 @@ def test_openrouter_free_tier_limiter_exhaustion_never_reads_as_clean_review(mon
         )
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "all_failed", (
         f"kind={out.kind!r} - a limiter timeout must read as a backend "
@@ -1715,7 +1719,7 @@ def test_parse_failed_attributes_secondary_backend(monkeypatch) -> None:
         return httpx.Response(200, json=parse_fail_envelope)
 
     with patch.object(httpx, "post", side_effect=staged):
-        out = review_diff([_hunk()], installation_id=2)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=2)
 
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.CAVE_REASONER
@@ -1742,7 +1746,7 @@ def test_parse_failure_on_primary_falls_back_to_secondary(monkeypatch) -> None:
         return httpx.Response(200, json=good)
 
     with patch.object(httpx, "post", side_effect=staged):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE_REASONER
@@ -1756,7 +1760,7 @@ def test_both_parse_fail_returns_parse_failed_attributed_to_primary(monkeypatch)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     bad = httpx.Response(200, json=_openai_json_response("nope, prose only"))
     with patch.object(httpx, "post", return_value=bad):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "parse_failed"
     assert out.backend_used == Backend.CAVE  # first (coder) arm
 
@@ -1776,7 +1780,7 @@ def test_non_dict_finding_entries_dropped() -> None:
     response = httpx.Response(200, json=_openai_json_response(findings_json))
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert len(out.findings) == 1
@@ -1795,7 +1799,7 @@ def test_bad_type_finding_entry_dropped() -> None:
     response = httpx.Response(200, json=_openai_json_response(findings_json))
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert len(out.findings) == 1
@@ -1808,7 +1812,7 @@ def test_envelope_json_array_returns_parse_failed() -> None:
     response = httpx.Response(200, json=["not", "a", "dict"])
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "parse_failed"
     assert "envelope" in out.error.lower() or "dict" in out.error.lower()
@@ -1823,7 +1827,7 @@ def test_envelope_missing_choices_returns_parse_failed() -> None:
     )
 
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "parse_failed"
     assert "choices" in out.error.lower() or "missing" in out.error.lower()
@@ -1841,7 +1845,7 @@ def test_non_retryable_5xx_does_not_burn_retry_budget(monkeypatch) -> None:
         return httpx.Response(502, text="bad gateway")
 
     with patch.object(httpx, "post", side_effect=staged):
-        out = review_diff([_hunk()], installation_id=2)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=2)
 
     assert out.kind == "all_failed"
     # 1 attempt per backend x 4 backends (both Cave arms, then the
@@ -1859,7 +1863,7 @@ def test_envelope_non_json_returns_parse_failed(monkeypatch) -> None:
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     response = httpx.Response(200, text="<html>error</html>")
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     # 200+non-JSON short-circuits to parse_failed (no fallback — the
     # other backend would likely return the same edge HTML).
     assert out.kind == "parse_failed"
@@ -2044,7 +2048,7 @@ def test_review_diff_emits_llmobs_span_on_success(monkeypatch) -> None:
     body["usage"] = {"prompt_tokens": 100, "completion_tokens": 25}
     response = httpx.Response(200, json=body)
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert len(annotate_calls) == 1
@@ -2073,7 +2077,7 @@ def test_review_diff_llmobs_span_variant_id_reflects_experiment(monkeypatch) -> 
     annotate_calls = _capture_llmobs(monkeypatch)
     response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
     with patch.object(httpx, "post", return_value=response):
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert annotate_calls[0]["metadata"]["variant_id"] == "v2"
 
 
@@ -2089,9 +2093,7 @@ def test_review_diff_llmobs_span_carries_pr_context_tags(monkeypatch) -> None:
         "head_sha": "abc123def456",
     }
     with patch.object(httpx, "post", return_value=response):
-        review_diff(
-            [_hunk()], installation_id=42, pr_context=pr_context,
-        )
+        review_diff(assemble_evidence([_hunk()], pr_context=pr_context), installation_id=42)
 
     tags = annotate_calls[0]["tags"]
     assert tags["installation_id"] == "42"
@@ -2112,7 +2114,7 @@ def test_review_diff_emits_llmobs_span_on_transport_failure(monkeypatch) -> None
         raise httpx.ReadTimeout("hung")
 
     with patch.object(httpx, "post", side_effect=_timeout):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "all_failed"
     # Both Cave arms tried, then the OpenRouter/Poolside overload fallback
@@ -2136,7 +2138,7 @@ def test_review_diff_llmobs_span_handles_missing_usage(monkeypatch) -> None:
     body = {"choices": [{"message": {"content": '{"findings":[]}'}}], "model": "x"}
     response = httpx.Response(200, json=body)
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     metrics = annotate_calls[0]["metrics"]
     # latency must still be present even when tokens are missing.
@@ -2172,7 +2174,7 @@ def test_llmobs_span_annotate_called_exactly_once_per_backend_attempt(monkeypatc
         return x
 
     with patch.object(httpx, "post", side_effect=staged):
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     # Exactly 2 spans (one per backend attempt — primary timeout +
     # secondary success). Not 3 (one per httpx.post retry) — the span
@@ -2188,11 +2190,11 @@ def test_llmobs_tags_match_pr_context_keys(monkeypatch) -> None:
     response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
     with patch.object(httpx, "post", return_value=response):
         review_diff(
-            [_hunk()], installation_id=42,
-            pr_context={
+            assemble_evidence([_hunk()], pr_context={
                 "installation_id": 42, "repo": "o/r", "pr_number": 1,
                 "head_sha": "abc123def456",
-            },
+            }),
+            installation_id=42,
         )
     assert set(annotate_calls[0]["tags"].keys()) == {
         "installation_id", "repo", "pr_number", "head_sha",
@@ -2245,7 +2247,7 @@ def test_llmobs_metadata_kind_parse_failed_on_200_with_bad_content(monkeypatch) 
     # 200 envelope is valid JSON, but the message.content is not JSON.
     response = httpx.Response(200, json=_openai_json_response("sorry I cannot"))
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "parse_failed"
     assert annotate_calls[0]["metadata"]["kind"] == "parse_failed"
 
@@ -2259,7 +2261,7 @@ def test_llmobs_metadata_kind_http_error_on_non_200(monkeypatch) -> None:
     # 500 with no retryable status; both backends will return 500.
     response = httpx.Response(500, json={"error": "down"})
     with patch.object(httpx, "post", return_value=response):
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
     # Both backends tagged http_error.
     for call in annotate_calls:
         assert call["metadata"]["kind"] == "http_error"
@@ -2328,7 +2330,7 @@ def test_llmobs_body_reparse_failure_logs_warning(monkeypatch, caplog) -> None:
     monkeypatch.setattr(httpx.Response, "json", fake_json)
     with caplog.at_level("WARNING"):
         with patch.object(httpx, "post", return_value=response):
-            review_diff([_hunk()], installation_id=1)
+            review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert any(
         "llm_body_reparse_failed" in r.message for r in caplog.records
     )
@@ -2393,7 +2395,7 @@ def test_llmobs_input_data_is_redacted_on_success(monkeypatch) -> None:
     )
     response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
     with patch.object(httpx, "post", return_value=response):
-        review_diff([leaky_hunk], installation_id=1)
+        review_diff(assemble_evidence([leaky_hunk]), installation_id=1)
     span_input_str = json.dumps(annotate_calls[0]["input_data"])
     assert "AKIAIOSFODNN7EXAMPLE" not in span_input_str
     assert "[REDACTED:aws-access-key]" in span_input_str
@@ -2409,7 +2411,7 @@ def test_llmobs_output_data_is_redacted_on_success(monkeypatch) -> None:
     )
     response = httpx.Response(200, json=_openai_json_response(leaky_content))
     with patch.object(httpx, "post", return_value=response):
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
     out_str = str(annotate_calls[0]["output_data"])
     assert "AKIAIOSFODNN7EXAMPLE" not in out_str
     assert "[REDACTED:aws-access-key]" in out_str
@@ -2419,7 +2421,7 @@ def test_build_messages_redacts_secrets_in_diff(monkeypatch) -> None:
     """#438: secrets in the diff are masked in the user message BEFORE it is sent
     to the backend (a third-party SaaS endpoint), not just in the DD span."""
     hunks = [lc.Hunk(path="bad.py", body="+AWS_KEY = 'AKIAIOSFODNN7EXAMPLE'")]
-    user = lc._build_messages(hunks, "v1")[1]["content"]
+    user = lc._build_messages(assemble_evidence(hunks), "v1")[1]["content"]
     assert "AKIAIOSFODNN7EXAMPLE" not in user
     assert "[REDACTED:aws-access-key]" in user
 
@@ -2428,7 +2430,10 @@ def test_build_messages_redacts_secrets_in_file_context() -> None:
     """#438: the full-file context block (#336) is also redacted - a secret on an
     UNCHANGED line of a changed file must not reach the backend either."""
     hunks = [lc.Hunk(path="bad.py", body="+x = 1")]
-    user = lc._build_messages(hunks, "v1", {"bad.py": "KEY = 'AKIAIOSFODNN7EXAMPLE'\nx = 1\n"})[1]["content"]
+    user = lc._build_messages(
+        assemble_evidence(hunks, file_contents={"bad.py": "KEY = 'AKIAIOSFODNN7EXAMPLE'\nx = 1\n"}),
+        "v1",
+    )[1]["content"]
     assert "AKIAIOSFODNN7EXAMPLE" not in user
 
 
@@ -2444,7 +2449,7 @@ def test_backend_request_body_is_redacted(monkeypatch) -> None:
         return httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
 
     monkeypatch.setattr(httpx, "post", _capture_post)
-    review_diff([leaky_hunk], installation_id=1)
+    review_diff(assemble_evidence([leaky_hunk]), installation_id=1)
     body_str = json.dumps(captured["json"])
     assert "AKIAIOSFODNN7EXAMPLE" not in body_str
     assert "[REDACTED:aws-access-key]" in body_str
@@ -2454,7 +2459,7 @@ def test_no_diff_short_circuit_does_not_emit_llmobs_span(monkeypatch) -> None:
     """Empty hunks short-circuit before any LLM call — no span should
     be emitted (no LLM call happened)."""
     annotate_calls = _capture_llmobs(monkeypatch)
-    out = review_diff([], installation_id=1)
+    out = review_diff(assemble_evidence([]), installation_id=1)
     assert out.kind == "no_diff"
     assert annotate_calls == []
 
@@ -2469,7 +2474,7 @@ def test_review_diff_carries_exported_span_context_on_success(monkeypatch) -> No
     )
     response = httpx.Response(200, json=_openai_json_response('{"findings":[]}'))
     with patch.object(httpx, "post", return_value=response):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.review_span_context == {"span_id": "s1", "trace_id": "t1"}
 
@@ -2494,7 +2499,7 @@ def test_judge_findings_makes_second_llm_call_and_parses_verdicts(monkeypatch) -
         {"rule_name": "style", "file": "x.py", "line": 3, "message": "m2"},
     ]
     with patch.object(httpx, "post", return_value=response):
-        out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+        out = lc.judge_findings(findings_repr, assemble_evidence([_hunk()]), installation_id=1)
 
     assert len(out) == 2
     assert out[0].finding_index == 0
@@ -2512,7 +2517,7 @@ def test_judge_findings_emits_its_own_llmobs_span(monkeypatch) -> None:
     response = httpx.Response(200, json=_openai_json_response('{"verdicts":[]}'))
     findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
     with patch.object(httpx, "post", return_value=response):
-        lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+        lc.judge_findings(findings_repr, assemble_evidence([_hunk()]), installation_id=1)
     # judge call emits a span tagged judge=True (distinct from the
     # review span) even when the LLM returns zero verdicts.
     assert len(annotate_calls) == 1
@@ -2556,7 +2561,11 @@ def test_judge_findings_stays_off_the_review_seam(monkeypatch) -> None:
         with patch.object(
             httpx, "post", side_effect=httpx.ReadTimeout("judge backend down"),
         ) as mock_post:
-            out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+            out = lc.judge_findings(
+                findings_repr,
+                assemble_evidence([_hunk()]),
+                installation_id=1,
+            )
     finally:
         lc._LADDER_SKIP.reset(skip_token)
         lc._LADDER_TRAIL.reset(trail_token)
@@ -2580,7 +2589,7 @@ def test_judge_findings_returns_empty_on_llm_failure(monkeypatch) -> None:
 
     findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
     with patch.object(httpx, "post", side_effect=_timeout):
-        out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+        out = lc.judge_findings(findings_repr, assemble_evidence([_hunk()]), installation_id=1)
     assert out == ()
 
 
@@ -2595,7 +2604,7 @@ def test_judge_findings_skips_above_max_findings(monkeypatch, caplog) -> None:
     ]
     with caplog.at_level("INFO"):
         with patch.object(httpx, "post") as mock_post:
-            out = lc.judge_findings(too_many, [_hunk()], installation_id=1)
+            out = lc.judge_findings(too_many, assemble_evidence([_hunk()]), installation_id=1)
     assert out == ()
     mock_post.assert_not_called()
     assert any(
@@ -2613,7 +2622,7 @@ def test_judge_findings_at_max_findings_still_runs(monkeypatch) -> None:
     ]
     response = httpx.Response(200, json=_openai_json_response('{"verdicts":[]}'))
     with patch.object(httpx, "post", return_value=response) as mock_post:
-        lc.judge_findings(at_limit, [_hunk()], installation_id=1)
+        lc.judge_findings(at_limit, assemble_evidence([_hunk()]), installation_id=1)
     mock_post.assert_called()
 
 
@@ -2621,7 +2630,7 @@ def test_judge_findings_empty_findings_short_circuits(monkeypatch) -> None:
     """No findings → no judge call (nothing to evaluate)."""
     annotate_calls = _capture_llmobs(monkeypatch)
     with patch.object(httpx, "post") as mock_post:
-        out = lc.judge_findings([], [_hunk()], installation_id=1)
+        out = lc.judge_findings([], assemble_evidence([_hunk()]), installation_id=1)
     # Empty findings is a legit "nothing to judge" — skip the LLM call.
     assert out == ()
     mock_post.assert_not_called()
@@ -2636,7 +2645,7 @@ def test_judge_findings_redacts_secrets_in_judge_span(monkeypatch) -> None:
     leaky_hunk = lc.Hunk(path="x.py", body="+key='AKIAIOSFODNN7EXAMPLE'")
     findings_repr = [{"rule_name": "r", "file": "x.py", "line": 1, "message": "m"}]
     with patch.object(httpx, "post", return_value=response):
-        lc.judge_findings(findings_repr, [leaky_hunk], installation_id=1)
+        lc.judge_findings(findings_repr, assemble_evidence([leaky_hunk]), installation_id=1)
     span_input = json.dumps(annotate_calls[0]["input_data"])
     assert "AKIAIOSFODNN7EXAMPLE" not in span_input
     assert "[REDACTED:aws-access-key]" in span_input
@@ -2688,7 +2697,11 @@ def test_judge_unparseable_response_logs_warning(monkeypatch, caplog) -> None:
     findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
     with caplog.at_level("WARNING"):
         with patch.object(httpx, "post", return_value=response):
-            out = lc.judge_findings(findings_repr, [_hunk()], installation_id=1)
+            out = lc.judge_findings(
+                findings_repr,
+                assemble_evidence([_hunk()]),
+                installation_id=1,
+            )
     assert out == ()
     assert any("judge_verdicts_unparseable" in r.message for r in caplog.records)
 
@@ -2704,7 +2717,7 @@ def test_judge_unparseable_log_redacts_secrets(monkeypatch, caplog) -> None:
     fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
     with caplog.at_level("WARNING"):
         with patch.object(httpx, "post", return_value=response):
-            lc.judge_findings(fr, [_hunk()], installation_id=1)
+            lc.judge_findings(fr, assemble_evidence([_hunk()]), installation_id=1)
     rec = next(r for r in caplog.records if r.message == "judge_verdicts_unparseable")
     assert "AKIAIOSFODNN7EXAMPLE" not in rec.__dict__["raw"]
     assert "[REDACTED:aws-access-key]" in rec.__dict__["raw"]
@@ -2725,7 +2738,7 @@ def test_judge_partial_drop_logs_count(monkeypatch, caplog) -> None:
     fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
     with caplog.at_level("WARNING"):
         with patch.object(httpx, "post", return_value=response):
-            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+            out = lc.judge_findings(fr, assemble_evidence([_hunk()]), installation_id=1)
     assert len(out) == 1
     rec = next(r for r in caplog.records if r.message == "judge_verdicts_partial_drop")
     assert rec.__dict__["dropped"] == 2
@@ -2759,7 +2772,7 @@ def test_judge_non_200_returns_empty_no_empty_content_warning(monkeypatch, caplo
     fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
     with caplog.at_level("WARNING"):
         with patch.object(httpx, "post", return_value=response):
-            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+            out = lc.judge_findings(fr, assemble_evidence([_hunk()]), installation_id=1)
     assert out == ()
     assert not any("judge_empty_content" in r.message for r in caplog.records)
 
@@ -2772,7 +2785,7 @@ def test_judge_verdicts_envelope_non_dict_logs_warning(monkeypatch, caplog) -> N
     fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
     with caplog.at_level("WARNING"):
         with patch.object(httpx, "post", return_value=response):
-            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+            out = lc.judge_findings(fr, assemble_evidence([_hunk()]), installation_id=1)
     assert out == ()
     assert any(
         "judge_verdicts_envelope_not_dict" in r.message for r in caplog.records
@@ -2786,7 +2799,7 @@ def test_judge_verdicts_not_a_list_logs_warning(monkeypatch, caplog) -> None:
     fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
     with caplog.at_level("WARNING"):
         with patch.object(httpx, "post", return_value=response):
-            out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+            out = lc.judge_findings(fr, assemble_evidence([_hunk()]), installation_id=1)
     assert out == ()
     assert any(
         "judge_verdicts_not_a_list" in r.message for r in caplog.records
@@ -2800,7 +2813,7 @@ def test_judge_200_with_non_json_body_does_not_crash(monkeypatch) -> None:
     response = httpx.Response(200, text="<html>not json</html>")
     fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
     with patch.object(httpx, "post", return_value=response):
-        out = lc.judge_findings(fr, [_hunk()], installation_id=1)
+        out = lc.judge_findings(fr, assemble_evidence([_hunk()]), installation_id=1)
     assert out == ()
 
 
@@ -2813,7 +2826,7 @@ def test_judge_empty_content_on_200_logs_warning(monkeypatch, caplog) -> None:
     fr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
     with caplog.at_level("WARNING"):
         with patch.object(httpx, "post", return_value=response):
-            lc.judge_findings(fr, [_hunk()], installation_id=1)
+            lc.judge_findings(fr, assemble_evidence([_hunk()]), installation_id=1)
     assert any("judge_empty_content" in r.message for r in caplog.records)
 
 
@@ -2868,10 +2881,10 @@ def test_submit_finding_evaluation_skips_when_no_span_context(monkeypatch) -> No
 def test_build_messages_diff_only_is_backward_compatible():
     """No file_contents → byte-identical to the pre-#336 diff-only shape."""
     hunks = [Hunk(path="src/x.py", body="@@ -1,2 +1,3 @@\n a\n+b")]
-    msgs = lc._build_messages(hunks, "v1")
+    msgs = lc._build_messages(assemble_evidence(hunks), "v1")
     assert msgs[1]["content"] == "### src/x.py\n```diff\n@@ -1,2 +1,3 @@\n a\n+b\n```"
     # and explicitly identical whether file_contents is None or {}
-    assert lc._build_messages(hunks, "v1", {}) == msgs
+    assert lc._build_messages(assemble_evidence(hunks, file_contents={}), "v1") == msgs
 
 
 def test_build_messages_includes_full_file_when_provided():
@@ -2879,7 +2892,10 @@ def test_build_messages_includes_full_file_when_provided():
     Elder can see a cleanup/guard outside the changed lines."""
     hunks = [Hunk(path="ci.yml", body="@@ -5,1 +5,2 @@\n a\n+b")]
     file_contents = {"ci.yml": "line-one\nline-two\nrm -f /tmp/x  # cleanup"}
-    content = lc._build_messages(hunks, "v1", file_contents)[1]["content"]
+    content = lc._build_messages(assemble_evidence(
+        hunks,
+        file_contents=file_contents,
+    ), "v1")[1]["content"]
     assert "FULL FILE" in content
     assert "1: line-one" in content                 # 1-based line numbers
     assert "3: rm -f /tmp/x  # cleanup" in content   # the mitigation is visible
@@ -2889,13 +2905,12 @@ def test_build_messages_includes_full_file_when_provided():
 def test_build_messages_includes_pr_intent_as_untrusted_context():
     hunks = [Hunk(path="src/x.py", body="@@ -1 +1 @@\n+x")]
     messages = lc._build_messages(
-        hunks,
-        "v1",
-        pr_context={
+        assemble_evidence(hunks, pr_context={
             "title": "Handle expired sessions",
             "body": "Closes #7. Preserve refresh-token fallback.",
             "base_sha": "base123",
-        },
+        }),
+        "v1",
     )
     content = messages[1]["content"]
 
@@ -2910,12 +2925,11 @@ def test_build_messages_includes_pr_intent_as_untrusted_context():
 def test_build_messages_redacts_and_bounds_pr_intent():
     fake_key = "AKIAIOSFODNN7EXAMPLE"
     content = lc._build_messages(
-        [_hunk()],
-        "v2",
-        pr_context={
+        assemble_evidence([_hunk()], pr_context={
             "title": f"Do not leak {fake_key}",
-            "body": fake_key + ("x" * lc._MAX_PR_INTENT_BODY_CHARS),
-        },
+            "body": fake_key + ("x" * ev.MAX_PR_INTENT_BODY_CHARS),
+        }),
+        "v2",
     )[1]["content"]
 
     assert fake_key not in content
@@ -2925,13 +2939,13 @@ def test_build_messages_redacts_and_bounds_pr_intent():
 
 def test_render_file_block_skips_oversized_file():
     """A file beyond either budget degrades to diff-only (token guard)."""
-    big = "\n".join(f"x{i}" for i in range(lc._MAX_FILE_CONTEXT_LINES + 1))
-    assert lc._render_file_block("big.py", big) == ""
-    assert lc._render_file_block(
-        "wide.py", "x" * (lc._MAX_FILE_CONTEXT_CHARS + 1),
+    big = "\n".join(f"x{i}" for i in range(ev.MAX_FILE_CONTEXT_LINES + 1))
+    assert ev._render_file_block("big.py", big) == ""
+    assert ev._render_file_block(
+        "wide.py", "x" * (ev.MAX_FILE_CONTEXT_CHARS + 1),
     ) == ""
-    assert lc._render_file_block("none.py", None) == ""
-    assert lc._render_file_block("none.py", "") == ""
+    assert ev._render_file_block("none.py", None) == ""
+    assert ev._render_file_block("none.py", "") == ""
 
 
 def test_build_messages_renders_file_block_once_per_path():
@@ -2940,7 +2954,10 @@ def test_build_messages_renders_file_block_once_per_path():
         Hunk(path="a.py", body="@@ -1 +1 @@\n+x"),
         Hunk(path="a.py", body="@@ -9 +9 @@\n+y"),
     ]
-    content = lc._build_messages(hunks, "v1", {"a.py": "one\ntwo"})[1]["content"]
+    content = lc._build_messages(
+        assemble_evidence(hunks, file_contents={"a.py": "one\ntwo"}),
+        "v1",
+    )[1]["content"]
     assert content.count("FULL FILE") == 1
 
 
@@ -2951,8 +2968,7 @@ def test_build_judge_messages_includes_full_file_when_provided():
     msgs = lc._build_judge_messages(
         [{"severity": "medium", "rule_name": "resource-leak",
           "file": "ci.yml", "line": "5", "message": "no cleanup"}],
-        hunks,
-        {"ci.yml": "open()\nrm -f /tmp/x"},
+        assemble_evidence(hunks, file_contents={"ci.yml": "open()\nrm -f /tmp/x"}),
     )
     assert "FULL FILE" in msgs[1]["content"]
     assert "2: rm -f /tmp/x" in msgs[1]["content"]
@@ -2964,16 +2980,18 @@ def test_build_judge_messages_receives_same_context_as_reviewer():
     msgs = lc._build_judge_messages(
         [{"severity": "medium", "rule_name": "caller-not-updated",
           "file": "src/a.py", "line": 5, "message": "stale caller"}],
-        [Hunk(path="src/a.py", body="@@ -5 +5 @@\n+new_api()")],
-        {"src/a.py": "new_api()"},
-        cross_file_contents={"src/b.py": "18: old_api()"},
-        runtime_context="src/a.py: 12 errors in 24h",
-        pr_context={
-            "title": "Change API contract",
-            "body": "All callers must migrate",
-            "base_sha": "base",
-            "head_sha": "head",
-        },
+        assemble_evidence(
+            [Hunk(path="src/a.py", body="@@ -5 +5 @@\n+new_api()")],
+            pr_context={
+                "title": "Change API contract",
+                "body": "All callers must migrate",
+                "base_sha": "base",
+                "head_sha": "head",
+            },
+            file_contents={"src/a.py": "new_api()"},
+            cross_file_contents={"src/b.py": "18: old_api()"},
+            runtime_context="src/a.py: 12 errors in 24h",
+        ),
         team_practices="TEAM PRACTICES\n- migrate all callers",
         few_shot_examples="REPOSITORY EXAMPLES\n- prior stale caller",
         redact=True,
@@ -3012,8 +3030,8 @@ def test_review_diff_injects_cached_exemplars(monkeypatch) -> None:
 
     with patch.object(httpx, "post", side_effect=fake_post):
         out = review_diff(
-            [_hunk()], installation_id=2,
-            pr_context={"repo": "o/r", "pr_number": 1},
+            assemble_evidence([_hunk()], pr_context={"repo": "o/r", "pr_number": 1}),
+            installation_id=2,
         )
     assert out.kind == "reviewed"
     system = captured["messages"][0]["content"]
@@ -3566,7 +3584,8 @@ def test_build_messages_threads_guidelines_into_the_system_prompt() -> None:
     system message, exactly where a live model would read it."""
     hunks = [Hunk(path="a.py", body="+x = 1")]
     messages = lc._build_messages(
-        hunks, "v2",
+        assemble_evidence(hunks),
+        "v2",
         guidelines="TRIBE'S OWN CARVINGS: never use bare except",
     )
     system = next(m["content"] for m in messages if m["role"] == "system")
@@ -3592,7 +3611,7 @@ def test_claude_md_rule_reaches_system_prompt_end_to_end(monkeypatch) -> None:
     assert "never use bare except" in block
 
     hunks = [Hunk(path="a.py", body="+x = 1")]
-    messages = lc._build_messages(hunks, "v2", guidelines=block)
+    messages = lc._build_messages(assemble_evidence(hunks), "v2", guidelines=block)
     system = next(m["content"] for m in messages if m["role"] == "system")
     assert "never use bare except" in system
     # The precedence statement rides along: the model is told the carving
@@ -3618,9 +3637,11 @@ def test_path_instructions_outrank_guidelines_in_both_blocks() -> None:
     ))
     repo_docs = rc.with_instructions(None, ["legacy/old.py"], cfg)
     messages = lc._build_messages(
-        [Hunk(path="legacy/old.py", body="+try:\n+    x()\n+except:\n+    pass")],
+        assemble_evidence(
+            [Hunk(path="legacy/old.py", body="+try:\n+    x()\n+except:\n+    pass")],
+            repo_docs_context=repo_docs,
+        ),
         "v2",
-        repo_docs_context=repo_docs,
         learnings="WHAT YOUR TRIBE TOLD GRUG: some learning",
         guidelines=guidelines,
     )
@@ -4150,7 +4171,7 @@ def test_review_reasoner_diff_cut_off_findings_is_partial_not_clean(monkeypatch)
     body["choices"][0]["finish_reason"] = "stop"
 
     with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
-        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+        out = lc.review_reasoner_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert len(out.findings) == 5
@@ -4170,7 +4191,7 @@ def test_saas_overload_fallback_cut_off_findings_is_partial(monkeypatch) -> None
         return httpx.Response(200, json=_openai_json_response(_cut_off_findings(2)))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.POOLSIDE
@@ -4207,7 +4228,7 @@ def test_cloud_priority_with_cloud_success_never_calls_cave(monkeypatch) -> None
     response = httpx.Response(200, json=_openai_json_response(findings_json))
 
     with patch.object(httpx, "post", return_value=response) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.OPENCODE_GO, (
@@ -4237,7 +4258,7 @@ def test_cloud_priority_total_cloud_failure_falls_through_to_cave(monkeypatch) -
             cave_response,
         ],
     ) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE, (
@@ -4282,7 +4303,7 @@ def test_cloud_chain_tries_free_tier_when_opencode_go_fails_and_free_tier_config
         httpx, "post",
         side_effect=[httpx.ConnectError("opencode go unreachable"), free_tier_response],
     ) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.OPENROUTER, (
@@ -4316,7 +4337,7 @@ def test_cloud_chain_all_tiers_fail_falls_through_to_cave_with_free_tier_configu
             cave_response,
         ],
     ) as mock_post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
@@ -4453,7 +4474,7 @@ def test_cave_priority_is_byte_identical_to_pre_906_behavior(monkeypatch) -> Non
     response = httpx.Response(200, json=_openai_json_response(findings_json))
 
     with patch.object(httpx, "post", return_value=response) as mock_post:
-        out = review_diff([_hunk()], installation_id=2)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=2)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
@@ -4948,7 +4969,7 @@ def test_deep_append_under_cloud_priority_answers_from_cloud_not_cave(monkeypatc
     response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", return_value=response) as post:
-        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+        out = lc.review_reasoner_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backends_used == (Backend.OPENCODE_GO,)
@@ -4964,7 +4985,7 @@ def test_deep_append_falls_back_to_capped_cave_reasoner_when_cloud_is_down(monke
 
     pool_down = httpx.ConnectError("poolside unreachable")
     with patch.object(httpx, "post", side_effect=[go_429, pool_down, cave]) as post:
-        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+        out = lc.review_reasoner_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backends_used == (Backend.CAVE_REASONER,)
@@ -4977,7 +4998,7 @@ def test_deep_append_under_cave_priority_is_unchanged(monkeypatch) -> None:
     response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", return_value=response) as post:
-        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+        out = lc.review_reasoner_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.backends_used == (Backend.CAVE_REASONER,)
     post.assert_called_once()
@@ -4996,7 +5017,7 @@ def test_free_tier_parse_failure_falls_through_to_cave(monkeypatch) -> None:
 
     pool_down = httpx.ConnectError("poolside unreachable")
     with patch.object(httpx, "post", side_effect=[go_429, junk, pool_down, cave]) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
@@ -5094,8 +5115,8 @@ def test_opencode_go_usage_limit_opens_breaker_and_skips_go_until_retry_after(
     ok = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", side_effect=[_go_limit_429("105419"), ok, ok]) as post:
-        review_diff([_hunk()], installation_id=1)
-        review_diff([_hunk()], installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     urls = [c.args[0] for c in post.call_args_list]
     assert sum("opencode.ai" in u for u in urls) == 1
@@ -5148,7 +5169,7 @@ def test_degenerate_empty_review_falls_through_to_the_next_tier(monkeypatch) -> 
     with patch.object(
         httpx, "post", side_effect=[_go_limit_429(), degenerate, real],
     ) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.POOLSIDE
@@ -5175,7 +5196,12 @@ def test_judge_truncated_at_output_cap_is_a_failure_not_a_verdict() -> None:
                "severity": "low", "message": "m"}
     cave = lc._cave_judge_config()
     with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
-        assert lc.judge_findings([finding], [_hunk()], installation_id=1, config=cave) == ()
+        assert lc.judge_findings(
+            [finding],
+            assemble_evidence([_hunk()]),
+            installation_id=1,
+            config=cave,
+        ) == ()
 
 
 def test_cloud_judge_configs_empty_under_cave_priority(monkeypatch) -> None:
@@ -5204,7 +5230,7 @@ def test_poolside_parse_failure_falls_through_to_cave(monkeypatch) -> None:
     cave = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", side_effect=[go_down, prose, cave]) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
@@ -5291,7 +5317,7 @@ def test_two_models_agreeing_on_no_findings_is_a_clean_review(monkeypatch, caplo
     with caplog.at_level("INFO"), patch.object(
         httpx, "post", side_effect=[_degenerate_response(), _degenerate_response()],
     ) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.findings == ()
@@ -5308,7 +5334,7 @@ def test_second_model_findings_win_over_a_primary_skim(monkeypatch) -> None:
         '"severity": "medium", "message": "m"}]}', 15_000, 400,
     )
     with patch.object(httpx, "post", side_effect=[_degenerate_response(), real]) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert len(out.findings) == 1
@@ -5329,7 +5355,7 @@ def test_second_model_parse_failure_is_a_miss_not_the_answer(monkeypatch) -> Non
     with patch.object(
         httpx, "post", side_effect=[httpx.ConnectError("go down"), junk, real],
     ) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.POOLSIDE
@@ -5349,7 +5375,7 @@ def test_the_same_model_twice_is_not_consensus(monkeypatch) -> None:
         httpx, "post",
         side_effect=[_degenerate_response(), httpx.ConnectError("longcat down"), real],
     ) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.backend_used == Backend.POOLSIDE
     assert post.call_count == 3
@@ -5404,7 +5430,7 @@ def test_the_free_openrouter_model_cannot_confirm_an_empty_answer(monkeypatch) -
             real,
         ],
     ) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.backend_used == Backend.POOLSIDE
     assert len(out.findings) == 1
@@ -5577,7 +5603,7 @@ def test_benched_tiers_are_skipped_in_the_walk_and_the_worst_case(monkeypatch) -
     assert _cloud_chain_worst_case_s() == before - lc._opencode_go_chain_config().timeout_seconds
     real = _usage_response(_JUNK_FINDING, 15_000, 400)
     with patch.object(httpx, "post", return_value=real) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.backend_used == Backend.POOLSIDE
     assert post.call_count == 1
 
@@ -5628,7 +5654,7 @@ def test_fallback_parse_failure_is_a_miss_not_the_answer(monkeypatch) -> None:
     with patch.object(
         httpx, "post", side_effect=[httpx.ConnectError("go down"), junk, real],
     ) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.POOLSIDE
     assert post.call_args_list[1].kwargs["json"]["model"] == "deepseek-v4.1-flash"
@@ -5648,7 +5674,7 @@ def test_primary_parse_failure_is_still_the_answer_with_a_fallback(monkeypatch) 
         raise httpx.ConnectError("down")
 
     with patch.object(httpx, "post", side_effect=fake_post):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "parse_failed"
     assert calls[:2] == ["space-bunny-free", "deepseek-v4.1-flash"]
 
@@ -5659,7 +5685,7 @@ def test_fallback_empty_answer_agrees_with_a_free_empty_answer(monkeypatch) -> N
     with patch.object(
         httpx, "post", side_effect=[_degenerate_response(), _degenerate_response()],
     ) as post:
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed" and out.findings == ()
     assert post.call_count == 2
 
@@ -5893,10 +5919,10 @@ def test_a_slow_primary_is_skipped_on_the_next_review(monkeypatch) -> None:
 
     with patch.object(httpx, "post", side_effect=fake_post):
         for _ in range(3):
-            assert review_diff([_hunk()], installation_id=1).kind == "reviewed"
+            assert review_diff(assemble_evidence([_hunk()]), installation_id=1).kind == "reviewed"
         assert calls == ["space-bunny-free", "deepseek-v4.1-flash"] * 3
         calls.clear()
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert calls == ["deepseek-v4.1-flash"]
 
@@ -5935,7 +5961,7 @@ def test_deepseek_degenerate_with_every_later_tier_failing_is_low_confidence(
         raise httpx.ConnectError("down")
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.findings == ()
@@ -5976,7 +6002,7 @@ def test_low_confidence_cohort_does_not_starve_the_next_cohort(monkeypatch) -> N
         )
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff(hunks, installation_id=1)
+        out = review_diff(assemble_evidence(hunks), installation_id=1)
 
     assert out.kind == "reviewed"
     assert [f.path for f in out.findings] == ["tests/test_x.py"]
@@ -6002,7 +6028,7 @@ def test_deep_append_keeps_a_degenerate_answer_when_the_reasoner_fails(
         raise httpx.ConnectError("down")
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = lc.review_reasoner_diff([_hunk()], installation_id=1)
+        out = lc.review_reasoner_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.findings == ()

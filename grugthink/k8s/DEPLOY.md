@@ -99,17 +99,8 @@ kubectl port-forward -n grugthink svc/grugthink 8080:8080
 
 In the dashboard: add each Discord bot token (they're in SSM at
 `/quadseven/grugthink/discord_token_*`), pick a personality template
-(Grug, Big Rob, ...), and Start. The gateway serves the LLM. Persistence:
-bot configuration lives in Postgres (the `grugthink_config` table - the
-dashboard writes it exactly as before, no PVC involved) and long-term memory
-lives in the `grugthink_facts` pgvector table, so the pod reschedules onto
-any arm64 node. `/data` in the pod is ephemeral scratch only.
-
-> **One-time cutover from the PVC era:** before the first rollout of the
-> PVC-free manifest, export the running config from the dashboard
-> (Settings -> Export) and save the file. After the new pod is up, import it
-> back via the dashboard (Settings -> Import). On a fresh install with an
-> empty `grugthink_config` table the app seeds a default config automatically.
+(Grug, Big Rob, ...), and Start. The gateway serves the LLM; the PVC persists
+config + memory across restarts.
 
 ## Notes
 

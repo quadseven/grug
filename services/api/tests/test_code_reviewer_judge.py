@@ -7,10 +7,11 @@ Best-effort — a judge failure never affects the (already-published)
 review."""
 from __future__ import annotations
 
-from llm_client import Backend, FindingJudgement, LlmReviewResponse
+from llm_client import Backend, FindingJudgement, Hunk, LlmReviewResponse
 from personas.code_reviewer import judge as cr_judge
 from personas.code_reviewer.diff_parser import parse_diff
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+from review_evidence import assemble_evidence
 
 
 _DIFF = """diff --git a/src/x.py b/src/x.py
@@ -22,6 +23,11 @@ _DIFF = """diff --git a/src/x.py b/src/x.py
 +new1
 +new2
 """
+
+
+def _wire(diff_hunks) -> list[Hunk]:
+    """Parser DiffHunks -> the wire hunks dispatch assembles into evidence."""
+    return [Hunk(path=h.file_path, body=h.body) for h in diff_hunks]
 
 
 def _finding(rule="r", line=2, severity="medium") -> Finding:
@@ -61,9 +67,10 @@ def test_run_judge_submits_one_eval_per_finding(monkeypatch):
     )
 
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF)), pr_context={"repo": "o/r"}),
+        installation_id=1,
         review_span_context=review.review_span_context,
-        pr_context={"repo": "o/r"},
     )
 
     assert len(submitted) == 2
@@ -85,7 +92,9 @@ def test_run_judge_skips_when_no_findings(monkeypatch):
     monkeypatch.setattr(cr_judge, "submit_finding_evaluation", lambda **kw: None)
 
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context={"span_id": "s"},
     )
     assert called["judge"] is False
@@ -106,7 +115,9 @@ def test_run_judge_skips_when_no_review_span_context(monkeypatch):
     monkeypatch.setattr(cr_judge, "submit_finding_evaluation", lambda **kw: None)
 
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context=None,
     )
     assert called["judge"] is False
@@ -133,7 +144,9 @@ def test_run_judge_tolerates_verdict_index_gaps(monkeypatch):
     )
 
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context={"span_id": "s"},
     )
     assert len(submitted) == 1
@@ -156,7 +169,9 @@ def test_run_judge_ignores_out_of_range_verdict_index(monkeypatch):
         lambda **kw: submitted.append(kw),
     )
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context={"span_id": "s"},
     )
     assert submitted == []
@@ -184,7 +199,9 @@ def test_run_judge_dedupes_duplicate_verdict_indices(monkeypatch):
         lambda **kw: submitted.append(kw),
     )
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context={"span_id": "s"},
     )
     # 2 evals (one per finding index), not 3 — the duplicate index-0
@@ -213,7 +230,9 @@ def test_run_judge_never_raises_on_submit_failure(monkeypatch):
 
     # Must not raise.
     cr_judge.run_judge(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
         review_span_context={"span_id": "s"},
     )
 # ── #467 judge-gated publication ──────────────────────────────────────
@@ -298,7 +317,9 @@ def test_grade_findings_fail_open_on_llm_error(monkeypatch):
 
     monkeypatch.setattr(cr_judge, "judge_findings", _boom)
     verdicts = cr_judge.grade_findings(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
     )
     assert verdicts == ()
 
@@ -306,5 +327,7 @@ def test_grade_findings_fail_open_on_llm_error(monkeypatch):
 def test_grade_findings_empty_when_no_findings():
     evaluation = CodeReviewEvaluation(findings=(), conclusion="success")
     assert cr_judge.grade_findings(
-        evaluation, parse_diff(_DIFF), installation_id=1,
+        evaluation,
+        assemble_evidence(_wire(parse_diff(_DIFF))),
+        installation_id=1,
     ) == ()

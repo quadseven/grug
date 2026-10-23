@@ -28,6 +28,7 @@ from personas.code_reviewer.degraded_gate import (
 from personas.code_reviewer.persona import CodeReviewEvaluation
 from personas.review_publish import plan_publish
 from review_pipeline import ReviewCoverage
+from review_evidence import assemble_evidence
 
 
 def _lead(reason: str) -> str:
@@ -215,8 +216,10 @@ def _cut_off_review(monkeypatch, severity: str) -> LlmReviewResponse:
         "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
     }
     with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
-        return lc.review_diff([lc.Hunk(path="src/x.py", body="@@ -1 +1 @@\n-a\n+b")],
-                              installation_id=1)
+        return lc.review_diff(
+            assemble_evidence([lc.Hunk(path="src/x.py", body="@@ -1 +1 @@\n-a\n+b")]),
+            installation_id=1,
+        )
 
 
 def _publish_offline(elder, llm: LlmReviewResponse, *, blocking: bool) -> list:

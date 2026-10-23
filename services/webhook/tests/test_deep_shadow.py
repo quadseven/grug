@@ -22,6 +22,7 @@ import deep_shadow
 import llm_client as lc
 from elder_eval import gate
 from llm_client import Backend, Hunk
+from review_evidence import assemble_evidence
 from sast_benchmark import backends
 
 _GATEWAY = "http://cave.test"
@@ -108,7 +109,7 @@ def _review(fake: _Fake):
     with patch.object(httpx, "post", side_effect=fake.post), patch.object(
         httpx, "get", side_effect=fake.get,
     ):
-        return lc.review_reasoner_diff([_hunk()], installation_id=1)
+        return lc.review_reasoner_diff(assemble_evidence([_hunk()]), installation_id=1)
 
 
 def _vllm_posts(fake: _Fake) -> list[str]:
@@ -344,5 +345,5 @@ def test_a_cancelled_review_is_not_shadowed(monkeypatch) -> None:
     with patch.object(httpx, "post", side_effect=fake.post), patch.object(
         httpx, "get", side_effect=fake.get,
     ):
-        lc.review_reasoner_diff([_hunk()], installation_id=1, cancel_event=cancelled)
+        lc.review_reasoner_diff(assemble_evidence([_hunk()]), installation_id=1, cancel_event=cancelled)
     assert _vllm_posts(fake) == []

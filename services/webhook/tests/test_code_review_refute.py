@@ -14,6 +14,7 @@ from personas.code_reviewer import judge as judge_mod
 from personas.code_reviewer.judge import partition_refuted, refute_findings
 from personas.code_reviewer.persona import Finding
 from llm_client import FindingJudgement
+from review_evidence import assemble_evidence
 
 
 def _finding(**kw) -> Finding:
@@ -95,7 +96,7 @@ def test_refute_findings_calls_judge_with_refute_flag(monkeypatch):
         return (FindingJudgement(0, False, "refuted", 0.95),)
 
     monkeypatch.setattr(judge_mod, "judge_findings", _fake_judge)
-    out = refute_findings((_finding(),), (), 42)
+    out = refute_findings((_finding(),), assemble_evidence(()), 42)
     assert captured["refute"] is True
     assert captured["redact"] is True
     assert captured["count"] == 1
@@ -107,11 +108,11 @@ def test_refute_findings_fail_open_on_judge_error(monkeypatch):
         raise RuntimeError("judge exploded")
 
     monkeypatch.setattr(judge_mod, "judge_findings", _boom)
-    assert refute_findings((_finding(),), (), 42) == ()
+    assert refute_findings((_finding(),), assemble_evidence(()), 42) == ()
 
 
 def test_refute_findings_empty_input_makes_no_call(monkeypatch):
     called = []
     monkeypatch.setattr(judge_mod, "judge_findings", lambda *a, **kw: called.append(1))
-    assert refute_findings((), (), 42) == ()
+    assert refute_findings((), assemble_evidence(()), 42) == ()
     assert called == []
