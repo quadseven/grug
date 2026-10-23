@@ -37,7 +37,11 @@ import httpx
 
 from adapters.install_store import get_repo_config, is_elder_paused  # type: ignore
 from github_app_auth import get_app_id, with_install_token_retry
-from github_checks_client import CheckRunResult, post_check_run
+from github_checks_client import (
+    CheckRunResult,
+    list_check_runs_for_ref,
+    post_check_run,
+)
 from personas import board_client
 from personas.code_reviewer.dispatch import (
     DIFF_TOO_LARGE,
@@ -196,35 +200,62 @@ def _review_dedup_id(
     return f"elder-review:{hashlib.sha256(material.encode('utf-8')).hexdigest()}"
 
 
-def enqueue_rerun(*, install_id: int, repo: str, pr_number: int, persona: str) -> None:
+def enqueue_rerun(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    persona: str,
+    not_before: float = 0.0,
+    requeue_of: str = "",
+) -> None:
     """Send a `RerunJob` to `grug-rerun-jobs` (the webhook-side producer used by
     Elder self-recovery, #418). Same job shape + FIFO dedup as the api producer:
     content-dedup on `(install, repo, pr, persona)` over the 5-min window, so a
     self-recover enqueue that races an operator re-run (or a second drop) for the
     same PR collapses to one job. `head_sha` is NOT in the key - a re-run always
     targets the PR's CURRENT head. Raises `RuntimeError` when the queue isn't
-    configured (the caller treats enqueue as best-effort)."""
+    configured (the caller treats enqueue as best-effort).
+
+    `not_before` (grug#1270) keeps a command that the installation's exhausted
+    hourly GitHub budget refused: the job carries the epoch second the budget
+    resets at, and the consumer holds it until then instead of running it into
+    the same wall. A deferred job gets its OWN dedup id - the plain
+    `(install, repo, pr, persona)` id is still inside SQS's 5-minute dedup
+    window when the deferral is sent, and a collapsed send would lose the
+    command (the same trap the learn lane already handles)."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
+    job: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "install_id": install_id,
+        "repo": repo,
+        "pr_number": pr_number,
+        "persona": persona,
+    }
+    dedup_id = f"{install_id}:{repo}:{pr_number}:{persona}"
+    if not_before > 0:
+        job["not_before"] = float(not_before)
+        # Hash the dedup id: a long owner/repo can push the plain string past
+        # SQS's 128-char limit (the same fix as the learn lane's id).
+        material = f"{dedup_id}\x1fnotbefore{int(not_before)}"
+        if requeue_of:
+            material += f"\x1frequeue{requeue_of}"
+        dedup_id = "rerun:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
     _sqs.send_message(
         QueueUrl=_RERUN_QUEUE_URL,
-        MessageBody=json.dumps(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "install_id": install_id,
-                "repo": repo,
-                "pr_number": pr_number,
-                "persona": persona,
-            }
-        ),
+        MessageBody=json.dumps(job),
         MessageGroupId=_rerun_group_id(
             install_id, repo, pr_number, persona,
         ),
-        MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:{persona}",
+        MessageDeduplicationId=dedup_id,
     )
     log.info(
         "rerun_enqueued",
-        extra={"install_id": install_id, "repo": repo, "pr": pr_number, "persona": persona},
+        extra={
+            "install_id": install_id, "repo": repo, "pr": pr_number,
+            "persona": persona, "not_before": int(not_before),
+        },
     )
 
 
@@ -249,38 +280,11 @@ def _elder_check_already_terminal_or_pending(
         # em-dash variants) still count as Elder during the nomenclature
         # cutover; filter client-side with _ELDER_CHECK_NAMES.
         #
-        # Paginate: a busy commit can carry >100 distinct check names even
-        # under filter=latest (one run per name), and the Elder run could sit
-        # on a later page. Missing it would wrongly re-post in_progress over a
-        # settled required check - the exact reopen this guard prevents. Cap
-        # the page walk as a runaway backstop (1000 runs >> any real commit).
-        _MAX_PAGES = 10
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        url = (
-            f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
-            f"/commits/{quote(head_sha, safe='')}/check-runs"
-        )
-        runs: list = []
-        seen = 0
-        for page in range(1, _MAX_PAGES + 1):
-            resp = httpx.get(
-                url,
-                params={"filter": "latest", "per_page": 100, "page": page},
-                headers=headers,
-                timeout=_FETCH_TIMEOUT,
-            )
-            resp.raise_for_status()
-            payload = resp.json() or {}
-            total = int(payload.get("total_count") or 0)
-            batch = payload.get("check_runs") or []
-            runs.extend(batch)
-            seen += len(batch)
-            if not batch or seen >= total:
-                break
+        # `list_check_runs_for_ref` walks the pages (filter=latest: one run
+        # per name) and is the SAME listing the `grug:reviewing` label's
+        # lifecycle reads, so the label and this guard can never disagree
+        # about what is running on a head.
+        runs = list_check_runs_for_ref(token, owner, repo_name, head_sha)
         for run in runs:
             if str(run.get("name") or "") not in _ELDER_CHECK_NAMES:
                 continue
@@ -1174,6 +1178,12 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
         return "skipped_persona"
 
     owner, _, repo_name = repo_full.partition("/")
+    # A job the installation's exhausted GitHub budget refused carries the
+    # epoch second the budget resets at (grug#1270). It is HELD until then
+    # instead of being run into the same wall - and never dropped.
+    deferred = _deferred_rerun_status(job, receive_count, message_id)
+    if deferred:
+        return deferred
     # Fetch the PR's CURRENT head (+ the repo id, for RepoConfig). A 5xx/
     # RequestError raises → ESM retry → DLQ. with_install_token_retry refreshes
     # a stale token once.
@@ -1210,14 +1220,221 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
         # Teller has no blocking mode (comment-only, no blocking_flag).
         dispatch_walkthrough_review(payload, blocking=False)
     else:
-        dispatch_code_review(
-            payload, blocking=bool(cfg.get("code_reviewer_blocking", False)),
+        # Elder re-run: the `grug:reviewing` label rides it (grug#1270).
+        _dispatch_elder_rerun(
+            payload, install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number, pr=pr, cfg=cfg,
         )
     log.info(
         "rerun_dispatched",
         extra={"repo": f"{owner}/{repo_name}", "pr": pr_number, "persona": persona},
     )
     return "dispatched"
+
+
+def _mark_reviewing_label(
+    *, install_id: int, owner: str, repo_name: str, pr_number: int,
+) -> bool:
+    """Put the `grug:reviewing` label on the PR while Elder re-reviews it.
+
+    True when the PR carries the label afterwards.
+
+    The label is the visible sign, the Elder CHECK RUN is the truth
+    (grug#1270), so a failed write must not fail the review - but it must
+    not look like a sign that is up either: a refused write is logged as an
+    ERROR and reported as False, so the reader of the log can tell a
+    missing sign from a raised one."""
+    from review_label import add_reviewing_label
+
+    def _do(token: str) -> bool:
+        return add_reviewing_label(
+            token=token, owner=owner, repo=repo_name, pr_number=pr_number,
+        )
+
+    try:
+        attached = bool(with_install_token_retry(install_id, _do))
+    except httpx.HTTPError as error:
+        log.error(
+            "reviewing_label_mark_failed",
+            extra={
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "kind": type(error).__name__,
+            },
+            exc_info=True,
+        )
+        return False
+    if not attached:
+        log.error(
+            "reviewing_label_mark_refused",
+            extra={"repo": f"{owner}/{repo_name}", "pr": pr_number},
+        )
+    return attached
+
+
+def _clear_reviewing_label(
+    *, install_id: int, owner: str, repo_name: str, pr_number: int, head_sha: str,
+) -> bool:
+    """Take the `grug:reviewing` label off the PR now that Elder concluded.
+
+    The CHECK RUN is the source of truth: the label goes only when the Elder
+    check on this head reached a terminal conclusion - success, failure and a
+    degraded neutral all end the review. A check that is still running, or a
+    GitHub that cannot be read, keeps the label; the consumer's sweep clears
+    it later if the review really is over (grug#1270).
+
+    True when the PR does not carry the label afterwards. A refused removal
+    is logged as an ERROR: a sign that stays up on a head Elder already
+    finished would tell every later reader that Elder is busy."""
+    from review_label import elder_check_conclusion, remove_reviewing_label
+
+    def _conclusion(token: str) -> str:
+        return elder_check_conclusion(
+            token=token, owner=owner, repo=repo_name, head_sha=head_sha,
+        )
+
+    def _remove(token: str) -> bool:
+        return remove_reviewing_label(
+            token=token, owner=owner, repo=repo_name, pr_number=pr_number,
+        )
+
+    try:
+        conclusion = str(with_install_token_retry(install_id, _conclusion) or "")
+    except httpx.HTTPError as error:
+        log.error(
+            "reviewing_label_clear_failed",
+            extra={
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "kind": type(error).__name__,
+            },
+            exc_info=True,
+        )
+        return False
+    if not conclusion:
+        # The check has not concluded (or could not be read): the sign
+        # stays, and the sweep clears it if the review really is over.
+        return False
+    try:
+        removed = bool(with_install_token_retry(install_id, _remove))
+    except httpx.HTTPError as error:
+        log.error(
+            "reviewing_label_clear_failed",
+            extra={
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "kind": type(error).__name__,
+            },
+            exc_info=True,
+        )
+        return False
+    log.info(
+        "reviewing_label_cleared",
+        extra={
+            "repo": f"{owner}/{repo_name}",
+            "pr": pr_number,
+            "head_sha": head_sha[:8],
+            "conclusion": conclusion,
+            "removed": removed,
+        },
+    )
+    if not removed:
+        log.error(
+            "reviewing_label_clear_refused",
+            extra={
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "conclusion": conclusion,
+            },
+        )
+    return removed
+
+
+def _deferred_rerun_status(
+    job: dict[str, Any], receive_count: int, message_id: str,
+) -> str | None:
+    """The status of a job the installation's GitHub budget refused, or None
+    when the job is due (or was never deferred).
+
+    A deferred job is HELD until it is due - never dropped, and never run
+    into the same wall (grug#1270)."""
+    not_before = float(job.get("not_before", 0) or 0)
+    if not_before <= 0:
+        return None
+    remaining = not_before - _now()
+    if remaining <= 0:
+        return None
+    return _hold_or_requeue_deferred(job, remaining, receive_count, message_id)
+
+
+def _hold_or_requeue_deferred(
+    job: dict[str, Any], remaining: float, receive_count: int, message_id: str,
+) -> str:
+    """Hold a deferred job until it is due, or replace the copy.
+
+    SQS FIFO cannot delay a single message, so a job the GitHub budget
+    refused is enqueued at once and held HERE until it is due (grug#1270).
+    The first early arrival is a hold - one receive, not a failure. A REPEAT
+    means the visibility call did not take, so the job is replaced by a fresh
+    copy: otherwise the message would burn its receive budget and dead-letter
+    a command that was never dropped."""
+    if receive_count < 2:
+        raise JobNotDue(remaining)
+    enqueue_rerun(
+        install_id=int(job["install_id"]),
+        repo=str(job["repo"]),
+        pr_number=int(job["pr_number"]),
+        persona=str(job.get("persona", "elder")),
+        not_before=float(job.get("not_before", 0) or 0),
+        requeue_of=message_id,
+    )
+    log.info(
+        "rerun_deferred_requeued",
+        extra={
+            "repo": str(job["repo"]),
+            "pr": int(job["pr_number"]),
+            "persona": str(job.get("persona", "elder")),
+            "remaining_s": int(remaining),
+        },
+    )
+    return "rerun_deferred_requeued"
+
+
+def _dispatch_elder_rerun(
+    payload: dict[str, Any], *, install_id: int, owner: str, repo_name: str,
+    pr_number: int, pr: dict[str, Any], cfg: dict[str, Any],
+) -> None:
+    """Run Elder on the re-run, label the PR while it runs, and clear the
+    label when the Elder check concludes.
+
+    The `grug:reviewing` label goes on as the re-run STARTS, not only when
+    it was queued: a command held back by the GitHub budget carries no sign
+    until it finally runs, and the sign must be there while Elder works
+    (grug#1270).
+
+    The label comes off in a `finally`: a review that RAISED is a review
+    that is over, and a `grug:reviewing` label left on it would tell every
+    later reader - and the command path - that Elder is still busy."""
+    head_sha = str((pr.get("head") or {}).get("sha") or "")
+    _mark_reviewing_label(
+        install_id=install_id, owner=owner, repo_name=repo_name,
+        pr_number=pr_number,
+    )
+    try:
+        dispatch_code_review(
+            payload, blocking=bool(cfg.get("code_reviewer_blocking", False)),
+        )
+    finally:
+        # Elder concluded: the sign goes with it. The CHECK RUN is the source
+        # of truth - success, failure and a degraded neutral all end the
+        # review.
+        _clear_reviewing_label(
+            install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number, head_sha=head_sha,
+        )
 
 
 def _fetch_current_pr(

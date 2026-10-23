@@ -20,6 +20,7 @@ from llm_client import (
 from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.review_publish import plan_publish
+from review_evidence import ElderEvidence
 from review_pipeline import ReviewCoverage, ReviewabilityConcern
 
 
@@ -97,7 +98,7 @@ def test_dispatch_advisory_mode_posts_neutral_check_and_comment_review(monkeypat
     posted_check = []
     posted_review = []
 
-    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None, ci_context=None, repo_docs_context=None, voice="caveman", cancel_event=None):
+    def _fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
         return llm
 
     def _fake_post_check_run(install_token, owner, repo, result, external_id=None):
@@ -1127,12 +1128,49 @@ def test_dispatch_judge_failure_does_not_change_result(monkeypatch):
     assert out["result"] == "pass"
 
 
+def test_dispatch_judge_grades_against_the_reviewers_own_evidence(monkeypatch):
+    """The production judge caller is migrated to the evidence seam (#1189):
+    `grade_findings` receives the very `ElderEvidence` object the reviewer
+    read, never hunks plus loose kwargs and never a second assembly."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="r", severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "rs1"},
+    )
+    reviewed: list = []
+    graded: list = []
+
+    def _fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
+        reviewed.append(evidence)
+        return llm
+
+    def _fake_grade(evaluation, evidence, installation_id, *a, **kw):
+        graded.append(evidence)
+        return (FindingJudgement(0, True, "real", 0.9),)
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", _fake_review_diff)
+    monkeypatch.setattr(cr_dispatch, "grade_findings", _fake_grade)
+    monkeypatch.setattr(cr_dispatch, "submit_evals", lambda *a, **kw: None)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert len(reviewed) == 1 and len(graded) == 1
+    assert isinstance(graded[0], ElderEvidence)
+    assert graded[0] is reviewed[0]
+
+
 def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
     """The review receives both trace coordinates and author intent."""
     captured = []
 
-    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None, ci_context=None, repo_docs_context=None, voice="caveman", cancel_event=None):
-        captured.append(pr_context)
+    def _fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
+        captured.append(evidence.pr_context)
         return LlmReviewResponse(kind="no_diff")
 
     monkeypatch.setattr(cr_dispatch, "review_diff", _fake_review_diff)
@@ -4077,8 +4115,8 @@ def test_dispatch_skips_a_byte_identical_copy_of_an_untouched_repo_file(monkeypa
     reviewed_paths: list[str] = []
     posted_check = []
 
-    def _fake_review_diff(hunks, installation_id, **kwargs):
-        reviewed_paths.extend(h.path for h in hunks)
+    def _fake_review_diff(evidence, installation_id, **kwargs):
+        reviewed_paths.extend(h.path for h in evidence.hunks)
         return LlmReviewResponse(
             kind="reviewed", findings=(),
             backend_used=Backend.POOLSIDE, model_name="laguna",
@@ -4132,8 +4170,8 @@ def test_dispatch_reviews_a_copy_when_the_head_tree_is_unreadable(monkeypatch):
     )
     reviewed_paths: list[str] = []
 
-    def _fake_review_diff(hunks, installation_id, **kwargs):
-        reviewed_paths.extend(h.path for h in hunks)
+    def _fake_review_diff(evidence, installation_id, **kwargs):
+        reviewed_paths.extend(h.path for h in evidence.hunks)
         return LlmReviewResponse(
             kind="reviewed", findings=(),
             backend_used=Backend.POOLSIDE, model_name="laguna",

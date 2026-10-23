@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Callable, Literal
 
 from llm_client import Hunk, LlmReviewResponse, review_diff
+from review_evidence import assemble_evidence
 from observability import emit_gauge
 
 log = logging.getLogger("grug.elder_canary")
@@ -187,8 +188,10 @@ def run_canary(timeout_s: float = 240.0) -> list[CanaryResult]:
         slot = slots[name]
         try:
             slot["resp"] = review_diff(
-                hunks, 0,
-                pr_context={"repo": CANARY_REPO, "pr_number": 0},
+                assemble_evidence(
+                    hunks, pr_context={"repo": CANARY_REPO, "pr_number": 0},
+                ),
+                0,
                 cancel_event=cancel,
             )
         except Exception as e:  # noqa: BLE001 - reported as an `error` outcome

@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Dict
 
 from ..grug_structured_logger import get_logger
-from . import pg_store
 
 log = get_logger(__name__)
 
@@ -32,66 +31,49 @@ def is_yaml_available() -> bool:
     return _YAML_AVAILABLE
 
 
-def load_config(config_file: str, templates: Dict = None) -> Dict[str, Any]:
-    """Load configuration.
+def load_config(config_file: str) -> Dict[str, Any]:
+    """Load configuration from file.
 
-    With a Postgres DSN configured the config document lives in the
-    ``grugthink_config`` table (see pg_store) and ``config_file`` is only the
-    first-boot seed path. Otherwise the YAML/JSON file is read as before.
+    Returns {} only when the file is missing or holds no document (zero
+    bytes, whitespace or comments only): the caller then writes a default
+    config. An unreadable or unparseable file raises instead, because a
+    default written over it would destroy the real configuration.
     """
-    if pg_store.pg_config_enabled():
-        return pg_store.load_or_seed(config_file, templates or {})
-
-    return _load_file_config(config_file)
-
-
-def _load_file_config(config_file: str) -> Dict[str, Any]:
-    """Load configuration from a YAML/JSON file (the no-database backend)."""
     try:
-        if os.path.exists(config_file):
-            # Treat zero-byte or whitespace-only files as uninitialized
-            try:
-                if os.path.getsize(config_file) == 0:
-                    raise ValueError("Config file is empty")
-            except OSError:
-                pass
-
-            with open(config_file, "r") as f:
-                if config_file.endswith(".yaml") or config_file.endswith(".yml"):
-                    if _YAML_AVAILABLE:
-                        data = yaml.safe_load(f)
-                        if not data:
-                            # Empty or invalid YAML
-                            raise ValueError("Empty or invalid YAML config")
-                    else:
-                        log.warning("YAML config file found but PyYAML not available, skipping")
-                        data = {}
+        with open(config_file, "r") as f:
+            if config_file.endswith(".yaml") or config_file.endswith(".yml"):
+                if _YAML_AVAILABLE:
+                    data = yaml.safe_load(f)
                 else:
-                    data = json.load(f)
-
-            log.info(
-                "Configuration loaded", extra={"config_file": config_file, "env_vars": len(data.get("environment", {}))}
-            )
-            return data
-        else:
-            return {}
-
-    except Exception as e:
-        log.error("Failed to load configuration", extra={"error": str(e), "config_file": config_file})
+                    log.warning("YAML config file found but PyYAML not available, skipping")
+                    data = {}
+            else:
+                text = f.read()
+                data = json.loads(text) if text.strip() else {}
+    except FileNotFoundError:
         return {}
+    except (OSError, ValueError) as e:
+        # json.JSONDecodeError is a ValueError; yaml.YAMLError is handled below.
+        log.error("Failed to load configuration", extra={"error": str(e), "config_file": config_file})
+        raise
+    except Exception as e:
+        if yaml is not None and isinstance(e, yaml.YAMLError):
+            log.error("Failed to parse configuration", extra={"error": str(e), "config_file": config_file})
+        raise
+
+    if not data:
+        log.warning("Configuration file holds no document", extra={"config_file": config_file})
+        return {}
+    if not isinstance(data, dict):
+        log.error("Configuration is not a mapping", extra={"config_file": config_file})
+        raise ValueError(f"Configuration in {config_file} is not a mapping")
+
+    log.info("Configuration loaded", extra={"config_file": config_file, "env_vars": len(data.get("environment", {}))})
+    return data
 
 
 def save_config(config_file: str, config_data: Dict[str, Any]):
-    """Save current configuration.
-
-    With a Postgres DSN configured the document is upserted into the
-    ``grugthink_config`` table (``config_file`` is ignored); otherwise the
-    file is written atomically as before.
-    """
-    if pg_store.pg_config_enabled():
-        pg_store.save_config(config_data)
-        return
-
+    """Save current configuration to file."""
     try:
         # Atomic write: write to temp then replace
         cfg_path = Path(config_file)
@@ -122,9 +104,9 @@ def save_config(config_file: str, config_data: Dict[str, Any]):
         raise
 
 
-def build_default_config(templates: Dict) -> Dict[str, Any]:
-    """Build the default configuration document (no I/O)."""
-    return {
+def create_default_config(config_file: str, templates: Dict) -> Dict[str, Any]:
+    """Create default configuration file."""
+    default_config = {
         "version": "2.0",
         "description": "GrugThink Multi-Bot Configuration",
         "global_settings": {
@@ -141,11 +123,6 @@ def build_default_config(templates: Dict) -> Dict[str, Any]:
         },
         "bot_templates": {template_id: asdict(template) for template_id, template in templates.items()},
     }
-
-
-def create_default_config(config_file: str, templates: Dict) -> Dict[str, Any]:
-    """Create default configuration file."""
-    default_config = build_default_config(templates)
 
     try:
         with open(config_file, "w") as f:
@@ -167,8 +144,19 @@ def create_default_config(config_file: str, templates: Dict) -> Dict[str, Any]:
 
 
 def reload_config(config_manager, old_config: Dict[str, Any], old_env: Dict[str, str]):
-    """Reload configuration and notify callbacks."""
-    config_data = load_config(config_manager.config_file, config_manager.templates)
+    """Reload configuration and notify callbacks.
+
+    A file that cannot be read or parsed (a torn write, a bad hand edit)
+    leaves the running configuration in place rather than replacing it.
+    """
+    try:
+        config_data = load_config(config_manager.config_file)
+    except Exception as e:
+        log.error(
+            "Config reload failed; keeping the running configuration",
+            extra={"error": str(e), "config_file": config_manager.config_file},
+        )
+        return
 
     # Load external personalities
     from .personalities import load_external_personalities

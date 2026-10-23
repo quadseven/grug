@@ -7,7 +7,7 @@ Load-bearing contracts:
 - any fetch/render failure degrades to None (today's review), never raises;
 - the prompt renders a `### CI STATUS` block only when ci_context is given;
 - every test below fails against the pre-#902 code (no ci_status module,
-  no ci_context kwarg on _build_review_parts).
+  no ci_context on the review evidence).
 """
 
 from __future__ import annotations
@@ -15,8 +15,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from llm_client import Hunk, _build_review_parts
+from llm_client import Hunk
 from personas.code_reviewer.ci_status import build_ci_status_context, is_test_path
+from review_evidence import assemble_evidence
 
 
 def _run(name, status="completed", conclusion="success"):
@@ -136,16 +137,16 @@ def _hunks():
 
 
 def test_review_parts_include_ci_status_block_when_given():
-    parts, _ = _build_review_parts(_hunks(), ci_context="tests: success")
+    parts, _ = assemble_evidence(_hunks(), ci_context="tests: success").reviewer_view()
     assert any(p.startswith("### CI STATUS") and "tests: success" in p for p in parts)
 
 
 def test_review_parts_omit_ci_status_block_when_absent():
-    parts, _ = _build_review_parts(_hunks())
+    parts, _ = assemble_evidence(_hunks()).reviewer_view()
     assert not any("CI STATUS" in p for p in parts)
 
 
 def test_ci_status_block_comes_after_production_signal():
-    parts, _ = _build_review_parts(_hunks(), runtime_context="PROD", ci_context="CI")
+    parts, _ = assemble_evidence(_hunks(), runtime_context="PROD", ci_context="CI").reviewer_view()
     idx = {p.split("\n")[0]: i for i, p in enumerate(parts)}
     assert idx["### PRODUCTION SIGNAL"] < idx["### CI STATUS"]
