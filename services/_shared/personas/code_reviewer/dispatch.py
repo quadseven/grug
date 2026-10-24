@@ -3874,7 +3874,7 @@ def _apply_refute_gate(
         return findings
     dead = {id(f) for f in refuted}
     replacement = {
-        id(orig): new for orig, new in zip(high, softened) if new is not orig
+        id(orig): new for orig, new in zip(high, softened, strict=True) if new is not orig
     }
     return tuple(
         replacement.get(id(f), f) for f in findings if id(f) not in dead
