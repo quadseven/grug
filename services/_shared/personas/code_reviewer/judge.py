@@ -467,3 +467,64 @@ def partition_refuted(
         else:
             kept.append(f)
     return tuple(kept), tuple(refuted)
+
+
+# Severity an unrefuted high/critical drops to when the plain judge called it
+# not real (#1400): medium still posts inline but never blocks a merge.
+_ADVISORY_SEVERITY: Severity = "medium"
+
+_ADVISORY_NOTE = (
+    " [Advisory, not blocking: the refute check returned no verdict, and the "
+    "judge rated this not a real bug (confidence {confidence:.2f}). Confirm "
+    "by hand.]"
+)
+
+
+def _finding_identity(f: Finding) -> tuple[str, int, str, str]:
+    return (f.file, f.line, f.rule_name, f.message)
+
+
+def advisory_when_unrefuted(
+    findings: tuple[Finding, ...],
+    refute_verdicts: tuple[FindingJudgement, ...],
+    *,
+    plain_findings: tuple[Finding, ...],
+    plain_verdicts: tuple[FindingJudgement, ...],
+    confidence_floor: float = _REFUTE_CONFIDENCE_FLOOR,
+) -> tuple[tuple[Finding, ...], tuple[tuple[Finding, FindingJudgement], ...]]:
+    """Soften the refute gate's fail-open (#1400). Returns (findings,
+    downgraded) where `downgraded` pairs each original finding with the
+    plain verdict that softened it.
+
+    `findings` is the high/critical list the refute gate was asked about;
+    `refute_verdicts` index into it. A finding the refute gate gave NO
+    verdict (every backend failed, an index miss, over the batch cap)
+    whose plain judge verdict (`plain_verdicts`, indexed into
+    `plain_findings`) is not-real at `confidence_floor` or above becomes an
+    advisory medium carrying a note. It still publishes: nothing is hidden.
+    A refute verdict that ran always wins, so a high the refute gate upheld
+    or was unsure about keeps blocking. Pure - no IO."""
+    answered = {
+        v.finding_index for v in refute_verdicts
+        if 0 <= v.finding_index < len(findings)
+    }
+    plain: dict[tuple[str, int, str, str], FindingJudgement] = {}
+    for v in plain_verdicts:
+        if 0 <= v.finding_index < len(plain_findings):
+            plain.setdefault(_finding_identity(plain_findings[v.finding_index]), v)
+    out: list[Finding] = []
+    downgraded: list[tuple[Finding, FindingJudgement]] = []
+    for i, f in enumerate(findings):
+        v = None if i in answered else plain.get(_finding_identity(f))
+        if (
+            v is None
+            or v.is_real_bug
+            or v.confidence < confidence_floor
+            or f.severity not in ("high", "critical")
+        ):
+            out.append(f)
+            continue
+        note = _ADVISORY_NOTE.format(confidence=v.confidence)
+        out.append(replace(f, severity=_ADVISORY_SEVERITY, message=f.message + note))
+        downgraded.append((f, v))
+    return tuple(out), tuple(downgraded)

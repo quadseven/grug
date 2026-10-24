@@ -116,3 +116,71 @@ def test_refute_findings_empty_input_makes_no_call(monkeypatch):
     monkeypatch.setattr(judge_mod, "judge_findings", lambda *a, **kw: called.append(1))
     assert refute_findings((), assemble_evidence(()), 42) == ()
     assert called == []
+
+
+# --- refute fail-open with a confident plain not-real verdict (#1400) -----
+
+from personas.code_reviewer.judge import advisory_when_unrefuted  # noqa: E402
+
+
+def _fj(index, real, confidence):
+    return FindingJudgement(index, real, "reason", confidence)
+
+
+def test_unrefuted_high_the_judge_called_not_real_becomes_advisory():
+    """#1400, the live case: every refute backend failed (no verdict) and
+    the plain judge had called the high finding not real at 0.92. It still
+    publishes, as a non-blocking medium carrying a note, never hidden."""
+    f = _finding()
+    out, downgraded = advisory_when_unrefuted(
+        (f,), (), plain_findings=(f,), plain_verdicts=(_fj(0, False, 0.92),),
+    )
+    assert len(out) == 1
+    assert out[0].severity == "medium"
+    assert out[0].message.startswith(f.message)
+    assert "0.92" in out[0].message
+    assert [(d[0], d[1].confidence) for d in downgraded] == [(f, 0.92)]
+
+
+def test_partial_refute_answer_downgrades_only_the_unanswered_finding():
+    a, b = _finding(line=5), _finding(line=9)
+    out, downgraded = advisory_when_unrefuted(
+        (a, b), (_fj(0, True, 0.95),),
+        plain_findings=(a, b),
+        plain_verdicts=(_fj(0, False, 0.95), _fj(1, False, 0.95)),
+    )
+    assert out[0] is a
+    assert out[1].severity == "medium"
+    assert [d[0] for d in downgraded] == [b]
+
+
+def test_high_stays_blocking_when_the_refute_gate_answered():
+    """A refute verdict that ran always wins: it upheld the finding (or was
+    unsure), so the plain judge's not-real cannot soften it."""
+    f = _finding()
+    for refute in ((_fj(0, True, 0.95),), (_fj(0, False, 0.5),)):
+        out, downgraded = advisory_when_unrefuted(
+            (f,), refute, plain_findings=(f,),
+            plain_verdicts=(_fj(0, False, 0.99),),
+        )
+        assert out == (f,) and downgraded == ()
+
+
+def test_high_stays_blocking_without_a_confident_plain_not_real():
+    f = _finding()
+    for plain in ((_fj(0, True, 0.99),), (_fj(0, False, 0.89),), ()):
+        out, downgraded = advisory_when_unrefuted(
+            (f,), (), plain_findings=(f,), plain_verdicts=plain,
+        )
+        assert out == (f,) and downgraded == ()
+
+
+def test_plain_verdict_must_match_the_same_finding():
+    """The plain verdict index refers to the judge's own finding list; a
+    not-real verdict on a different finding never softens this one."""
+    f, other = _finding(line=5), _finding(line=7, message="other")
+    out, _ = advisory_when_unrefuted(
+        (f,), (), plain_findings=(other, f),
+        plain_verdicts=(_fj(0, False, 0.99), _fj(1, True, 0.99)),
+    )
+    assert out == (f,)

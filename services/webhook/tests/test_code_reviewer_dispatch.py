@@ -2743,6 +2743,101 @@ def test_dispatch_refute_gate_kills_confidently_refuted_high_finding(monkeypatch
     assert out["result"] == "pass"
 
 
+def _run_refute_outage_review(monkeypatch, caplog, *, plain_confidence):
+    """One blocking Tier-1 review with a single HIGH finding, every refute
+    backend failing (no verdict), and the plain judge calling the finding
+    not real at `plain_confidence`. Returns (check conclusions, reviews)."""
+    import logging
+
+    from llm_client import FindingJudgement as FJ
+
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="null-deref",
+            severity="high", message="value may be None here",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "rs1"},
+    )
+    conclusions: list = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run",
+        lambda token, owner, repo, result, **kw: conclusions.append(
+            result.conclusion) or {},
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "grade_findings",
+        lambda *a, **kw: (FJ(0, False, "guarded above", plain_confidence),),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "fetch_file_contents",
+        lambda token, owner, repo, paths, sha: {"src/x.py": "x = 1\ny = 2\nz = 3\n"},
+    )
+    monkeypatch.setattr(cr_dispatch, "refute_findings", lambda *a, **kw: ())
+    posted_reviews: list = []
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_reviews.append(kw["result"]) or {},
+    )
+    with patch("httpx.get", return_value=_diff_response()), \
+         caplog.at_level(logging.INFO):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=True)
+    return conclusions, posted_reviews
+
+
+def test_refute_outage_publishes_a_judged_not_real_high_as_advisory(monkeypatch, caplog):
+    """#1400, live 2026-10-24: every refute backend failed and the plain
+    judge had called the high null-deref not real at 0.92. The finding
+    still posts, but as a non-blocking advisory: the check does not fail
+    and the review does not request changes."""
+    conclusions, reviews = _run_refute_outage_review(
+        monkeypatch, caplog, plain_confidence=0.92,
+    )
+
+    assert conclusions and conclusions[0] != "failure"
+    assert reviews, "the finding must still publish"
+    assert all(r.event != "REQUEST_CHANGES" for r in reviews)
+    assert any("0.92" in c.body for r in reviews for c in r.comments)
+    row = next(
+        r for r in caplog.records
+        if r.getMessage() == "code_review_refute_unverified_downgraded"
+    )
+    assert (row.rule, row.arm, row.confidence) == ("null-deref", "tier1", 0.92)
+
+
+def test_refute_outage_keeps_a_high_blocking_below_the_floor(monkeypatch, caplog):
+    """The plain judge at 0.85 is not confident enough: the high still blocks."""
+    conclusions, reviews = _run_refute_outage_review(
+        monkeypatch, caplog, plain_confidence=0.85,
+    )
+
+    assert conclusions and conclusions[0] == "failure"
+    assert any(r.event == "REQUEST_CHANGES" for r in reviews)
+
+
+def test_deep_arm_refute_outage_downgrades_a_judged_not_real_high(monkeypatch):
+    """#1400: the deep arm grades with its own plain verdicts and gets the
+    same advisory treatment when its refute call returns nothing."""
+    from llm_client import FindingJudgement as FJ
+    from review_evidence import assemble_evidence
+
+    monkeypatch.setattr(
+        cr_dispatch, "grade_findings",
+        lambda *a, **kw: (FJ(0, False, "guarded above", 0.95),),
+    )
+    monkeypatch.setattr(cr_dispatch, "refute_findings", lambda *a, **kw: ())
+    hunks = tuple(cr_dispatch.parse_diff(_DIFF))
+    deep_eval, _, _, _ = cr_dispatch._grade_deep_response(
+        _deep_llm_with_finding(rule="null-deref", severity="high"),
+        hunks, assemble_evidence(()), 11,
+        pr_context={}, owner="o", repo_name="r", pull_number=1,
+    )
+
+    assert [f.severity for f in deep_eval.findings] == ["medium"]
+
+
 # --- #730: deep review capture + stack refresh --------------------------------
 
 
