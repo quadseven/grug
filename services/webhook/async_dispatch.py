@@ -59,8 +59,9 @@ import threading
 from dataclasses import dataclass
 from typing import Any
 
-from personas.code_reviewer.snapshot import (
+from personas.code_reviewer.elder_review import (
     adaptive_elder_settle_seconds,
+    durable_elder_settle_seconds,
     review_snapshot_id_from_pr,
 )
 
@@ -83,8 +84,6 @@ _THREAD_NAME_LEN = 19
 # Intent is useful review evidence, but a PR body can approach GitHub's own
 # large payload limits. Keep the async projection bounded.
 _MAX_PR_BODY_CHARS = 12_000
-_DEFAULT_ELDER_SETTLE_SECONDS = 90
-_MAX_ELDER_SETTLE_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -404,23 +403,12 @@ def _run_job(spec: _AsyncPersonaSpec, event: dict[str, Any]) -> dict[str, str]:
 
 
 def _durable_elder_settle_seconds(pr: dict[str, Any]) -> int:
-    """Resolve base settle env + Swift Hunt adaptive cap for one PR."""
-    raw_settle = os.getenv(
-        "GRUG_ELDER_SETTLE_SECONDS",
-        str(_DEFAULT_ELDER_SETTLE_SECONDS),
-    )
-    try:
-        settle_seconds = int(raw_settle)
-    except ValueError:
-        log.warning(
-            "elder_settle_seconds_invalid",
-            extra={"value": raw_settle},
-        )
-        settle_seconds = _DEFAULT_ELDER_SETTLE_SECONDS
-    settle_seconds = min(
-        _MAX_ELDER_SETTLE_SECONDS, max(0, settle_seconds),
-    )
-    return adaptive_elder_settle_seconds(pr, base_seconds=settle_seconds)
+    """Resolve base settle env + Swift Hunt adaptive cap for one PR.
+
+    Delegates to `personas.code_reviewer.elder_review.durable_elder_settle_seconds`
+    so the settle policy has one home.
+    """
+    return durable_elder_settle_seconds(pr)
 
 
 

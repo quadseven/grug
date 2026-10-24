@@ -56,10 +56,24 @@ from personas.code_reviewer.degraded_gate import (
     gate_sentence,
     lead_with_degraded_line,
 )
-from personas.code_reviewer.snapshot import (
+from personas.code_reviewer.elder_review import (
+    ReviewClaimHeartbeat,
+    StalenessWatch,
+    _MAX_ELDER_SETTLE_SECONDS,
+    _REVIEW_CLAIM_LEASE_SECONDS,
+    decide_redrive,
+    durable_elder_settle_seconds,
+    register_active_review_claim,
+    release_active_review_claims,
+    review_eligible,
     review_freshness_id_from_pr,
     review_snapshot_id,
     review_snapshot_id_from_pr,
+    start_review_claim_heartbeat,
+    start_staleness_watch,
+    stop_review_claim_heartbeat,
+    stop_staleness_watch,
+    unregister_active_review_claim,
 )
 from personas.guard.dispatch import dispatch_guard_review
 from personas.smasher.dispatch import dispatch_smasher_review
@@ -89,13 +103,6 @@ _sqs = boto3.client("sqs")
 # local/dev/tests -> enqueue raises, surfaced as best-effort by the caller.
 _RERUN_QUEUE_URL = os.getenv("GRUG_RERUN_QUEUE_URL", "")
 SCHEMA_VERSION = 1
-_MAX_SETTLE_SECONDS = 300
-# grug#773 AC3: a review discarded and re-enqueued against the SAME head_sha
-# this many times running gives up with a terminal neutral check instead of
-# looping forever - the backstop for a PR whose title/body keeps changing
-# faster than Elder can finish reviewing it. A genuinely new commit always
-# resets this to 0; it only counts same-sha redrives.
-_MAX_INTENT_DRIFT_REDRIVES = 3
 # A learn job whose classifier backends are all rate limited or down (the
 # OpenRouter key is free-tier only and refuses intermittently - operator
 # decision 2026-09-23) is DEFERRED: re-enqueued as a fresh message with a
@@ -122,19 +129,13 @@ def _learn_defer_delay(defer_count: int) -> int:
     )
 # The lease matches the queue's fallback visibility timeout and is renewed on
 # the same cadence as the SQS visibility heartbeat while a review is active.
-_REVIEW_CLAIM_LEASE_SECONDS = 900
-_REVIEW_CLAIM_HEARTBEAT_SECONDS = 120.0
+# Constants live in elder_review; imported above.
 # How often the mid-flight staleness watcher re-fetches the PR while Elder is
 # actually generating (#635 follow-up). Separate from the 120s claim-lease
 # heartbeat above, which exists to stop SQS redelivery, not to catch a
 # superseding commit quickly - a superseded review should die within roughly
 # this many seconds of the new commit landing, not run to its full budget.
-_STALENESS_WATCH_INTERVAL_S = 10.0
-# Must match personas/code_reviewer/dispatch.py:_CHECK_NAME — this is the
-# REQUIRED status-check context on grug-gated repos. Posting it as
-# in_progress at enqueue time is what stops GitHub rulesets from treating a
-# multi-minute durable review as "required check never ran" (BLOCKED).
-# Accept legacy "Grug - Code Review" when listing existing runs mid-cutover.
+# Constants live in elder_review; imported above.
 _ELDER_CHECK_NAME = CHECK_ELDER
 _ELDER_CHECK_NAMES = frozenset(acceptable_check_names(CHECK_ELDER))
 
@@ -178,20 +179,6 @@ _SELF_COMPLETING_SKIP_REASONS = frozenset({
     DIFF_TOO_LARGE,
     REMOVED_REFERENCE_CHECK_FAILED,
 })
-
-
-@dataclass(frozen=True, slots=True)
-class _ReviewClaimHeartbeat:
-    stop: threading.Event
-    ownership_lost: threading.Event
-    thread: threading.Thread
-
-
-@dataclass(frozen=True, slots=True)
-class _StalenessWatch:
-    stop: threading.Event
-    cancel: threading.Event
-    thread: threading.Thread
 
 
 def _review_dedup_id(
@@ -559,7 +546,7 @@ def enqueue_review(
         title=requested_title,
         body=requested_body,
     )
-    settle = min(_MAX_SETTLE_SECONDS, max(0, int(settle_seconds)))
+    settle = min(_MAX_ELDER_SETTLE_SECONDS, max(0, int(settle_seconds)))
     _sqs.send_message(
         QueueUrl=_RERUN_QUEUE_URL,
         MessageBody=json.dumps({
@@ -1606,7 +1593,13 @@ def _redrive_or_give_up(
     repo_full = f"{owner}/{repo_name}"
     same_sha = current_head_sha == claimed_head_sha
     next_redrive_count = job_redrive_count + 1 if same_sha else 0
-    if same_sha and next_redrive_count > _MAX_INTENT_DRIFT_REDRIVES:
+    is_held = _held_by_autopause(install_id, repo_full, pr_number, current_head_sha) if not same_sha else False
+    decision = decide_redrive(
+        same_sha=same_sha,
+        job_redrive_count=job_redrive_count,
+        is_held_by_autopause=is_held,
+    )
+    if decision.action == "give_up":
         log.warning(
             "elder_review_intent_drift_exhausted",
             extra={
@@ -1636,7 +1629,7 @@ def _redrive_or_give_up(
             conclusion=degraded_conclusion(blocking),
         )
         return False
-    if not same_sha and _held_by_autopause(install_id, repo_full, pr_number, current_head_sha):
+    if decision.action == "hold":
         return True
     _enqueue_current_review(
         install_id=install_id,
@@ -1672,202 +1665,6 @@ def _held_by_autopause(
             extra={"repo": repo_full, "pr": pr_number, "head_sha": head_sha[:8]},
         )
     return paused
-
-
-def _review_claim_heartbeat_loop(
-    owned_claim_args: dict[str, Any],
-    stop: threading.Event,
-    ownership_lost: threading.Event,
-) -> None:
-    from adapters.install_store import renew_review_claim
-
-    while not stop.wait(_REVIEW_CLAIM_HEARTBEAT_SECONDS):
-        try:
-            renewed = renew_review_claim(
-                **owned_claim_args,
-                lease_seconds=_REVIEW_CLAIM_LEASE_SECONDS,
-            )
-        except Exception as error:  # noqa: BLE001 - retry within lease buffer
-            log.warning(
-                "elder_review_claim_heartbeat_failed",
-                extra={
-                    "repo": owned_claim_args["repo"],
-                    "pr": owned_claim_args["pr_number"],
-                    "kind": type(error).__name__,
-                },
-            )
-            continue
-        if renewed:
-            continue
-        ownership_lost.set()
-        log.error(
-            "elder_review_claim_ownership_lost",
-            extra={
-                "repo": owned_claim_args["repo"],
-                "pr": owned_claim_args["pr_number"],
-            },
-        )
-        return
-
-
-def _review_staleness_watch_loop(
-    install_id: int, owner: str, repo_name: str, pr_number: int,
-    expected_freshness_id: str,
-    expected_head_sha: str,
-    stop: threading.Event,
-    cancel: threading.Event,
-) -> None:
-    """Poll the PR every `_STALENESS_WATCH_INTERVAL_S` while Elder is
-    actually generating a review (#635 follow-up: mid-flight cancellation).
-
-    Elder's per-arm network calls have no natural checkpoint mid-generation
-    - once `_call_backend` starts, nothing inside it re-checks the PR. This
-    loop is what lets a superseded review die within roughly
-    `_STALENESS_WATCH_INTERVAL_S` of the new commit landing, instead of
-    always running to its full ~330-660s budget for a snapshot that's
-    already known stale.
-
-    A transient GitHub hiccup must never cancel a genuinely current review,
-    so a fetch failure is logged and skipped, not treated as staleness."""
-    while not stop.wait(_STALENESS_WATCH_INTERVAL_S):
-        try:
-            latest = _fetch_current_pr(install_id, owner, repo_name, pr_number)
-        except Exception as error:  # noqa: BLE001 - transient fetch failure, keep watching
-            log.warning(
-                "elder_review_staleness_watch_fetch_failed",
-                extra={
-                    "repo": f"{owner}/{repo_name}",
-                    "pr": pr_number,
-                    "kind": type(error).__name__,
-                },
-            )
-            continue
-        # HEAD SHA DECIDES. Killing a running review is only justified when
-        # the DIFF changed, because that is the only case where the answer
-        # being generated is worthless.
-        #
-        # This used to compare `review_freshness_id`, which also hashes title
-        # and body - so editing the PR body aborted both Cave arms mid-
-        # generation and threw the whole review away. Live on
-        # quadseven/infra#2157 (2026-08-02), a PR breaking a packet-mode
-        # bootstrap deadlock: the review started at 13:51:12 over 2 cohorts,
-        # the author edited the body at ~13:52:43, and at 13:52:51 it landed
-        # as `all_failed` ("cancelled: review input changed while the review
-        # was running"). The human got mailed "eyes cloudy - read for self"
-        # carrying one cyclomatic-complexity nitpick, on a concurrency fix.
-        #
-        # An intent edit is exactly the case where the work is still good: the
-        # diff is byte-identical, so every finding still anchors to real lines.
-        # The pre-publish guard already knows this and publishes such a review
-        # (`code_review_intent_drift_publishing_anyway`) - but it had nothing
-        # left to publish, because this loop had already killed the generation
-        # that would have produced it. Same rule, both halves.
-        #
-        # Base-insensitive too: `review_snapshot_id_from_pr` hashes base_sha,
-        # so ANY unrelated merge to the base branch used to cancel this review.
-        # Measured on quadseven/infra 2026-07-25: eight merges in one session
-        # left Elder unable to publish, cancelling and re-enqueuing against an
-        # identical head. Comparing head sha covers that case as well.
-        latest_head = str((latest.get("head") or {}).get("sha") or "")
-        if not latest_head:
-            # A malformed payload is not evidence of a new commit. Treat it
-            # like a fetch failure and keep watching rather than killing a
-            # review that is probably fine.
-            log.warning(
-                "elder_review_staleness_watch_no_head_sha",
-                extra={"repo": f"{owner}/{repo_name}", "pr": pr_number},
-            )
-            continue
-        if latest_head != expected_head_sha:
-            cancel.set()
-            log.info(
-                "elder_review_cancelled_mid_flight",
-                extra={
-                    "repo": f"{owner}/{repo_name}", "pr": pr_number,
-                    "reviewed_head_sha": expected_head_sha[:8],
-                    "current_head_sha": latest_head[:8],
-                    # Carried for diagnosis only. If this DIFFERS while the
-                    # shas match, an intent edit happened and was correctly
-                    # ignored - that pairing is the signature of the
-                    # infra#2157 class, and it should never cancel again.
-                    "reviewed_freshness_id": expected_freshness_id[:11],
-                    "current_freshness_id": review_freshness_id_from_pr(
-                        latest,
-                    )[:11],
-                },
-            )
-            return
-
-
-# --- Active-claim registry (graceful-shutdown release) ----------------------
-# A consumer pod that dies mid-review (every deploy rolls it; reviews run
-# minutes, the terminationGracePeriod is 30s) orphans its snapshot claim: the
-# in-function except/finally never runs, the lease outlives the pod by up to
-# _REVIEW_CLAIM_LEASE_SECONDS, and the SQS redelivery bounces off
-# "claim busy" - burning receives toward the DLQ (maxReceiveCount) while the
-# PR sits without its (now REQUIRED, grug#515) check. The registry tracks
-# every in-flight claim so main() can release them all on SIGTERM; the next
-# consumer's redelivery then acquires cleanly on its first attempt.
-_ACTIVE_REVIEW_CLAIMS: dict[str, dict[str, Any]] = {}
-_ACTIVE_REVIEW_CLAIMS_LOCK = threading.Lock()
-
-
-def _register_active_review_claim(token: str, owned_claim_args: dict[str, Any]) -> None:
-    with _ACTIVE_REVIEW_CLAIMS_LOCK:
-        _ACTIVE_REVIEW_CLAIMS[token] = owned_claim_args
-
-
-def _unregister_active_review_claim(token: str) -> None:
-    with _ACTIVE_REVIEW_CLAIMS_LOCK:
-        _ACTIVE_REVIEW_CLAIMS.pop(token, None)
-
-
-def release_active_review_claims() -> int:
-    """Release every still-registered review claim (graceful shutdown).
-
-    Called by the consumer's main() after its threads were asked to stop: any
-    claim still registered belongs to a review that will not finish in this
-    process. Releasing lets the SQS redelivery acquire immediately instead of
-    bouncing off the orphaned lease. Best-effort per claim - one failed
-    release (e.g. ownership already lost to a completing handler racing the
-    shutdown) must not stop the rest. Returns the number released."""
-    with _ACTIVE_REVIEW_CLAIMS_LOCK:
-        claims = list(_ACTIVE_REVIEW_CLAIMS.items())
-        _ACTIVE_REVIEW_CLAIMS.clear()
-    released = 0
-    if not claims:
-        return 0
-    from adapters.install_store import release_review_claim
-
-    for _token, owned_claim_args in claims:
-        try:
-            if release_review_claim(**owned_claim_args):
-                released += 1
-                log.info(
-                    "elder_review_claim_released_on_shutdown",
-                    extra={
-                        "repo": owned_claim_args.get("repo"),
-                        "pr": owned_claim_args.get("pr_number"),
-                    },
-                )
-            else:
-                log.warning(
-                    "elder_review_claim_shutdown_release_lost_ownership",
-                    extra={
-                        "repo": owned_claim_args.get("repo"),
-                        "pr": owned_claim_args.get("pr_number"),
-                    },
-                )
-        except Exception:  # noqa: BLE001 - best-effort during shutdown
-            log.warning(
-                "elder_review_claim_shutdown_release_failed",
-                extra={
-                    "repo": owned_claim_args.get("repo"),
-                    "pr": owned_claim_args.get("pr_number"),
-                },
-                exc_info=True,
-            )
-    return released
 
 
 # --- In-progress board-note registry (#819) ---------------------------------
@@ -2038,62 +1835,6 @@ def _board_in_progress_note(
             )
 
 
-def _start_review_claim_heartbeat(
-    owned_claim_args: dict[str, Any],
-) -> _ReviewClaimHeartbeat:
-    stop = threading.Event()
-    ownership_lost = threading.Event()
-    thread = threading.Thread(
-        target=_review_claim_heartbeat_loop,
-        args=(owned_claim_args, stop, ownership_lost),
-        name="review-claim-heartbeat",
-        daemon=True,
-    )
-    thread.start()
-    return _ReviewClaimHeartbeat(
-        stop=stop,
-        ownership_lost=ownership_lost,
-        thread=thread,
-    )
-
-
-def _stop_review_claim_heartbeat(
-    heartbeat: _ReviewClaimHeartbeat | None,
-) -> bool:
-    if heartbeat is None:
-        return True
-    heartbeat.stop.set()
-    heartbeat.thread.join(timeout=1.0)
-    return not heartbeat.ownership_lost.is_set()
-
-
-def _start_staleness_watch(
-    install_id: int, owner: str, repo_name: str, pr_number: int,
-    expected_freshness_id: str,
-    expected_head_sha: str,
-) -> _StalenessWatch:
-    stop = threading.Event()
-    cancel = threading.Event()
-    thread = threading.Thread(
-        target=_review_staleness_watch_loop,
-        args=(
-            install_id, owner, repo_name, pr_number,
-            expected_freshness_id, expected_head_sha, stop, cancel,
-        ),
-        name="review-staleness-watch",
-        daemon=True,
-    )
-    thread.start()
-    return _StalenessWatch(stop=stop, cancel=cancel, thread=thread)
-
-
-def _stop_staleness_watch(watch: _StalenessWatch | None) -> None:
-    if watch is None:
-        return
-    watch.stop.set()
-    watch.thread.join(timeout=2.0)
-
-
 def _run_hot_review(
     job: dict[str, Any], install_id: int, repo_full: str, pr_number: int,
 ) -> str:
@@ -2223,15 +1964,15 @@ def _run_hot_review(
         )
         raise RuntimeError("Elder review snapshot claim is still in progress")
 
-    heartbeat: _ReviewClaimHeartbeat | None = None
+    heartbeat: ReviewClaimHeartbeat | None = None
     # Register for graceful-shutdown release; the finally-unregister runs on
     # every in-process exit (normal, except-release, raise), so the shutdown
     # sweep only ever sees claims whose handler was killed mid-flight.
-    _register_active_review_claim(owner_token, owned_claim_args)
+    register_active_review_claim(owner_token, owned_claim_args)
     try:
-        heartbeat = _start_review_claim_heartbeat(owned_claim_args)
+        heartbeat = start_review_claim_heartbeat(owned_claim_args)
         settle_seconds = min(
-            _MAX_SETTLE_SECONDS,
+            _MAX_ELDER_SETTLE_SECONDS,
             max(0, int(job.get("settle_seconds", 0))),
         )
         if settle_seconds:
@@ -2251,7 +1992,7 @@ def _run_hot_review(
         current_head = str((after.get("head") or {}).get("sha") or "")
         current_snapshot_id = review_snapshot_id_from_pr(after)
         if not _review_eligible(after):
-            if not _stop_review_claim_heartbeat(heartbeat):
+            if not stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError(
                     "Elder review claim ownership lost during settle"
                 )
@@ -2282,7 +2023,7 @@ def _run_hot_review(
                 current_head_sha=current_head,
                 job_redrive_count=int(job.get("redrive_count", 0)),
             )
-            if not _stop_review_claim_heartbeat(heartbeat):
+            if not stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError(
                     "Elder review claim ownership lost for stale snapshot"
                 )
@@ -2311,7 +2052,7 @@ def _run_hot_review(
         # Mid-flight cancellation (#635 follow-up): current_snapshot_id is the
         # snapshot this job is ABOUT to spend the Elder budget on (checked
         # fresh, immediately above). The watch loop re-fetches the PR every
-        # _STALENESS_WATCH_INTERVAL_S for as long as dispatch_code_review is
+        # 10s for as long as dispatch_code_review is
         # running and sets `cancel` the moment that snapshot changes.
         # dispatch_code_review then returns almost immediately instead of
         # waiting out the arm calls' full remaining duration - the arm
@@ -2331,10 +2072,11 @@ def _run_hot_review(
         # board write doesn't cover - check-publish failure, DLQ/redrive
         # raise, fail-open, or an unexpected result.
         with _board_in_progress_note(install_id, owner, repo_name, pr_number):
-            watch = _start_staleness_watch(
+            watch = start_staleness_watch(
                 install_id, owner, repo_name, pr_number,
                 review_freshness_id_from_pr(after),
                 str((after.get("head") or {}).get("sha") or ""),
+                fetch_current_pr=_fetch_current_pr,
             )
             try:
                 result = dispatch_code_review(
@@ -2349,7 +2091,7 @@ def _run_hot_review(
                     cancel_event=watch.cancel,
                 )
             finally:
-                _stop_staleness_watch(watch)
+                stop_staleness_watch(watch)
             degraded_reason = result.get("degraded_reason", "")
             if degraded_reason == "stale_snapshot":
                 latest = _fetch_current_pr(
@@ -2396,7 +2138,7 @@ def _run_hot_review(
                     if _review_eligible(latest)
                     else False
                 )
-                if not _stop_review_claim_heartbeat(heartbeat):
+                if not stop_review_claim_heartbeat(heartbeat):
                     raise RuntimeError(
                         "Elder review claim ownership lost during dispatch"
                     )
@@ -2414,7 +2156,7 @@ def _run_hot_review(
                 # moment the PR is reopened/marked ready, before the freshly
                 # scheduled review posts. Leave the check pending; the
                 # ready_for_review/reopen enqueue completes it via a real review.
-                if not _stop_review_claim_heartbeat(heartbeat):
+                if not stop_review_claim_heartbeat(heartbeat):
                     raise RuntimeError(
                         "Elder review claim ownership lost during dispatch"
                     )
@@ -2464,7 +2206,7 @@ def _run_hot_review(
                     raise RuntimeError(
                         "Elder fail-open completion did not land (freshness outage)"
                     )
-                if not _stop_review_claim_heartbeat(heartbeat):
+                if not stop_review_claim_heartbeat(heartbeat):
                     raise RuntimeError(
                         "Elder review claim ownership lost after fail-open"
                     )
@@ -2515,7 +2257,7 @@ def _run_hot_review(
                         "Elder fail-open completion did not land "
                         f"(skip: {degraded_reason or 'unknown'})"
                     )
-                if not _stop_review_claim_heartbeat(heartbeat):
+                if not stop_review_claim_heartbeat(heartbeat):
                     raise RuntimeError(
                         "Elder review claim ownership lost after fail-open skip"
                     )
@@ -2534,12 +2276,12 @@ def _run_hot_review(
                 raise RuntimeError(
                     f"Elder review returned unexpected result: {result_status!r}"
                 )
-            if not _stop_review_claim_heartbeat(heartbeat):
+            if not stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError("Elder review claim ownership lost during review")
             if not complete_review_claim(**owned_claim_args):
                 raise RuntimeError("Elder review claim completion lost ownership")
     except Exception:
-        _stop_review_claim_heartbeat(heartbeat)
+        stop_review_claim_heartbeat(heartbeat)
         try:
             released = release_review_claim(**owned_claim_args)
             if not released:
@@ -2558,7 +2300,7 @@ def _run_hot_review(
             )
         raise
     finally:
-        _unregister_active_review_claim(owner_token)
+        unregister_active_review_claim(owner_token)
     log.info(
         "elder_review_durable_done",
         extra={"repo": repo_full, "pr": pr_number, **result},
