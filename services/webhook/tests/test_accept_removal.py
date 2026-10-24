@@ -1,4 +1,4 @@
-"""Tests for `/grug accept-removal <path>` (#1405).
+"""Tests for `/grug accept-removal <path> <sha>` (#1405).
 
 A deletion-only PR that removes a guard path gets a blocking
 `removed-guarded-path` finding (#1401). The file is gone, so no inline
@@ -30,15 +30,30 @@ from tests.test_removed_files import (  # noqa: F401 - _patch_token is an autous
 )
 
 _HEAD = "abcd1234efgh"  # the head `_run` reviews
+_SHA = "abcdef1234567890abcdef1234567890abcdef12"  # the PR head the command sees
 
 
 # Parsing.
 
 
 def test_parses_accept_removal_with_its_path():
-    assert parse_command(f"/grug accept-removal {_WORKFLOW}") == GrugCommand(
-        verb="accept-removal", arg=_WORKFLOW,
+    assert parse_command(f"/grug accept-removal {_WORKFLOW} {_SHA[:7]}") == GrugCommand(
+        verb="accept-removal", arg=f"{_WORKFLOW} {_SHA[:7]}",
     )
+
+
+@pytest.mark.parametrize(("arg", "sha"), [
+    (f"{_WORKFLOW} {_SHA[:7]}", _SHA[:7]),
+    (f"`{_WORKFLOW}` `{_SHA}`", _SHA),
+    (f"{_WORKFLOW} {_SHA[:7].upper()} looks fine", _SHA[:7]),
+    (f"{_WORKFLOW} {_SHA[:6]}", ""),  # too short
+    (f"{_WORKFLOW} notahexsha", ""),
+    (_WORKFLOW, ""),
+])
+def test_the_head_sha_is_the_word_after_the_path(arg, sha):
+    import accept_removal
+
+    assert accept_removal.accept_args(arg) == (_WORKFLOW, sha)
 
 
 @pytest.mark.parametrize("arg", [
@@ -68,12 +83,19 @@ class _Store:
         self.recorded: list[dict[str, Any]] = []
         self.enqueued: list[dict[str, Any]] = []
         self.replies: list[str] = []
+        self.claimed: set[str] = set()
+
+    def claim(self, key: str) -> bool:
+        if key in self.claimed:
+            return False
+        self.claimed.add(key)
+        return True
 
 
 def _payload(
     *, login: str = "maintainer", user_type: str | None = "User",
     association: str | None = "OWNER", pr_author: str = "maintainer",
-    body: str = f"/grug accept-removal {_WORKFLOW}", app: object = None,
+    body: str = f"/grug accept-removal {_WORKFLOW} {_SHA[:7]}", app: object = None,
 ) -> dict[str, Any]:
     user: dict[str, Any] = {"login": login}
     if user_type is not None:
@@ -95,15 +117,16 @@ def _payload(
 
 
 def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin",
-              head_sha: str = _HEAD) -> tuple[dict[str, str], _Store]:
-    store = _Store()
+              head_sha: str = _SHA, store: _Store | None = None,
+              ) -> tuple[dict[str, str], _Store]:
+    store = store or _Store()
     monkeypatch.setattr(d, "is_install_allowlisted", lambda _id: True)
     monkeypatch.setattr(d, "is_persona_enabled", lambda *_: True)
     monkeypatch.setattr(
         pg_install_store, "record_removal_acceptance",
         lambda **k: store.recorded.append(k),
     )
-    monkeypatch.setattr(pg_install_store, "claim_delivery", lambda key: True)
+    monkeypatch.setattr(pg_install_store, "claim_delivery", store.claim)
     monkeypatch.setattr(rerun, "enqueue_rerun", lambda **k: store.enqueued.append(k))
 
     class _Resp:
@@ -140,21 +163,112 @@ def test_a_trusted_maintainer_records_the_acceptance_on_the_head(monkeypatch):
     assert out["status"] == "dispatched", out
     assert store.recorded == [{
         "install_id": 1, "repo": "myorg/myrepo", "pr_number": 42,
-        "head_sha": _HEAD, "path": _WORKFLOW, "accepted_by": "maintainer",
+        "head_sha": _SHA, "path": _WORKFLOW, "accepted_by": "maintainer",
         "comment_id": 555,
     }]
     # Elder re-reviews, so the check updates with no further step.
     assert [j["persona"] for j in store.enqueued] == ["code_reviewer"]
     assert store.enqueued[0]["dedup_key"]
-    assert any(_HEAD[:8] in r and _WORKFLOW in r for r in store.replies)
+    assert any(_SHA[:8] in r and _WORKFLOW in r for r in store.replies)
 
 
-def test_the_pr_author_may_accept_when_trusted(monkeypatch):
+@pytest.mark.parametrize(("association", "permission"), [
+    ("OWNER", "write"), ("COLLABORATOR", "admin"), ("MEMBER", "admin"),
+])
+def test_the_pr_author_may_accept_as_owner_or_admin(monkeypatch, association, permission):
+    """A solo maintainer authors their own PRs and can still accept."""
     out, store = _dispatch(monkeypatch, _payload(
-        login="solo", pr_author="solo", association="COLLABORATOR",
-    ), permission="write")
+        login="solo", pr_author="solo", association=association,
+    ), permission=permission)
     assert out["status"] == "dispatched", out
     assert store.recorded and store.recorded[0]["accepted_by"] == "solo"
+
+
+@pytest.mark.parametrize(("association", "permission"), [
+    ("COLLABORATOR", "write"), ("MEMBER", "maintain"), ("MEMBER", "write"),
+])
+def test_the_pr_author_with_only_write_access_is_refused(monkeypatch, association, permission):
+    out, store = _dispatch(monkeypatch, _payload(
+        login="author", pr_author="author", association=association,
+    ), permission=permission)
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+
+
+def test_write_access_may_accept_someone_elses_pr(monkeypatch):
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association="COLLABORATOR",
+    ), permission="write")
+    assert out["status"] == "dispatched", out
+    assert store.recorded and store.recorded[0]["accepted_by"] == "reviewer"
+
+
+@pytest.mark.parametrize("named", [
+    "1234567",  # another head
+    _SHA[1:8],  # not a prefix
+])
+def test_a_sha_that_does_not_match_the_head_is_refused(monkeypatch, named):
+    out, store = _dispatch(monkeypatch, _payload(
+        body=f"/grug accept-removal {_WORKFLOW} {named}",
+    ))
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+    # the reply names the exact command for the current head
+    assert any(f"/grug accept-removal {_WORKFLOW} {_SHA}" in r for r in store.replies)
+
+
+def test_a_command_without_a_sha_is_refused(monkeypatch):
+    out, store = _dispatch(monkeypatch, _payload(
+        body=f"/grug accept-removal {_WORKFLOW}",
+    ))
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+
+
+def test_a_duplicate_comment_delivery_records_nothing(monkeypatch):
+    store = _Store()
+    first, store = _dispatch(monkeypatch, _payload(), store=store)
+    again, store = _dispatch(monkeypatch, _payload(), store=store)
+    assert first["status"] == "dispatched", first
+    assert again["status"] == "no_op", again
+    assert len(store.recorded) == 1 and len(store.enqueued) == 1
+
+
+def test_a_claimed_comment_records_nothing():
+    import accept_removal
+
+    store = _Store()
+    store.claimed.add("grugcmd:3")
+    out = accept_removal.run_accept_removal(
+        f"{_WORKFLOW} {_SHA[:7]}", install_id=1, owner="o", repo="r",
+        pr_number=2, comment_id=3, head_sha=_SHA, actor="maintainer",
+        token_fn=lambda fn: fn("tok"),
+        record=lambda **k: store.recorded.append(k),
+        enqueue=lambda **k: store.enqueued.append(k),
+        claim=store.claim, reply=lambda body: store.replies.append(body) or True,
+    )
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+
+
+@pytest.mark.parametrize("seam", ["record", "enqueue", "claim"])
+def test_a_non_callable_seam_fails_closed(seam):
+    import accept_removal
+
+    store = _Store()
+    seams: dict[str, Any] = {
+        "record": lambda **k: store.recorded.append(k),
+        "enqueue": lambda **k: store.enqueued.append(k),
+        "claim": store.claim,
+    }
+    seams[seam] = "not callable"
+    out = accept_removal.run_accept_removal(
+        f"{_WORKFLOW} {_SHA[:7]}", install_id=1, owner="o", repo="r",
+        pr_number=2, comment_id=3, head_sha=_SHA, actor="maintainer",
+        token_fn=lambda fn: fn("tok"), reply=lambda body: True, **seams,
+    )
+    assert out["status"] == "skip", out
+    assert store.recorded == [] and store.enqueued == [] and not store.claimed
 
 
 @pytest.mark.parametrize("user_type", ["Bot", "Organization", "Mannequin"])
@@ -229,24 +343,23 @@ def test_no_path_records_nothing(monkeypatch):
     assert store.recorded == [] and store.enqueued == []
 
 
-def test_a_failed_record_does_not_enqueue_or_claim(monkeypatch):
+def test_a_failed_record_does_not_enqueue(monkeypatch):
     import accept_removal
 
     def _boom(**_k: Any) -> None:
         raise RuntimeError("db down")
 
     store = _Store()
-    claims: list[str] = []
     out = accept_removal.run_accept_removal(
-        _WORKFLOW, install_id=1, owner="o", repo="r", pr_number=2,
-        comment_id=3, head_sha=_HEAD, actor="maintainer",
+        f"{_WORKFLOW} {_SHA[:7]}", install_id=1, owner="o", repo="r",
+        pr_number=2, comment_id=3, head_sha=_SHA, actor="maintainer",
         token_fn=lambda fn: fn("tok"), record=_boom,
         enqueue=lambda **k: store.enqueued.append(k),
-        claim=lambda key: claims.append(key) or True,
+        claim=store.claim,
         reply=lambda body: store.replies.append(body) or True,
     )
     assert out["status"] == "skip", out
-    assert store.enqueued == [] and claims == []
+    assert store.enqueued == []
     assert store.replies  # the reader is told it did not take
 
 
@@ -329,3 +442,10 @@ def test_an_acceptance_rerun_is_not_collapsed_into_an_earlier_one(monkeypatch):
     assert len(set(ids)) == 3
     assert all(len(i) <= 128 for i in ids)
     assert len({m["MessageGroupId"] for m in sent}) == 1  # still serial per PR
+
+
+def test_the_blocking_finding_prints_the_exact_command_for_this_head(monkeypatch):
+    _accepted(monkeypatch, {})
+    final = _run(monkeypatch, _DELETION_DIFF, {})[-1]
+    assert final.conclusion == "failure", (final.conclusion, final.title)
+    assert f"/grug accept-removal {_WORKFLOW} {_HEAD}" in final.summary

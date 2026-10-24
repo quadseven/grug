@@ -142,8 +142,11 @@ def _covered_code_goes_too(test: str, removed: frozenset[str]) -> bool:
     )
 
 
-def scan_guarded_deletions(removed: tuple[str, ...]) -> tuple[Finding, ...]:
-    """One high finding per deleted guard path. Pure."""
+def scan_guarded_deletions(
+    removed: tuple[str, ...], head_sha: str = "",
+) -> tuple[Finding, ...]:
+    """One high finding per deleted guard path, naming the exact command
+    that accepts it on `head_sha` (#1405). Pure."""
     gone = frozenset(removed)
     found: list[Finding] = []
     for path in removed:
@@ -157,8 +160,9 @@ def scan_guarded_deletions(removed: tuple[str, ...]) -> tuple[Finding, ...]:
             rule_name=RULE_GUARDED,
             message=(
                 f"This PR deletes `{path}`, which removes {kind}. A guard that "
-                "is gone passes everything. Keep the file, or have a person "
-                "confirm the removal is intended before this merges."
+                "is gone passes everything. Keep the file, or, if the removal "
+                "is intended, a maintainer who reviewed this head comments "
+                f"`/grug accept-removal {path} {head_sha or '<head-sha>'}`."
             ),
             suggestion=None,
             effort="quick-win",

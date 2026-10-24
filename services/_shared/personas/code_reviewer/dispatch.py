@@ -2562,7 +2562,7 @@ def _review_deletion_only(
         return evaluation, ""
     pr = f"{owner}/{repo_name}#{pull_number}"
     guarded, accepted_note = _accept_guarded_removals(
-        scan_guarded_deletions(removed), installation_id=installation_id,
+        scan_guarded_deletions(removed, head_sha), installation_id=installation_id,
         owner=owner, repo_name=repo_name, pull_number=pull_number,
         head_sha=head_sha,
     )

@@ -604,16 +604,27 @@ def _actor_has_write(
     while the learnings handler always requires write+ (corpus-poisoning
     guard ADR-0020).
     """
-    from urllib.parse import quote as _q
-    from github_app_auth import with_install_token_retry  # type: ignore
-    import httpx  # type: ignore
-
     # Author short-circuit: if allow_author is True and the sender is the
     # PR author, auto-trust without an API call. Used by /grug recheck
     # (an author re-running their own PR is harmless). The learnings
     # handler passes allow_author=False so fork authors are always checked.
     if allow_author and sender_login == pr_author_login:
         return True
+    perm = _actor_permission(installation_id, owner, repo_name, sender_login)
+    if perm is None:
+        return None
+    return perm in _AUTHORIZED_ROLES
+
+
+def _actor_permission(
+    installation_id: int, owner: str, repo_name: str, sender_login: str,
+) -> str | None:
+    """The sender's collaborator permission on the repo ("admin", "write",
+    ...), or None when the lookup failed with an HTTP error. A transport
+    error raises httpx.RequestError for the caller to classify (F-01)."""
+    from urllib.parse import quote as _q
+    from github_app_auth import with_install_token_retry  # type: ignore
+    import httpx  # type: ignore
 
     def _check_perm(token: str) -> str:
         r = httpx.get(
@@ -627,22 +638,16 @@ def _actor_has_write(
             timeout=10,
         )
         r.raise_for_status()
-        return (r.json() or {}).get("permission", "")
+        return str((r.json() or {}).get("permission", "") or "")
 
     try:
-        perm = with_install_token_retry(int(installation_id), _check_perm)
+        return with_install_token_retry(int(installation_id), _check_perm)
     except httpx.HTTPStatusError as e:
         log.warning(
             "perm_lookup_failed",
             extra={"sender": sender_login, "status": e.response.status_code},
         )
         return None
-    except httpx.RequestError:
-        # Transport-level failure (timeout, DNS, connection-reset).
-        # Re-raise so the caller can return a distinct skip reason
-        # (mirrors the PR-fetch path's transport catch). F-01.
-        raise
-    return perm in _AUTHORIZED_ROLES
 
 
 def _handle_issues(payload: dict[str, Any]) -> dict[str, str]:
@@ -1017,7 +1022,8 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # takes a stricter gate than a re-run. The comment's author must be a
     # User (never a Bot or App) with an OWNER, MEMBER or COLLABORATOR
     # association, read from the payload and failing closed when absent,
-    # and must hold write access with no PR-author shortcut.
+    # and must hold write access with no PR-author shortcut. Their own PR
+    # takes OWNER or admin.
     accepting = cmd.verb == "accept-removal"
     if accepting:
         from accept_removal import trusted_acceptor  # type: ignore
@@ -1048,10 +1054,30 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     from urllib.parse import quote as _q
 
     try:
-        has_write = _actor_has_write(
-            int(installation_id), owner, repo_name, sender_login,
-            allow_author=not accepting, pr_author_login=pr_author_login,
-        )
+        if accepting:
+            # grug#1405: no PR-author shortcut. A PR author accepts their
+            # own deletion only as OWNER or with admin permission.
+            perm = _actor_permission(
+                int(installation_id), owner, repo_name, sender_login,
+            )
+            has_write = None if perm is None else perm in _AUTHORIZED_ROLES
+            if has_write and sender_login == pr_author_login:
+                from accept_removal import may_accept_own_pr  # type: ignore
+                association = str(comment.get("author_association") or "")
+                if not may_accept_own_pr(association, perm or ""):
+                    log.info(
+                        "accept_removal_refused",
+                        extra={"sender": sender_login, "owner": owner,
+                               "repo": repo_name, "pr_number": pr_number,
+                               "reason": "own PR without admin"},
+                    )
+                    return {"status": "no_op",
+                            "reason": "PR author lacks admin to accept own removal"}
+        else:
+            has_write = _actor_has_write(
+                int(installation_id), owner, repo_name, sender_login,
+                allow_author=True, pr_author_login=pr_author_login,
+            )
     except httpx.RequestError as e:
         log.warning(
             "perm_lookup_transport_failed",

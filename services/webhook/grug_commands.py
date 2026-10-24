@@ -14,7 +14,7 @@ delete` which forgets a taught preference):
   /grug review         one Elder review now; an auto-pause stays (grug#1188)
   /grug learnings list list the repo's remembered markings (usage counts)
   /grug learnings delete <digest>  forget one remembered marking by digest
-  /grug accept-removal <path>  accept one deleted guard path on this head (#1405)
+  /grug accept-removal <path> <sha>  accept one deleted guard path on head <sha> (#1405)
 """
 
 from __future__ import annotations
