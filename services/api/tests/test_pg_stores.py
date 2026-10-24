@@ -1526,6 +1526,56 @@ def test_expired_pause_reads_as_not_paused(pg):
 
 
 # ---------------------------------------------------------------------------
+# Accepted guard removals: one row per PR head (grug#1405)
+# ---------------------------------------------------------------------------
+
+
+def test_removal_acceptances_are_bound_to_the_head(pg):
+    from adapters import pg_install_store as store
+
+    pr = dict(install_id=7, repo="o/r", pr_number=3)
+    assert store.get_removal_acceptances(**pr, head_sha="sha-a") == {}
+    store.record_removal_acceptance(
+        **pr, head_sha="sha-a", path=".github/workflows/x.yml",
+        accepted_by="maintainer", comment_id=11,
+    )
+    store.record_removal_acceptance(
+        **pr, head_sha="sha-a", path="CODEOWNERS",
+        accepted_by="other", comment_id=12,
+    )
+    got = store.get_removal_acceptances(**pr, head_sha="sha-a")
+    assert set(got) == {".github/workflows/x.yml", "CODEOWNERS"}
+    assert got[".github/workflows/x.yml"]["accepted_by"] == "maintainer"
+    assert got["CODEOWNERS"]["comment_id"] == 12
+    # a new head, another PR and another install see nothing
+    assert store.get_removal_acceptances(**pr, head_sha="sha-b") == {}
+    assert store.get_removal_acceptances(
+        install_id=7, repo="o/r", pr_number=4, head_sha="sha-a") == {}
+    assert store.get_removal_acceptances(
+        install_id=8, repo="o/r", pr_number=3, head_sha="sha-a") == {}
+
+
+def test_an_expired_removal_acceptance_is_replaced_not_merged(pg):
+    from adapters import pg_install_store as store
+
+    pr = dict(install_id=7, repo="o/r", pr_number=3, head_sha="sha-a")
+    store.record_removal_acceptance(
+        **pr, path="old.yml", accepted_by="maintainer", comment_id=1,
+    )
+    with store.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint - 10 "
+            "WHERE sk = %s",
+            ("REMOVAL#ACCEPT#o/r#3#sha-a",),
+        )
+    assert store.get_removal_acceptances(**pr) == {}
+    store.record_removal_acceptance(
+        **pr, path="new.yml", accepted_by="maintainer", comment_id=2,
+    )
+    assert set(store.get_removal_acceptances(**pr)) == {"new.yml"}
+
+
+# ---------------------------------------------------------------------------
 # Hunt Board review session: compare-and-swap row per PR (grug#1207)
 # ---------------------------------------------------------------------------
 

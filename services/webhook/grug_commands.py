@@ -14,6 +14,7 @@ delete` which forgets a taught preference):
   /grug review         one Elder review now; an auto-pause stays (grug#1188)
   /grug learnings list list the repo's remembered markings (usage counts)
   /grug learnings delete <digest>  forget one remembered marking by digest
+  /grug accept-removal <path> <sha>  accept one deleted guard path on head <sha> (#1405)
 """
 
 from __future__ import annotations
@@ -23,14 +24,17 @@ from dataclasses import dataclass
 
 # Anchored at line start (MULTILINE) so a command can appear on its own
 # line in a longer comment; the verb is a known token, everything after is
-# the arg (only `ask` and `learnings` consume it). Case-insensitive.
+# the arg (only `ask`, `learnings` and `accept-removal` consume it). Case-insensitive.
 _CMD_RE = re.compile(
-    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings)\b[ \t]*(.*)$",
+    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings|accept-removal|accept_removal)\b[ \t]*(.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 
-_CANON = {"test_gaps": "test-gaps"}
-VERBS = frozenset({"recheck", "improve", "ask", "test-gaps", "resume", "review", "learnings"})
+_CANON = {"test_gaps": "test-gaps", "accept_removal": "accept-removal"}
+VERBS = frozenset({
+    "recheck", "improve", "ask", "test-gaps", "resume", "review", "learnings",
+    "accept-removal",
+})
 
 # The verbs that start an ELDER re-run. They are the ones that must not
 # overlap with a review already in flight, that must carry the
@@ -43,7 +47,7 @@ ELDER_RERUN_VERBS = frozenset({"improve", "resume", "review"})
 @dataclass(frozen=True)
 class GrugCommand:
     verb: str          # canonical verb (one of VERBS)
-    arg: str = ""      # trailing text (only `ask` consumes it)
+    arg: str = ""      # trailing text (`ask`, `learnings`, `accept-removal`)
 
 
 def parse_command(body: str) -> GrugCommand | None:

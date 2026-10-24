@@ -18,8 +18,10 @@ checks. Neither one can pass a deletion it could not finish checking.
   the same PR deletes a code file of the same module name in the test's
   directory or the one above it, never a doc or a root-level file. There
   is no ticket downgrade: a linked issue can be written by the PR's own
-  author, so a person or session answers the finding to merge. Same
-  layer list as the weakened-verification check (#1367, #1381).
+  author, so a person answers the finding to merge: a trusted maintainer's
+  `/grug accept-removal <path>` clears that path's finding on that head
+  only (#1405, `apply_removal_acceptances`). Same layer list as the
+  weakened-verification check (#1367, #1381).
 - `removed-but-referenced`: a file at head still names a removed path (in
   full, or relative to its own directory). High for code or config, medium
   for docs. Discovery uses code search (the default-branch index, where the
@@ -140,8 +142,11 @@ def _covered_code_goes_too(test: str, removed: frozenset[str]) -> bool:
     )
 
 
-def scan_guarded_deletions(removed: tuple[str, ...]) -> tuple[Finding, ...]:
-    """One high finding per deleted guard path. Pure."""
+def scan_guarded_deletions(
+    removed: tuple[str, ...], head_sha: str = "",
+) -> tuple[Finding, ...]:
+    """One high finding per deleted guard path, naming the exact command
+    that accepts it on `head_sha` (#1405). Pure."""
     gone = frozenset(removed)
     found: list[Finding] = []
     for path in removed:
@@ -155,14 +160,34 @@ def scan_guarded_deletions(removed: tuple[str, ...]) -> tuple[Finding, ...]:
             rule_name=RULE_GUARDED,
             message=(
                 f"This PR deletes `{path}`, which removes {kind}. A guard that "
-                "is gone passes everything. Keep the file, or have a person "
-                "confirm the removal is intended before this merges."
+                "is gone passes everything. Keep the file, or, if the removal "
+                "is intended, a maintainer who reviewed this head comments "
+                f"`/grug accept-removal {path} {head_sha or '<head-sha>'}`."
             ),
             suggestion=None,
             effort="quick-win",
             outside_diff_reason=_OUTSIDE,
         ))
     return tuple(found)
+
+
+def apply_removal_acceptances(
+    guarded: tuple[Finding, ...], accepted: Mapping[str, Mapping[str, object]],
+) -> tuple[tuple[Finding, ...], tuple[tuple[str, str], ...]]:
+    """Drop each `removed-guarded-path` finding whose exact path was
+    accepted on this head. Returns the findings that still stand and the
+    (path, accepted_by) pairs that cleared one, in finding order. Any other
+    rule stands whatever was accepted. Pure."""
+    kept: list[Finding] = []
+    cleared: list[tuple[str, str]] = []
+    for finding in guarded:
+        row = accepted.get(finding.file) if finding.rule_name == RULE_GUARDED else None
+        by = str((row or {}).get("accepted_by") or "")
+        if by:
+            cleared.append((finding.file, by))
+        else:
+            kept.append(finding)
+    return tuple(kept), tuple(cleared)
 
 
 def _pattern(path: str, referrer: str) -> re.Pattern[str]:

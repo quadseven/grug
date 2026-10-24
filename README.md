@@ -178,6 +178,15 @@ the adaptive quiet window:
   range in the check title. Five pushes inside ten minutes pause Elder with one
   note on the PR; `/grug resume` lifts the pause and reviews the delta, and
   `/grug review` takes one look while the pause stays (grug#1188).
+- **Deletion-only review** - a PR that only deletes files gets a verdict. A
+  deleted guard (a CI workflow, CODEOWNERS, ruleset config, a security, policy
+  or leak-scan file, or a test whose code stays) blocks, and only a person can
+  clear it. The finding prints the exact command,
+  `/grug accept-removal <path> <full-head-sha>`. From a User account that is
+  an admin (OWNER, or admin permission), it clears that path's finding while
+  the SHA is still the head, then Elder re-reviews. The check summary names
+  who accepted it and on which head; a new push needs a new acceptance
+  (grug#1401, grug#1405).
 - **Feedback learning** - judge labels and write-authorized maintainer reactions
   retain per-model provenance. Confirmed findings refresh positive practices and
   few-shot examples; false positives become bounded AVOID guidance for later

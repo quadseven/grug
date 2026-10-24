@@ -5,7 +5,8 @@ Routes GitHub events to active personas. Handles:
   - pull_request: iterates the persona registry (ADR-0010) — every
     registered persona whose `events` include pull_request dispatches
     through the uniform `dispatch_pull_request(ctx)` seam
-  - issue_comment: the `/grug recheck` slash command
+  - issue_comment: the `/grug recheck` slash command, and the other
+    `/grug` commands (`accept-removal` takes a stricter trust gate, #1405)
   - check_run / check_suite (`rerequested` only, grug#948): GitHub's own
     "Re-run" button - re-dispatches a synthetic pull_request event,
     scoped to just the rerequested persona for check_run, everyone
@@ -603,16 +604,27 @@ def _actor_has_write(
     while the learnings handler always requires write+ (corpus-poisoning
     guard ADR-0020).
     """
-    from urllib.parse import quote as _q
-    from github_app_auth import with_install_token_retry  # type: ignore
-    import httpx  # type: ignore
-
     # Author short-circuit: if allow_author is True and the sender is the
     # PR author, auto-trust without an API call. Used by /grug recheck
     # (an author re-running their own PR is harmless). The learnings
     # handler passes allow_author=False so fork authors are always checked.
     if allow_author and sender_login == pr_author_login:
         return True
+    perm = _actor_permission(installation_id, owner, repo_name, sender_login)
+    if perm is None:
+        return None
+    return perm in _AUTHORIZED_ROLES
+
+
+def _actor_permission(
+    installation_id: int, owner: str, repo_name: str, sender_login: str,
+) -> str | None:
+    """The sender's collaborator permission on the repo ("admin", "write",
+    ...), or None when the lookup failed with an HTTP error. A transport
+    error raises httpx.RequestError for the caller to classify (F-01)."""
+    from urllib.parse import quote as _q
+    from github_app_auth import with_install_token_retry  # type: ignore
+    import httpx  # type: ignore
 
     def _check_perm(token: str) -> str:
         r = httpx.get(
@@ -626,22 +638,16 @@ def _actor_has_write(
             timeout=10,
         )
         r.raise_for_status()
-        return (r.json() or {}).get("permission", "")
+        return str((r.json() or {}).get("permission", "") or "")
 
     try:
-        perm = with_install_token_retry(int(installation_id), _check_perm)
+        return with_install_token_retry(int(installation_id), _check_perm)
     except httpx.HTTPStatusError as e:
         log.warning(
             "perm_lookup_failed",
             extra={"sender": sender_login, "status": e.response.status_code},
         )
         return None
-    except httpx.RequestError:
-        # Transport-level failure (timeout, DNS, connection-reset).
-        # Re-raise so the caller can return a distinct skip reason
-        # (mirrors the PR-fetch path's transport catch). F-01.
-        raise
-    return perm in _AUTHORIZED_ROLES
 
 
 def _handle_issues(payload: dict[str, Any]) -> dict[str, str]:
@@ -1012,6 +1018,23 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     ):
         return {"status": "no_op", "reason": "tpm disabled for this repo"}
 
+    # grug#1405: accepting a deleted guard clears a blocking finding, so it
+    # takes a stricter gate than a re-run. The comment's author must be a
+    # User (never a Bot or App) with an OWNER, MEMBER or COLLABORATOR
+    # association, read from the payload and failing closed when absent,
+    # and must be an admin (OWNER, or admin from the permission API).
+    accepting = cmd.verb == "accept-removal"
+    if accepting:
+        from accept_removal import acceptor_from_payload  # type: ignore
+        sender_login, refused = acceptor_from_payload(payload)
+        if refused:
+            log.info(
+                "accept_removal_refused",
+                extra={"sender": sender.get("login", ""), "owner": owner,
+                       "repo": repo_name, "pr_number": pr_number, "reason": refused},
+            )
+            return {"status": "no_op", "reason": refused}
+
     # Author OR write+ collaborator only — public-listed App means random
     # commenters can't spam re-evaluations. Lazy imports keep cold-start
     # cheap when only PR events fire.
@@ -1030,10 +1053,20 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     from urllib.parse import quote as _q
 
     try:
-        has_write = _actor_has_write(
-            int(installation_id), owner, repo_name, sender_login,
-            allow_author=True, pr_author_login=pr_author_login,
-        )
+        if accepting:
+            # grug#1405: only an admin accepts a removal, whoever wrote
+            # the PR. No PR-author shortcut, and no write-level path.
+            from accept_removal import may_accept  # type: ignore
+            perm = _actor_permission(
+                int(installation_id), owner, repo_name, sender_login,
+            )
+            association = str(comment.get("author_association") or "")
+            has_write = None if perm is None else may_accept(association, perm)
+        else:
+            has_write = _actor_has_write(
+                int(installation_id), owner, repo_name, sender_login,
+                allow_author=True, pr_author_login=pr_author_login,
+            )
     except httpx.RequestError as e:
         log.warning(
             "perm_lookup_transport_failed",
@@ -1128,7 +1161,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             repo=repo_name, pr_number=int(pr_number),
             comment_id=int(comment_id) if comment_id is not None else 0,
             token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
-            head_sha=head_sha,
+            head_sha=head_sha, actor=sender_login if accepting else "",
         )
 
     # Final guard (FLINT on #575): main.py forwards dispatch()
