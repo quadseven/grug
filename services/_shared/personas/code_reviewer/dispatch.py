@@ -108,7 +108,7 @@ from personas.code_reviewer.repo_config import (
     with_instructions,
 )
 from personas.code_reviewer.criteria_judge import criteria_judge_for
-from personas.code_reviewer.lane_work import criteria_in_scope, lane_work_findings
+from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
@@ -2493,8 +2493,7 @@ def _drop_non_correctness_findings(
 
 def _review_deletion_only(
     evaluation: CodeReviewEvaluation, diff_text: str,
-    parsed_hunks: tuple[DiffHunk, ...], *, criteria: tuple[str, ...],
-    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    parsed_hunks: tuple[DiffHunk, ...], *, installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str,
 ) -> tuple[CodeReviewEvaluation, str]:
     """A pull request that only deletes files gets a verdict, not no_diff (#1401).
@@ -2503,9 +2502,9 @@ def _review_deletion_only(
     the model with nothing and published a neutral "eyes clouded
     (no_diff)" that never clears a blocking gate. When the diff deletes
     files and has no other hunk, the verdict comes from the deterministic
-    checks in `removed_files`: a deleted guard path is a finding (high
-    unless a linked criterion names it), and so is a file at head that
-    still names a removed path. A referrer check that cannot finish
+    checks in `removed_files`: a deleted guard path is a high finding with
+    no ticket downgrade (a linked issue can be the PR author's own), and a
+    file at head that still names a removed path is a finding too. A referrer check that cannot finish
     degrades to `REMOVED_REFERENCE_CHECK_FAILED`, never a pass. Returns the
     evaluation and a summary note; any other diff is returned unchanged
     with no note."""
@@ -2515,7 +2514,7 @@ def _review_deletion_only(
     if not removed:
         return evaluation, ""
     pr = f"{owner}/{repo_name}#{pull_number}"
-    guarded = scan_guarded_deletions(removed, criteria)
+    guarded = scan_guarded_deletions(removed)
     try:
         referenced = removed_reference_findings(
             removed,
@@ -3424,12 +3423,6 @@ def dispatch_code_review(
 
     evaluation, deletion_note = _review_deletion_only(
         evaluation, diff_text, parsed_hunks,
-        criteria=tuple(c.text for c in criteria_in_scope(
-            rendered_criteria_with_state(
-                str(pr_context.get("linked_issue_context") or ""),
-            ),
-            str(pr_context.get("body") or ""),
-        )),
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,
     )

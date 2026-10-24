@@ -11,14 +11,15 @@ none added.
 A deletion-only pull request now gets a verdict from two deterministic
 checks. Neither one can pass a deletion it could not finish checking.
 
-- `removed-guarded-path`: the deletion removes a guard by its path alone: a
-  CI workflow, CODEOWNERS, branch protection or ruleset config, anything
-  under a security, policy or leak-scan directory, or a test file whose
-  covered code stays (no non-test file in its directory or the one above
-  goes with it). High unless a linked acceptance criterion, which the
-  operator writes, names the removed path; then medium. The PR title is the
-  author's and does not count. Same layer list and ticket rule as the
-  weakened-verification check (#1367, #1381) uses for edits.
+- `removed-guarded-path` (high, always): the deletion removes a guard by
+  its path alone: a CI workflow, CODEOWNERS, branch protection or ruleset
+  config, anything under a security, policy or leak-scan directory, or a
+  test file whose covered code stays. A test counts as covered only when
+  the same PR deletes a code file of the same module name in the test's
+  directory or the one above it, never a doc or a root-level file. There
+  is no ticket downgrade: a linked issue can be written by the PR's own
+  author, so a person or session answers the finding to merge. Same
+  layer list as the weakened-verification check (#1367, #1381).
 - `removed-but-referenced`: a file at head still names a removed path (in
   full, or relative to its own directory). High for code or config, medium
   for docs. Discovery uses code search (the default-branch index, where the
@@ -36,7 +37,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 
 import httpx
 
@@ -100,52 +101,62 @@ def _guard_kind(path: str, removed: frozenset[str]) -> str | None:
     return None
 
 
+_CODE_EXT_RE = re.compile(
+    r"\.(?:py|sh|bash|js|jsx|mjs|ts|tsx|go|rs|rb|java|kt|swift|c|cc|cpp|h|hpp"
+    r"|cs|php|scala|ex|exs)$"
+)
+_TEST_AFFIX_RE = re.compile(r"^test_|_test$|[._-](?:test|spec)$")
+
+
+def _module_stem(path: str) -> str:
+    """The module name a file is about: `test_check.py`, `check_test.go`
+    and `check.test.ts` are all `check`."""
+    base = path.rsplit("/", 1)[-1]
+    name = base.rsplit(".", 1)[0] if "." in base else base
+    return _TEST_AFFIX_RE.sub("", name.lower())
+
+
+# Never covered code: package markers and docs.
+_NOT_CODE_RE = re.compile(r"(?:^|/)(?:__init__\.py|README[^/]*|[^/]*\.md)$", re.IGNORECASE)
+
+
 def _covered_code_goes_too(test: str, removed: frozenset[str]) -> bool:
-    """A non-test file in the test's directory, or the directory above it,
-    is deleted too: the tests go with the code they covered."""
+    """The tests go with the code they covered: the PR also deletes a code
+    file (by extension; docs never count) that is not at the repository
+    root, sits in the test's directory or the one above it, and has the
+    test's module name. Package markers and docs never count. When in
+    doubt this answers False, so the finding is raised."""
     parts = test.split("/")[:-1]
-    homes = {"/".join(parts[:depth]) for depth in (len(parts) - 1, len(parts)) if depth >= 0}
-    return any(
-        not is_test_file(other) and "/".join(other.split("/")[:-1]) in homes
+    homes = {"/".join(parts[:depth]) for depth in (len(parts) - 1, len(parts)) if depth >= 1}
+    stem = _module_stem(test)
+    return bool(stem) and any(
+        "/" in other
+        and not is_test_file(other)
+        and _NOT_CODE_RE.search(other) is None
+        and _CODE_EXT_RE.search(other) is not None
+        and other.rsplit("/", 1)[0] in homes
+        and _module_stem(other) == stem
         for other in removed
     )
 
 
-def _criteria_name(path: str, criteria: str) -> bool:
-    lowered = criteria.lower()
-    return path.lower() in lowered or (
-        "/" in path and search_term(path).lower() in lowered
-    )
-
-
-def scan_guarded_deletions(
-    removed: tuple[str, ...], criteria: Iterable[str],
-) -> tuple[Finding, ...]:
-    """One finding per deleted guard path. Pure."""
+def scan_guarded_deletions(removed: tuple[str, ...]) -> tuple[Finding, ...]:
+    """One high finding per deleted guard path. Pure."""
     gone = frozenset(removed)
-    asked = "\n".join(criteria)
     found: list[Finding] = []
     for path in removed:
         kind = _guard_kind(path, gone)
         if kind is None:
             continue
-        named = _criteria_name(path, asked)
         found.append(Finding(
             file=path,
             line=1,
-            severity="medium" if named else "high",
+            severity="high",
             rule_name=RULE_GUARDED,
             message=(
                 f"This PR deletes `{path}`, which removes {kind}. A guard that "
-                "is gone passes everything. "
-                + (
-                    "A linked acceptance criterion names this path; confirm "
-                    "the removal is the one it asks for."
-                    if named else
-                    "No linked acceptance criterion names it. Keep the file, "
-                    "or have the ticket name the removal so a person has "
-                    "approved it."
-                )
+                "is gone passes everything. Keep the file, or have a person "
+                "confirm the removal is intended before this merges."
             ),
             suggestion=None,
             effort="quick-win",

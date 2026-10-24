@@ -135,7 +135,7 @@ def test_a_removed_file_naming_another_removed_file_is_not_a_reference():
     "tools/leak-scan/deny.txt",
 ])
 def test_deleting_a_guard_path_is_a_blocking_finding(path):
-    found = scan_guarded_deletions((path,), ())
+    found = scan_guarded_deletions((path,))
     assert [(f.rule_name, f.severity, f.file) for f in found] == [
         ("removed-guarded-path", "high", path),
     ]
@@ -143,24 +143,38 @@ def test_deleting_a_guard_path_is_a_blocking_finding(path):
 
 
 def test_deleting_tests_whose_code_stays_removes_coverage():
-    found = scan_guarded_deletions(("src/billing/tests/test_refunds.py",), ())
+    found = scan_guarded_deletions(("src/billing/tests/test_refunds.py",))
     assert [f.severity for f in found] == ["high"]
     assert "test coverage" in found[0].message
 
 
 def test_tests_deleted_with_the_code_they_covered_are_not_a_guard():
     removed = (_SCRIPT, "ops/scripts/isolation/tests/test_check.py")
-    assert scan_guarded_deletions(removed, ()) == ()
+    assert scan_guarded_deletions(removed) == ()
 
 
 def test_an_ordinary_file_is_not_a_guard():
-    assert scan_guarded_deletions(("src/old_helper.py", "docs/old.md"), ()) == ()
+    assert scan_guarded_deletions(("src/old_helper.py", "docs/old.md")) == ()
 
 
-def test_a_linked_criterion_naming_the_removal_makes_it_advisory():
-    criteria = (f"`{_WORKFLOW}` no longer exists on main.",)
-    found = scan_guarded_deletions((_WORKFLOW,), criteria)
-    assert [f.severity for f in found] == ["medium"]
+@pytest.mark.parametrize("other", [
+    "ops/scripts/isolation/README.md",
+    "ops/scripts/isolation/__init__.py",
+    "ops/scripts/isolation/notes.md",
+    "check.py",
+    "ops/scripts/isolation/unrelated.sh",
+])
+def test_a_doc_marker_root_or_other_module_does_not_cover_a_removed_test(other):
+    removed = ("ops/scripts/isolation/tests/test_check.py", other)
+    found = scan_guarded_deletions(removed)
+    assert [(f.file, f.severity) for f in found] == [
+        ("ops/scripts/isolation/tests/test_check.py", "high"),
+    ]
+
+
+def test_a_root_level_test_is_not_covered_by_a_root_level_file():
+    found = scan_guarded_deletions(("test_check.py", "check.py"))
+    assert [f.file for f in found] == ["test_check.py"]
 
 
 # The referrer check never vouches for what it could not finish.
@@ -212,7 +226,7 @@ def _patch_token(monkeypatch):
     )
 
 
-def _payload() -> dict:
+def _payload(body: str = "Removes the check and its workflow.") -> dict:
     return {
         "action": "opened",
         "installation": {"id": 11},
@@ -222,7 +236,7 @@ def _payload() -> dict:
             "head": {"sha": "abcd1234efgh"},
             "base": {"sha": "base5678ijkl"},
             "title": "Revert the isolation check",
-            "body": "Removes the check and its workflow.",
+            "body": body,
             "user": {"login": "alice"},
         },
     }
@@ -244,7 +258,8 @@ def _response(*, text: str = "", json: object = None, status: int = 200):
 
 
 def _run(monkeypatch, diff: str, referrers: dict[str, str], *,
-         blocking: bool = True, search_error: Exception | None = None) -> list:
+         blocking: bool = True, search_error: Exception | None = None,
+         body: str = "Removes the check and its workflow.") -> list:
     posted_check: list = []
 
     def _fake_get(url, *args, **kwargs):
@@ -276,7 +291,7 @@ def _run(monkeypatch, diff: str, referrers: dict[str, str], *,
     )
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 2})
     with patch("httpx.get", side_effect=_fake_get):
-        cr_dispatch.dispatch_code_review(_payload(), blocking=blocking)
+        cr_dispatch.dispatch_code_review(_payload(body), blocking=blocking)
     return posted_check
 
 
@@ -319,3 +334,27 @@ def test_a_referrer_check_that_raises_never_passes_a_blocking_gate(monkeypatch):
         search_error=httpx.ConnectError("search down"),
     )[-1]
     assert final.conclusion == "failure", (final.conclusion, final.title)
+
+
+_LEAK_SCAN = ".github/workflows/leak-scan.yml"
+
+
+@pytest.mark.parametrize("criterion", [
+    f"Remove `{_LEAK_SCAN}`, it is obsolete.",
+    "Delete `old/workflows/leak-scan.yml` from the tree.",
+    "Drop scan.yml.",
+])
+def test_a_linked_issue_naming_the_removal_never_downgrades_the_block(
+    monkeypatch, criterion,
+):
+    """Anyone can open and link an issue on a public repo, the PR author
+    included, so its criteria cannot approve removing a guard."""
+    monkeypatch.setattr(
+        cr_dispatch, "_attach_linked_issue_context",
+        lambda pr_context, **k: pr_context.__setitem__(
+            "linked_issue_context", f"#9 criterion 1 [open]: {criterion}",
+        ),
+    )
+    final = _run(monkeypatch, _deleted(_LEAK_SCAN), {}, body="Closes #9")[-1]
+    assert final.conclusion == "failure", (final.conclusion, final.title)
+    assert "removed-guarded-path" in final.summary
