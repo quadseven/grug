@@ -24,6 +24,7 @@ import httpx
 # not a reimplementation. These are llm_client internals; if their signatures
 # change, this runner must follow (it is the whole point of the benchmark).
 from llm_client import Hunk, _build_messages, _parse_response
+from review_evidence import assemble_evidence
 
 from .backends import BenchBackend
 from .corpus import CorpusSample
@@ -129,7 +130,8 @@ def run_sample(backend: BenchBackend, sample: CorpusSample) -> tuple[int, bool]:
         # Cross-file samples (#468) carry their unchanged-caller context;
         # single-file samples pass None (prompt byte-identical to pre-#468).
         messages = _build_messages(
-            hunks, _BENCH_PROMPT_VARIANT, None, sample.cross_file_contents,
+            assemble_evidence(hunks, cross_file_contents=sample.cross_file_contents),
+            _BENCH_PROMPT_VARIANT,
         )
         resp = _post(backend, messages)
         findings, _model, err = _parse_response(resp)

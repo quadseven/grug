@@ -20,6 +20,7 @@ import httpx
 import llm_client as lc
 import pytest
 from llm_client import Backend, Hunk, LlmReviewResponse, review_diff
+from review_evidence import assemble_evidence
 
 
 @pytest.fixture(autouse=True)
@@ -83,7 +84,7 @@ def test_later_cohorts_still_run_while_the_budget_has_time(monkeypatch) -> None:
         return _completion(json.dumps({"findings": []}))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff(hunks, installation_id=2)
+        out = review_diff(assemble_evidence(hunks), installation_id=2)
 
     assert out.coverage is not None
     assert out.coverage.unattempted_cohorts == ()
@@ -224,7 +225,7 @@ def test_a_cohort_cut_mid_ladder_by_the_deadline_is_never_attempted(monkeypatch)
         raise httpx.ReadTimeout("slow")
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff(hunks, installation_id=2)
+        out = review_diff(assemble_evidence(hunks), installation_id=2)
 
     assert out.coverage is not None
     assert out.coverage.unattempted_cohorts == (2,)

@@ -15,6 +15,7 @@ import pytest
 import llm_client as lc
 import rerun
 from llm_client import Backend, Hunk, review_diff
+from review_evidence import assemble_evidence
 
 _CAVE_ARMS = ("judge", Backend.CAVE, Backend.CAVE_REASONER)
 _PUBLIC = {"repo": "quadseven/grug", "pr_number": 7, "repo_private": False}
@@ -119,8 +120,11 @@ def test_the_job_reaches_both_arm_threads(monkeypatch) -> None:
 
     with patch.object(httpx, "post", side_effect=capture):
         review_diff(
-            [Hunk(path="src/x.py", body="@@ -1 +1 @@\n-a\n+b")],
-            installation_id=1, pr_context=_PUBLIC,
+            assemble_evidence(
+                [Hunk(path="src/x.py", body="@@ -1 +1 @@\n-a\n+b")],
+                pr_context=_PUBLIC,
+            ),
+            installation_id=1,
         )
 
     assert len(seen) == 2
@@ -142,8 +146,13 @@ def test_the_cave_judge_names_the_job() -> None:
                "severity": "low", "message": "m"}
     with patch.object(httpx, "post", side_effect=capture):
         lc.judge_findings(
-            [finding], [Hunk(path="src/x.py", body="@@ -1 +1 @@\n-a\n+b")],
-            installation_id=1, pr_context=_PUBLIC, config=lc._cave_judge_config(),
+            [finding],
+            assemble_evidence(
+                [Hunk(path="src/x.py", body="@@ -1 +1 @@\n-a\n+b")],
+                pr_context=_PUBLIC,
+            ),
+            installation_id=1,
+            config=lc._cave_judge_config(),
         )
 
     assert sent and sent[0]["X-Spark-Job"] == "quadseven/grug#7"

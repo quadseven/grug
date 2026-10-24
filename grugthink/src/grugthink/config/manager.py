@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from ..grug_structured_logger import get_logger
-from . import loader, migration, personalities, pg_store, templates, tokens, watcher
+from . import loader, migration, personalities, templates, tokens, watcher
 from .models import ConfigTemplate
 
 log = get_logger(__name__)
@@ -53,31 +53,21 @@ class ConfigManager:
         self.change_callbacks: List[Callable] = []
         self._lock = threading.Lock()
 
-        # Postgres backend (grug#1190): config lives in the grugthink_config
-        # table, not on a volume, so there is nothing to hot-reload from disk.
-        # Dashboard writes go through this manager, so in-process state stays
-        # current without a file watcher.
-        self._pg_config = pg_store.pg_config_enabled()
-        if self._pg_config:
-            self.observer, self.handler = None, None
-            log.info("Postgres config backend active - file watcher disabled")
-        else:
-            # File watcher for hot-reloading (if watchdog available)
-            self.observer, self.handler = watcher.create_observer_and_handler(self)
+        # File watcher for hot-reloading (if watchdog available)
+        self.observer, self.handler = watcher.create_observer_and_handler(self)
 
         # Built-in templates
         self.templates = templates.create_default_templates()
 
         # Load initial configuration
         self._load_config()
-        if not self._pg_config:
-            watcher.start_watching(self)
+        watcher.start_watching(self)
 
         log.info("ConfigManager initialized", extra={"config_file": config_file, "templates": len(self.templates)})
 
     def _load_config(self):
-        """Load configuration from the active backend (Postgres or file)."""
-        config_data = loader.load_config(self.config_file, self.templates)
+        """Load configuration from file."""
+        config_data = loader.load_config(self.config_file)
 
         if config_data:
             # Load external personalities

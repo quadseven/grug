@@ -3,7 +3,8 @@
 End-to-end for one `pull_request` event:
   1. Fetch the PR's unified diff via the GitHub API.
   2. parse_diff → DiffHunks.
-  3. review_diff(hunks, installation_id) → LlmReviewResponse.
+  3. assemble_evidence(...) once -> review_diff(evidence, installation_id)
+     -> LlmReviewResponse; the judge grades against the same evidence.
   4. evaluate_diff(hunks, llm_response) → CodeReviewEvaluation.
   5. Build the inline-comment ReviewResult + the summary CheckRunResult.
   6. Publish via post_check_run + (optionally) post_review.
@@ -28,7 +29,7 @@ import re
 import threading
 from collections import deque
 from datetime import datetime, timezone
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -61,6 +62,7 @@ from llm_client import (
     review_reasoner_diff,
 )
 from voice_pack import VoiceSelection, entitled_voice
+from review_evidence import ElderEvidence, assemble_evidence
 from review_types import EFFORTS, SEVERITIES
 from personas.review_publish import (
     DIFF_FETCH_TIMEOUT, PUBLISHABLE_DEGRADATIONS, ReviewMode, fetch_file_contents,
@@ -71,7 +73,7 @@ from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, rule_marker,
 )
 from personas.code_reviewer.diff_parser import (
-    DiffHunk, DiffParseError, is_tree_copy_candidate, new_file_blob_ids,
+    DiffHunk, DiffParseError, file_changes, is_tree_copy_candidate, new_file_blob_ids,
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
@@ -85,9 +87,6 @@ from personas.code_reviewer.claim_check import (
 from personas.code_reviewer.model_metrics import emit_finding_posted
 from personas import board
 from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
-from personas.code_reviewer.criteria_coverage import (
-    LinkedCriterion, scan_criteria_coverage,
-)
 from personas.code_reviewer.analyzers import (
     RepoAnalyzerConfig, configured_engines, merge_analyzer_findings,
     run_analyzers,
@@ -108,11 +107,14 @@ from personas.code_reviewer.repo_config import (
     split_ignored_hunks,
     with_instructions,
 )
+from personas.code_reviewer.criteria_judge import criteria_judge_for
+from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
 from personas.code_reviewer.linked_issue import (
     build_linked_issue_context, rendered_criteria, rendered_criteria_with_state,
+    rendered_health_issues,
 )
 from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
@@ -2485,34 +2487,136 @@ def _drop_non_correctness_findings(
     )
 
 
-def _merge_criteria_coverage(
+def _merge_lane_work(
     evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
-    file_contents: dict[str, str], pr_context: PrContext, *,
+    diff_text: str, file_contents: dict[str, str],
+    base_contents: dict[str, str], pr_context: PrContext, *,
     correctness_only: bool,
 ) -> CodeReviewEvaluation:
-    """Merge the deterministic criteria-coverage findings (#1179).
+    """Merge the deterministic lane-work findings (#1179, #1363).
 
-    Only criteria of issues the PR CLOSES count: a `Refs`/`Part of` link
-    may be one slice of several and is not expected to meet them all.
-    Dead-code findings follow the correctness-only scope the LLM's do."""
+    The criteria in scope are those of an issue the PR closes, every linked
+    criterion of a lane PR (the station closes its ticket on merge), and a
+    box the body claims (`lane_work.criteria_in_scope`). Dead-code findings
+    follow the correctness-only scope the LLM's do."""
     body = str(pr_context.get("body") or "")
-    closed = set(closes_refs(body))
-    criteria = tuple(
-        LinkedCriterion(issue, number, text)
-        for issue, number, text in rendered_criteria(
+    found = lane_work_findings(
+        diff_text=diff_text,
+        hunks=hunks,
+        file_contents=file_contents,
+        base_line_counts={
+            path: len(text.splitlines()) for path, text in base_contents.items()
+        },
+        boxes=rendered_criteria_with_state(
             str(pr_context.get("linked_issue_context") or ""),
-        )
-        if issue in closed
-    )
-    found = scan_criteria_coverage(
-        hunks, file_contents, criteria=criteria,
-        pr_title=str(pr_context.get("title") or ""), pr_body=body,
+        ),
+        pr_title=str(pr_context.get("title") or ""),
+        pr_body=body,
+        health_issues=rendered_health_issues(
+            str(pr_context.get("linked_issue_context") or ""),
+        ),
+        criteria_judge=criteria_judge_for(pr_context),
     )
     if correctness_only:
         found = tuple(f for f in found if f.rule_name != "dead-code")
     return with_extra_findings(
         evaluation, filter_novel_claim_findings(found, evaluation.findings),
     )
+
+
+@dataclass(frozen=True)
+class _LaneWorkInputs:
+    """The whole pull request, as the lane-work checks read it."""
+
+    diff_text: str
+    hunks: tuple[DiffHunk, ...]
+    file_contents: dict[str, str]
+    base_contents: dict[str, str]
+
+
+def _full_pr_lane_work_inputs(
+    installation_id: int, owner: str, repo_name: str, pull_number: int, *,
+    base_sha: str, head_sha: str, known_contents: dict[str, str],
+) -> _LaneWorkInputs | None:
+    """The full PR diff (merge base..head) and its file texts, for a delta
+    review's lane-work checks (#1343). The model still reviews only the
+    delta. Head texts the delta already fetched are reused. None when the
+    full diff cannot be fetched: the checks then skip this pass, logged,
+    as they did before."""
+    try:
+        diff_text = with_install_token_retry(
+            installation_id,
+            lambda token: fetch_pr_diff(
+                token, owner, repo_name, pull_number,
+                base_sha=base_sha, head_sha=head_sha,
+            ),
+        )
+        hunks = parse_diff(diff_text)
+    except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
+        log.info(
+            "code_review_lane_work_full_diff_unavailable",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        return None
+    paths = tuple(dict.fromkeys(h.file_path for h in hunks))
+    missing = tuple(p for p in paths if p not in known_contents)
+    contents = {p: known_contents[p] for p in paths if p in known_contents}
+    if missing:
+        try:
+            contents.update(with_install_token_retry(
+                installation_id,
+                lambda token: fetch_file_contents(
+                    token, owner, repo_name, missing, head_sha,
+                ),
+            ) or {})
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            log.info(
+                "code_review_file_contents_unavailable",
+                extra={"pr": f"{owner}/{repo_name}#{pull_number}", "error": str(e)},
+            )
+    rename_sources = tuple(
+        c.previous_path for c in file_changes(diff_text)
+        if c.status == "renamed" and c.previous_path
+    )
+    base_contents = _fetch_base_contents(
+        installation_id, owner, repo_name, pull_number,
+        tuple(dict.fromkeys(paths + rename_sources)), base_sha,
+    )
+    return _LaneWorkInputs(diff_text, hunks, contents, base_contents)
+
+
+def _merge_lane_work_for_pass(
+    evaluation: CodeReviewEvaluation, this_pass: _LaneWorkInputs,
+    pr_context: PrContext, *, living_range: str, base_sha: str,
+    correctness_only: bool,
+) -> CodeReviewEvaluation:
+    """Merge the lane-work findings for one review pass. A full review
+    judges the diff it reviewed; a living delta hides callers and the
+    commits that met a criterion, so a delta review judges the full PR diff
+    instead (#1343). Never aborts the review."""
+    owner, _, repo_name = str(pr_context.get("repo") or "").partition("/")
+    pull_number = int(pr_context.get("pr_number") or 0)
+    try:
+        inputs: _LaneWorkInputs | None = this_pass
+        if living_range:
+            inputs = _full_pr_lane_work_inputs(
+                int(pr_context.get("installation_id") or 0), owner, repo_name,
+                pull_number, base_sha=base_sha,
+                head_sha=str(pr_context.get("head_sha") or ""),
+                known_contents=this_pass.file_contents,
+            )
+        if inputs is None:
+            return evaluation
+        return _merge_lane_work(
+            evaluation, inputs.hunks, inputs.diff_text, inputs.file_contents,
+            inputs.base_contents, pr_context, correctness_only=correctness_only,
+        )
+    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
+        log.info(
+            "code_review_criteria_coverage_failed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        return evaluation
 
 
 def _filter_checked_shell_commands(
@@ -2750,9 +2854,10 @@ def dispatch_code_review(
             living_range = ""
         pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
-        # Criteria coverage (#1179) judges the WHOLE diff; any hunk dropped
-        # below (excluded, ignored, oversized, duplicate) voids that.
-        parsed_hunk_count = len(hunks)
+        # The lane-work checks (#1179, #1363) judge the WHOLE diff, so they
+        # keep every parsed hunk, including those dropped below (excluded,
+        # ignored, oversized, duplicate) from the model's plate.
+        parsed_hunks = hunks
         review_scope = _correctness_only_scope(
             tuple(hunk.file_path for hunk in hunks), labels,
         )
@@ -2906,9 +3011,15 @@ def dispatch_code_review(
     # and falls back to the old absolute behaviour. That direction is
     # deliberate: going SILENT on a fetch error would hide real regressions,
     # whereas falling back only restores the previous noise level.
+    # A renamed file's base text lives at its old path (#1365).
+    rename_sources = tuple(
+        c.previous_path for c in file_changes(diff_text)
+        if c.status == "renamed" and c.previous_path
+    )
     base_file_contents = _fetch_base_contents(
         installation_id, owner, repo_name, pull_number,
-        changed_paths, str(pr_context.get("base_sha") or ""),
+        tuple(dict.fromkeys(changed_paths + rename_sources)),
+        str(pr_context.get("base_sha") or ""),
     )
 
     # Cross-file context (#468): resolve the diff's changed defs + external
@@ -3024,17 +3135,23 @@ def dispatch_code_review(
         pr_context, installation_id=installation_id, owner=owner, repo_name=repo_name,
     )
 
-    # PR context supplies both trace identity and author intent. The prompt
-    # treats title/body as untrusted repository data before sending it.
-    llm_response: LlmReviewResponse = review_diff(
+    # The ONE assembled evidence object (#1189): the reviewer, the judge,
+    # the refute gate and the async deep arm all read this, so reviewer and
+    # judge parity holds by construction. PR context supplies both trace
+    # identity and author intent; the prompt treats title/body as untrusted
+    # repository data before sending it.
+    evidence = assemble_evidence(
         _to_llm_hunks(hunks),
-        installation_id=installation_id,
+        pr_context=pr_context,
         file_contents=file_contents,
         cross_file_contents=cross_file_contents,
         runtime_context=runtime_context,
         ci_context=ci_context,
         repo_docs_context=repo_docs_context,
-        pr_context=pr_context,
+    )
+    llm_response: LlmReviewResponse = review_diff(
+        evidence,
+        installation_id=installation_id,
         voice=voice,
         cancel_event=cancel_event,
     )
@@ -3055,7 +3172,7 @@ def dispatch_code_review(
         )
 
     evaluation = evaluate_diff(
-        hunks, llm_response, cross_file_contents=cross_file_contents,
+        hunks, llm_response, cross_file_contents=evidence.cross_file_contents,
     )
     correctness_only = bool(pr_context.get("review_scope"))
     if correctness_only:
@@ -3098,13 +3215,7 @@ def dispatch_code_review(
     # the DD evals below. `graded_findings` keeps the FULL set so the eval
     # denominator counts suppressed rows too.
     graded_findings = evaluation.findings
-    judge_verdicts = grade_findings(
-        evaluation, hunks, installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-    )
+    judge_verdicts = grade_findings(evaluation, evidence, installation_id)
     kept, suppressed = partition_findings(evaluation.findings, judge_verdicts)
     if suppressed:
         evaluation = with_findings(evaluation, kept)
@@ -3139,10 +3250,7 @@ def dispatch_code_review(
         owner=owner, repo_name=repo_name, pull_number=pull_number, arm="tier1",
     )
     surviving = _apply_refute_gate(
-        evaluation.findings, hunks, installation_id,
-        pr_context=pr_context, file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context, owner=owner,
+        evaluation.findings, evidence, installation_id, owner=owner,
         repo_name=repo_name, pull_number=pull_number, arm="tier1",
     )
     if len(surviving) != len(evaluation.findings):
@@ -3240,21 +3348,15 @@ def dispatch_code_review(
             },
         )
 
-    # Deterministic criteria coverage (#1179): a new function nothing calls,
-    # and closing-issue criteria no hunk can satisfy. Pure; never aborts.
-    # A living delta or a narrowed hunk set hides callers and runtime
-    # hunks, so the check runs only when Elder saw the whole diff.
-    try:
-        if not living_range and len(hunks) == parsed_hunk_count:
-            evaluation = _merge_criteria_coverage(
-                evaluation, hunks, file_contents, pr_context,
-                correctness_only=correctness_only,
-            )
-    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
-        log.info(
-            "code_review_criteria_coverage_failed",
-            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
-        )
+    # Deterministic lane-work checks (#1179, #1363): a new function nothing
+    # calls, linked criteria no hunk can satisfy, a file mostly deleted that
+    # nobody named. They judge the WHOLE pull request on every pass (#1343).
+    evaluation = _merge_lane_work_for_pass(
+        evaluation,
+        _LaneWorkInputs(diff_text, parsed_hunks, file_contents, base_file_contents),
+        pr_context, living_range=living_range, base_sha=base_sha,
+        correctness_only=correctness_only,
+    )
 
     # Durable reviews can spend several minutes in inference. Re-check the
     # complete input after reasoning so changes to code, base, or intent cannot
@@ -3637,13 +3739,8 @@ def dispatch_code_review(
             mode=mode,
             blocking=blocking,
             hunks=hunks,
-            llm_hunks=_to_llm_hunks(hunks),
+            evidence=evidence,
             pr_context=pr_context,
-            file_contents=file_contents,
-            cross_file_contents=cross_file_contents,
-            runtime_context=runtime_context,
-            ci_context=ci_context,
-            repo_docs_context=repo_docs_context,
             voice=voice,
             living_range=living_range,
             living_baseline_rejected=living_baseline_rejected,
@@ -3715,8 +3812,7 @@ def dispatch_code_review(
 
 
 def _apply_refute_gate(
-    findings, hunks, installation_id, *, pr_context, file_contents,
-    cross_file_contents, runtime_context, owner, repo_name, pull_number, arm,
+    findings, evidence, installation_id, *, owner, repo_name, pull_number, arm,
 ):
     """Refute gate (#714): adversarial evidence-check for the HIGH/CRITICAL
     findings that survived deterministic verification - the semantic-
@@ -3727,13 +3823,7 @@ def _apply_refute_gate(
     high = tuple(f for f in findings if f.severity in ("high", "critical"))
     if not high:
         return findings
-    verdicts = refute_findings(
-        high, hunks, installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-    )
+    verdicts = refute_findings(high, evidence, installation_id)
     if not verdicts:
         return findings
     _, refuted = partition_refuted(high, verdicts)
@@ -3888,18 +3978,16 @@ def _deep_snapshot_is_stale(
 def _grade_deep_response(
     deep_llm: LlmReviewResponse,
     hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
     installation_id: int,
     *,
     pr_context: PrContext,
-    file_contents: dict[str, str] | None,
-    cross_file_contents: dict[str, str] | None,
-    runtime_context: str | None,
     owner: str,
     repo_name: str,
     pull_number: int,
 ) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
     deep_eval = evaluate_diff(
-        hunks, deep_llm, cross_file_contents=cross_file_contents,
+        hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
     )
     # The reasoner reads the same linked criteria, so its intent-mismatch
     # findings get the same evidence filter and box scope (#1170, #1218).
@@ -3908,21 +3996,13 @@ def _grade_deep_response(
         repo_name=repo_name, pull_number=pull_number, pr_context=pr_context,
     )
     deep_graded = deep_eval.findings
-    deep_verdicts = grade_findings(
-        deep_eval,
-        hunks,
-        installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-    )
+    deep_verdicts = grade_findings(deep_eval, evidence, installation_id)
     deep_kept, deep_suppressed = partition_findings(deep_graded, deep_verdicts)
     if deep_suppressed:
         deep_eval = with_findings(deep_eval, deep_kept)
     deep_verified, deep_killed = verify_findings(
         deep_eval.findings,
-        file_contents or {},
+        evidence.file_contents,
     )
     if deep_killed:
         deep_eval = with_findings(deep_eval, deep_verified)
@@ -3935,17 +4015,13 @@ def _grade_deep_response(
         arm="deep",
     )
     deep_eval = _apply_bound_name_downgrade(
-        deep_eval, file_contents or {}, installation_id=installation_id,
+        deep_eval, evidence.file_contents, installation_id=installation_id,
         owner=owner, repo_name=repo_name, pull_number=pull_number, arm="deep",
     )
     deep_surviving = _apply_refute_gate(
         deep_eval.findings,
-        hunks,
+        evidence,
         installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
         owner=owner,
         repo_name=repo_name,
         pull_number=pull_number,
@@ -4358,13 +4434,8 @@ def _async_deep_append_if_needed(
     mode: ReviewMode,
     blocking: bool,
     hunks: tuple[DiffHunk, ...],
-    llm_hunks: list[LlmHunk],
+    evidence: ElderEvidence,
     pr_context: PrContext,
-    file_contents: dict[str, str] | None,
-    cross_file_contents: dict[str, str] | None,
-    runtime_context: str | None,
-    ci_context: str | None,
-    repo_docs_context: str | None,
     voice: VoiceSelection,
     living_range: str,
     living_baseline_rejected: str,
@@ -4383,7 +4454,7 @@ def _async_deep_append_if_needed(
     """
     decision = _async_deep_decision(
         check_publish_failed=check_publish_failed,
-        llm_hunks=llm_hunks,
+        llm_hunks=list(evidence.hunks),
         pr_context=pr_context,
         evaluation=evaluation,
         cancel_event=cancel_event,
@@ -4415,14 +4486,8 @@ def _async_deep_append_if_needed(
         return
 
     deep_llm = review_reasoner_diff(
-        llm_hunks,
+        evidence,
         installation_id=installation_id,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-        ci_context=ci_context,
-        repo_docs_context=repo_docs_context,
-        pr_context=pr_context,
         voice=voice,
         cancel_event=cancel_event,
     )
@@ -4453,7 +4518,7 @@ def _async_deep_append_if_needed(
         # The deep check-run then completes `neutral`, naming the arm that
         # never ran, in place of the unqualified Tier-1 `success`.
         deep_eval = evaluate_diff(
-            hunks, deep_llm, cross_file_contents=cross_file_contents,
+            hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
         )
         deep_graded: tuple[Finding, ...] = ()
         deep_verdicts: tuple[Any, ...] = ()
@@ -4462,11 +4527,9 @@ def _async_deep_append_if_needed(
         deep_eval, deep_graded, deep_verdicts, deep_suppressed_count = _grade_deep_response(
             deep_llm,
             hunks,
+            evidence,
             installation_id,
             pr_context=pr_context,
-            file_contents=file_contents,
-            cross_file_contents=cross_file_contents,
-            runtime_context=runtime_context,
             owner=owner,
             repo_name=repo_name,
             pull_number=pull_number,
@@ -4581,7 +4644,7 @@ def _async_deep_append_if_needed(
         pr_title=str(pr_context.get("title") or ""),
         base_sha=str(pr_context.get("base_sha") or ""),
         repo_config=repo_config,
-        file_contents=file_contents,
+        file_contents=evidence.file_contents,
         action=action,
     )
     _submit_deep_evals(

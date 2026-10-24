@@ -20,6 +20,7 @@ import llm_client as lc
 import voice_pack as vp
 from code_review_prompt import _VOICE as CAVEMAN_VOICE
 from llm_client import Hunk
+from review_evidence import assemble_evidence
 
 
 # --- voice_pack.apply_voice -------------------------------------------------
@@ -112,15 +113,15 @@ def test_sage_prompt_cache_built_for_every_variant():
 
 def test_build_messages_routes_to_the_selected_voice():
     hunks = [Hunk(path="a.py", body="+x = 1")]
-    caveman_sys = lc._build_messages(hunks, "v1", voice="caveman")[0]["content"]
-    sage_sys = lc._build_messages(hunks, "v1", voice="sage")[0]["content"]
+    caveman_sys = lc._build_messages(assemble_evidence(hunks), "v1", voice="caveman")[0]["content"]
+    sage_sys = lc._build_messages(assemble_evidence(hunks), "v1", voice="sage")[0]["content"]
     assert CAVEMAN_VOICE in caveman_sys and "sage cadence" not in caveman_sys
     assert "sage cadence" in sage_sys and CAVEMAN_VOICE not in sage_sys
 
 
 def test_build_messages_defaults_to_caveman():
     hunks = [Hunk(path="a.py", body="+x = 1")]
-    default_sys = lc._build_messages(hunks, "v1")[0]["content"]
+    default_sys = lc._build_messages(assemble_evidence(hunks), "v1")[0]["content"]
     assert CAVEMAN_VOICE in default_sys
 
 
