@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any
+from urllib.parse import quote as _q
 
 from personas.code_reviewer.suggestion import checked_suggestion
 from review_session import FindingRecord
@@ -248,6 +249,68 @@ def _prepare_changes(
     return applied, skipped, changes
 
 
+def _load_candidates(
+    *, install_id: int, repo: str, pr_number: int, get_session, reply,
+) -> tuple[Any | None, list[FindingRecord], dict[str, Any] | None]:
+    """Load the review session and handle requests with no fixable findings."""
+    session = get_session(install_id, repo, pr_number)
+    if not session:
+        reply("Grug found no review session for this PR, so there is nothing to fix.")
+        return None, [], {"verb": "fix", "status": "skip", "reason": "no_review_session"}
+
+    candidates = _open_committable_findings(session)
+    if candidates:
+        return session, candidates, None
+
+    reply("Grug found no unresolved committable suggestions on this PR.")
+    return session, [], {"verb": "fix", "status": "no_op", "reason": "no_committable_findings"}
+
+
+def _commit_and_report(
+    *, applied: list[FindingRecord], skipped: list[tuple[FindingRecord, str]],
+    changes: dict[str, str], candidates: list[FindingRecord], token_fn,
+    owner: str, repo: str, head_sha: str, pr_number: int, apply_commit, reply,
+) -> dict[str, Any]:
+    """Commit prepared changes once and report every applied or skipped finding."""
+    if not changes:
+        reply(_build_reply(applied, skipped))
+        return {
+            "verb": "fix", "status": "no_op", "reason": "nothing_applies",
+            "applied": [],
+            "skipped": [
+                {"path": f.path, "line": f.line, "rule": f.rule, "reason": reason}
+                for f, reason in skipped
+            ],
+        }
+
+    new_head = apply_commit(
+        token_fn, owner, repo, head_sha, changes,
+        f"Apply grug autofix suggestions on PR #{pr_number}", pr_number,
+    )
+    if new_head is None:
+        failed = [(candidate, "commit could not be created") for candidate in candidates]
+        reply(_build_reply([], failed))
+        return {
+            "verb": "fix", "status": "skip", "reason": "commit_failed",
+            "applied": [],
+            "skipped": [
+                {"path": f.path, "line": f.line, "rule": f.rule,
+                 "reason": "commit could not be created"}
+                for f in candidates
+            ],
+        }
+
+    reply(_build_reply(applied, skipped))
+    return {
+        "verb": "fix", "status": "dispatched",
+        "applied": [{"path": f.path, "line": f.line, "rule": f.rule} for f in applied],
+        "skipped": [
+            {"path": f.path, "line": f.line, "rule": f.rule, "reason": reason}
+            for f, reason in skipped
+        ],
+    }
+
+
 def run_fix(
     *,
     install_id: int,
@@ -266,8 +329,6 @@ def run_fix(
     Returns a status dict. On success the commit is pushed and a reply is
     posted naming every applied and skipped suggestion.
     """
-    out = {"verb": "fix"}
-
     if get_session is None:
         get_session = _default_get_session
     if fetch_file is None:
@@ -280,56 +341,24 @@ def run_fix(
         )
     )
 
-    session = get_session(install_id, repo, pr_number)
-    if not session:
-        reply("Grug found no review session for this PR, so there is nothing to fix.")
-        return {**out, "status": "skip", "reason": "no_review_session"}
-
-    candidates = _open_committable_findings(session)
-    if not candidates:
-        reply("Grug found no unresolved committable suggestions on this PR.")
-        return {**out, "status": "no_op", "reason": "no_committable_findings"}
+    _, candidates, early_result = _load_candidates(
+        install_id=install_id, repo=repo, pr_number=pr_number,
+        get_session=get_session, reply=reply,
+    )
+    if early_result is not None:
+        return early_result
 
     applied, skipped, changes = _prepare_changes(
         candidates, token_fn=token_fn, owner=owner, repo=repo,
         head_sha=head_sha, fetch_file=fetch_file,
     )
 
-    if not changes:
-        body = _build_reply(applied, skipped)
-        reply(body)
-        return {**out, "status": "no_op", "reason": "nothing_applies",
-                "applied": [],
-                "skipped": [
-                    {"path": f.path, "line": f.line, "rule": f.rule,
-                     "reason": reason} for f, reason in skipped],
-                }
-
-    # Apply all valid changes as ONE commit.
-    new_head = apply_commit(
-        token_fn, owner, repo, head_sha, changes,
-        f"Apply grug autofix suggestions on PR #{pr_number}",
-        pr_number,
+    # Apply all valid changes as ONE commit and report the exact outcome.
+    return _commit_and_report(
+        applied=applied, skipped=skipped, changes=changes, candidates=candidates,
+        token_fn=token_fn, owner=owner, repo=repo, head_sha=head_sha,
+        pr_number=pr_number, apply_commit=apply_commit, reply=reply,
     )
-    if new_head is None:
-        body = _build_reply(
-            [], [(c, "commit could not be created") for c in candidates],
-        )
-        reply(body)
-        return {**out, "status": "skip", "reason": "commit_failed",
-                "applied": [], "skipped": [
-                    {"path": c.path, "line": c.line, "rule": c.rule,
-                     "reason": "commit could not be created"}
-                    for c in candidates],
-                }
-
-    body = _build_reply(applied, skipped)
-    reply(body)
-    return {
-        **out, "status": "dispatched",
-        "applied": [{"path": f.path, "line": f.line, "rule": f.rule} for f in applied],
-        "skipped": [{"path": f.path, "line": f.line, "rule": f.rule, "reason": reason} for f, reason in skipped],
-}
 
 
 def _build_reply(
