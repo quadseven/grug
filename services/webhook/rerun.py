@@ -61,8 +61,11 @@ from personas.code_reviewer.elder_review import (
     StalenessWatch,
     _MAX_ELDER_SETTLE_SECONDS,
     _REVIEW_CLAIM_LEASE_SECONDS,
+    acquire_review_claim,
+    complete_review_claim,
     decide_redrive,
     durable_elder_settle_seconds,
+    release_review_claim,
     register_active_review_claim,
     release_active_review_claims,
     review_eligible,
@@ -1529,13 +1532,6 @@ def _review_payload(
     }
 
 
-def _review_eligible(pr: dict[str, Any]) -> bool:
-    """Only open, non-draft pull requests may publish a review."""
-    return str(pr.get("state") or "") == "open" and not bool(
-        pr.get("draft", False)
-    )
-
-
 def _enqueue_current_review(
     *,
     install_id: int,
@@ -1918,12 +1914,6 @@ def _run_hot_review(
     repo_id = int(((before.get("base") or {}).get("repo") or {})["id"])
     snapshot_id = review_snapshot_id_from_pr(before)
 
-    from adapters.install_store import (
-        acquire_review_claim,
-        complete_review_claim,
-        release_review_claim,
-    )
-
     claim_args = {
         "install_id": install_id,
         "repo": repo_full,
@@ -1991,7 +1981,7 @@ def _run_hot_review(
         after = _fetch_current_pr(install_id, owner, repo_name, pr_number)
         current_head = str((after.get("head") or {}).get("sha") or "")
         current_snapshot_id = review_snapshot_id_from_pr(after)
-        if not _review_eligible(after):
+        if not review_eligible(after):
             if not stop_review_claim_heartbeat(heartbeat):
                 raise RuntimeError(
                     "Elder review claim ownership lost during settle"
@@ -2135,7 +2125,7 @@ def _run_hot_review(
                         current_head_sha=latest_head,
                         job_redrive_count=int(job.get("redrive_count", 0)),
                     )
-                    if _review_eligible(latest)
+                    if review_eligible(latest)
                     else False
                 )
                 if not stop_review_claim_heartbeat(heartbeat):
@@ -2146,7 +2136,7 @@ def _run_hot_review(
                     raise RuntimeError(
                         "Elder review claim ownership lost after stale dispatch"
                     )
-                if not _review_eligible(latest):
+                if not review_eligible(latest):
                     return "pr_ineligible"
                 return "stale_snapshot" if redrived else "intent_drift_exhausted"
             if degraded_reason == "pr_ineligible":

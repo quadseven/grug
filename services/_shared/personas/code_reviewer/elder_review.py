@@ -29,8 +29,6 @@ from github_app_auth import with_install_token_retry
 from adapters.install_store import (
     acquire_review_claim as _adapter_acquire_review_claim,
     complete_review_claim as _adapter_complete_review_claim,
-    get_repo_config as _adapter_get_repo_config,
-    is_elder_paused as _adapter_is_elder_paused,
     release_review_claim as _adapter_release_review_claim,
     renew_review_claim as _adapter_renew_review_claim,
 )
@@ -243,6 +241,25 @@ class ReviewClaimHeartbeat:
     stop: threading.Event
     ownership_lost: threading.Event
     thread: threading.Thread
+
+
+def acquire_review_claim(
+    *, lease_seconds: int = _REVIEW_CLAIM_LEASE_SECONDS, **claim_args: Any,
+) -> str:
+    """Acquire ownership of one durable Elder attempt."""
+    return _adapter_acquire_review_claim(
+        **claim_args, lease_seconds=lease_seconds,
+    )
+
+
+def release_review_claim(**claim_args: Any) -> bool:
+    """Release an attempt only when its ownership token still matches."""
+    return _adapter_release_review_claim(**claim_args)
+
+
+def complete_review_claim(**claim_args: Any) -> bool:
+    """Mark an owned attempt complete through the persistence adapter."""
+    return _adapter_complete_review_claim(**claim_args)
 
 
 def _review_claim_heartbeat_loop(
