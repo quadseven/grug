@@ -1,4 +1,4 @@
-"""`/grug accept-removal <path>`: a maintainer answers a deleted guard (#1405).
+"""`/grug accept-removal <path> <sha>`: an admin answers a deleted guard (#1405).
 
 A deletion-only PR that removes a CI workflow, CODEOWNERS, ruleset config,
 a security, policy or leak-scan file, or a test whose code stays gets a
@@ -11,22 +11,17 @@ text, and each part failing closed when it is missing:
   or a Mannequin, and the comment was not posted through a GitHub App;
 - the comment's author is the delivery's sender;
 - its author_association is OWNER, MEMBER or COLLABORATOR;
-- the collaborator permission API says admin, maintain or write. The PR
-  author shortcut that `/grug improve` takes does not apply;
-- whoever wrote the change (the PR author, or the author or committer of
-  any commit in the PR) may accept only as OWNER or with admin
-  permission, so a solo maintainer still can, while plain write access
-  accepts only a change someone else wrote. A commit listing that fails
-  counts the commenter as a writer.
+- the comment's author is an admin: association OWNER, or admin from the
+  collaborator permission API. Write or maintain is refused, whether or
+  not they wrote the PR, and so is a failed permission lookup. Git
+  authorship is not consulted: it can be spoofed.
 
-The command names the head the maintainer reviewed
-(`/grug accept-removal <path> <sha>`, the full 40-character SHA that
-Elder's finding prints), and it counts only while that is still the PR's
-head. The acceptance is stored
-against that head, so a new head finds no acceptance and the finding comes
-back. Each comment is claimed before anything is recorded, so a
-redelivered comment records nothing.
-Accepting a path clears only that path's `removed-guarded-path` finding.
+The command names the head the admin reviewed (the full 40-character SHA
+that Elder's finding prints), and it counts only while that is still the
+PR's head. The acceptance is stored against that head, so a new head finds
+no acceptance and the finding comes back. Each comment is claimed before
+anything is recorded, so a redelivered comment records nothing. Accepting a
+path clears only that path's `removed-guarded-path` finding.
 Elder then re-reviews, so the check updates without another step.
 """
 
@@ -39,7 +34,7 @@ from typing import Any
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.accept_removal")
 
-TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+ACCEPTING_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 _MAX_PATH = 1024
 SHA_LEN = 40
 USAGE = (
@@ -47,10 +42,6 @@ USAGE = (
     "and the full 40-character SHA of the head you reviewed. Elder's finding "
     "prints the exact command."
 )
-# GitHub lists at most 250 commits for a pull request; a listing that long
-# may be cut short, so it cannot prove who wrote the change.
-_COMMITS_CAP = 250
-_COMMITS_PAGE = 100
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -99,63 +90,14 @@ def accept_command(path: str, head_sha: str) -> str:
     return f"/grug accept-removal {path} {head_sha}"
 
 
-def may_accept_own_pr(association: str, permission: str) -> bool:
-    """Whoever wrote the change accepts their own deletion only as the
-    repo's OWNER or with admin permission. Plain write may accept only a
-    change someone else wrote."""
+def may_accept(association: str, permission: str) -> bool:
+    """Only an admin accepts a removal: the repo's OWNER, or admin
+    permission from the collaborator API. Write, maintain and anything
+    else are refused, whoever wrote the PR."""
     return association == "OWNER" or permission == "admin"
 
 
-def pr_commit_logins(
-    install_id: int, owner: str, repo: str, pr_number: int,
-) -> frozenset[str] | None:
-    """Every GitHub login that authored or committed a commit in the PR, or
-    None when the listing failed or may be cut short. None fails closed:
-    the caller treats the commenter as a writer of the change."""
-    from urllib.parse import quote as _q
-
-    import httpx  # type: ignore
-    from github_app_auth import with_install_token_retry  # type: ignore
-
-    def _list(token: str) -> list[Any]:
-        commits: list[Any] = []
-        for page in range(1, _COMMITS_CAP // _COMMITS_PAGE + 2):
-            r = httpx.get(
-                f"https://api.github.com/repos/{_q(owner, safe='')}/"
-                f"{_q(repo, safe='')}/pulls/{int(pr_number)}/commits",
-                params={"per_page": _COMMITS_PAGE, "page": page},
-                headers={"Authorization": f"token {token}",
-                         "Accept": "application/vnd.github+json"},
-                timeout=10,
-            )
-            r.raise_for_status()
-            batch = r.json()
-            if not isinstance(batch, list):
-                raise TypeError("commit listing is not a list")
-            commits.extend(batch)
-            if len(batch) < _COMMITS_PAGE:
-                break
-        return commits
-
-    try:
-        commits = with_install_token_retry(int(install_id), _list)
-    except Exception as e:  # noqa: BLE001 - an unread listing fails closed
-        log.warning("accept_removal_commit_list_failed", extra={"kind": type(e).__name__})
-        return None
-    if not commits or len(commits) >= _COMMITS_CAP:
-        return None
-    logins: set[str] = set()
-    for commit in commits:
-        if not isinstance(commit, dict):
-            return None
-        for role in ("author", "committer"):
-            login = (commit.get(role) or {}).get("login")
-            if login:
-                logins.add(str(login))
-    return frozenset(logins)
-
-
-def trusted_acceptor(payload: dict[str, Any]) -> tuple[str, str]:
+def acceptor_from_payload(payload: dict[str, Any]) -> tuple[str, str]:
     """(login, "") when the comment's author may accept a removal, else
     ("", reason). Reads only the payload's comment and sender fields."""
     comment = payload.get("comment") or {}
@@ -170,7 +112,7 @@ def trusted_acceptor(payload: dict[str, Any]) -> tuple[str, str]:
         return "", "comment author is not a user account"
     if comment.get("performed_via_github_app"):
         return "", "comment posted through a GitHub App"
-    if comment.get("author_association") not in TRUSTED_ASSOCIATIONS:
+    if comment.get("author_association") not in ACCEPTING_ASSOCIATIONS:
         return "", "comment author is not an owner, member or collaborator"
     return login, ""
 
@@ -186,8 +128,8 @@ def run_accept_removal(
     """Claim the comment, check the named head, record the acceptance on
     it, then re-run Elder.
 
-    The dispatcher has already applied `trusted_acceptor`, the write check
-    and the self-acceptance rule; `actor` is the login that passed them.
+    The dispatcher has already applied `acceptor_from_payload` and the admin
+    check; `actor` is the login that passed them.
     The claim comes FIRST: a redelivered comment must record nothing, so a
     comment is one acceptance at most. The command must name the head the
     maintainer reviewed, and that head must still be the PR's head. The

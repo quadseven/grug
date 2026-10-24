@@ -1022,13 +1022,11 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # takes a stricter gate than a re-run. The comment's author must be a
     # User (never a Bot or App) with an OWNER, MEMBER or COLLABORATOR
     # association, read from the payload and failing closed when absent,
-    # and must hold write access with no PR-author shortcut. A change they
-    # wrote (PR author, or any commit's author or committer) takes OWNER
-    # or admin.
+    # and must be an admin (OWNER, or admin from the permission API).
     accepting = cmd.verb == "accept-removal"
     if accepting:
-        from accept_removal import trusted_acceptor  # type: ignore
-        sender_login, refused = trusted_acceptor(payload)
+        from accept_removal import acceptor_from_payload  # type: ignore
+        sender_login, refused = acceptor_from_payload(payload)
         if refused:
             log.info(
                 "accept_removal_refused",
@@ -1056,35 +1054,14 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
 
     try:
         if accepting:
-            # grug#1405: no PR-author shortcut. Whoever wrote the change
-            # accepts their own deletion only as OWNER or with admin.
+            # grug#1405: only an admin accepts a removal, whoever wrote
+            # the PR. No PR-author shortcut, and no write-level path.
+            from accept_removal import may_accept  # type: ignore
             perm = _actor_permission(
                 int(installation_id), owner, repo_name, sender_login,
             )
-            has_write = None if perm is None else perm in _AUTHORIZED_ROLES
-            from accept_removal import (  # type: ignore
-                may_accept_own_pr, pr_commit_logins,
-            )
             association = str(comment.get("author_association") or "")
-            if has_write and not may_accept_own_pr(association, perm or ""):
-                # Below admin, the commenter must not have written the
-                # change: not the PR author, and not the author or
-                # committer of any commit. An unread listing fails closed.
-                writers = (
-                    frozenset({pr_author_login}) if sender_login == pr_author_login
-                    else pr_commit_logins(
-                        int(installation_id), owner, repo_name, int(pr_number),
-                    )
-                )
-                if writers is None or sender_login in writers:
-                    log.info(
-                        "accept_removal_refused",
-                        extra={"sender": sender_login, "owner": owner,
-                               "repo": repo_name, "pr_number": pr_number,
-                               "reason": "wrote the change without admin"},
-                    )
-                    return {"status": "no_op",
-                            "reason": "a writer of the change needs admin to accept"}
+            has_write = None if perm is None else may_accept(association, perm)
         else:
             has_write = _actor_has_write(
                 int(installation_id), owner, repo_name, sender_login,

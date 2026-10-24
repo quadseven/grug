@@ -121,12 +121,8 @@ def _payload(
 
 def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin",
               head_sha: str = _SHA, store: _Store | None = None,
-              commits: list[dict[str, Any]] | None = None,
-              commits_fail: bool = False,
+              perm_fail: str = "",
               ) -> tuple[dict[str, str], _Store]:
-    if commits is None:
-        author = payload["issue"]["user"]["login"]
-        commits = [{"author": {"login": author}, "committer": {"login": "web-flow"}}]
     store = store or _Store()
     monkeypatch.setattr(d, "is_install_allowlisted", lambda _id: True)
     monkeypatch.setattr(d, "is_persona_enabled", lambda *_: True)
@@ -149,11 +145,15 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
 
     def _get(url: str, *a: Any, **k: Any) -> _Resp:
         if "/collaborators/" in url:
+            if perm_fail == "transport":
+                raise httpx.ConnectError("permission lookup down")
+            if perm_fail == "http":
+                request = httpx.Request("GET", url)
+                raise httpx.HTTPStatusError(
+                    "boom", request=request,
+                    response=httpx.Response(502, request=request),
+                )
             return _Resp({"permission": permission})
-        if "/pulls/42/commits" in url:
-            if commits_fail:
-                raise httpx.ConnectError("listing down")
-            return _Resp(commits)
         if "/pulls/42" in url:
             return _Resp({"head": {"sha": head_sha}, "body": "",
                           "user": {"login": payload["issue"]["user"]["login"]}})
@@ -170,7 +170,7 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
     return out, store
 
 
-def test_a_trusted_maintainer_records_the_acceptance_on_the_head(monkeypatch):
+def test_an_admin_records_the_acceptance_on_the_head(monkeypatch):
     out, store = _dispatch(monkeypatch, _payload())
     assert out["status"] == "dispatched", out
     assert store.recorded == [{
@@ -187,7 +187,7 @@ def test_a_trusted_maintainer_records_the_acceptance_on_the_head(monkeypatch):
 @pytest.mark.parametrize(("association", "permission"), [
     ("OWNER", "write"), ("COLLABORATOR", "admin"), ("MEMBER", "admin"),
 ])
-def test_the_pr_author_may_accept_as_owner_or_admin(monkeypatch, association, permission):
+def test_an_admin_may_accept_their_own_pr(monkeypatch, association, permission):
     """A solo maintainer authors their own PRs and can still accept."""
     out, store = _dispatch(monkeypatch, _payload(
         login="solo", pr_author="solo", association=association,
@@ -207,41 +207,35 @@ def test_the_pr_author_with_only_write_access_is_refused(monkeypatch, associatio
     assert store.recorded == [] and store.enqueued == []
 
 
-@pytest.mark.parametrize("role", ["author", "committer"])
-def test_a_write_user_who_pushed_a_commit_onto_someone_elses_pr_is_refused(monkeypatch, role):
-    other = "committer" if role == "author" else "author"
+@pytest.mark.parametrize(("association", "permission"), [
+    ("COLLABORATOR", "write"), ("MEMBER", "maintain"), ("MEMBER", "write"),
+])
+def test_write_only_access_is_refused_even_on_someone_elses_pr(
+    monkeypatch, association, permission,
+):
     out, store = _dispatch(monkeypatch, _payload(
-        login="pusher", pr_author="author", association="COLLABORATOR",
-    ), permission="write", commits=[
-        {"author": {"login": "author"}, "committer": {"login": "web-flow"}},
-        {role: {"login": "pusher"}, other: {"login": "author"}},
-    ])
+        login="reviewer", pr_author="author", association=association,
+    ), permission=permission)
     assert out["status"] == "no_op", out
     assert store.recorded == [] and store.enqueued == []
 
 
-def test_an_admin_who_pushed_a_commit_may_accept(monkeypatch):
+@pytest.mark.parametrize("association", ["COLLABORATOR", "MEMBER", "OWNER"])
+def test_an_admin_may_accept_someone_elses_pr(monkeypatch, association):
     out, store = _dispatch(monkeypatch, _payload(
-        login="pusher", pr_author="author", association="MEMBER",
-    ), permission="admin", commits=[{"author": {"login": "pusher"}}])
-    assert out["status"] == "dispatched", out
-    assert store.recorded and store.recorded[0]["accepted_by"] == "pusher"
-
-
-def test_a_failed_commit_listing_fails_closed(monkeypatch):
-    out, store = _dispatch(monkeypatch, _payload(
-        login="reviewer", pr_author="author", association="COLLABORATOR",
-    ), permission="write", commits_fail=True)
-    assert out["status"] == "no_op", out
-    assert store.recorded == [] and store.enqueued == []
-
-
-def test_write_access_may_accept_someone_elses_pr(monkeypatch):
-    out, store = _dispatch(monkeypatch, _payload(
-        login="reviewer", pr_author="author", association="COLLABORATOR",
-    ), permission="write")
+        login="reviewer", pr_author="author", association=association,
+    ), permission="admin")
     assert out["status"] == "dispatched", out
     assert store.recorded and store.recorded[0]["accepted_by"] == "reviewer"
+
+
+@pytest.mark.parametrize("failure", ["http", "transport"])
+def test_a_failed_permission_lookup_is_refused(monkeypatch, failure):
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association="MEMBER",
+    ), perm_fail=failure)
+    assert out["status"] == "skip", out
+    assert store.recorded == [] and store.enqueued == []
 
 
 @pytest.mark.parametrize("named", [
