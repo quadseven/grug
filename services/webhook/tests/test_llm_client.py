@@ -2760,6 +2760,35 @@ def test_judge_rejects_non_boolean_is_real_bug(raw) -> None:
     assert verdicts == ()
 
 
+_LIVE_VERDICT = {
+    "index": 0, "is_real_bug": False, "confidence": 0.92,
+    "reasoning": "The code gathers only exact case-blind matches first.",
+}
+
+
+@pytest.mark.parametrize("content", [
+    # Live 2026-10-24 (mod-overseer PR 1135): the judge answered a correct
+    # not-real verdict inside a json fence, and the bare parse dropped it.
+    "```json\n" + json.dumps({"verdicts": [_LIVE_VERDICT]}) + "\n```",
+    "Looking at the finding:\n\n" + json.dumps({"verdicts": [_LIVE_VERDICT]}),
+    json.dumps({"verdicts": [_LIVE_VERDICT]}) + "\n\nSo the finding is wrong.",
+])
+def test_judge_recovers_a_verdicts_object_wrapped_in_a_fence_or_prose(content) -> None:
+    verdicts = lc._parse_judge_verdicts(content)
+    assert len(verdicts) == 1
+    assert verdicts[0].is_real_bug is False
+    assert verdicts[0].confidence == 0.92
+
+
+def test_judge_does_not_take_an_example_object_quoted_in_prose(caplog) -> None:
+    """Only the documented envelope is recovered: prose quoting some other
+    object is still unparseable, never a fake empty verdict set."""
+    content = 'Looking at {"index": 0} in the code, I cannot decide.'
+    with caplog.at_level("WARNING"):
+        assert lc._parse_judge_verdicts(content) == ()
+    assert any(r.message == "judge_verdicts_unparseable" for r in caplog.records)
+
+
 def test_judge_non_200_returns_empty_no_empty_content_warning(monkeypatch, caplog) -> None:
     """A non-200 judge response (rate-limited / 5xx) → body={}, no
     content, returns (). The `judge_empty_content` warning is gated on

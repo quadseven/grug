@@ -2763,7 +2763,7 @@ def _recover_fenced_json(content: str) -> object | None:
 _EMBEDDED_JSON_MAX_STARTS = 200
 
 
-def _recover_embedded_json(content: str) -> dict | None:
+def _recover_embedded_json(content: str, envelope: str = "findings") -> dict | None:
     """Repair an answer whose findings object is wrapped in prose (grug#1196).
 
     Live 2026-10-17: a cloud model answered with a sentence and then a valid
@@ -2783,7 +2783,7 @@ def _recover_embedded_json(content: str) -> dict | None:
             parsed, _end = decoder.raw_decode(scan, start)
         except json.JSONDecodeError:
             parsed = None
-        if isinstance(parsed, dict) and isinstance(parsed.get("findings"), list):
+        if isinstance(parsed, dict) and isinstance(parsed.get(envelope), list):
             return parsed
         start = scan.find("{", start + 1)
     return None
@@ -6903,6 +6903,19 @@ def _build_judge_messages(
     ]
 
 
+def _recover_judge_envelope(content: str) -> dict | None:
+    """A `{"verdicts": [...]}` object wrapped in a fence or prose, else None.
+
+    Live 2026-10-24 (mod-overseer PR 1135): the judge answered a correct
+    not-real verdict inside a json fence, the bare parse dropped it, and a
+    false high finding blocked the merge. Same recovery the review path has
+    (grug#883, grug#1196), held to the documented envelope only."""
+    fenced = _recover_fenced_json(content)
+    if isinstance(fenced, dict) and isinstance(fenced.get("verdicts"), list):
+        return fenced
+    return _recover_embedded_json(content, envelope="verdicts")
+
+
 def _parse_judge_verdicts(content: str) -> tuple[FindingJudgement, ...]:
     """Parse the judge LLM's JSON into FindingJudgements. Malformed
     entries are dropped (best-effort — a judge parse failure must not
@@ -6918,8 +6931,10 @@ def _parse_judge_verdicts(content: str) -> tuple[FindingJudgement, ...]:
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
-        log.warning("judge_verdicts_unparseable", extra={"raw": _redact_secrets(content)[:200]})
-        return ()
+        parsed = _recover_judge_envelope(content)
+        if parsed is None:
+            log.warning("judge_verdicts_unparseable", extra={"raw": _redact_secrets(content)[:200]})
+            return ()
     if not isinstance(parsed, dict):
         log.warning("judge_verdicts_envelope_not_dict", extra={"raw": _redact_secrets(content)[:200]})
         return ()
