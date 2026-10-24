@@ -213,6 +213,7 @@ def enqueue_rerun(
     persona: str,
     not_before: float = 0.0,
     requeue_of: str = "",
+    dedup_key: str = "",
 ) -> None:
     """Send a `RerunJob` to `grug-rerun-jobs` (the webhook-side producer used by
     Elder self-recovery, #418). Same job shape + FIFO dedup as the api producer:
@@ -228,7 +229,12 @@ def enqueue_rerun(
     the same wall. A deferred job gets its OWN dedup id - the plain
     `(install, repo, pr, persona)` id is still inside SQS's 5-minute dedup
     window when the deferral is sent, and a collapsed send would lose the
-    command (the same trap the learn lane already handles)."""
+    command (the same trap the learn lane already handles).
+
+    `dedup_key` (grug#1405) gives a job that must run even right after
+    another re-run of the same PR its own dedup id: `/grug accept-removal`
+    records state the earlier job never read, so collapsing into it would
+    leave the check stale."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
     job: dict[str, Any] = {
@@ -246,6 +252,9 @@ def enqueue_rerun(
         material = f"{dedup_id}\x1fnotbefore{int(not_before)}"
         if requeue_of:
             material += f"\x1frequeue{requeue_of}"
+        dedup_id = "rerun:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+    elif dedup_key:
+        material = f"{dedup_id}\x1fkey{dedup_key}"
         dedup_id = "rerun:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
     _sqs.send_message(
         QueueUrl=_RERUN_QUEUE_URL,

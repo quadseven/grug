@@ -132,8 +132,9 @@ from personas.code_reviewer.persona import (
     with_extra_findings, with_findings,
 )
 from personas.code_reviewer.removed_files import (
-    REMOVED_REFERENCE_CHECK_FAILED, find_referrer_candidates, removed_paths,
-    removed_reference_findings, scan_guarded_deletions,
+    REMOVED_REFERENCE_CHECK_FAILED, apply_removal_acceptances,
+    find_referrer_candidates, removed_paths, removed_reference_findings,
+    scan_guarded_deletions,
 )
 from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
@@ -2491,6 +2492,51 @@ def _drop_non_correctness_findings(
     )
 
 
+def _accept_guarded_removals(
+    guarded: tuple[Finding, ...], *, installation_id: int, owner: str,
+    repo_name: str, pull_number: int, head_sha: str,
+) -> tuple[tuple[Finding, ...], str]:
+    """Clear each guard finding a trusted maintainer accepted on this head
+    with `/grug accept-removal <path>` (#1405). The store row is keyed by the
+    head SHA, so a new head finds nothing. A store that cannot be read
+    clears nothing. Returns the findings that still stand and a summary
+    note naming who accepted which path on which head."""
+    if not guarded:
+        return guarded, ""
+    pr = f"{owner}/{repo_name}#{pull_number}"
+    try:
+        from adapters.install_store import get_removal_acceptances  # type: ignore
+
+        accepted = get_removal_acceptances(
+            install_id=installation_id, repo=f"{owner}/{repo_name}",
+            pr_number=pull_number, head_sha=head_sha,
+        )
+    except Exception as e:  # noqa: BLE001 - an unread acceptance clears nothing
+        log.warning(
+            "code_review_removal_acceptances_unreadable",
+            extra={"pr": pr, "kind": type(e).__name__},
+        )
+        return guarded, (
+            "\n\nGrug could not read accepted removals for this head, so every "
+            "deleted guard still blocks."
+        )
+    kept, cleared = apply_removal_acceptances(guarded, accepted or {})
+    if not cleared:
+        return kept, ""
+    log.info(
+        "code_review_removal_accepted",
+        extra={"pr": pr, "head_sha": head_sha[:8], "cleared": len(cleared)},
+    )
+    lines = "".join(
+        f"\n- `{path}`: removal accepted by `{by}` on `{head_sha[:8]}`."
+        for path, by in cleared
+    )
+    return kept, (
+        "\n\nAccepted removals on this head (a new push needs a new "
+        "`/grug accept-removal`):" + lines
+    )
+
+
 def _review_deletion_only(
     evaluation: CodeReviewEvaluation, diff_text: str,
     parsed_hunks: tuple[DiffHunk, ...], *, installation_id: int, owner: str, repo_name: str, pull_number: int,
@@ -2503,7 +2549,8 @@ def _review_deletion_only(
     (no_diff)" that never clears a blocking gate. When the diff deletes
     files and has no other hunk, the verdict comes from the deterministic
     checks in `removed_files`: a deleted guard path is a high finding with
-    no ticket downgrade (a linked issue can be the PR author's own), and a
+    no ticket downgrade (a linked issue can be the PR author's own) unless
+    a trusted maintainer accepted that path on this head (#1405), and a
     file at head that still names a removed path is a finding too. A referrer check that cannot finish
     degrades to `REMOVED_REFERENCE_CHECK_FAILED`, never a pass. Returns the
     evaluation and a summary note; any other diff is returned unchanged
@@ -2514,7 +2561,11 @@ def _review_deletion_only(
     if not removed:
         return evaluation, ""
     pr = f"{owner}/{repo_name}#{pull_number}"
-    guarded = scan_guarded_deletions(removed)
+    guarded, accepted_note = _accept_guarded_removals(
+        scan_guarded_deletions(removed), installation_id=installation_id,
+        owner=owner, repo_name=repo_name, pull_number=pull_number,
+        head_sha=head_sha,
+    )
     try:
         referenced = removed_reference_findings(
             removed,
@@ -2555,6 +2606,7 @@ def _review_deletion_only(
         f"\n\nDeletion-only diff: {len(removed)} deleted file(s). Grug "
         f"checked them for removed guards and {referrers}."
         + (" See the markings above." if findings else "")
+        + accepted_note
     )
     return with_extra_findings(base, findings), note
 

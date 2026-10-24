@@ -1026,6 +1026,89 @@ def resume_elder(*, install_id: int, repo: str, pr_number: int) -> bool:
     return any(sk == paused_sk and live for sk, live in rows)
 
 
+# --- Accepted guard removals: one row per PR head (grug#1405) -------------
+# `/grug accept-removal <path>` from a trusted maintainer answers a
+# `removed-guarded-path` finding. The head SHA is part of the key, so an
+# acceptance can never carry over to a new head: a push reads a different
+# row, which is empty until someone accepts again.
+
+
+def _removal_accept_sk(repo: str, pr_number: int, head_sha: str) -> str:
+    return f"REMOVAL#ACCEPT#{repo}#{int(pr_number)}#{head_sha}"
+
+
+def record_removal_acceptance(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    path: str,
+    accepted_by: str,
+    comment_id: int,
+) -> None:
+    """Record that `accepted_by` accepted deleting `path` on `head_sha`.
+
+    One atomic upsert that merges the path into the head's row, so two
+    acceptances landing at once both stay. An expired row is replaced, not
+    merged into. Raises on a database error; the
+    caller tells the commenter it did not take."""
+    if not head_sha or not path or not accepted_by:
+        raise ValueError("an acceptance needs a head, a path and who accepted it")
+    ttl = int(datetime.now(timezone.utc).timestamp() + _ELDER_LAST_TTL_DAYS * 86400)
+    entry = {path: {
+        "accepted_by": accepted_by,
+        "comment_id": int(comment_id),
+        "accepted_at": datetime.now(timezone.utc).isoformat(),
+    }}
+    attrs = {"repo": repo, "pr_number": int(pr_number), "head_sha": head_sha,
+             "accepted": entry}
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = CASE
+                        WHEN grug_kv.ttl IS NOT NULL
+                             AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+                        THEN %(data)s
+                        ELSE jsonb_set(
+                            grug_kv.data, '{accepted}',
+                            COALESCE(grug_kv.data->'accepted', '{}'::jsonb)
+                                || %(entry)s
+                        )
+                    END,
+                    ttl = %(ttl)s
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": _removal_accept_sk(repo, pr_number, head_sha),
+                "data": encode_attrs(attrs),
+                "entry": encode_attrs(entry),
+                "ttl": ttl,
+            },
+        )
+
+
+def get_removal_acceptances(
+    *, install_id: int, repo: str, pr_number: int, head_sha: str,
+) -> dict[str, dict[str, Any]]:
+    """The accepted guard removals on exactly this head, by path. Empty for
+    any other head. Raises on a database error; the caller keeps the
+    finding."""
+    if not head_sha:
+        return {}
+    item = _get_item(_inst_pk(install_id), _removal_accept_sk(repo, pr_number, head_sha))
+    accepted = (item or {}).get("accepted")
+    if not isinstance(accepted, dict):
+        return {}
+    return {
+        str(path): dict(row) for path, row in accepted.items()
+        if isinstance(row, dict) and row.get("accepted_by")
+    }
+
+
 # --- Review-findings ledger (#361 slice 1) ------------------------------
 # Ledger rows are REPO-scoped (not install-scoped like the activity feed),
 # so they live under their own pk=`LEDGER#<repo>` partition. The access

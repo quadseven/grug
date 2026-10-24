@@ -5,7 +5,8 @@ Routes GitHub events to active personas. Handles:
   - pull_request: iterates the persona registry (ADR-0010) — every
     registered persona whose `events` include pull_request dispatches
     through the uniform `dispatch_pull_request(ctx)` seam
-  - issue_comment: the `/grug recheck` slash command
+  - issue_comment: the `/grug recheck` slash command, and the other
+    `/grug` commands (`accept-removal` takes a stricter trust gate, #1405)
   - check_run / check_suite (`rerequested` only, grug#948): GitHub's own
     "Re-run" button - re-dispatches a synthetic pull_request event,
     scoped to just the rerequested persona for check_run, everyone
@@ -1012,6 +1013,23 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     ):
         return {"status": "no_op", "reason": "tpm disabled for this repo"}
 
+    # grug#1405: accepting a deleted guard clears a blocking finding, so it
+    # takes a stricter gate than a re-run. The comment's author must be a
+    # User (never a Bot or App) with an OWNER, MEMBER or COLLABORATOR
+    # association, read from the payload and failing closed when absent,
+    # and must hold write access with no PR-author shortcut.
+    accepting = cmd.verb == "accept-removal"
+    if accepting:
+        from accept_removal import trusted_acceptor  # type: ignore
+        sender_login, refused = trusted_acceptor(payload)
+        if refused:
+            log.info(
+                "accept_removal_refused",
+                extra={"sender": sender.get("login", ""), "owner": owner,
+                       "repo": repo_name, "pr_number": pr_number, "reason": refused},
+            )
+            return {"status": "no_op", "reason": refused}
+
     # Author OR write+ collaborator only — public-listed App means random
     # commenters can't spam re-evaluations. Lazy imports keep cold-start
     # cheap when only PR events fire.
@@ -1032,7 +1050,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     try:
         has_write = _actor_has_write(
             int(installation_id), owner, repo_name, sender_login,
-            allow_author=True, pr_author_login=pr_author_login,
+            allow_author=not accepting, pr_author_login=pr_author_login,
         )
     except httpx.RequestError as e:
         log.warning(
@@ -1128,7 +1146,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             repo=repo_name, pr_number=int(pr_number),
             comment_id=int(comment_id) if comment_id is not None else 0,
             token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
-            head_sha=head_sha,
+            head_sha=head_sha, actor=sender_login if accepting else "",
         )
 
     # Final guard (FLINT on #575): main.py forwards dispatch()

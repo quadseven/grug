@@ -12,6 +12,8 @@ comment_id so a re-delivered webhook doesn't double-act.
 - review    -> enqueue one Elder re-run; an auto-pause stays
 - learnings list  -> list the repo's remembered markings (read-only reply)
 - learnings delete <digest>  -> forget one remembered marking by digest
+- accept-removal <path>  -> record a trusted maintainer accepting one deleted
+  guard path on the current head, then re-run Elder (grug#1405)
 
 grug#1270 - an Elder re-run now (a) is refused while one is already running
 on the same head, (b) puts the `grug:reviewing` label on the PR while it
@@ -379,7 +381,7 @@ def run_command(
     verb: str, arg: str, *, install_id: int, owner: str, repo: str,
     pr_number: int, comment_id: int, token_fn, enqueue=None, enqueue_ask=None,
     claim=None, resume=None, is_paused=None, head_sha: str = "",
-    defer_until: float = 0.0,
+    defer_until: float = 0.0, actor: str = "",
 ) -> dict[str, str]:
     """Execute a gated command. All heavy work is ASYNC via the rerun lane -
     the webhook only enqueues (fast) so the delivery ACK never blocks on an
@@ -396,7 +398,16 @@ def run_command(
     `head_sha` is the PR's current head - the ground truth for "is Elder
     already reviewing this?". `defer_until` is the epoch second the
     installation's GitHub budget resets at: a non-zero value keeps the
-    command instead of dropping it (grug#1270)."""
+    command instead of dropping it (grug#1270). `actor` is the login that
+    passed `accept-removal`'s stricter trust gate (grug#1405)."""
+    if verb == "accept-removal":
+        from accept_removal import run_accept_removal  # type: ignore
+        return run_accept_removal(
+            arg, install_id=install_id, owner=owner, repo=repo,
+            pr_number=pr_number, comment_id=comment_id, head_sha=head_sha,
+            actor=actor, token_fn=token_fn, enqueue=enqueue, claim=claim,
+        )
+
     if claim is None:
         from adapters.pg_install_store import claim_delivery  # type: ignore
         claim = claim_delivery
