@@ -4081,45 +4081,55 @@ def _newer_elder_verdict_on_head(
     head_sha: str,
     tier1_check_run_id: int | None,
 ) -> bool:
-    """True when a newer review already owns this head's Elder check (#1344).
+    """True when a newer review's verdict owns this head's Elder check (#1344).
 
     Every Elder publish creates a new check run, and GitHub shows the newest
     one per name. The deep append lands minutes after its own Tier-1, so a
     review of the same head that started and finished in between already
     posted a newer `Grug - Elder` run; appending on top of it would replace
     that newer verdict with this superseded one. Check-run ids rise with
-    creation, so a latest Elder run whose id is above this run's Tier-1 id
-    belongs to a later review (its in-progress marker or its verdict).
+    creation, so a run above this run's Tier-1 id is a later one.
 
-    Fails open: with no Tier-1 id or a failed listing nothing proves a newer
-    verdict, and the deep append publishes as before.
+    Counts only a run this app created (another app or an Actions job can
+    name a run `Grug - Elder`) that completed with a real verdict, success
+    or failure. An in-progress marker, a neutral or skipped run, or a
+    cancelled one decided nothing, so the deep append still publishes.
+
+    Fails open: with no Tier-1 id, no app id, or a failed listing nothing
+    proves a newer verdict, and the deep append publishes as before.
     """
     if not isinstance(tier1_check_run_id, int):
         return False
     pr = f"{owner}/{repo_name}#{pull_number}"
     try:
+        own_app_id = str(get_app_id() or "")
         runs = with_install_token_retry(
             installation_id,
             lambda token: list_check_runs_for_ref(token, owner, repo_name, head_sha),
         )
-    except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+    except Exception as e:  # noqa: BLE001 - lookup failure keeps the old publish
         log.warning(
             "elder_async_deep_supersession_check_failed",
             extra={"pr": pr, "kind": type(e).__name__},
         )
+        return False
+    if not own_app_id:
         return False
     newer = [
         run["id"]
         for run in runs or ()
         if isinstance(run, dict)
         and run.get("name") == _CHECK_NAME
+        and str((run.get("app") or {}).get("id")) == own_app_id
+        and run.get("status") == "completed"
+        and run.get("conclusion") in ("success", "failure")
         and isinstance(run.get("id"), int)
         and run["id"] > tier1_check_run_id
     ]
     if not newer:
         return False
     log.info(
-        "elder_async_deep_skipped_superseded",
+        "elder_async_deep_check_superseded",
         extra={
             "pr": pr,
             "tier1_check_run_id": tier1_check_run_id,
@@ -4674,22 +4684,30 @@ def _async_deep_append_if_needed(
     )
     summary = f"{preamble}\n\n{summary}"
     summary = _lead_if_degraded(summary, combined)
-    if _newer_elder_verdict_on_head(
+    superseded = _newer_elder_verdict_on_head(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,
         tier1_check_run_id=tier1_check_run_id,
-    ):
-        return
-    _publish_deep_check(
-        installation_id=installation_id,
-        owner=owner,
-        repo_name=repo_name,
-        pull_number=pull_number,
-        head_sha=head_sha,
-        conclusion=conclusion,
-        title=title,
-        summary=summary,
     )
+    if superseded:
+        # #1344: a later review owns the check, so this run leaves it alone
+        # and posts its findings as a COMMENT review. The inline threads stay
+        # open, so the next review carries a still-standing high finding
+        # into its own verdict (carry_forward), while a superseded
+        # REQUEST_CHANGES never re-blocks a pull request the newer review
+        # cleared.
+        event = "COMMENT"
+    else:
+        _publish_deep_check(
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+            head_sha=head_sha,
+            conclusion=conclusion,
+            title=title,
+            summary=summary,
+        )
     _publish_deep_review(
         deep_eval,
         novel_deep=novel_deep,

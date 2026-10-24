@@ -474,35 +474,79 @@ _HIGH_DEEP = LlmReviewResponse(
 )
 
 
-def test_superseded_review_deep_append_never_replaces_a_newer_verdict(monkeypatch):
+_APP_ID = "4242"
+
+
+def _elder_run(run_id: int, *, app_id: str = _APP_ID, status: str = "completed",
+               conclusion: str | None = "success") -> dict:
+    return {"id": run_id, "name": "Grug - Elder", "app": {"id": int(app_id)},
+            "status": status, "conclusion": conclusion}
+
+
+@pytest.fixture
+def _own_app(monkeypatch):
+    monkeypatch.setattr(cr_dispatch, "get_app_id", lambda: _APP_ID)
+
+
+def test_superseded_review_deep_append_never_replaces_a_newer_verdict(
+    monkeypatch, _own_app,
+):
     """#1344: a newer review of the same head already posted the newest
-    `Grug - Elder` check run (id 99, after this run's Tier-1 id 1). This
-    run's late deep append must not land on top of it: no deep check run,
-    no deep review, so the newer review keeps deciding the check."""
+    `Grug - Elder` verdict (id 99, after this run's Tier-1 id 1). This run's
+    late deep append must not land on top of it: no deep check run and no
+    REQUEST_CHANGES. Its high finding still posts as a COMMENT review, so
+    the open thread carries into the next review's verdict."""
     reviews: list = []
     posted = _run_escalated_review(
         monkeypatch, deep=_HIGH_DEEP,
-        checks_on_head=[
-            {"id": 99, "name": "Grug - Elder", "status": "completed",
-             "conclusion": "success"},
-        ],
+        checks_on_head=[_elder_run(99)],
         posted_reviews=reviews,
     )
 
     assert _deep_checks(posted) == []
     assert not [r for r in reviews if r.event == "REQUEST_CHANGES"]
+    deep_reviews = [
+        r for r in reviews if any(c.line == 3 for c in r.comments)
+    ]
+    assert deep_reviews and deep_reviews[-1].event == "COMMENT"
 
 
-def test_latest_review_deep_append_still_updates_the_check(monkeypatch):
+@pytest.mark.parametrize(
+    "newer",
+    [
+        _elder_run(99, app_id="777"),
+        _elder_run(99, status="in_progress", conclusion=None),
+        _elder_run(99, conclusion="neutral"),
+    ],
+    ids=["other_app", "in_progress", "neutral"],
+)
+def test_a_newer_run_that_is_not_our_verdict_does_not_supersede(
+    monkeypatch, _own_app, newer,
+):
+    """#1344: only a completed success/failure run this app created counts.
+    A run another app named `Grug - Elder`, an in-progress marker, and a
+    neutral run decided nothing, so the deep append publishes as before."""
+    reviews: list = []
+    posted = _run_escalated_review(
+        monkeypatch, deep=_HIGH_DEEP, checks_on_head=[newer],
+        posted_reviews=reviews,
+    )
+
+    deep = _deep_checks(posted)
+    assert deep, "deep check-run was never posted"
+    assert deep[-1]["conclusion"] == "failure"
+    assert [r for r in reviews if r.event == "REQUEST_CHANGES"]
+
+
+def test_latest_review_deep_append_still_updates_the_check(monkeypatch, _own_app):
     """#1344: when this run's own Tier-1 check run is still the newest Elder
     run on the head, the deep append publishes as before."""
     posted = _run_escalated_review(
         monkeypatch, deep=_HIGH_DEEP,
         checks_on_head=[
-            {"id": 1, "name": "Grug - Elder", "status": "completed",
-             "conclusion": "success"},
-            {"id": 50, "name": "Grug - Chief", "status": "completed",
-             "conclusion": "success"},
+            _elder_run(1),
+            {"id": 50, "name": "Grug - Chief", "app": {"id": int(_APP_ID)},
+             "status": "completed", "conclusion": "success"},
         ],
     )
 
@@ -511,7 +555,9 @@ def test_latest_review_deep_append_still_updates_the_check(monkeypatch):
     assert deep[-1]["conclusion"] == "failure"
 
 
-def test_deep_append_publishes_when_the_supersession_lookup_fails(monkeypatch):
+def test_deep_append_publishes_when_the_supersession_lookup_fails(
+    monkeypatch, _own_app,
+):
     """#1344: a failed check-run listing cannot prove a newer verdict, so the
     deep append keeps its old behavior rather than silently vanishing."""
     def _boom(*a, **k):
