@@ -533,8 +533,8 @@ def test_reply_scan_excludes_unconfigured_bot_replies(monkeypatch):
         {"id": 1, "in_reply_to_id": None, "user": {"login": "Elder[bot]", "type": "Bot"}},
         {"id": 2, "in_reply_to_id": 1, "user": {"login": "some-other-app[bot]", "type": "Bot"}},
         # Finding with a human reply
-        {"id": 3, "in_reply_to_id": None, "user": {"login": "evan", "type": "User"}},
-        {"id": 4, "in_reply_to_id": 3, "user": {"login": "evan", "type": "User"}},
+        {"id": 3, "in_reply_to_id": None, "user": {"login": "reviewer", "type": "User"}},
+        {"id": 4, "in_reply_to_id": 3, "user": {"login": "reviewer", "type": "User"}},
     ]
 
     class _Response:
