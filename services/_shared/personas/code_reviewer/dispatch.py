@@ -3751,6 +3751,7 @@ def dispatch_code_review(
             author_login=author_login,
             repo_config=repo_config,
             config_note=config_note,
+            tier1_check_run_id=check_run_id,
         )
     except Exception as e:  # noqa: BLE001 - deep append is best-effort
         log.warning(
@@ -4069,6 +4070,63 @@ def _publish_deep_check(
                 "kind": type(error).__name__,
             },
         )
+
+
+def _newer_elder_verdict_on_head(
+    *,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    head_sha: str,
+    tier1_check_run_id: int | None,
+) -> bool:
+    """True when a newer review already owns this head's Elder check (#1344).
+
+    Every Elder publish creates a new check run, and GitHub shows the newest
+    one per name. The deep append lands minutes after its own Tier-1, so a
+    review of the same head that started and finished in between already
+    posted a newer `Grug - Elder` run; appending on top of it would replace
+    that newer verdict with this superseded one. Check-run ids rise with
+    creation, so a latest Elder run whose id is above this run's Tier-1 id
+    belongs to a later review (its in-progress marker or its verdict).
+
+    Fails open: with no Tier-1 id or a failed listing nothing proves a newer
+    verdict, and the deep append publishes as before.
+    """
+    if not isinstance(tier1_check_run_id, int):
+        return False
+    pr = f"{owner}/{repo_name}#{pull_number}"
+    try:
+        runs = with_install_token_retry(
+            installation_id,
+            lambda token: list_check_runs_for_ref(token, owner, repo_name, head_sha),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+        log.warning(
+            "elder_async_deep_supersession_check_failed",
+            extra={"pr": pr, "kind": type(e).__name__},
+        )
+        return False
+    newer = [
+        run["id"]
+        for run in runs or ()
+        if isinstance(run, dict)
+        and run.get("name") == _CHECK_NAME
+        and isinstance(run.get("id"), int)
+        and run["id"] > tier1_check_run_id
+    ]
+    if not newer:
+        return False
+    log.info(
+        "elder_async_deep_skipped_superseded",
+        extra={
+            "pr": pr,
+            "tier1_check_run_id": tier1_check_run_id,
+            "newer_check_run_id": max(newer),
+        },
+    )
+    return True
 
 
 def _submitted_before(review: dict[str, Any], moment: datetime) -> bool:
@@ -4446,6 +4504,7 @@ def _async_deep_append_if_needed(
     author_login: str,
     repo_config: RepoConfig | None = None,
     config_note: str = "",
+    tier1_check_run_id: int | None = None,
 ) -> None:
     """Run reasoner after Tier-1 publish when tiered escalation fires (#646).
 
@@ -4615,6 +4674,12 @@ def _async_deep_append_if_needed(
     )
     summary = f"{preamble}\n\n{summary}"
     summary = _lead_if_degraded(summary, combined)
+    if _newer_elder_verdict_on_head(
+        installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pull_number=pull_number, head_sha=head_sha,
+        tier1_check_run_id=tier1_check_run_id,
+    ):
+        return
     _publish_deep_check(
         installation_id=installation_id,
         owner=owner,

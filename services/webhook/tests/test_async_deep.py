@@ -298,6 +298,8 @@ def _clean_tier1() -> LlmReviewResponse:
 
 def _run_escalated_review(
     monkeypatch, *, deep: LlmReviewResponse, blocking: bool = True,
+    checks_on_head: list[dict] | None = None,
+    posted_reviews: list | None = None,
 ) -> list[dict]:
     """Drive one escalated tiered review (clean Tier-1, `deep` from the
     reasoner) in blocking mode (unless told otherwise) and return every
@@ -319,12 +321,23 @@ def _run_escalated_review(
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _clean_tier1())
     monkeypatch.setattr(cr_dispatch, "review_reasoner_diff", lambda *a, **kw: deep)
     monkeypatch.setattr(cr_dispatch, "post_check_run", _fake_post_check)
-    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 1})
+
+    def _fake_post_review(*a, result, **k):
+        if posted_reviews is not None:
+            posted_reviews.append(result)
+        return {"id": 1}
+
+    monkeypatch.setattr(cr_dispatch, "post_review", _fake_post_review)
     monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
     monkeypatch.setattr(
         cr_dispatch, "_fetch_current_review_snapshot",
         lambda *a, **k: ("base5678ijkl", "abcd1234efgh", "t", "b"),
     )
+    if checks_on_head is not None:
+        monkeypatch.setattr(
+            cr_dispatch, "list_check_runs_for_ref",
+            lambda *a, **k: checks_on_head,
+        )
     with patch("adapters.install_store.put_elder_last_reviewed", lambda **k: None), \
          patch("adapters.install_store.get_elder_last_reviewed", return_value=None), \
          patch("httpx.get", return_value=_diff_response()):
@@ -448,3 +461,63 @@ def test_async_deep_arm_no_diff_is_not_a_failure(monkeypatch, caplog):
 
     assert [r for r in caplog.records if r.message == "elder_async_deep_arm_empty"]
     assert _deep_checks(posted) == []
+
+
+_HIGH_DEEP = LlmReviewResponse(
+    kind="reviewed",
+    findings=(LlmFinding(
+        path="src/auth.py", line=3, rule="null-deref",
+        severity="high", message="deep",  # type: ignore[arg-type]
+    ),),
+    backend_used=Backend.CAVE_REASONER, model_name="reasoner",
+    backends_used=(Backend.CAVE_REASONER,), models_used=("reasoner",),
+)
+
+
+def test_superseded_review_deep_append_never_replaces_a_newer_verdict(monkeypatch):
+    """#1344: a newer review of the same head already posted the newest
+    `Grug - Elder` check run (id 99, after this run's Tier-1 id 1). This
+    run's late deep append must not land on top of it: no deep check run,
+    no deep review, so the newer review keeps deciding the check."""
+    reviews: list = []
+    posted = _run_escalated_review(
+        monkeypatch, deep=_HIGH_DEEP,
+        checks_on_head=[
+            {"id": 99, "name": "Grug - Elder", "status": "completed",
+             "conclusion": "success"},
+        ],
+        posted_reviews=reviews,
+    )
+
+    assert _deep_checks(posted) == []
+    assert not [r for r in reviews if r.event == "REQUEST_CHANGES"]
+
+
+def test_latest_review_deep_append_still_updates_the_check(monkeypatch):
+    """#1344: when this run's own Tier-1 check run is still the newest Elder
+    run on the head, the deep append publishes as before."""
+    posted = _run_escalated_review(
+        monkeypatch, deep=_HIGH_DEEP,
+        checks_on_head=[
+            {"id": 1, "name": "Grug - Elder", "status": "completed",
+             "conclusion": "success"},
+            {"id": 50, "name": "Grug - Chief", "status": "completed",
+             "conclusion": "success"},
+        ],
+    )
+
+    deep = _deep_checks(posted)
+    assert deep, "deep check-run was never posted"
+    assert deep[-1]["conclusion"] == "failure"
+
+
+def test_deep_append_publishes_when_the_supersession_lookup_fails(monkeypatch):
+    """#1344: a failed check-run listing cannot prove a newer verdict, so the
+    deep append keeps its old behavior rather than silently vanishing."""
+    def _boom(*a, **k):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(cr_dispatch, "list_check_runs_for_ref", _boom)
+    posted = _run_escalated_review(monkeypatch, deep=_HIGH_DEEP)
+
+    assert _deep_checks(posted)
