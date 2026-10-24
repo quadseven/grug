@@ -1,8 +1,8 @@
 """Tests for the deletion-only review (#1401).
 
 Recorded shape: an infrastructure-repo revert deletes a workflow, the
-script it runs and the script's tests, 255 lines removed and none added. The parser
-skips `+++ /dev/null` blocks, so Elder had no hunks and answered "Grug eyes
+script it runs and the script's tests, 255 lines removed and none added.
+The parser skips `+++ /dev/null` blocks, so Elder had no hunks and answered "Grug eyes
 clouded (no_diff)" on both passes, which never satisfies a blocking gate.
 """
 
@@ -16,13 +16,31 @@ from llm_client import LlmReviewResponse
 from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer.removed_files import (
+    RemovedReferenceCheckIncomplete,
+    find_referrer_candidates,
     removed_paths,
+    removed_reference_findings,
+    scan_guarded_deletions,
     scan_removed_references,
     search_term,
 )
 
 _WORKFLOW = ".github/workflows/check.isolation.yml"
 _SCRIPT = "ops/scripts/isolation/check.sh"
+def _deleted(*paths: str) -> str:
+    return "".join(
+        f"diff --git a/{p} b/{p}\n"
+        "deleted file mode 100644\n"
+        "index 39dc28b90..000000000\n"
+        f"--- a/{p}\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        "-line one\n"
+        "-line two\n"
+        for p in paths
+    )
+
+
 _DELETION_DIFF = (
     f"diff --git a/{_WORKFLOW} b/{_WORKFLOW}\n"
     "deleted file mode 100644\n"
@@ -104,6 +122,83 @@ def test_a_removed_file_naming_another_removed_file_is_not_a_reference():
     assert scan_removed_references((_WORKFLOW, _SCRIPT), contents) == ()
 
 
+# Guarded paths: a deletion that removes a guard by its path alone.
+
+
+@pytest.mark.parametrize("path", [
+    ".github/workflows/leak-scan.yml",
+    "CODEOWNERS",
+    ".github/CODEOWNERS",
+    "infra/github/rulesets/main.json",
+    "config/branch-protection.yaml",
+    "services/security/allowlist.py",
+    "tools/leak-scan/deny.txt",
+])
+def test_deleting_a_guard_path_is_a_blocking_finding(path):
+    found = scan_guarded_deletions((path,), ())
+    assert [(f.rule_name, f.severity, f.file) for f in found] == [
+        ("removed-guarded-path", "high", path),
+    ]
+    assert found[0].outside_diff_reason
+
+
+def test_deleting_tests_whose_code_stays_removes_coverage():
+    found = scan_guarded_deletions(("src/billing/tests/test_refunds.py",), ())
+    assert [f.severity for f in found] == ["high"]
+    assert "test coverage" in found[0].message
+
+
+def test_tests_deleted_with_the_code_they_covered_are_not_a_guard():
+    removed = (_SCRIPT, "ops/scripts/isolation/tests/test_check.py")
+    assert scan_guarded_deletions(removed, ()) == ()
+
+
+def test_an_ordinary_file_is_not_a_guard():
+    assert scan_guarded_deletions(("src/old_helper.py", "docs/old.md"), ()) == ()
+
+
+def test_a_linked_criterion_naming_the_removal_makes_it_advisory():
+    criteria = (f"`{_WORKFLOW}` no longer exists on main.",)
+    found = scan_guarded_deletions((_WORKFLOW,), criteria)
+    assert [f.severity for f in found] == ["medium"]
+
+
+# The referrer check never vouches for what it could not finish.
+
+
+def test_more_deletions_than_the_search_cap_is_incomplete():
+    many = tuple(f"src/m{i}.py" for i in range(6))
+    with pytest.raises(RemovedReferenceCheckIncomplete):
+        find_referrer_candidates("t", "o", "r", many)
+
+
+def test_a_failed_search_is_incomplete():
+    with (
+        patch("httpx.get", side_effect=httpx.ConnectError("down")),
+        pytest.raises(RemovedReferenceCheckIncomplete),
+    ):
+        find_referrer_candidates("t", "o", "r", (_SCRIPT,))
+
+
+def test_a_rate_limited_search_is_incomplete():
+    limited = MagicMock(spec=httpx.Response)
+    limited.raise_for_status = MagicMock(side_effect=httpx.HTTPStatusError(
+        "403", request=MagicMock(), response=limited,
+    ))
+    with (
+        patch("httpx.get", return_value=limited),
+        pytest.raises(RemovedReferenceCheckIncomplete),
+    ):
+        find_referrer_candidates("t", "o", "r", (_SCRIPT,))
+
+
+def test_a_referrer_unreadable_at_head_is_incomplete():
+    with pytest.raises(RemovedReferenceCheckIncomplete):
+        removed_reference_findings(
+            (_SCRIPT,), search=lambda p: ("ops/run.sh",), fetch_at_head=lambda p: {},
+        )
+
+
 # Dispatch: the real deletion-only path.
 
 
@@ -148,12 +243,18 @@ def _response(*, text: str = "", json: object = None, status: int = 200):
     return r
 
 
-def _run(monkeypatch, referrers: dict[str, str]) -> list:
+def _run(monkeypatch, diff: str, referrers: dict[str, str], *,
+         blocking: bool = True, search_error: Exception | None = None) -> list:
     posted_check: list = []
 
     def _fake_get(url, *args, **kwargs):
         if "/search/code" in url:
-            return _response(json={"items": [{"path": p} for p in referrers]})
+            if search_error is not None:
+                raise search_error
+            return _response(json={
+                "total_count": len(referrers),
+                "items": [{"path": p} for p in referrers],
+            })
         if "/contents/" in url:
             path = url.split("/contents/", 1)[1]
             if path in referrers:
@@ -161,7 +262,7 @@ def _run(monkeypatch, referrers: dict[str, str]) -> list:
             return _response(status=404)
         if "/git/trees/" in url:
             return _response(json={"tree": []})
-        return _response(text=_DELETION_DIFF)
+        return _response(text=diff)
 
     monkeypatch.setattr(
         cr_dispatch, "review_diff",
@@ -175,24 +276,46 @@ def _run(monkeypatch, referrers: dict[str, str]) -> list:
     )
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 2})
     with patch("httpx.get", side_effect=_fake_get):
-        cr_dispatch.dispatch_code_review(_payload(), blocking=True)
+        cr_dispatch.dispatch_code_review(_payload(), blocking=blocking)
     return posted_check
 
 
-def test_a_deletion_only_pr_gets_a_real_verdict_not_no_diff(monkeypatch):
-    posted = _run(monkeypatch, {})
-    final = posted[-1]
+def test_deleting_an_ordinary_unreferenced_file_passes(monkeypatch):
+    final = _run(monkeypatch, _deleted("src/old_helper.py"), {})[-1]
     assert final.conclusion == "success", (final.conclusion, final.title)
     assert "no_diff" not in final.title
     assert "clouded" not in final.title
-    assert "2 deleted file(s)" in final.summary
+    assert "1 deleted file(s)" in final.summary
+
+
+def test_deleting_a_workflow_file_blocks(monkeypatch):
+    final = _run(monkeypatch, _DELETION_DIFF, {})[-1]
+    assert final.conclusion == "failure", (final.conclusion, final.title)
+    assert "removed-guarded-path" in final.summary
+    assert _WORKFLOW in final.summary
 
 
 def test_a_deletion_that_something_still_relies_on_blocks(monkeypatch):
-    posted = _run(monkeypatch, {
+    final = _run(monkeypatch, _deleted(_SCRIPT), {
         ".github/workflows/nightly.yml": f"steps:\n  - run: bash {_SCRIPT}\n",
-    })
-    final = posted[-1]
+    })[-1]
     assert final.conclusion == "failure", (final.conclusion, final.title)
     assert "removed-but-referenced" in final.summary
     assert ".github/workflows/nightly.yml" in final.summary
+
+
+def test_a_referrer_check_that_raises_is_neutral_not_success(monkeypatch):
+    final = _run(
+        monkeypatch, _deleted("src/old_helper.py"), {},
+        blocking=False, search_error=httpx.ConnectError("search down"),
+    )[-1]
+    assert final.conclusion == "neutral", (final.conclusion, final.title)
+    assert "removed_reference_check_failed" in final.title
+
+
+def test_a_referrer_check_that_raises_never_passes_a_blocking_gate(monkeypatch):
+    final = _run(
+        monkeypatch, _deleted("src/old_helper.py"), {},
+        search_error=httpx.ConnectError("search down"),
+    )[-1]
+    assert final.conclusion == "failure", (final.conclusion, final.title)

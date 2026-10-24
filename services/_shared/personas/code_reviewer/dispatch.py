@@ -108,7 +108,7 @@ from personas.code_reviewer.repo_config import (
     with_instructions,
 )
 from personas.code_reviewer.criteria_judge import criteria_judge_for
-from personas.code_reviewer.lane_work import lane_work_findings
+from personas.code_reviewer.lane_work import criteria_in_scope, lane_work_findings
 from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
@@ -132,7 +132,8 @@ from personas.code_reviewer.persona import (
     with_extra_findings, with_findings,
 )
 from personas.code_reviewer.removed_files import (
-    find_referrer_candidates, removed_paths, removed_reference_findings,
+    REMOVED_REFERENCE_CHECK_FAILED, find_referrer_candidates, removed_paths,
+    removed_reference_findings, scan_guarded_deletions,
 )
 from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
@@ -2492,8 +2493,9 @@ def _drop_non_correctness_findings(
 
 def _review_deletion_only(
     evaluation: CodeReviewEvaluation, diff_text: str,
-    parsed_hunks: tuple[DiffHunk, ...], *, installation_id: int, owner: str,
-    repo_name: str, pull_number: int, head_sha: str,
+    parsed_hunks: tuple[DiffHunk, ...], *, criteria: tuple[str, ...],
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str,
 ) -> tuple[CodeReviewEvaluation, str]:
     """A pull request that only deletes files gets a verdict, not no_diff (#1401).
 
@@ -2501,17 +2503,21 @@ def _review_deletion_only(
     the model with nothing and published a neutral "eyes clouded
     (no_diff)" that never clears a blocking gate. When the diff deletes
     files and has no other hunk, the verdict comes from the deterministic
-    referrer check instead: a clean pass when nothing at head still names a
-    removed file, a finding per file that does. Returns the evaluation and
-    a summary note; any other diff is returned unchanged with no note."""
+    checks in `removed_files`: a deleted guard path is a finding (high
+    unless a linked criterion names it), and so is a file at head that
+    still names a removed path. A referrer check that cannot finish
+    degrades to `REMOVED_REFERENCE_CHECK_FAILED`, never a pass. Returns the
+    evaluation and a summary note; any other diff is returned unchanged
+    with no note."""
     if evaluation.degraded_reason != "no_diff" or parsed_hunks:
         return evaluation, ""
     removed = removed_paths(diff_text)
     if not removed:
         return evaluation, ""
     pr = f"{owner}/{repo_name}#{pull_number}"
+    guarded = scan_guarded_deletions(removed, criteria)
     try:
-        findings = removed_reference_findings(
+        referenced = removed_reference_findings(
             removed,
             search=lambda paths: with_install_token_retry(
                 installation_id,
@@ -2522,23 +2528,36 @@ def _review_deletion_only(
                 lambda token: fetch_file_contents(token, owner, repo_name, paths, head_sha),
             ),
         )
-    except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
-        log.info(
+        degraded: str | None = None
+    except Exception as e:  # noqa: BLE001 - an unfinished check degrades, never passes
+        log.warning(
             "code_review_removed_reference_check_failed",
-            extra={"pr": pr, "kind": type(e).__name__},
+            extra={"pr": pr, "kind": type(e).__name__, "error": str(e)[:200]},
         )
-        findings = ()
+        referenced, degraded = (), REMOVED_REFERENCE_CHECK_FAILED
+    findings = guarded + referenced
     log.info(
         "code_review_deletion_only",
-        extra={"pr": pr, "removed": len(removed), "findings": len(findings)},
+        extra={
+            "pr": pr, "removed": len(removed), "guarded": len(guarded),
+            "referenced": len(referenced), "degraded": degraded,
+        },
     )
-    clean = CodeReviewEvaluation(findings=(), conclusion="success")
+    base = CodeReviewEvaluation(
+        findings=(), conclusion="neutral" if degraded else "success",
+        degraded_reason=degraded,
+    )
+    referrers = (
+        "could not finish checking whether any file at this head still names "
+        "them, so this is not a pass" if degraded
+        else "checked whether any file at this head still names them"
+    )
     note = (
         f"\n\nDeletion-only diff: {len(removed)} deleted file(s). Grug "
-        "checked whether any file at this head still names them"
-        + (" - see the markings above." if findings else " and found none.")
+        f"checked them for removed guards and {referrers}."
+        + (" See the markings above." if findings else "")
     )
-    return with_extra_findings(clean, findings), note
+    return with_extra_findings(base, findings), note
 
 
 def _merge_lane_work(
@@ -3405,6 +3424,12 @@ def dispatch_code_review(
 
     evaluation, deletion_note = _review_deletion_only(
         evaluation, diff_text, parsed_hunks,
+        criteria=tuple(c.text for c in criteria_in_scope(
+            rendered_criteria_with_state(
+                str(pr_context.get("linked_issue_context") or ""),
+            ),
+            str(pr_context.get("body") or ""),
+        )),
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,
     )
