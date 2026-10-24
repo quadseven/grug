@@ -210,6 +210,44 @@ def _do_commit(
     return new_commit_sha
 
 
+def _prepare_changes(
+    candidates: list[FindingRecord], *, token_fn, owner: str, repo: str,
+    head_sha: str, fetch_file,
+) -> tuple[list[FindingRecord], list[tuple[FindingRecord, str]], dict[str, str]]:
+    """Verify candidates and group their safe replacements by file."""
+    applied: list[FindingRecord] = []
+    skipped: list[tuple[FindingRecord, str]] = []
+    file_lines: dict[str, list[str]] = {}
+    trailing_newline: dict[str, bool] = {}
+    patched_lines: set[tuple[str, int]] = set()
+
+    for rec in candidates:
+        file_text = fetch_file(token_fn, owner, repo, rec.path, head_sha)
+        if file_text is None:
+            skipped.append((rec, "could not read the file at this head"))
+            continue
+        file_lines.setdefault(rec.path, file_text.splitlines())
+        trailing_newline[rec.path] = file_text.endswith("\n")
+        replacement = _fix_still_applies(rec, file_text)
+        if replacement is None:
+            skipped.append((rec, "suggestion no longer applies cleanly"))
+            continue
+        location = (rec.path, rec.line)
+        if location in patched_lines:
+            skipped.append((rec, "another suggestion targets the same line"))
+            continue
+        file_lines[rec.path][rec.line - 1] = replacement
+        patched_lines.add(location)
+        applied.append(rec)
+
+    changes = {
+        path: "\n".join(lines) + ("\n" if trailing_newline[path] else "")
+        for path, lines in file_lines.items()
+        if any(f.path == path for f in applied)
+    }
+    return applied, skipped, changes
+
+
 def run_fix(
     *,
     install_id: int,
@@ -252,37 +290,10 @@ def run_fix(
         reply("Grug found no unresolved committable suggestions on this PR.")
         return {**out, "status": "no_op", "reason": "no_committable_findings"}
 
-    # Verify each suggestion still applies against the current head.
-    applied: list[FindingRecord] = []
-    skipped: list[tuple[FindingRecord, str]] = []
-    file_lines: dict[str, list[str]] = {}
-    trailing_newline: dict[str, bool] = {}
-    patched_lines: set[tuple[str, int]] = set()
-
-    for rec in candidates:
-        file_text = fetch_file(token_fn, owner, repo, rec.path, head_sha)
-        if file_text is None:
-            skipped.append((rec, "could not read the file at this head"))
-            continue
-        file_lines.setdefault(rec.path, file_text.splitlines())
-        trailing_newline[rec.path] = file_text.endswith("\n")
-        replacement = _fix_still_applies(rec, file_text)
-        if replacement is None:
-            skipped.append((rec, "suggestion no longer applies cleanly"))
-            continue
-        location = (rec.path, rec.line)
-        if location in patched_lines:
-            skipped.append((rec, "another suggestion targets the same line"))
-            continue
-        file_lines[rec.path][rec.line - 1] = replacement
-        patched_lines.add(location)
-        applied.append(rec)
-
-    changes = {
-        path: "\n".join(lines) + ("\n" if trailing_newline[path] else "")
-        for path, lines in file_lines.items()
-        if any(f.path == path for f in applied)
-    }
+    applied, skipped, changes = _prepare_changes(
+        candidates, token_fn=token_fn, owner=owner, repo=repo,
+        head_sha=head_sha, fetch_file=fetch_file,
+    )
 
     if not changes:
         body = _build_reply(applied, skipped)
