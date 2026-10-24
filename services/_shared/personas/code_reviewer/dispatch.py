@@ -122,7 +122,7 @@ from personas.tpm.issue_fetcher import build_issue_details_fetcher
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     advisory_when_unrefuted, eval_tags, grade_findings, partition_findings,
-    partition_refuted, refute_findings, submit_evals,
+    partition_refuted, refute_with_outcome, submit_evals,
 )
 from personas.code_reviewer.intent_filter import (
     filter_intent_mismatch_findings, scope_intent_mismatch_to_claimed_boxes,
@@ -3824,15 +3824,17 @@ def _apply_refute_gate(
     (reason "refuted") so the #707 scoreboard attributes them and the
     false-kill hunt covers this gate too.
 
-    Fail-open, softened (#1400): a high the gate returned no verdict for
-    still publishes, but as an advisory medium when the plain judge
+    Fail-open, softened (#1400): a HIGH whose refute batch no backend
+    answered still publishes, but as an advisory medium when the plain judge
     (`plain_verdicts`, indexed into `plain_findings`) already called it not
-    real at the refute floor. One `code_review_refute_unverified_downgraded`
-    row per downgrade."""
+    real at the refute floor. A critical never softens. One
+    `code_review_refute_unverified_downgraded` row per downgrade, plus the
+    `grug.elder.refute_unverified_downgraded` gauge for the #707 scoreboard."""
     high = tuple(f for f in findings if f.severity in ("high", "critical"))
     if not high:
         return findings
-    verdicts = refute_findings(high, evidence, installation_id)
+    outcome = refute_with_outcome(high, evidence, installation_id)
+    verdicts = outcome.verdicts
     _, refuted = partition_refuted(high, verdicts) if verdicts else ((), ())
     if refuted:
         from personas.code_reviewer.verify import KilledFinding
@@ -3842,7 +3844,7 @@ def _apply_refute_gate(
             repo_name=repo_name, pull_number=pull_number, arm=arm,
         )
     softened, downgraded = advisory_when_unrefuted(
-        high, verdicts,
+        high, outcome.unavailable,
         plain_findings=tuple(plain_findings), plain_verdicts=tuple(plain_verdicts),
     )
     for original, verdict in downgraded:
@@ -3859,6 +3861,15 @@ def _apply_refute_gate(
                 "arm": arm,
             },
         )
+    if downgraded:
+        try:
+            from observability import emit_gauge  # type: ignore
+            emit_gauge(
+                "grug.elder.refute_unverified_downgraded", len(downgraded),
+                tags={"repo": f"{owner}/{repo_name}", "arm": arm},
+            )
+        except Exception as e:  # noqa: BLE001 - telemetry never breaks the review
+            log.debug("refute_downgrade_gauge_failed", extra={"kind": type(e).__name__})
     if not refuted and not downgraded:
         return findings
     dead = {id(f) for f in refuted}

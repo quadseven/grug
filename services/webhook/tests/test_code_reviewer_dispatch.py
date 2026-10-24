@@ -19,6 +19,7 @@ from llm_client import (
 )
 from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
+from personas.code_reviewer.judge import RefuteOutcome
 from personas.review_publish import plan_publish
 from review_evidence import ElderEvidence
 from review_pipeline import ReviewCoverage, ReviewabilityConcern
@@ -2717,9 +2718,12 @@ def test_dispatch_refute_gate_kills_confidently_refuted_high_finding(monkeypatch
 
     def _fake_refute(findings, hunks, installation_id, **kw):
         refute_calls.append(findings)
-        return (FJ(0, False, "quoted code shows the opposite of the claim", 0.95),)
+        return RefuteOutcome(
+            (FJ(0, False, "quoted code shows the opposite of the claim", 0.95),),
+            frozenset(),
+        )
 
-    monkeypatch.setattr(cr_dispatch, "refute_findings", _fake_refute)
+    monkeypatch.setattr(cr_dispatch, "refute_with_outcome", _fake_refute)
     posted_reviews: list = []
     monkeypatch.setattr(
         cr_dispatch, "post_review",
@@ -2775,7 +2779,12 @@ def _run_refute_outage_review(monkeypatch, caplog, *, plain_confidence):
         cr_dispatch, "fetch_file_contents",
         lambda token, owner, repo, paths, sha: {"src/x.py": "x = 1\ny = 2\nz = 3\n"},
     )
-    monkeypatch.setattr(cr_dispatch, "refute_findings", lambda *a, **kw: ())
+    monkeypatch.setattr(
+        cr_dispatch, "refute_with_outcome",
+        lambda findings, *a, **kw: RefuteOutcome(
+            (), frozenset(range(len(findings))),
+        ),
+    )
     posted_reviews: list = []
     monkeypatch.setattr(
         cr_dispatch, "post_review",
@@ -2827,7 +2836,12 @@ def test_deep_arm_refute_outage_downgrades_a_judged_not_real_high(monkeypatch):
         cr_dispatch, "grade_findings",
         lambda *a, **kw: (FJ(0, False, "guarded above", 0.95),),
     )
-    monkeypatch.setattr(cr_dispatch, "refute_findings", lambda *a, **kw: ())
+    monkeypatch.setattr(
+        cr_dispatch, "refute_with_outcome",
+        lambda findings, *a, **kw: RefuteOutcome(
+            (), frozenset(range(len(findings))),
+        ),
+    )
     hunks = tuple(cr_dispatch.parse_diff(_DIFF))
     deep_eval, _, _, _ = cr_dispatch._grade_deep_response(
         _deep_llm_with_finding(rule="null-deref", severity="high"),
