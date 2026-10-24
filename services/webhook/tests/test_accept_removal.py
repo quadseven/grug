@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import patch
 
 import dispatcher as d
+import httpx
 import pytest
 import rerun
 from adapters import install_store, pg_install_store
@@ -37,16 +38,18 @@ _SHA = "abcdef1234567890abcdef1234567890abcdef12"  # the PR head the command see
 
 
 def test_parses_accept_removal_with_its_path():
-    assert parse_command(f"/grug accept-removal {_WORKFLOW} {_SHA[:7]}") == GrugCommand(
-        verb="accept-removal", arg=f"{_WORKFLOW} {_SHA[:7]}",
+    assert parse_command(f"/grug accept-removal {_WORKFLOW} {_SHA}") == GrugCommand(
+        verb="accept-removal", arg=f"{_WORKFLOW} {_SHA}",
     )
 
 
 @pytest.mark.parametrize(("arg", "sha"), [
-    (f"{_WORKFLOW} {_SHA[:7]}", _SHA[:7]),
+    (f"{_WORKFLOW} {_SHA}", _SHA),
     (f"`{_WORKFLOW}` `{_SHA}`", _SHA),
-    (f"{_WORKFLOW} {_SHA[:7].upper()} looks fine", _SHA[:7]),
-    (f"{_WORKFLOW} {_SHA[:6]}", ""),  # too short
+    (f"{_WORKFLOW} {_SHA.upper()} looks fine", _SHA),
+    (f"{_WORKFLOW} {_SHA[:7]}", ""),  # a prefix is refused
+    (f"{_WORKFLOW} {_SHA[:39]}", ""),
+    (f"{_WORKFLOW} {_SHA}0", ""),
     (f"{_WORKFLOW} notahexsha", ""),
     (_WORKFLOW, ""),
 ])
@@ -95,7 +98,7 @@ class _Store:
 def _payload(
     *, login: str = "maintainer", user_type: str | None = "User",
     association: str | None = "OWNER", pr_author: str = "maintainer",
-    body: str = f"/grug accept-removal {_WORKFLOW} {_SHA[:7]}", app: object = None,
+    body: str = f"/grug accept-removal {_WORKFLOW} {_SHA}", app: object = None,
 ) -> dict[str, Any]:
     user: dict[str, Any] = {"login": login}
     if user_type is not None:
@@ -118,7 +121,12 @@ def _payload(
 
 def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin",
               head_sha: str = _SHA, store: _Store | None = None,
+              commits: list[dict[str, Any]] | None = None,
+              commits_fail: bool = False,
               ) -> tuple[dict[str, str], _Store]:
+    if commits is None:
+        author = payload["issue"]["user"]["login"]
+        commits = [{"author": {"login": author}, "committer": {"login": "web-flow"}}]
     store = store or _Store()
     monkeypatch.setattr(d, "is_install_allowlisted", lambda _id: True)
     monkeypatch.setattr(d, "is_persona_enabled", lambda *_: True)
@@ -142,6 +150,10 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
     def _get(url: str, *a: Any, **k: Any) -> _Resp:
         if "/collaborators/" in url:
             return _Resp({"permission": permission})
+        if "/pulls/42/commits" in url:
+            if commits_fail:
+                raise httpx.ConnectError("listing down")
+            return _Resp(commits)
         if "/pulls/42" in url:
             return _Resp({"head": {"sha": head_sha}, "body": "",
                           "user": {"login": payload["issue"]["user"]["login"]}})
@@ -195,6 +207,35 @@ def test_the_pr_author_with_only_write_access_is_refused(monkeypatch, associatio
     assert store.recorded == [] and store.enqueued == []
 
 
+@pytest.mark.parametrize("role", ["author", "committer"])
+def test_a_write_user_who_pushed_a_commit_onto_someone_elses_pr_is_refused(monkeypatch, role):
+    other = "committer" if role == "author" else "author"
+    out, store = _dispatch(monkeypatch, _payload(
+        login="pusher", pr_author="author", association="COLLABORATOR",
+    ), permission="write", commits=[
+        {"author": {"login": "author"}, "committer": {"login": "web-flow"}},
+        {role: {"login": "pusher"}, other: {"login": "author"}},
+    ])
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+
+
+def test_an_admin_who_pushed_a_commit_may_accept(monkeypatch):
+    out, store = _dispatch(monkeypatch, _payload(
+        login="pusher", pr_author="author", association="MEMBER",
+    ), permission="admin", commits=[{"author": {"login": "pusher"}}])
+    assert out["status"] == "dispatched", out
+    assert store.recorded and store.recorded[0]["accepted_by"] == "pusher"
+
+
+def test_a_failed_commit_listing_fails_closed(monkeypatch):
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association="COLLABORATOR",
+    ), permission="write", commits_fail=True)
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+
+
 def test_write_access_may_accept_someone_elses_pr(monkeypatch):
     out, store = _dispatch(monkeypatch, _payload(
         login="reviewer", pr_author="author", association="COLLABORATOR",
@@ -204,8 +245,8 @@ def test_write_access_may_accept_someone_elses_pr(monkeypatch):
 
 
 @pytest.mark.parametrize("named", [
-    "1234567",  # another head
-    _SHA[1:8],  # not a prefix
+    "1" * 40,  # another head
+    _SHA[:7],  # a prefix of the head
 ])
 def test_a_sha_that_does_not_match_the_head_is_refused(monkeypatch, named):
     out, store = _dispatch(monkeypatch, _payload(
@@ -240,7 +281,7 @@ def test_a_claimed_comment_records_nothing():
     store = _Store()
     store.claimed.add("grugcmd:3")
     out = accept_removal.run_accept_removal(
-        f"{_WORKFLOW} {_SHA[:7]}", install_id=1, owner="o", repo="r",
+        f"{_WORKFLOW} {_SHA}", install_id=1, owner="o", repo="r",
         pr_number=2, comment_id=3, head_sha=_SHA, actor="maintainer",
         token_fn=lambda fn: fn("tok"),
         record=lambda **k: store.recorded.append(k),
@@ -263,7 +304,7 @@ def test_a_non_callable_seam_fails_closed(seam):
     }
     seams[seam] = "not callable"
     out = accept_removal.run_accept_removal(
-        f"{_WORKFLOW} {_SHA[:7]}", install_id=1, owner="o", repo="r",
+        f"{_WORKFLOW} {_SHA}", install_id=1, owner="o", repo="r",
         pr_number=2, comment_id=3, head_sha=_SHA, actor="maintainer",
         token_fn=lambda fn: fn("tok"), reply=lambda body: True, **seams,
     )
@@ -351,7 +392,7 @@ def test_a_failed_record_does_not_enqueue(monkeypatch):
 
     store = _Store()
     out = accept_removal.run_accept_removal(
-        f"{_WORKFLOW} {_SHA[:7]}", install_id=1, owner="o", repo="r",
+        f"{_WORKFLOW} {_SHA}", install_id=1, owner="o", repo="r",
         pr_number=2, comment_id=3, head_sha=_SHA, actor="maintainer",
         token_fn=lambda fn: fn("tok"), record=_boom,
         enqueue=lambda **k: store.enqueued.append(k),

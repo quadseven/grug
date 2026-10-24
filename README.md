@@ -181,10 +181,10 @@ the adaptive quiet window:
 - **Deletion-only review** - a PR that only deletes files gets a verdict. A
   deleted guard (a CI workflow, CODEOWNERS, ruleset config, a security, policy
   or leak-scan file, or a test whose code stays) blocks, and only a person can
-  clear it: `/grug accept-removal <path> <head-sha>` (the finding prints the
+  clear it: `/grug accept-removal <path> <head-sha>` with the full SHA (the finding prints the
   exact command) from a User account with an OWNER, MEMBER or COLLABORATOR
   association and write access clears that path's finding when the SHA is the
-  current head, then Elder re-reviews. A PR author accepts their own PR only
+  current head, then Elder re-reviews. Whoever wrote the change accepts only
   as OWNER or with admin. The check summary names who accepted it and on which
   head; a new push needs a new acceptance (grug#1401, grug#1405).
 - **Feedback learning** - judge labels and write-authorized maintainer reactions

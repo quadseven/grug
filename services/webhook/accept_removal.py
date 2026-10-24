@@ -13,13 +13,16 @@ text, and each part failing closed when it is missing:
 - its author_association is OWNER, MEMBER or COLLABORATOR;
 - the collaborator permission API says admin, maintain or write. The PR
   author shortcut that `/grug improve` takes does not apply;
-- the PR author may accept their own PR only as OWNER or with admin
+- whoever wrote the change (the PR author, or the author or committer of
+  any commit in the PR) may accept only as OWNER or with admin
   permission, so a solo maintainer still can, while plain write access
-  accepts only someone else's PR.
+  accepts only a change someone else wrote. A commit listing that fails
+  counts the commenter as a writer.
 
 The command names the head the maintainer reviewed
-(`/grug accept-removal <path> <sha>`, at least 7 hex characters), and it
-counts only while that is still the PR's head. The acceptance is stored
+(`/grug accept-removal <path> <sha>`, the full 40-character SHA that
+Elder's finding prints), and it counts only while that is still the PR's
+head. The acceptance is stored
 against that head, so a new head finds no acceptance and the finding comes
 back. Each comment is claimed before anything is recorded, so a
 redelivered comment records nothing.
@@ -38,11 +41,16 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.accept_removal")
 
 TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 _MAX_PATH = 1024
-MIN_SHA = 7
+SHA_LEN = 40
 USAGE = (
     "Usage: `/grug accept-removal <path> <head-sha>`, naming one deleted file "
-    f"and at least the first {MIN_SHA} characters of the head you reviewed."
+    "and the full 40-character SHA of the head you reviewed. Elder's finding "
+    "prints the exact command."
 )
+# GitHub lists at most 250 commits for a pull request; a listing that long
+# may be cut short, so it cannot prove who wrote the change.
+_COMMITS_CAP = 250
+_COMMITS_PAGE = 100
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -68,9 +76,9 @@ def removal_path(arg: str) -> str:
 
 
 def accept_args(arg: str) -> tuple[str, str]:
-    """(path, head SHA prefix) from the command's argument. The SHA is the
-    word after the path, lowercased; empty unless it is 7 to 40 hex
-    characters."""
+    """(path, head SHA) from the command's argument. The SHA is the word
+    after the path, lowercased; empty unless it is the full 40 hex
+    characters (a prefix is refused)."""
     text = (arg or "").strip()
     path = removal_path(text)
     if text.startswith("`"):
@@ -81,7 +89,7 @@ def accept_args(arg: str) -> tuple[str, str]:
         rest = parts[1] if len(parts) > 1 else ""
     words = rest.split()
     sha = words[0].strip("`").lower() if words else ""
-    if not (MIN_SHA <= len(sha) <= 40 and set(sha) <= _HEX):
+    if len(sha) != SHA_LEN or not set(sha) <= _HEX:
         sha = ""
     return path, sha
 
@@ -92,9 +100,59 @@ def accept_command(path: str, head_sha: str) -> str:
 
 
 def may_accept_own_pr(association: str, permission: str) -> bool:
-    """A PR author accepts their own deletion only as the repo's OWNER or
-    with admin permission. Plain write may accept only someone else's PR."""
+    """Whoever wrote the change accepts their own deletion only as the
+    repo's OWNER or with admin permission. Plain write may accept only a
+    change someone else wrote."""
     return association == "OWNER" or permission == "admin"
+
+
+def pr_commit_logins(
+    install_id: int, owner: str, repo: str, pr_number: int,
+) -> frozenset[str] | None:
+    """Every GitHub login that authored or committed a commit in the PR, or
+    None when the listing failed or may be cut short. None fails closed:
+    the caller treats the commenter as a writer of the change."""
+    from urllib.parse import quote as _q
+
+    import httpx  # type: ignore
+    from github_app_auth import with_install_token_retry  # type: ignore
+
+    def _list(token: str) -> list[Any]:
+        commits: list[Any] = []
+        for page in range(1, _COMMITS_CAP // _COMMITS_PAGE + 2):
+            r = httpx.get(
+                f"https://api.github.com/repos/{_q(owner, safe='')}/"
+                f"{_q(repo, safe='')}/pulls/{int(pr_number)}/commits",
+                params={"per_page": _COMMITS_PAGE, "page": page},
+                headers={"Authorization": f"token {token}",
+                         "Accept": "application/vnd.github+json"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            batch = r.json()
+            if not isinstance(batch, list):
+                raise TypeError("commit listing is not a list")
+            commits.extend(batch)
+            if len(batch) < _COMMITS_PAGE:
+                break
+        return commits
+
+    try:
+        commits = with_install_token_retry(int(install_id), _list)
+    except Exception as e:  # noqa: BLE001 - an unread listing fails closed
+        log.warning("accept_removal_commit_list_failed", extra={"kind": type(e).__name__})
+        return None
+    if not commits or len(commits) >= _COMMITS_CAP:
+        return None
+    logins: set[str] = set()
+    for commit in commits:
+        if not isinstance(commit, dict):
+            return None
+        for role in ("author", "committer"):
+            login = (commit.get(role) or {}).get("login")
+            if login:
+                logins.add(str(login))
+    return frozenset(logins)
 
 
 def trusted_acceptor(payload: dict[str, Any]) -> tuple[str, str]:
@@ -166,11 +224,11 @@ def run_accept_removal(
         return {**out, "status": "no_op", "reason": "comment already handled"}
     path, sha = accept_args(arg)
     if not path or not sha:
-        say(USAGE)
+        say(USAGE + (f" For this head: `{accept_command(path, head_sha)}`." if path else ""))
         return {**out, "status": "no_op", "reason": "no path or head named"}
     repo_full = f"{owner}/{repo}"
     coords = {"repo": repo_full, "pr": pr_number, "head_sha": head_sha[:8]}
-    if not head_sha.lower().startswith(sha):
+    if head_sha.lower() != sha:
         log.info("accept_removal_wrong_head", extra={**coords, "named": sha[:12]})
         say(f"The head is now `{head_sha[:12]}`, not `{sha[:12]}`, so Grug "
             "recorded nothing. Review the new head, then comment "
