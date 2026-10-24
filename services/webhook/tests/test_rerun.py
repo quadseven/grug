@@ -2097,12 +2097,10 @@ def _run_watch_once(monkeypatch, current_pr, expected_pr):
         stop.set()  # one iteration only
         return current_pr
 
-    monkeypatch.setattr(rerun, "_fetch_current_pr", _fetch)
     elder_review._review_staleness_watch_loop(
         1, "o", "r", 7,
-        rerun.review_freshness_id_from_pr(expected_pr),
         str((expected_pr.get("head") or {}).get("sha") or ""),
-        stop, cancel,
+        stop, cancel, _fetch,
     )
     return cancel.is_set()
 
@@ -2112,8 +2110,8 @@ def test_staleness_watch_does_not_cancel_on_an_intent_only_edit(monkeypatch):
     byte of it, so a running review is still producing a valid answer."""
     before = _pr("aaaa1111", body="original why")
     after = _pr("aaaa1111", body="rewritten why, same code")
-    assert rerun.review_freshness_id_from_pr(after) != \
-        rerun.review_freshness_id_from_pr(before), "fixture must move the id"
+    assert elder_review.review_freshness_id_from_pr(after) != \
+        elder_review.review_freshness_id_from_pr(before), "fixture must move the id"
 
     assert _run_watch_once(monkeypatch, after, before) is False, (
         "an intent-only edit must not cancel a running review - that is what "
@@ -2141,11 +2139,8 @@ def test_staleness_watch_ignores_a_transient_fetch_failure(monkeypatch):
         stop.set()
         raise RuntimeError("GitHub 502")
 
-    monkeypatch.setattr(rerun, "_fetch_current_pr", _boom)
     elder_review._review_staleness_watch_loop(
-        1, "o", "r", 7,
-        rerun.review_freshness_id_from_pr(_pr("aaaa1111")),
-        "aaaa1111", stop, cancel,
+        1, "o", "r", 7, "aaaa1111", stop, cancel, _boom,
     )
     assert cancel.is_set() is False
 

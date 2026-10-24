@@ -223,7 +223,6 @@ def test_start_stop_staleness_watch():
     args = {"install_id": 1, "repo": "owner/name", "pr_number": 42}
     watch = start_staleness_watch(
         install_id=1, owner="owner", repo_name="name", pr_number=42,
-        expected_freshness_id="fresh-abc",
         expected_head_sha="head-sha",
         fetch_current_pr=lambda *a, **k: {"head": {"sha": "head-sha"}},
     )
@@ -248,7 +247,6 @@ def test_staleness_watch_cancels_on_head_sha_change(monkeypatch):
 
     watch = start_staleness_watch(
         install_id=1, owner="owner", repo_name="name", pr_number=42,
-        expected_freshness_id="fresh-abc",
         expected_head_sha="old-sha",
         fetch_current_pr=fetch,
     )
@@ -269,7 +267,6 @@ def test_staleness_watch_transient_fetch_failure_does_not_cancel():
 
     watch = start_staleness_watch(
         install_id=1, owner="owner", repo_name="name", pr_number=42,
-        expected_freshness_id="fresh-abc",
         expected_head_sha="expected-sha",
         fetch_current_pr=fetch,
     )
@@ -291,7 +288,7 @@ def test_register_unregister_release_claims(monkeypatch):
         released.append(kwargs.get("repo"))
         return True
 
-    monkeypatch.setattr("personas.code_reviewer.elder_review._adapter_release_review_claim", fake_release)
+    monkeypatch.setattr("adapters.install_store.release_review_claim", fake_release)
 
     args_a = {"install_id": 1, "repo": "a/repo", "pr_number": 1, "owner_token": "tok-a"}
     args_b = {"install_id": 2, "repo": "b/repo", "pr_number": 2, "owner_token": "tok-b"}
@@ -317,7 +314,7 @@ def test_release_active_review_claims_best_effort(monkeypatch):
         results[repo] = True
         return True
 
-    monkeypatch.setattr("personas.code_reviewer.elder_review._adapter_release_review_claim", fake_release)
+    monkeypatch.setattr("adapters.install_store.release_review_claim", fake_release)
 
     register_active_review_claim("tok-1", {"repo": "ok/repo", "pr_number": 1, "owner_token": "tok-1"})
     register_active_review_claim("tok-2", {"repo": "fail/repo", "pr_number": 2, "owner_token": "tok-2"})
@@ -450,3 +447,101 @@ def test_review_freshness_failure_github_unavailable(monkeypatch):
     )
     assert result is not None
     assert result["degraded_reason"] == "freshness_check_failed"
+
+
+# --- ReviewClaimLease: acquire / heartbeat / release ordering -------------
+
+
+class _FakeStore:
+    """In-memory stand-in for the install_store claim adapter."""
+
+    def __init__(self, acquire="acquired", complete=True, release=True):
+        self.calls: list[str] = []
+        self._acquire, self._complete, self._release = acquire, complete, release
+
+    def acquire_review_claim(self, **kw):
+        self.calls.append("acquire")
+        return self._acquire
+
+    def renew_review_claim(self, **kw):
+        return True
+
+    def complete_review_claim(self, **kw):
+        self.calls.append("complete")
+        return self._complete
+
+    def release_review_claim(self, **kw):
+        self.calls.append("release")
+        return self._release
+
+
+_CLAIM = {
+    "install_id": 1, "repo": "o/r", "pr_number": 7,
+    "persona": "code_reviewer", "head_sha": "v1:snap",
+}
+
+
+def _lease(monkeypatch, store):
+    from personas.code_reviewer import elder_review as er
+
+    for name in ("acquire", "renew", "complete", "release"):
+        monkeypatch.setattr(
+            f"adapters.install_store.{name}_review_claim",
+            getattr(store, f"{name}_review_claim"),
+        )
+    return er, er.ReviewClaimLease.acquire(dict(_CLAIM))
+
+
+def test_lease_not_acquired_returns_status_and_no_lease(monkeypatch):
+    er, (status, lease) = _lease(monkeypatch, _FakeStore(acquire="busy"))
+    assert (status, lease) == ("busy", None)
+    assert er.release_active_review_claims() == 0
+
+
+def test_lease_complete_stops_heartbeat_then_completes(monkeypatch):
+    store = _FakeStore()
+    er, (_, lease) = _lease(monkeypatch, store)
+    lease.complete("done")
+    lease.close()
+    assert store.calls == ["acquire", "complete"]
+    assert er.release_active_review_claims() == 0
+
+
+def test_lease_complete_without_ownership_raises(monkeypatch):
+    er, (_, lease) = _lease(monkeypatch, _FakeStore(complete=False))
+    with pytest.raises(er.ReviewClaimLost):
+        lease.complete("done")
+    lease.close()
+
+
+def test_lease_complete_falls_back_to_release_then_raises_if_both_fail(monkeypatch):
+    store = _FakeStore(complete=False)
+    er, (_, lease) = _lease(monkeypatch, store)
+    lease.complete("after skip", release_fallback=True)
+    assert store.calls == ["acquire", "complete", "release"]
+    store._release = False
+    with pytest.raises(er.ReviewClaimLost, match="claim settlement failed"):
+        lease.complete("after skip", release_fallback=True)
+    lease.close()
+
+
+def test_lease_release_raises_when_ownership_lost(monkeypatch):
+    er, (_, lease) = _lease(monkeypatch, _FakeStore(release=False))
+    with pytest.raises(er.ReviewClaimLost):
+        lease.release("for stale snapshot")
+    lease.close()
+
+
+def test_lease_abort_never_raises_and_close_unregisters(monkeypatch):
+    er, (_, lease) = _lease(monkeypatch, _FakeStore(release=False))
+    lease.abort()
+    lease.close()
+    assert er.release_active_review_claims() == 0
+
+
+def test_shutdown_sweep_releases_an_unclosed_lease(monkeypatch):
+    store = _FakeStore()
+    er, (_, lease) = _lease(monkeypatch, store)
+    assert er.release_active_review_claims() == 1
+    assert store.calls == ["acquire", "release"]
+    lease.abort()

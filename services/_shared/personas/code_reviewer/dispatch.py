@@ -530,7 +530,7 @@ def _list_dir_contents(
 # known helpers (best-effort) so the claim-check detector can still compare
 # numbers. Harmless no-ops on foreign repos (404 -> skip).
 _CLAIM_CHECK_POLICY_PATHS: tuple[str, ...] = (
-    "services/_shared/personas/code_reviewer/snapshot.py",
+    "services/_shared/personas/code_reviewer/elder_review.py",
     "services/_shared/llm_client.py",
 )
 _CLAIM_HINT_RE = re.compile(

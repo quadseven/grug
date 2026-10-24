@@ -17,7 +17,6 @@ import logging
 import os
 import re
 import threading
-import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -26,14 +25,7 @@ from typing import Any
 import httpx
 from github_app_auth import with_install_token_retry
 
-from adapters.install_store import (
-    acquire_review_claim as _adapter_acquire_review_claim,
-    complete_review_claim as _adapter_complete_review_claim,
-    get_repo_config as _adapter_get_repo_config,
-    is_elder_paused as _adapter_is_elder_paused,
-    release_review_claim as _adapter_release_review_claim,
-    renew_review_claim as _adapter_renew_review_claim,
-)
+from adapters import install_store
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.elder_review")
 
@@ -252,7 +244,7 @@ def _review_claim_heartbeat_loop(
 ) -> None:
     while not stop.wait(_REVIEW_CLAIM_HEARTBEAT_SECONDS):
         try:
-            renewed = _adapter_renew_review_claim(
+            renewed = install_store.renew_review_claim(
                 **owned_claim_args,
                 lease_seconds=_REVIEW_CLAIM_LEASE_SECONDS,
             )
@@ -308,6 +300,100 @@ def stop_review_claim_heartbeat(
     heartbeat.stop.set()
     heartbeat.thread.join(timeout=1.0)
     return not heartbeat.ownership_lost.is_set()
+
+
+class ReviewClaimLost(RuntimeError):
+    """The claim lease was taken over or expired before a terminal transition."""
+
+
+class ReviewClaimLease:
+    """One owned Elder snapshot claim, from acquire to terminal transition.
+
+    Owns the ordering every exit must follow: stop the heartbeat FIRST (so a
+    renewal cannot race the settle), then complete or release the claim, then
+    drop the shutdown-registry entry. Callers pick the transition; they never
+    re-code the sequence.
+    """
+
+    def __init__(self, owned_claim_args: dict[str, Any]) -> None:
+        self.args = owned_claim_args
+        self._token = str(owned_claim_args["owner_token"])
+        self._heartbeat: ReviewClaimHeartbeat | None = None
+
+    @classmethod
+    def acquire(
+        cls, claim_args: dict[str, Any],
+    ) -> tuple[str, ReviewClaimLease | None]:
+        """Try to take the claim. Returns (status, lease); lease is None
+        unless status is "acquired". On success the lease is registered for
+        graceful-shutdown release and its heartbeat is running."""
+        owned = {**claim_args, "owner_token": uuid.uuid4().hex}
+        status = install_store.acquire_review_claim(
+            **owned, lease_seconds=_REVIEW_CLAIM_LEASE_SECONDS,
+        )
+        if status != "acquired":
+            return status, None
+        lease = cls(owned)
+        register_active_review_claim(lease._token, owned)
+        try:
+            lease._heartbeat = start_review_claim_heartbeat(owned)
+        except Exception:
+            lease.abort()
+            lease.close()
+            raise
+        return status, lease
+
+    def _stop_heartbeat(self, reason: str) -> None:
+        if not stop_review_claim_heartbeat(self._heartbeat):
+            raise ReviewClaimLost(f"Elder review claim ownership lost {reason}")
+
+    def release(self, reason: str) -> None:
+        """Terminal transition: hand the snapshot back (redrive or skip)."""
+        self._stop_heartbeat(reason)
+        if not install_store.release_review_claim(**self.args):
+            raise ReviewClaimLost(
+                f"Elder review claim release lost ownership {reason}"
+            )
+
+    def complete(self, reason: str, *, release_fallback: bool = False) -> None:
+        """Terminal transition: mark the snapshot reviewed.
+
+        With `release_fallback`, a failed completion falls back to release
+        (better than hanging until lease expiry); only if BOTH fail does it
+        raise so the message redrives."""
+        self._stop_heartbeat(reason)
+        if install_store.complete_review_claim(**self.args):
+            return
+        if not release_fallback:
+            raise ReviewClaimLost(
+                f"Elder review claim completion lost ownership {reason}"
+            )
+        if not install_store.release_review_claim(**self.args):
+            raise ReviewClaimLost(
+                f"Elder claim settlement failed {reason}"
+            )
+
+    def abort(self) -> None:
+        """Error-path release: best effort, never masks the primary failure."""
+        stop_review_claim_heartbeat(self._heartbeat)
+        try:
+            if not install_store.release_review_claim(**self.args):
+                raise ReviewClaimLost("Elder review claim release lost ownership")
+        except Exception as release_error:  # noqa: BLE001 - preserve primary failure
+            log.error(
+                "elder_review_claim_release_failed",
+                extra={
+                    "repo": self.args["repo"],
+                    "pr": self.args["pr_number"],
+                    "snapshot_id": str(self.args["head_sha"])[:11],
+                    "kind": type(release_error).__name__,
+                },
+                exc_info=True,
+            )
+
+    def close(self) -> None:
+        """Drop the shutdown-registry entry; runs on every in-process exit."""
+        unregister_active_review_claim(self._token)
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +597,6 @@ def start_staleness_watch(
     owner: str,
     repo_name: str,
     pr_number: int,
-    expected_freshness_id: str,
     expected_head_sha: str,
     fetch_current_pr: Callable[..., dict[str, Any]],
 ) -> StalenessWatch:
@@ -614,7 +699,7 @@ def release_active_review_claims() -> int:
         return 0
     for _token, owned_claim_args in claims:
         try:
-            if _adapter_release_review_claim(**owned_claim_args):
+            if install_store.release_review_claim(**owned_claim_args):
                 released += 1
                 log.info(
                     "elder_review_claim_released_on_shutdown",

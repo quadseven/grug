@@ -60,7 +60,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from personas.code_reviewer.elder_review import (
-    adaptive_elder_settle_seconds,
     durable_elder_settle_seconds,
     review_snapshot_id_from_pr,
 )

@@ -205,7 +205,7 @@ def test_enqueue_hashes_snapshot_from_full_body_not_slimmed(monkeypatch):
     """LORE #585: the claim_review snapshot must hash the FULL PR body, not the
     _slim_payload-truncated one - else a body edit past _MAX_PR_BODY_CHARS is
     invisible to idempotency. The enqueued job must carry the full-body hash."""
-    from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+    from personas.code_reviewer.elder_review import review_snapshot_id_from_pr
 
     long_body = "x" * (ad._MAX_PR_BODY_CHARS + 500)
     payload = _full_gh_payload(body=long_body)

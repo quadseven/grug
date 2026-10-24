@@ -120,8 +120,8 @@ def _claim_text(text: str) -> str:
 # .py (tests, fixtures, unrelated helpers) lets a fixture like
 # `added > threshold` poison the policy fact and hide real drift.
 _SETTLE_FACT_PATH_SUFFIXES: tuple[str, ...] = (
-    "personas/code_reviewer/snapshot.py",
-    "/snapshot.py",
+    "personas/code_reviewer/elder_review.py",
+    "/elder_review.py",
 )
 _DEEP_FACT_PATH_SUFFIXES: tuple[str, ...] = (
     "services/_shared/llm_client.py",
