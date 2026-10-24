@@ -1,14 +1,14 @@
 # WEBHOOK-ONLY (NOT mirrored): the SQS consumer for operator-triggered re-runs
 # (#305, ADR-0004). The api service ENQUEUES (services/api/rerun.py); only the
 # webhook image carries the persona-dispatch + GitHub-App machinery, so the
-# consumer lives here — same split as the cave fallback (cave_fallback.py).
-"""Re-run consumer (#305, ADR-0004) — grug's backfill for a dropped/`errored`
+# consumer lives here - same split as the cave fallback (cave_fallback.py).
+"""Re-run consumer (#305, ADR-0004) - grug's backfill for a dropped/`errored`
 review.
 
 `consumer.py` long-polls `grug-rerun-jobs.fifo` and routes each batch here. For each job the
 consumer fetches the PR's **current** head + diff and re-runs the named persona
 via the unchanged `dispatch_code_review`, which posts the check-run and upserts
-the `CheckVerdictRecord` — healing the `errored` row in place if the head is
+the `CheckVerdictRecord` - healing the `errored` row in place if the head is
 unchanged, appending a fresh row if the PR moved on.
 
 Failure semantics differ from the cave result handler ON PURPOSE: a transient
@@ -392,7 +392,7 @@ def _post_elder_in_progress_check(
     Elder is durable + settle-windowed; a deep review routinely takes minutes
     and can be mid-flight-cancelled/re-enqueued when base/title/body moves.
     Without an in_progress check, GitHub required-status rulesets treat the
-    PR as BLOCKED ("check missing") for the entire queue+LLM window — the
+    PR as BLOCKED ("check missing") for the entire queue+LLM window - the
     failure mode agents keep reading as "Grug Code Review never ran".
 
     Failures here MUST NOT fail the enqueue: the durable SQS job is the
@@ -1122,12 +1122,12 @@ def _hold_or_requeue_learn(
 
 def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     """Re-run ONE job. Raises on a malformed message or an infra fetch failure
-    (→ ESM retry → DLQ). Returns a short status for the batch summary log.
+    (-> ESM retry -> DLQ). Returns a short status for the batch summary log.
 
-    Keyed by `repo` ("owner/name") — what the Activity row (the trigger) carries
-    — NOT a repo_id; the repo_id (for the RepoConfig lookup) is derived from the
+    Keyed by `repo` ("owner/name") - what the Activity row (the trigger) carries
+    - NOT a repo_id; the repo_id (for the RepoConfig lookup) is derived from the
     PR's `base.repo.id` in the same fetch."""
-    job = json.loads(body)  # malformed → JSONDecodeError → retry → DLQ
+    job = json.loads(body)  # malformed -> JSONDecodeError -> retry -> DLQ
     install_id = int(job["install_id"])
     repo_full = str(job["repo"])  # "owner/name"
     pr_number = int(job["pr_number"])
@@ -1153,7 +1153,7 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     persona = str(job.get("persona", "elder"))
 
     if persona not in _RERUNNABLE:
-        # Not an infra failure — don't retry/DLQ a persona we don't drive yet.
+        # Not an infra failure - don't retry/DLQ a persona we don't drive yet.
         log.info(
             "rerun_unsupported_persona",
             extra={"persona": persona, "repo": repo_full, "pr": pr_number},
@@ -1168,7 +1168,7 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     if deferred:
         return deferred
     # Fetch the PR's CURRENT head (+ the repo id, for RepoConfig). A 5xx/
-    # RequestError raises → ESM retry → DLQ. with_install_token_retry refreshes
+    # RequestError raises -> ESM retry -> DLQ. with_install_token_retry refreshes
     # a stale token once.
     pr = with_install_token_retry(
         install_id,
@@ -1190,7 +1190,7 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     # Neither dispatch raises a wire exception: each fetches the diff, re-runs
     # its persona, publishes, and upserts the verdict (heal-in-place on an
     # unchanged head, append on a moved-on PR). A repeat outage degrades to a
-    # published `errored` row — the job still completed.
+    # published `errored` row - the job still completed.
     if persona in _GUARD:
         dispatch_guard_review(
             payload, blocking=bool(cfg.get("guard_blocking", False)),
@@ -2201,7 +2201,7 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
     """Consume `grug-rerun-jobs` SQS records (event-source mapping, batch 1).
 
     Unlike the cave result handler, a failed job is allowed to RAISE so the ESM
-    retries it (visibility timeout) → DLQ after `maxReceiveCount`. With batch
+    retries it (visibility timeout) -> DLQ after `maxReceiveCount`. With batch
     size 1 each invocation owns exactly one message, so a raise re-drives only
     that job. Returns a summary for the structured log on the success path."""
     records = event.get("Records", []) if isinstance(event, dict) else []

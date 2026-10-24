@@ -157,7 +157,7 @@ def adaptive_elder_settle_seconds(
     every intermediate head.
 
     When GitHub omits size stats (additions/deletions/changed_files all
-    zero/absent), keep ``base_seconds`` — never invent a "tiny" path from
+    zero/absent), keep ``base_seconds`` - never invent a "tiny" path from
     missing data.
     """
     base = max(0, int(base_seconds))
@@ -171,13 +171,13 @@ def adaptive_elder_settle_seconds(
     changed = max(0, changed)
     if changed == 0 and churn == 0:
         return base
-    # Swift Hunt: small, focused PR — start review immediately.
+    # Swift Hunt: small, focused PR - start review immediately.
     if changed <= 5 and churn <= 120:
         return 0
-    # Steady Hunt: medium PR — short settle only.
+    # Steady Hunt: medium PR - short settle only.
     if changed <= 12 and churn <= 400:
         return min(base, 3)
-    # Full Hunt: large / noisy PR — full quiet window.
+    # Full Hunt: large / noisy PR - full quiet window.
     return base
 
 
@@ -397,7 +397,7 @@ class ReviewClaimLease:
 
 
 # ---------------------------------------------------------------------------
-# Freshness (stale vs fresh) — base-insensitive identity check
+# Freshness (stale vs fresh) - base-insensitive identity check
 # ---------------------------------------------------------------------------
 
 _DIFF_FETCH_TIMEOUT = 15.0
@@ -649,7 +649,7 @@ def decide_redrive(
 ) -> RedriveDecision:
     """Pure decision: re-enqueue the stale snapshot, give up, or hold.
 
-    Unit-testable with no mocks at all — no SQS, no Postgres, no GitHub.
+    Unit-testable with no mocks at all - no SQS, no Postgres, no GitHub.
     A genuinely new commit (not same_sha) always redrives with a fresh
     count; AC3 is about looping on an UNCHANGED sha.
     """
@@ -689,7 +689,7 @@ def unregister_active_review_claim(token: str) -> None:
 def release_active_review_claims() -> int:
     """Release every still-registered review claim (graceful shutdown).
 
-    Best-effort per claim — one failed release must not stop the rest.
+    Best-effort per claim - one failed release must not stop the rest.
     Returns the number released."""
     with _ACTIVE_REVIEW_CLAIMS_LOCK:
         claims = list(_ACTIVE_REVIEW_CLAIMS.items())

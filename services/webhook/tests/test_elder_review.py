@@ -1,7 +1,7 @@
 """Elder durable-attempt lifecycle unit tests.
 
 Covers identity, eligibility, settle, claim lease, freshness, staleness
-watch, decide_redrive, and the active-claim registry — all without
+watch, decide_redrive, and the active-claim registry - all without
 mocking SQS or psycopg at depth.
 """
 
