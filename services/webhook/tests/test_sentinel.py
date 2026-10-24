@@ -519,6 +519,11 @@ def test_reply_scan_counts_configured_agent_bot_as_handled(monkeypatch):
 
     # The finding with the configured agent bot should be marked as handled
     assert sentinel._replied_to_comment_ids("tok", "owner", "repo", 5) == {1}
+    candidates = [
+        {"comment_id": 1, "severity": "high", "rule_name": "configured-bot"},
+        {"comment_id": 3, "severity": "high", "rule_name": "other-bot"},
+    ]
+    assert sentinel._abandoned_findings("tok", "owner", "repo", 5, candidates) == [candidates[1]]
 
 
 def test_reply_scan_excludes_unconfigured_bot_replies(monkeypatch):
