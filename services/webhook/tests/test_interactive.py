@@ -515,3 +515,57 @@ def test_resume_while_elder_runs_does_not_queue_a_second_review(monkeypatch):
     assert res["status"] == "no_op" and res["reason"] == "already_reviewing"
     assert enq == []
 
+
+# --- /grug fix (epic #1311, v1 autofix) -------------------------------------
+
+
+def test_fix_routes_to_fix_module(monkeypatch):
+    """`/grug fix` is routed to fix.run_fix with the right arguments."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    called = {}
+    import fix as fix_module
+
+    def fake_run_fix(*, install_id, owner, repo, pr_number, comment_id,
+                     head_sha, token_fn, **_k):
+        called.update(install_id=install_id, owner=owner, repo=repo,
+                      pr_number=pr_number, comment_id=comment_id,
+                      head_sha=head_sha)
+        return {"status": "dispatched", "verb": "fix"}
+
+    monkeypatch.setattr(fix_module, "run_fix", fake_run_fix)
+    res = interactive.run_command(
+        "fix", "", install_id=3, owner="o", repo="r", pr_number=9,
+        comment_id=11, token_fn=_tok, claim=lambda k: True, head_sha="a" * 40,
+    )
+    assert res == {"status": "dispatched", "verb": "fix"}
+    assert called == {
+        "install_id": 3, "owner": "o", "repo": "r",
+        "pr_number": 9, "comment_id": 11, "head_sha": "a" * 40,
+    }
+
+
+def test_fix_claims_before_running(monkeypatch):
+    """A redelivered /grug fix comment is not run twice (claim first)."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    claimed = []
+    import fix as fix_module
+
+    def fake_run_fix(*, install_id, owner, repo, pr_number, comment_id,
+                     head_sha, token_fn, **_k):
+        return {"status": "dispatched", "verb": "fix"}
+
+    monkeypatch.setattr(fix_module, "run_fix", fake_run_fix)
+    res = interactive.run_command(
+        "fix", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: claimed.append(k) or False,
+        head_sha="a" * 40,
+    )
+    assert res["status"] == "no_op" and "already handled" in res["reason"]
+    assert claimed == ["grugcmd:1"]
+
+
+def test_fix_is_not_an_elder_rerun_verb():
+    """fix must not be in ELDER_RERUN_VERBS - it is not budget-deferred."""
+    from grug_commands import ELDER_RERUN_VERBS
+    assert "fix" not in ELDER_RERUN_VERBS
+

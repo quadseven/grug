@@ -429,6 +429,16 @@ def run_command(
             defer_until=defer_until,
         )
 
+    if verb == "fix":
+        if not claim(f"grugcmd:{comment_id}"):
+            return {"status": "no_op", "reason": "comment already handled", "verb": "fix"}
+        from fix import run_fix  # type: ignore
+        return run_fix(
+            install_id=install_id, owner=owner, repo=repo,
+            pr_number=pr_number, comment_id=comment_id,
+            head_sha=head_sha, token_fn=token_fn, claim=claim,
+        )
+
     if verb == "ask":
         if not arg:
             try:

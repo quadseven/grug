@@ -120,6 +120,11 @@ class ObservedFinding:
     # gave none (a deterministic scanner).
     source: str = "llm"
     inline_comment_id: Optional[int] = None
+    # The model's suggested replacement for the anchored line, or None when
+    # the producer did not supply a fix hint. /grug fix reads this to apply
+    # unresolved findings as a single commit. Kept as None (not "") to
+    # preserve the empty-vs-absent distinction.
+    suggestion: str | None = None
 
     @property
     def finding_id(self) -> str:
@@ -157,6 +162,7 @@ class FindingRecord:
     superseded_by: str = ""
     inline_comment_ids: tuple[int, ...] = ()
     check_run_ids: tuple[int, ...] = ()
+    suggestion: str | None = None
 
 
 @dataclass(frozen=True)
@@ -546,6 +552,7 @@ def from_dict(data: Mapping[str, Any]) -> ReviewSession:
             superseded_by=str(d.get("superseded_by", "")),
             inline_comment_ids=tuple(int(x) for x in d.get("inline_comment_ids", [])),
             check_run_ids=tuple(int(x) for x in d.get("check_run_ids", [])),
+            suggestion=d.get("suggestion"),
         )
 
     def _run(d: Mapping[str, Any]) -> ReviewRun:
