@@ -1,7 +1,7 @@
 """Tests for the deletion-only review (#1401).
 
-Recorded shape (an infrastructure-repo revert): it deletes a workflow, the script it
-runs and the script's tests, 255 lines removed and none added. The parser
+Recorded shape: an infrastructure-repo revert deletes a workflow, the
+script it runs and the script's tests, 255 lines removed and none added. The parser
 skips `+++ /dev/null` blocks, so Elder had no hunks and answered "Grug eyes
 clouded (no_diff)" on both passes, which never satisfies a blocking gate.
 """

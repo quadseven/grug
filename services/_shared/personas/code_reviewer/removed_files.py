@@ -4,8 +4,9 @@
 new-side line to anchor a finding on. A pull request that only deletes
 files therefore had no hunks, and Elder answered "eyes clouded (no_diff)"
 on every pass. That neutral never satisfies a blocking gate, so every pure
-revert stayed blocked (observed on an infrastructure-repo revert: a workflow, its script and the script's
-tests, 255 lines removed and none added).
+revert stayed blocked. Observed on an infrastructure-repo revert that
+deleted a workflow, its script and the script's tests: 255 lines removed,
+none added.
 
 A deletion-only pull request now gets a verdict from one deterministic
 check: does any file at head still name a removed path? A workflow step
@@ -125,7 +126,10 @@ def find_referrer_candidates(
         try:
             resp = httpx.get(
                 "https://api.github.com/search/code",
-                params={"q": f'"{search_term(path)}" repo:{owner}/{repo}', "per_page": MAX_REFERRERS},
+                params={
+                    "q": f'"{search_term(path)}" repo:{owner}/{repo}',
+                    "per_page": MAX_REFERRERS,
+                },
                 headers={
                     "Authorization": f"Bearer {install_token}",
                     "Accept": "application/vnd.github+json",
