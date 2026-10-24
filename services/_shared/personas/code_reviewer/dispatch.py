@@ -131,6 +131,10 @@ from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_degradation,
     with_extra_findings, with_findings,
 )
+from personas.code_reviewer.removed_files import (
+    REMOVED_REFERENCE_CHECK_FAILED, find_referrer_candidates, removed_paths,
+    removed_reference_findings, scan_guarded_deletions,
+)
 from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
 from personas.code_reviewer.snapshot import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward, hunt_link, living_review
@@ -2487,6 +2491,74 @@ def _drop_non_correctness_findings(
     )
 
 
+def _review_deletion_only(
+    evaluation: CodeReviewEvaluation, diff_text: str,
+    parsed_hunks: tuple[DiffHunk, ...], *, installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str,
+) -> tuple[CodeReviewEvaluation, str]:
+    """A pull request that only deletes files gets a verdict, not no_diff (#1401).
+
+    `parse_diff` keeps no hunk for a deleted file, so a pure revert reached
+    the model with nothing and published a neutral "eyes clouded
+    (no_diff)" that never clears a blocking gate. When the diff deletes
+    files and has no other hunk, the verdict comes from the deterministic
+    checks in `removed_files`: a deleted guard path is a high finding with
+    no ticket downgrade (a linked issue can be the PR author's own), and a
+    file at head that still names a removed path is a finding too. A referrer check that cannot finish
+    degrades to `REMOVED_REFERENCE_CHECK_FAILED`, never a pass. Returns the
+    evaluation and a summary note; any other diff is returned unchanged
+    with no note."""
+    if evaluation.degraded_reason != "no_diff" or parsed_hunks:
+        return evaluation, ""
+    removed = removed_paths(diff_text)
+    if not removed:
+        return evaluation, ""
+    pr = f"{owner}/{repo_name}#{pull_number}"
+    guarded = scan_guarded_deletions(removed)
+    try:
+        referenced = removed_reference_findings(
+            removed,
+            search=lambda paths: with_install_token_retry(
+                installation_id,
+                lambda token: find_referrer_candidates(token, owner, repo_name, paths),
+            ),
+            fetch_at_head=lambda paths: with_install_token_retry(
+                installation_id,
+                lambda token: fetch_file_contents(token, owner, repo_name, paths, head_sha),
+            ),
+        )
+        degraded: str | None = None
+    except Exception as e:  # noqa: BLE001 - an unfinished check degrades, never passes
+        log.warning(
+            "code_review_removed_reference_check_failed",
+            extra={"pr": pr, "kind": type(e).__name__, "error": str(e)[:200]},
+        )
+        referenced, degraded = (), REMOVED_REFERENCE_CHECK_FAILED
+    findings = guarded + referenced
+    log.info(
+        "code_review_deletion_only",
+        extra={
+            "pr": pr, "removed": len(removed), "guarded": len(guarded),
+            "referenced": len(referenced), "degraded": degraded,
+        },
+    )
+    base = CodeReviewEvaluation(
+        findings=(), conclusion="neutral" if degraded else "success",
+        degraded_reason=degraded,
+    )
+    referrers = (
+        "could not finish checking whether any file at this head still names "
+        "them, so this is not a pass" if degraded
+        else "checked whether any file at this head still names them"
+    )
+    note = (
+        f"\n\nDeletion-only diff: {len(removed)} deleted file(s). Grug "
+        f"checked them for removed guards and {referrers}."
+        + (" See the markings above." if findings else "")
+    )
+    return with_extra_findings(base, findings), note
+
+
 def _merge_lane_work(
     evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
     diff_text: str, file_contents: dict[str, str],
@@ -3349,6 +3421,12 @@ def dispatch_code_review(
             },
         )
 
+    evaluation, deletion_note = _review_deletion_only(
+        evaluation, diff_text, parsed_hunks,
+        installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pull_number=pull_number, head_sha=head_sha,
+    )
+
     # Deterministic lane-work checks (#1179, #1363): a new function nothing
     # calls, linked criteria no hunk can satisfy, a file mostly deleted that
     # nobody named. They judge the WHOLE pull request on every pass (#1343).
@@ -3418,6 +3496,7 @@ def dispatch_code_review(
         )
     summary += _analyzer_skip_note(analyzer_skips)
     summary += config_note
+    summary += deletion_note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
     )

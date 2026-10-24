@@ -48,6 +48,7 @@ from personas.code_reviewer.dispatch import (
     RETRIED_DEGRADATIONS,
     dispatch_code_review,
 )
+from personas.code_reviewer.removed_files import REMOVED_REFERENCE_CHECK_FAILED
 from personas.review_publish import LOW_CONFIDENCE
 from personas.code_reviewer.living_review import sync_pr as _sync_living_review
 from personas.code_reviewer.degraded_gate import (
@@ -166,12 +167,16 @@ _RETRYABLE_SKIP_REASONS = RETRIED_DEGRADATIONS
 #
 # LOW_CONFIDENCE (grug#1097) publishes its own advisory check the same way a
 # partial review does.
+#
+# REMOVED_REFERENCE_CHECK_FAILED (grug#1401) publishes its own degraded check
+# for a deletion-only diff, naming the guard findings it did make.
 _SELF_COMPLETING_SKIP_REASONS = frozenset({
     "no_diff",
     "fail_open_freshness",
     "partial_review",
     LOW_CONFIDENCE,
     DIFF_TOO_LARGE,
+    REMOVED_REFERENCE_CHECK_FAILED,
 })
 
 
