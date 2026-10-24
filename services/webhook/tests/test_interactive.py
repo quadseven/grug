@@ -525,11 +525,10 @@ def test_fix_routes_to_fix_module(monkeypatch):
     called = {}
     import fix as fix_module
 
-    def fake_run_fix(*, install_id, owner, repo, pr_number, comment_id,
+    def fake_run_fix(*, install_id, owner, repo, pr_number,
                      head_sha, token_fn, **_k):
         called.update(install_id=install_id, owner=owner, repo=repo,
-                      pr_number=pr_number, comment_id=comment_id,
-                      head_sha=head_sha)
+                      pr_number=pr_number, head_sha=head_sha)
         return {"status": "dispatched", "verb": "fix"}
 
     monkeypatch.setattr(fix_module, "run_fix", fake_run_fix)
@@ -540,7 +539,7 @@ def test_fix_routes_to_fix_module(monkeypatch):
     assert res == {"status": "dispatched", "verb": "fix"}
     assert called == {
         "install_id": 3, "owner": "o", "repo": "r",
-        "pr_number": 9, "comment_id": 11, "head_sha": "a" * 40,
+        "pr_number": 9, "head_sha": "a" * 40,
     }
 
 

@@ -90,18 +90,10 @@ def _run_fix(**overrides):
     """Helper that always injects a claim so the store is not touched."""
     kwargs = dict(
         install_id=1, owner="o", repo="r", pr_number=2,
-        comment_id=5, head_sha="a" * 40, token_fn=lambda fn: fn("tok"),
-        claim=lambda k: True,
+        head_sha="a" * 40, token_fn=lambda fn: fn("tok"),
     )
     kwargs.update(overrides)
     return fix.run_fix(**kwargs)
-
-
-def test_run_fix_claims_comment_then_no_ops_when_already_handled():
-    claimed = []
-    res = _run_fix(claim=lambda k: claimed.append(k) or False)
-    assert res["status"] == "no_op" and "already handled" in res["reason"]
-    assert claimed == ["grugcmd:5"]
 
 
 def test_run_fix_no_session_skips_and_replies():
@@ -156,7 +148,7 @@ def test_run_fix_applies_one_commit_and_reports():
     assert res["applied"][0]["path"] == "a.py"
     assert res["applied"][0]["line"] == 1
     assert res["skipped"] == []
-    assert committed["changes"] == {"a.py": "x = 2\ny = 2"}
+    assert committed["changes"] == {"a.py": "x = 2\ny = 2\n"}
     assert "Apply grug autofix suggestions" in committed["message"]
     assert committed["head_sha"] == "a" * 40
     body = posted[0]
@@ -217,10 +209,24 @@ def test_run_fix_mixed_applied_and_skipped():
     assert res["status"] == "dispatched"
     assert len(res["applied"]) == 1 and res["applied"][0]["path"] == "a.py"
     assert len(res["skipped"]) == 1 and res["skipped"][0]["path"] == "b.py"
-    assert committed["changes"] == {"a.py": "x = 2"}
+    assert committed["changes"] == {"a.py": "x = 2\n"}
     body = posted[0]
     assert "`a.py:1` [rule-a]" in body
     assert "`b.py:3` [rule-b]" in body
+
+
+def test_run_fix_preserves_multiple_fixes_in_same_file():
+    first = _make_finding_record(path="a.py", line=1, suggestion="x = 2", rule="r1")
+    second = _make_finding_record(path="a.py", line=2, suggestion="y = 3", rule="r2")
+    committed = {}
+    res = _run_fix(
+        get_session=lambda *_: _FakeSession([first, second]),
+        fetch_file=lambda *args: "x = 1\ny = 2\nz = 4\n",
+        apply_commit=lambda *args: committed.setdefault("changes", args[4]) or "newhead",
+        post_reply=lambda body: True,
+    )
+    assert res["status"] == "dispatched"
+    assert committed["changes"] == {"a.py": "x = 2\ny = 3\nz = 4\n"}
 
 
 def test_run_fix_file_fetch_failure_is_skipped():

@@ -435,8 +435,8 @@ def run_command(
         from fix import run_fix  # type: ignore
         return run_fix(
             install_id=install_id, owner=owner, repo=repo,
-            pr_number=pr_number, comment_id=comment_id,
-            head_sha=head_sha, token_fn=token_fn, claim=claim,
+            pr_number=pr_number,
+            head_sha=head_sha, token_fn=token_fn,
         )
 
     if verb == "ask":

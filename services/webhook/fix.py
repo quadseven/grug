@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable, Mapping
 from typing import Any
 
 from personas.code_reviewer.suggestion import checked_suggestion
@@ -64,7 +63,6 @@ def _default_post_reply(
     token_fn, owner: str, repo: str, pr_number: int, body: str,
 ) -> bool:
     import httpx  # type: ignore
-    from urllib.parse import quote as _q
 
     try:
         token_fn(lambda t: httpx.post(
@@ -99,17 +97,22 @@ def _default_fetch_file(
     from urllib.parse import quote as _q
 
     try:
-        return token_fn(lambda t: httpx.get(
-            f"{_API}/repos/{_q(owner, safe='')}/{_q(repo, safe='')}"
-            f"/contents/{_q(path, safe='/')}",
-            params={"ref": ref},
-            headers={
-                "Authorization": f"Bearer {t}",
-                "Accept": "application/vnd.github.raw",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-            timeout=_TIMEOUT,
-        ).text)
+        def _fetch(token: str) -> str:
+            response = httpx.get(
+                f"{_API}/repos/{_q(owner, safe='')}/{_q(repo, safe='')}"
+                f"/contents/{_q(path, safe='/')}",
+                params={"ref": ref},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github.raw",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=_TIMEOUT,
+            )
+            response.raise_for_status()
+            return response.text
+
+        return token_fn(_fetch)
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.info("fix_file_fetch_skipped", extra={"path": path, "kind": type(e).__name__})
         return None
@@ -124,13 +127,11 @@ def _default_apply_commit(
     Returns the new head SHA, or None when the commit could not be created.
     Uses the GitHub Git Data API: blobs -> tree -> commit -> update ref.
     """
-    import base64
     import httpx  # type: ignore
-    from urllib.parse import quote as _q
 
     def _req(token: str, method: str, url: str, json: Any = None) -> httpx.Response:
         h = {
-            "Authorization": f"token {t}",
+            "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
@@ -154,7 +155,9 @@ def _do_commit(
     changes: dict[str, str], message: str, pr_number: int, _req,
 ) -> str:
     """Actual GitHub Git Data API sequence. Raises on failure."""
-    base_url = f"{_API}/repos/{owner}/{repo}"
+    import base64
+    from urllib.parse import quote
+    base_url = f"{_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
 
     # Learn the PR's head branch name so we can update the ref.
     pr_resp = _req(token, "GET", f"{base_url}/pulls/{int(pr_number)}")
@@ -200,7 +203,7 @@ def _do_commit(
     # Update the branch ref to the new commit.
     ref_resp = _req(
         token, "PATCH",
-        f"{base_url}/git/ref/heads/{_q(head_ref, safe='')}",
+        f"{base_url}/git/ref/heads/{quote(head_ref, safe='')}",
         json={"sha": new_commit_sha, "force": False},
     )
     ref_resp.raise_for_status()
@@ -213,15 +216,13 @@ def run_fix(
     owner: str,
     repo: str,
     pr_number: int,
-    comment_id: int,
     head_sha: str,
     token_fn,
     get_session=None,
     fetch_file=None,
     apply_commit=None,
     post_reply=None,
-    claim=None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Apply all unresolved committable suggestions as one bot commit.
 
     Returns a status dict. On success the commit is pushed and a reply is
@@ -229,56 +230,63 @@ def run_fix(
     """
     out = {"verb": "fix"}
 
-    if claim is None:
-        from adapters.pg_install_store import claim_delivery  # type: ignore
-        claim = claim_delivery
-    if not claim(f"grugcmd:{comment_id}"):
-        return {**out, "status": "no_op", "reason": "comment already handled"}
-
     if get_session is None:
         get_session = _default_get_session
     if fetch_file is None:
         fetch_file = _default_fetch_file
     if apply_commit is None:
         apply_commit = _default_apply_commit
-    if post_reply is None:
-        post_reply = _default_post_reply
+    reply = post_reply or (
+        lambda body: _default_post_reply(
+            token_fn, owner, repo, pr_number, body,
+        )
+    )
 
     session = get_session(install_id, repo, pr_number)
     if not session:
-        say = post_reply or _default_post_reply
-        say("Grug found no review session for this PR, so there is nothing to fix.")
+        reply("Grug found no review session for this PR, so there is nothing to fix.")
         return {**out, "status": "skip", "reason": "no_review_session"}
 
     candidates = _open_committable_findings(session)
     if not candidates:
-        say = post_reply or _default_post_reply
-        say("Grug found no unresolved committable suggestions on this PR.")
+        reply("Grug found no unresolved committable suggestions on this PR.")
         return {**out, "status": "no_op", "reason": "no_committable_findings"}
 
     # Verify each suggestion still applies against the current head.
     applied: list[FindingRecord] = []
     skipped: list[tuple[FindingRecord, str]] = []
-    changes: dict[str, str] = {}
+    file_lines: dict[str, list[str]] = {}
+    trailing_newline: dict[str, bool] = {}
+    patched_lines: set[tuple[str, int]] = set()
 
     for rec in candidates:
         file_text = fetch_file(token_fn, owner, repo, rec.path, head_sha)
         if file_text is None:
             skipped.append((rec, "could not read the file at this head"))
             continue
+        file_lines.setdefault(rec.path, file_text.splitlines())
+        trailing_newline[rec.path] = file_text.endswith("\n")
         replacement = _fix_still_applies(rec, file_text)
         if replacement is None:
             skipped.append((rec, "suggestion no longer applies cleanly"))
             continue
-        lines = file_text.splitlines()
-        lines[rec.line - 1] = replacement
-        changes[rec.path] = "\n".join(lines)
+        location = (rec.path, rec.line)
+        if location in patched_lines:
+            skipped.append((rec, "another suggestion targets the same line"))
+            continue
+        file_lines[rec.path][rec.line - 1] = replacement
+        patched_lines.add(location)
         applied.append(rec)
 
+    changes = {
+        path: "\n".join(lines) + ("\n" if trailing_newline[path] else "")
+        for path, lines in file_lines.items()
+        if any(f.path == path for f in applied)
+    }
+
     if not changes:
-        say = post_reply or _default_post_reply
         body = _build_reply(applied, skipped)
-        say(body)
+        reply(body)
         return {**out, "status": "no_op", "reason": "nothing_applies",
                 "applied": [],
                 "skipped": [
@@ -293,11 +301,10 @@ def run_fix(
         pr_number,
     )
     if new_head is None:
-        say = post_reply or _default_post_reply
         body = _build_reply(
             [], [(c, "commit could not be created") for c in candidates],
         )
-        say(body)
+        reply(body)
         return {**out, "status": "skip", "reason": "commit_failed",
                 "applied": [], "skipped": [
                     {"path": c.path, "line": c.line, "rule": c.rule,
@@ -305,14 +312,13 @@ def run_fix(
                     for c in candidates],
                 }
 
-    say = post_reply or _default_post_reply
     body = _build_reply(applied, skipped)
-    say(body)
+    reply(body)
     return {
         **out, "status": "dispatched",
         "applied": [{"path": f.path, "line": f.line, "rule": f.rule} for f in applied],
         "skipped": [{"path": f.path, "line": f.line, "rule": f.rule, "reason": reason} for f, reason in skipped],
-    }
+}
 
 
 def _build_reply(

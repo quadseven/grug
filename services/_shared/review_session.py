@@ -357,6 +357,7 @@ def _reconcile(
                 category=seen.category,
                 confidence=seen.confidence,
                 evidence=seen.evidence,
+                suggestion=seen.suggestion,
                 last_seen_sha=sha,
                 inline_comment_ids=_add(rec.inline_comment_ids, seen.inline_comment_id),
                 check_run_ids=_add(rec.check_run_ids, check_run_id),
@@ -408,6 +409,7 @@ def _reconcile(
             history=(StateChange("open", sha, at, "first raised"),),
             inline_comment_ids=_add((), f.inline_comment_id),
             check_run_ids=_add((), check_run_id),
+            suggestion=f.suggestion,
         ))
     return tuple(out)
 
