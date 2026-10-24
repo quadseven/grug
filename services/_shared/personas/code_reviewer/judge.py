@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from llm_client import (
@@ -411,37 +411,78 @@ def run_judge(
 _REFUTE_CONFIDENCE_FLOOR = 0.9
 
 
+@dataclass(frozen=True)
+class RefuteOutcome:
+    """The refute gate's answer (#714, #1400). `verdicts` index into the
+    findings the gate was asked about. `unavailable` holds the indices whose
+    batch got no answer from any backend (every backend errored, timed out,
+    or answered unparseably). A finding a backend answered for but whose
+    index is missing from the answer is NOT unavailable."""
+
+    verdicts: tuple[FindingJudgement, ...]
+    unavailable: frozenset[int]
+
+
+def refute_with_outcome(
+    findings: tuple[Finding, ...],
+    evidence: ElderEvidence,
+    installation_id: int,
+) -> RefuteOutcome:
+    """Adversarial evidence-check (#714) for the HIGH/CRITICAL findings
+    that survived the deterministic verification pass. One refute-framed
+    judge call per batch of `JUDGE_BATCH_SIZE` (the burden inverts: the
+    adjudicator must ground the claim in quoted code or refute it); the
+    semantic-misreading class - two same-day production instances (grug PR
+    #710, a private repo) - passed the plausibility judge because nothing
+    forced a line-level check of the claim itself. Every finding is refuted:
+    there is no cap, so a finding never lacks a verdict just for being
+    late in the list. Fail-open per batch: a batch no backend answered is
+    recorded in `unavailable` and grades nothing. Callers pass ONLY the
+    high/critical subset (cost bound: typically 0-2 findings)."""
+    verdicts: list[FindingJudgement] = []
+    unavailable: set[int] = set()
+    for start in range(0, len(findings), JUDGE_BATCH_SIZE):
+        reprs = [
+            _finding_to_repr(f) for f in findings[start:start + JUDGE_BATCH_SIZE]
+        ]
+        try:
+            answered = _judge_evidence_packet(
+                reprs,
+                _batch_evidence(reprs, evidence),
+                installation_id=installation_id,
+                refute=True,
+            )
+        except Exception as e:  # noqa: BLE001 - fail-open, mirror grade_findings
+            log.error(
+                "refute_gate_failed",
+                extra={"kind": type(e).__name__, "count": len(reprs)},
+                exc_info=True,
+            )
+            answered = ()
+        if not answered:
+            unavailable.update(range(start, start + len(reprs)))
+            log.warning(
+                "refute_gate_unavailable",
+                extra={"batch_start": start, "count": len(reprs)},
+            )
+            continue
+        verdicts.extend(
+            replace(v, finding_index=v.finding_index + start)
+            for v in answered
+            if 0 <= v.finding_index < len(reprs)
+        )
+    return RefuteOutcome(tuple(verdicts), frozenset(unavailable))
+
+
 def refute_findings(
     findings: tuple[Finding, ...],
     evidence: ElderEvidence,
     installation_id: int,
 ) -> tuple[FindingJudgement, ...]:
-    """Adversarial evidence-check (#714) for the HIGH/CRITICAL findings
-    that survived the deterministic verification pass. One refute-framed
-    judge call (the burden inverts: the adjudicator must ground the claim
-    in quoted code or refute it); the semantic-misreading class - two
-    same-day production instances (grug PR #710, a private repo) -
-    passed the plausibility judge because nothing forced a line-level
-    check of the claim itself. Fail-OPEN like grade_findings: any error
-    returns () and everything publishes. Callers pass ONLY the
-    high/critical subset (cost bound: typically 0-2 findings)."""
+    """The refute gate's verdicts alone; see `refute_with_outcome`."""
     if not findings:
         return ()
-    reprs = [_finding_to_repr(f) for f in findings[:JUDGE_BATCH_SIZE]]
-    try:
-        return _judge_evidence_packet(
-            reprs,
-            _batch_evidence(reprs, evidence),
-            installation_id=installation_id,
-            refute=True,
-        )
-    except Exception as e:  # noqa: BLE001 - fail-open, mirror grade_findings
-        log.error(
-            "refute_gate_failed",
-            extra={"kind": type(e).__name__, "count": len(reprs)},
-            exc_info=True,
-        )
-        return ()
+    return refute_with_outcome(findings, evidence, installation_id).verdicts
 
 
 def partition_refuted(
@@ -467,3 +508,60 @@ def partition_refuted(
         else:
             kept.append(f)
     return tuple(kept), tuple(refuted)
+
+
+# Severity an unrefuted HIGH drops to when the plain judge called it not real
+# (#1400): medium still posts inline but never blocks a merge.
+_ADVISORY_SEVERITY: Severity = "medium"
+
+_ADVISORY_NOTE = (
+    " [Downgraded to advisory: the refute gate was unavailable and the plain "
+    "judge rated this not real (confidence {confidence:.2f}). Not blocking; "
+    "confirm by hand.]"
+)
+
+
+def _finding_identity(f: Finding) -> tuple[str, int, str, str]:
+    return (f.file, f.line, f.rule_name, f.message)
+
+
+def advisory_when_unrefuted(
+    findings: tuple[Finding, ...],
+    unavailable: frozenset[int],
+    *,
+    plain_findings: tuple[Finding, ...],
+    plain_verdicts: tuple[FindingJudgement, ...],
+    confidence_floor: float = _REFUTE_CONFIDENCE_FLOOR,
+) -> tuple[tuple[Finding, ...], tuple[tuple[Finding, FindingJudgement], ...]]:
+    """Soften the refute gate's fail-open (#1400). Returns (findings,
+    downgraded) where `downgraded` pairs each original finding with the
+    plain verdict that softened it.
+
+    `findings` is the list the refute gate was asked about, and
+    `unavailable` the indices no refute backend answered for (see
+    `RefuteOutcome`). Only a HIGH finding in `unavailable` whose plain judge
+    verdict (`plain_verdicts`, indexed into `plain_findings`) is not-real at
+    `confidence_floor` or above becomes an advisory medium carrying a
+    marker note. It still publishes: nothing is hidden. A critical always
+    keeps blocking, and so does any finding the refute gate answered for.
+    Pure - no IO."""
+    plain: dict[tuple[str, int, str, str], FindingJudgement] = {}
+    for v in plain_verdicts:
+        if 0 <= v.finding_index < len(plain_findings):
+            plain.setdefault(_finding_identity(plain_findings[v.finding_index]), v)
+    out: list[Finding] = []
+    downgraded: list[tuple[Finding, FindingJudgement]] = []
+    for i, f in enumerate(findings):
+        v = plain.get(_finding_identity(f)) if i in unavailable else None
+        if (
+            v is None
+            or v.is_real_bug
+            or v.confidence < confidence_floor
+            or f.severity != "high"
+        ):
+            out.append(f)
+            continue
+        note = _ADVISORY_NOTE.format(confidence=v.confidence)
+        out.append(replace(f, severity=_ADVISORY_SEVERITY, message=f.message + note))
+        downgraded.append((f, v))
+    return tuple(out), tuple(downgraded)
