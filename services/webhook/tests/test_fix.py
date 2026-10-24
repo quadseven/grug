@@ -255,11 +255,12 @@ def test_run_fix_file_fetch_failure_is_skipped():
 
 
 def test_run_fix_commit_failure_reports_all_skipped():
-    rec = _make_finding_record(path="a.py", line=1, suggestion="x = 2")
-    session = _FakeSession([rec])
+    rejected = _make_finding_record(path="a.py", line=1, suggestion="x = 2")
+    valid = _make_finding_record(path="b.py", line=1, suggestion="y = 2")
+    session = _FakeSession([rejected, valid])
 
     def fetch(token_fn, owner, repo, path, ref):
-        return "x = 1\n"
+        return "x = 2\n" if path == "a.py" else "y = 1\n"
 
     def apply(token_fn, owner, repo, head_sha, changes, message, pr_number):
         return None  # commit failed
@@ -272,9 +273,14 @@ def test_run_fix_commit_failure_reports_all_skipped():
         post_reply=lambda b: posted.append(b) or True,
     )
     assert res["status"] == "skip" and res["reason"] == "commit_failed"
-    assert len(res["skipped"]) == 1  # the candidate is reported as skipped
+    assert len(res["applied"]) == 0
+    assert len(res["skipped"]) == 2
+    assert res["skipped"][0]["reason"] == "suggestion no longer applies cleanly"
+    assert res["skipped"][1]["reason"] == "commit could not be created"
     body = posted[0]
     assert "Applied: (none)" in body
+    assert "suggestion no longer applies cleanly" in body
+    assert "commit could not be created" in body
 
 
 class _FakeHttp:

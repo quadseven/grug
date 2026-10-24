@@ -288,15 +288,17 @@ def _commit_and_report(
         f"Apply grug autofix suggestions on PR #{pr_number}", pr_number,
     )
     if new_head is None:
-        failed = [(candidate, "commit could not be created") for candidate in candidates]
+        failed = skipped + [
+            (finding, "commit could not be created") for finding in applied
+        ]
         reply(_build_reply([], failed))
         return {
             "verb": "fix", "status": "skip", "reason": "commit_failed",
             "applied": [],
             "skipped": [
                 {"path": f.path, "line": f.line, "rule": f.rule,
-                 "reason": "commit could not be created"}
-                for f in candidates
+                 "reason": reason}
+                for f, reason in failed
             ],
         }
 
