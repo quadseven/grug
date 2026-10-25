@@ -140,13 +140,16 @@ def test_no_filter_covers_everything():
 def test_the_scanned_file_floor_is_reachable():
     # The lint step fails when the linter reports fewer files than the floor,
     # so a glob that stops matching cannot read clean. The floor must not
-    # exceed what the pinned linter counts (workflows plus .sh), or the gate
-    # can never pass; the message must quote the same number.
+    # exceed what the pinned linter counts (workflows plus .sh plus composite
+    # action.yml), or the gate can never pass; the message must quote the same
+    # number.
     text = _WORKFLOW.read_text()
     floors = {int(n) for n in re.findall(r'-lt (\d+) \]', text)}
     quoted = {int(n) for n in re.findall(r"expected at least (\d+) ", text)}
     assert len(floors) == 1 and floors == quoted, (floors, quoted)
-    counted = len(list((_ROOT / ".github" / "workflows").glob("*.yml"))) + len(
-        list((_ROOT / ".github").rglob("*.sh"))
+    counted = (
+        len(list((_ROOT / ".github" / "workflows").glob("*.yml")))
+        + len(list((_ROOT / ".github").rglob("*.sh")))
+        + len(list((_ROOT / ".github" / "actions").rglob("action.yml")))
     )
     assert floors.pop() <= counted

@@ -22,7 +22,15 @@ PR's head. The acceptance is stored against that head, so a new head finds
 no acceptance and the finding comes back. Each comment is claimed before
 anything is recorded, so a redelivered comment records nothing. Accepting a
 path clears only that path's `removed-guarded-path` finding.
-Elder then re-reviews, so the check updates without another step.
+Elder then re-reviews, so the check updates without another step. That
+re-review is the one `/grug improve` queues: same persona, and the same
+`grug:reviewing` sign while it runs.
+
+Every refusal is answered once on the PR with the reason and what would
+work, so a command is never silently dropped. The one exception is a
+comment from a Bot, an App or an unconfirmed author: those get no reply, so
+two bots can never answer each other in a loop. The reply is claimed per
+comment, so a redelivery cannot post it twice.
 """
 
 from __future__ import annotations
@@ -97,6 +105,88 @@ def may_accept(association: str, permission: str) -> bool:
     return association == "OWNER" or permission == "admin"
 
 
+def refusal_reply(reason: str, association: str = "", permission: str = "") -> str:
+    """What to tell a commenter whose command was refused, and what would
+    work. Empty when the commenter gets no reply (a Bot, an App or an
+    unconfirmed author: replying to those could start a loop)."""
+    how = (
+        "Ask a repo admin to comment `/grug accept-removal <path> <head-sha>` "
+        "(Elder's finding prints the exact command)."
+    )
+    if reason == "not_admin":
+        return (
+            "Only a repo admin can accept a removal; your permission here is "
+            f"{permission or 'unknown'}. Grug recorded nothing. " + how
+        )
+    if reason == "association":
+        return (
+            "Only a repo admin can accept a removal; this comment's author is "
+            f"{(association or 'not a member of this repo').lower()} here. "
+            "Grug recorded nothing. " + how
+        )
+    if reason == "perm_lookup_failed":
+        return (
+            "Grug could not check this commenter's permission just now, so it "
+            "recorded nothing. Post the command again in a new comment."
+        )
+    return ""
+
+
+def refuse_removal(
+    reason: str, *, owner: str, repo: str, pr_number: int, comment_id: int,
+    token_fn, association: str = "", permission: str = "",
+    claim: Callable[[str], bool] | None = None,
+    reply: Callable[[str], bool] | None = None,
+) -> bool:
+    """Answer a refused command once. The comment is claimed first, so a
+    redelivered comment is not answered twice. True when a reply was posted."""
+    body = refusal_reply(reason, association, permission)
+    if not body or not isinstance(comment_id, int):
+        return False
+    if claim is None:
+        from adapters.pg_install_store import claim_delivery  # type: ignore
+        claim = claim_delivery
+    try:
+        if not claim(f"grugcmd:{comment_id}"):
+            return False
+        if reply is None:
+            from interactive import _reply  # type: ignore
+            return _reply(token_fn, owner, repo, pr_number, body)
+        return bool(reply(body))
+    except Exception as e:  # noqa: BLE001 - the refusal stands; the answer is best-effort
+        log.warning("accept_removal_refusal_reply_failed", extra={"kind": type(e).__name__})
+        return False
+
+
+def flagged_removals(token_fn, owner: str, repo: str, pr_number: int) -> set[str] | None:
+    """The deleted paths Elder flags as `removed-guarded-path` on this PR's
+    current diff, or None when the diff cannot be read (the caller then
+    records nothing)."""
+    import httpx  # type: ignore
+    from urllib.parse import quote
+    from personas.code_reviewer.removed_files import (  # type: ignore
+        removed_paths, scan_guarded_deletions,
+    )
+
+    def _fetch(token: str) -> str:
+        r = httpx.get(
+            f"https://api.github.com/repos/{quote(owner, safe='')}/"
+            f"{quote(repo, safe='')}/pulls/{int(pr_number)}",
+            headers={"Authorization": f"token {token}",
+                     "Accept": "application/vnd.github.v3.diff"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.text
+
+    try:
+        diff = token_fn(_fetch)
+        return {f.file for f in scan_guarded_deletions(removed_paths(diff))}
+    except Exception as e:  # noqa: BLE001 - an unread diff accepts nothing
+        log.warning("accept_removal_flagged_unreadable", extra={"kind": type(e).__name__})
+        return None
+
+
 def acceptor_from_payload(payload: dict[str, Any]) -> tuple[str, str]:
     """(login, "") when the comment's author may accept a removal, else
     ("", reason). Reads only the payload's comment and sender fields."""
@@ -124,6 +214,8 @@ def run_accept_removal(
     enqueue: Callable[..., None] | None = None,
     claim: Callable[[str], bool] | None = None,
     reply: Callable[[str], bool] | None = None,
+    flagged: Callable[[], set[str] | None] | None = None,
+    mark_reviewing: Callable[[], object] | None = None,
 ) -> dict[str, str]:
     """Claim the comment, check the named head, record the acceptance on
     it, then re-run Elder.
@@ -161,6 +253,9 @@ def run_accept_removal(
     do_record: Callable[..., None] = record
     do_enqueue: Callable[..., None] = enqueue
     do_claim: Callable[[str], bool] = claim
+    if flagged is None:
+        def flagged() -> set[str] | None:
+            return flagged_removals(token_fn, owner, repo, pr_number)
 
     if not do_claim(f"grugcmd:{comment_id}"):
         return {**out, "status": "no_op", "reason": "comment already handled"}
@@ -176,6 +271,19 @@ def run_accept_removal(
             "recorded nothing. Review the new head, then comment "
             f"`{accept_command(path, head_sha)}`.")
         return {**out, "status": "no_op", "reason": "head does not match"}
+    # Only a path Elder flags on this head can be accepted: a typo or a
+    # path from another PR would otherwise "succeed" and clear nothing.
+    names = flagged()
+    if names is None:
+        say("Grug could not read this PR's deletions to check that path, so it "
+            "recorded nothing. Post the command again in a new comment.")
+        return {**out, "status": "skip", "reason": "flagged_unreadable"}
+    if path not in names:
+        say(f"`{path}` is not a deleted guard that Elder flags on `{head_sha[:12]}`, "
+            "so Grug recorded nothing. "
+            + (("Flagged paths: " + ", ".join(f"`{n}`" for n in sorted(names)) + ".")
+               if names else "Elder flags no deleted guard on this head."))
+        return {**out, "status": "no_op", "reason": "path not flagged"}
     try:
         do_record(
             install_id=install_id, repo=repo_full, pr_number=pr_number,
@@ -197,6 +305,16 @@ def run_accept_removal(
             f"`{head_sha[:8]}`, but could not queue Elder. Comment `/grug "
             "improve` to re-review.")
         return {**out, "status": "skip", "reason": "enqueue_failed"}
+    # The same sign `/grug improve` raises while Elder re-reviews.
+    if mark_reviewing is None:
+        def mark_reviewing() -> object:
+            from interactive import _mark_reviewing  # type: ignore
+            return _mark_reviewing(token_fn=token_fn, owner=owner, repo=repo,
+                                   pr_number=pr_number)
+    try:
+        mark_reviewing()
+    except Exception as e:  # noqa: BLE001 - the sign is cosmetic; the check is the truth
+        log.warning("accept_removal_label_failed", extra={**coords, "kind": type(e).__name__})
     say(f"Grug recorded `{actor}` accepting the removal of `{path}` on "
         f"`{head_sha[:8]}`. Elder is re-reviewing this PR. A new push needs "
         "a new acceptance. So speaks Grug.")
