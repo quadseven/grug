@@ -379,6 +379,39 @@ def test_elder_lease_lifecycle_against_real_store(pg):
     assert release_active_review_claims() == 0
 
 
+def test_elder_stale_redrive_and_fallback_transitions_against_real_store(pg):
+    """The remaining terminal transitions over real Postgres: a stale snapshot
+    is released and redriven per decide_redrive, and COMPLETE_OR_RELEASE
+    completes an owned claim."""
+    from personas.code_reviewer.elder_review import (
+        ReviewClaimLease,
+        Transition,
+        decide_redrive,
+    )
+
+    claim = dict(
+        install_id=7,
+        repo="quadseven/grug",
+        pr_number=14,
+        persona="code_reviewer",
+        head_sha="snapshot-elder-stale",
+    )
+    status, lease = ReviewClaimLease.acquire(claim)
+    assert status == "acquired" and lease is not None
+    # Stale snapshot: hand the claim back, then the pure policy re-enqueues.
+    lease.settle(Transition.RELEASE, "stale")
+    lease.close()
+    decision = decide_redrive(same_sha=True, job_redrive_count=0)
+    assert decision.action == "redrive" and decision.next_redrive_count == 1
+
+    # The redriven attempt takes the released snapshot and finishes it.
+    status, lease = ReviewClaimLease.acquire(claim)
+    assert status == "acquired" and lease is not None
+    lease.settle(Transition.COMPLETE_OR_RELEASE, "test")
+    lease.close()
+    assert ReviewClaimLease.acquire(claim) == ("completed", None)
+
+
 def test_elder_shutdown_sweep_releases_real_claim(pg):
     """A claim whose handler never ran its exit is freed by the sweep."""
     from personas.code_reviewer.elder_review import (
