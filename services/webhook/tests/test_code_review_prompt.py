@@ -377,3 +377,39 @@ def test_intent_mismatch_rule_contract():
         prompt = crp.build_system_prompt(variant)
         assert "intent-mismatch" in prompt
         assert rule.description in prompt, f"variant {variant} lost the rule text"
+
+
+def test_stale_reverse_check_intermediary_rule_contract():
+    """#1421: Elder flags a reverse check built from a stale intermediary.
+    Pin the rule contract: correctness-class rule at high severity whose
+    description explicitly mandates naming the concrete stale entry that
+    would pass, rendering verbatim into BOTH prompt variants."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "stale-reverse-check-intermediary"),
+        None,
+    )
+    assert rule is not None, "stale-reverse-check-intermediary missing from RULES"
+    assert rule.severity == "high"
+    assert rule.bug_class == "correctness"
+    for variant in ("v1", "v2"):
+        prompt = crp.build_system_prompt(variant)
+        assert "stale-reverse-check-intermediary" in prompt
+        assert rule.description in prompt, f"variant {variant} lost the rule text"
+
+
+def test_stale_reverse_check_intermediary_rule_requires_concrete_stale_entry():
+    """#1421 AC: the rule description in the prompt mandates that every
+    finding emitted under this rule MUST name the concrete stale entry that
+    would pass, forbidding emission otherwise."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "stale-reverse-check-intermediary"),
+        None,
+    )
+    assert rule is not None
+    assert "concrete stale entry" in rule.description
+    assert "MUST name the concrete stale entry that would pass" in rule.description
+    assert "If you cannot name a concrete stale entry that would pass, do not emit the finding" in rule.description
+    for variant in ("v1", "v2"):
+        prompt = crp.build_system_prompt(variant)
+        assert "MUST name the concrete stale entry that would pass" in prompt
+
