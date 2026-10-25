@@ -337,6 +337,39 @@ def _elder_check_already_terminal_or_pending(
 
 
 
+def _has_terminal_elder_check_run(
+    install_id: int, owner: str, repo_name: str, head_sha: str,
+) -> bool:
+    """True if any of grug's Elder check-runs for this head SHA is terminal
+    (completed with a conclusion). Used for idempotent replay: a consumer
+    restart that re-delivers a review message must not post duplicate
+    comments or a conflicting conclusion on a head that already has a
+    verdict (grug#1275)."""
+    def _do(token: str) -> bool:
+        runs = list_check_runs_for_ref(token, owner, repo_name, head_sha)
+        for run in runs:
+            if str(run.get("name") or "") not in _ELDER_CHECK_NAMES:
+                continue
+            if str(run.get("status") or "") == "completed" and str(run.get("conclusion") or ""):
+                return True
+        return False
+
+    try:
+        return bool(with_install_token_retry(install_id, _do))
+    except Exception as error:  # noqa: BLE001 - prefer dispatch over silent skip on list failure
+        log.warning(
+            "elder_terminal_check_list_failed",
+            extra={
+                "install_id": install_id,
+                "repo": f"{owner}/{repo_name}",
+                "head_sha": head_sha[:8],
+                "kind": type(error).__name__,
+            },
+        )
+        return False
+
+
+
 def _complete_elder_check_open(
     *,
     install_id: int,
@@ -2308,6 +2341,24 @@ def _run_hot_review(
         # and every degraded terminal check below conclude under the same
         # mode (grug#1212), even if the toggle flips mid-flight.
         elder_blocking = bool(cfg.get("code_reviewer_blocking", False))
+        # Idempotent replay (#1275): if a terminal Elder check-run already
+        # exists for this head SHA, skip the dispatch - the review already
+        # completed. A re-run after a consumer restart must not post duplicate
+        # comments or a conflicting conclusion on a head that already has a
+        # verdict.
+        if _has_terminal_elder_check_run(install_id, owner, repo_name, current_head):
+            if not _stop_review_claim_heartbeat(heartbeat):
+                raise RuntimeError("Elder review claim ownership lost during idempotent skip")
+            if not complete_review_claim(**owned_claim_args):
+                raise RuntimeError("Elder review claim completion lost during idempotent skip")
+            log.info(
+                "elder_review_idempotent_skip",
+                extra={
+                    "repo": repo_full, "pr": pr_number,
+                    "head_sha": current_head[:8],
+                },
+            )
+            return "idempotent_skip"
         # Mid-flight cancellation (#635 follow-up): current_snapshot_id is the
         # snapshot this job is ABOUT to spend the Elder budget on (checked
         # fresh, immediately above). The watch loop re-fetches the PR every

@@ -23,15 +23,16 @@ spec:
   # #701). Per-pod GRUG_RERUN_WORKERS halved 6->3 so TOTAL in-flight Elder
   # concurrency is unchanged - this buys availability, not throughput.
   # RollingUpdate (was Recreate): with 2 replicas Recreate would kill both
-  # on every deploy. Surge-free (maxSurge 0, maxUnavailable 1): a surge pod
-  # would briefly run 3 pods = 9 workers, exceeding the 6-worker budget the
-  # halved GRUG_RERUN_WORKERS exists to hold (CodeRabbit, PR #704); replacing
-  # one pod at a time instead dips to 3 workers for the rollout window while
-  # the queue buffers, and always keeps a live pod.
+  # on every deploy. Surge-first (maxSurge 1, maxUnavailable 0): a new pod
+  # comes up BEFORE the old one is terminated, so an in-flight Elder review
+  # on the old pod can finish or hand its claim back to SQS while the
+  # replacement is already draining the queue. Never drops below 2 workers
+  # during the rollout window, and the queue buffers any burst from the
+  # brief 3-pod overlap (grug#1275).
   replicas: 2
   strategy:
     type: RollingUpdate
-    rollingUpdate: {maxUnavailable: 1, maxSurge: 0}
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
   selector:
     matchLabels: {app: grug-consumer}
   template:
@@ -49,11 +50,14 @@ spec:
       # (k8s/smasher-trial-namespace.yaml + ADR-0013) with none in `grug`.
       serviceAccountName: grug-smasher-launcher
       automountServiceAccountToken: true
-      # 60s (default 30): shutdown budget = 15s shared thread-join + the
-      # orphaned-claim release sweep (#607). The sweep MUST complete before
-      # SIGKILL or a killed Elder review's claim bounces redeliveries off
-      # "claim busy" while the PR waits on its REQUIRED check (grug#515).
-      terminationGracePeriodSeconds: 60
+      # 800s (matches GRUG_REVIEW_JOB_TIMEOUT_S): a SIGTERM'd pod gets the
+      # full review budget to finish an in-flight Elder review before SIGKILL.
+      # The preStop hook below delays SIGTERM so the pod enters Terminating
+      # and the graceful-shutdown path (SIGTERM → stop new work, release
+      # claims, finish in-flight review) starts before the grace clock runs.
+      # If a review can't finish in time, its SQS claim is released and the
+      # replacement pod (already up thanks to maxSurge 1) redelivers it.
+      terminationGracePeriodSeconds: 800
       nodeSelector:
         kubernetes.io/arch: arm64
       # Same soft spread pattern as webhook/api (#700): bias the pair across
@@ -108,6 +112,10 @@ spec:
           image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
           imagePullPolicy: Always
           command: ["python", "-m", "datadog_switch", "python", "consumer.py"]
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
           envFrom:
             - secretRef: {name: grug-secrets}
             # Roles Anywhere ONLY (#389 retirement): the static key and its

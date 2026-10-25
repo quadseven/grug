@@ -1224,6 +1224,37 @@ def test_hot_review_dispatch_error_releases_claim_and_raises_for_redrive(monkeyp
     complete.assert_not_called()
 
 
+def test_hot_review_idempotent_skip_when_terminal_check_exists(monkeypatch):
+    """If a terminal Elder check-run already exists for the head SHA,
+    _run_hot_review skips the dispatch (idempotent replay, grug#1275).
+    A re-run after a consumer restart must not post duplicate comments
+    or a conflicting conclusion."""
+    monkeypatch.setattr(
+        rerun,
+        "with_install_token_retry",
+        lambda iid, fn: _pr_data(head_sha="same-head"),
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    acquire, complete, release = _patch_hot_claims(
+        monkeypatch, status="acquired",
+    )
+    monkeypatch.setattr(
+        rerun, "_has_terminal_elder_check_run",
+        lambda iid, o, r, hs: True,
+    )
+    dispatch = MagicMock()
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="same-head", settle_seconds=0,
+    ))
+
+    assert status == "idempotent_skip"
+    dispatch.assert_not_called()
+    complete.assert_called_once()
+    release.assert_not_called()
+
+
 def test_shutdown_release_frees_claims_orphaned_by_a_killed_review(monkeypatch):
     """grug#515 blocking hardening: a consumer pod killed mid-review never
     reaches its except/finally, orphaning the snapshot claim for up to the

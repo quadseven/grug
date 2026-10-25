@@ -1071,6 +1071,206 @@ def main() -> None:
     # Gate startup on critical deps BEFORE spawning poll threads (#405).
     _startup_check()
 
+    # One-time startup recovery: close any grug check-run left stuck
+    # in_progress by a consumer that was killed mid-review, so a restart
+    # doesn't leave PRs hanging forever. No new review is dispatched and no
+    # comment is posted - just an honest terminal verdict on the orphaned
+    # run. Best-effort per install/repo/PR: one failure must not abort the
+    # whole sweep (grug#1275).
+    _recover_stuck_check_runs_at_startup()
+
+
+def _list_open_prs_for_recovery(token: str, owner: str, repo: str) -> list[dict[str, Any]]:
+    """Open PRs for one repo, paginated (bounded, mirroring check_run_reconciler)."""
+    from urllib.parse import quote
+    import httpx
+
+    _GH_API = "https://api.github.com"
+    _TIMEOUT = 10
+    _MAX_PR_PAGES = 10
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    out: list[dict[str, Any]] = []
+    for page in range(1, _MAX_PR_PAGES + 1):
+        resp = httpx.get(
+            f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls",
+            params={"state": "open", "per_page": 100, "page": page},
+            headers=headers,
+            timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        batch = resp.json() or []
+        out.extend(batch)
+        if len(batch) < 100:
+            break
+    return out
+
+
+def _recover_stuck_check_runs_at_startup() -> None:
+    """One-time sweep at consumer startup: close any grug check-run stuck
+    in_progress past the deadline. Best-effort; never raises."""
+    from datetime import datetime, timedelta, timezone
+
+    from adapters.install_store import (
+        is_persona_enabled,
+        list_allowlisted_installs,
+        list_check_run_reconcile_repos,
+    )
+    from github_app_auth import with_install_token_retry
+    from github_checks_client import (
+        CheckRunResult, list_check_runs_for_ref, patch_check_run,
+    )
+    from personas import registry as persona_registry
+
+    max_age_minutes = int(
+        os.getenv("GRUG_CHECK_RUN_STUCK_MAX_AGE_MINUTES", "60")
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
+    check_run_names = frozenset(
+        spec.check_run_name for spec in persona_registry.REGISTRY
+    )
+
+    try:
+        installs = list_allowlisted_installs()
+    except Exception as e:  # noqa: BLE001 - sweep must not crash startup
+        log.warning(
+            "consumer_startup_stuck_check_recovery_installs_failed",
+            extra={"kind": type(e).__name__},
+        )
+        return
+
+    for install_id in installs:
+        try:
+            repos = list_check_run_reconcile_repos(install_id)
+            if not repos:
+                continue
+        except Exception as e:  # noqa: BLE001 - per-install best-effort
+            log.warning(
+                "consumer_startup_stuck_check_recovery_repos_failed",
+                extra={"install_id": install_id, "kind": type(e).__name__},
+            )
+            continue
+
+        for repo in repos:
+            full_name = str(repo.get("full_name", ""))
+            owner, sep, repo_name = full_name.partition("/")
+            if not sep or not owner or not repo_name:
+                continue
+            repo_id = int(repo.get("id", 0))
+
+            try:
+                prs = with_install_token_retry(
+                    install_id,
+                    lambda token, iid=install_id, o=owner, r=repo_name: (
+                        _list_open_prs_for_recovery(token, o, r),
+                    ),
+                ) or []
+            except Exception as e:  # noqa: BLE001 - per-repo best-effort
+                log.warning(
+                    "consumer_startup_stuck_check_recovery_prs_failed",
+                    extra={
+                        "install_id": install_id, "repo": full_name,
+                        "kind": type(e).__name__,
+                    },
+                )
+                continue
+
+            for pr in prs:
+                head_sha = str((pr.get("head") or {}).get("sha", ""))
+                pr_number = pr.get("number")
+                if not head_sha or not pr_number:
+                    continue
+
+                try:
+                    runs = with_install_token_retry(
+                        install_id,
+                        lambda token, iid=install_id, o=owner, r=repo_name, hs=head_sha: (
+                            list_check_runs_for_ref(token, o, r, hs),
+                            [
+                                spec
+                                for spec in persona_registry.REGISTRY
+                                if "pull_request" in spec.events
+                                and is_persona_enabled(iid, repo_id, spec.key)
+                            ],
+                        ),
+                    )
+                    if runs is None:
+                        continue
+                    run_list, _expected = runs
+                except Exception as e:  # noqa: BLE001 - per-PR best-effort
+                    log.warning(
+                        "consumer_startup_stuck_check_recovery_runs_failed",
+                        extra={
+                            "install_id": install_id, "repo": full_name,
+                            "pr": pr_number, "kind": type(e).__name__,
+                        },
+                    )
+                    continue
+
+                for run in run_list:
+                    name = str(run.get("name") or "")
+                    if name not in check_run_names:
+                        continue
+                    if str(run.get("status") or "") != "in_progress":
+                        continue
+                    started_at = run.get("started_at")
+                    if not started_at:
+                        continue
+                    try:
+                        started = datetime.fromisoformat(
+                            str(started_at).replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        continue
+                    if started >= cutoff:
+                        continue
+
+                    result = CheckRunResult(
+                        name=name,
+                        head_sha=head_sha,
+                        status="completed",
+                        conclusion="failure",
+                        title="Grug lost track of this review",
+                        summary=(
+                            f"This check sat `in_progress` for over "
+                            f"{max_age_minutes} minutes with no "
+                            "conclusion - a consumer restart orphaned it. "
+                            "Push a new commit to get a real review."
+                        ),
+                    )
+                    try:
+                        with_install_token_retry(
+                            install_id,
+                            lambda token, o=owner, r=repo_name, rid=int(run["id"]): (
+                                patch_check_run(token, o, r, rid, result)
+                            ),
+                        )
+                        log.info(
+                            "consumer_startup_stuck_check_recovered",
+                            extra={
+                                "install_id": install_id,
+                                "repo": full_name,
+                                "pr": pr_number,
+                                "head_sha": head_sha[:8],
+                                "check_run_name": name,
+                                "check_run_id": run["id"],
+                            },
+                        )
+                    except Exception as e:  # noqa: BLE001 - per-run best-effort
+                        log.warning(
+                            "consumer_startup_stuck_check_recovery_patch_failed",
+                            extra={
+                                "install_id": install_id,
+                                "repo": full_name,
+                                "pr": pr_number,
+                                "check_run_id": run.get("id"),
+                                "kind": type(e).__name__,
+                            },
+                        )
+
     # Records that _stop was set by a SIGNAL (graceful shutdown), to tell a
     # deliberate stop apart from a thread death. _consume only ever returns
     # once _stop is set, so any non-alive thread while _stop is clear is a

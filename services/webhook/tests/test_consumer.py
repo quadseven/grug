@@ -1504,3 +1504,146 @@ def test_poll_not_yet_due_visibility_is_capped_below_the_sqs_maximum():
     ):
         consumer._poll_once(_spec(False, handler), "https://q", "arn")
     assert mock_vis.call_args.kwargs["VisibilityTimeout"] <= 43200
+
+
+def test_startup_recovery_closes_stuck_in_progress_check_runs(monkeypatch):
+    """A consumer restart closes orphaned in_progress check runs so PRs
+    don't hang forever (grug#1275)."""
+    from unittest.mock import patch
+
+    import personas.registry as persona_registry
+
+    monkeypatch.setattr(
+        "adapters.install_store.list_allowlisted_installs", lambda: [11],
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.list_check_run_reconcile_repos",
+        lambda iid: [{"full_name": "myorg/myrepo", "id": 222}],
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.is_persona_enabled",
+        lambda iid, rid, key: True,
+    )
+
+    def fake_with_token(iid, fn):
+        return fn("fake-token")
+
+    monkeypatch.setattr(
+        "github_app_auth.with_install_token_retry", fake_with_token,
+    )
+
+    stuck_run = {
+        "id": 42,
+        "name": "Grug - Elder",
+        "head_sha": "abc123def456",
+        "status": "in_progress",
+        "started_at": "2020-01-01T00:00:00Z",
+    }
+
+    captured = {}
+
+    def fake_list_check_runs(token, owner, repo, head_sha):
+        captured["list"] = (owner, repo, head_sha)
+        return [stuck_run]
+
+    def fake_patch_check_run(token, owner, repo, run_id, result):
+        captured["patch"] = (owner, repo, run_id, result)
+
+    # Avoid importing personas.registry inside the function (heavy import
+    # chain that can pull in the consumer's main()).
+    monkeypatch.setitem(
+        __import__("sys").modules, "personas.registry", persona_registry,
+    )
+    monkeypatch.setattr(
+        persona_registry, "REGISTRY", [],
+    )
+
+    with patch("github_checks_client.list_check_runs_for_ref",
+               side_effect=fake_list_check_runs), \
+         patch("github_checks_client.patch_check_run",
+               side_effect=fake_patch_check_run):
+        consumer._recover_stuck_check_runs_at_startup()
+
+    assert captured["list"] == ("myorg", "myrepo", "abc123def456")
+    patch_call = captured["patch"]
+    assert patch_call[0] == "myorg"
+    assert patch_call[1] == "myrepo"
+    assert patch_call[2] == 42
+    result = patch_call[3]
+    assert result.status == "completed"
+    assert result.conclusion == "failure"
+    assert "Grug lost track of this review" in result.title
+
+
+def test_startup_recovery_leaves_fresh_in_progress_run_alone(monkeypatch):
+    """A review still genuinely working (started within the deadline) must
+    not be swept by startup recovery (grug#1275)."""
+    from unittest.mock import patch
+    from datetime import datetime, timedelta, timezone
+
+    import personas.registry as persona_registry
+
+    monkeypatch.setattr(
+        "adapters.install_store.list_allowlisted_installs", lambda: [11],
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.list_check_run_reconcile_repos",
+        lambda iid: [{"full_name": "myorg/myrepo", "id": 222}],
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.is_persona_enabled",
+        lambda iid, rid, key: True,
+    )
+
+    def fake_with_token(iid, fn):
+        return fn("fake-token")
+
+    monkeypatch.setattr(
+        "github_app_auth.with_install_token_retry", fake_with_token,
+    )
+
+    fresh_run = {
+        "id": 43,
+        "name": "Grug - Elder",
+        "head_sha": "abc123def456",
+        "status": "in_progress",
+        "started_at": (datetime.now(timezone.utc)
+                       - timedelta(minutes=5)).isoformat().replace(
+                           "+00:00", "Z"),
+    }
+
+    captured = {}
+
+    def fake_list_check_runs(token, owner, repo, head_sha):
+        captured["list"] = (owner, repo, head_sha)
+        return [fresh_run]
+
+    patch_calls = []
+
+    def fake_patch_check_run(token, owner, repo, run_id, result):
+        patch_calls.append((owner, repo, run_id, result))
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "personas.registry", persona_registry,
+    )
+    monkeypatch.setattr(
+        persona_registry, "REGISTRY", [],
+    )
+
+    with patch("github_checks_client.list_check_runs_for_ref",
+               side_effect=fake_list_check_runs), \
+         patch("github_checks_client.patch_check_run",
+               side_effect=fake_patch_check_run):
+        consumer._recover_stuck_check_runs_at_startup()
+
+    assert captured["list"] == ("myorg", "myrepo", "abc123def456")
+    assert patch_calls == []
+
+
+def test_startup_recovery_handles_no_installs(monkeypatch):
+    """No allowlisted installs means nothing to recover - no crash."""
+    monkeypatch.setattr(
+        "adapters.install_store.list_allowlisted_installs", lambda: [],
+    )
+    # Should not raise
+    consumer._recover_stuck_check_runs_at_startup()
