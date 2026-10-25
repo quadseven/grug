@@ -67,6 +67,11 @@ from review_pipeline import (
     plan_review,
     render_review_map,
 )
+from reviewability import (
+    ReviewabilityAssessment,
+    ReviewabilityPolicy,
+    assess_reviewability,
+)
 from review_evidence import Hunk, ElderEvidence, seal
 from datadog_switch import datadog_enabled
 import call_report
@@ -588,6 +593,22 @@ def _review_llm_timeout_s() -> float:
         log.warning("review_llm_timeout_invalid", extra={"value": raw})
         return _DEFAULT_REVIEW_TIMEOUT_SECONDS
     return min(_MAX_REVIEW_TIMEOUT_SECONDS, max(_MIN_REVIEW_TIMEOUT_SECONDS, value))
+
+
+def _reviewability_policy() -> ReviewabilityPolicy:
+    """Repository policy for reviewability failures: warn, block, or ignore.
+
+    Read from config so the operator chooses the posture without touching any
+    model prompt. `ignore` silences the finding; `warn` makes it advisory;
+    `block` surfaces it as a blocking reviewability concern. None of them
+    refuse to review - the highest-risk cohorts are still reviewed first.
+    """
+    raw = os.getenv("GRUG_REVIEWABILITY_POLICY", "warn")
+    if raw in ("warn", "block", "ignore"):
+        return raw
+    log.warning("reviewability_policy_invalid", extra={"value": raw})
+    return "warn"
+
 _REVIEW_RETRY_ATTEMPTS = 3
 _REVIEW_TRANSPORT_RETRY_ATTEMPTS = 1
 # Exponential backoff applies on every attempt except the final one,
@@ -5206,12 +5227,48 @@ def review_diff(
     if not evidence.hunks:
         return LlmReviewResponse(kind="no_diff")
 
+    # Deterministic reviewability assessment produced BEFORE any model
+    # review. It never refuses to review - it only surfaces a policy-driven
+    # verdict and feeds the planner so high-risk cohorts run first.
+    assessment = assess_reviewability(
+        evidence.hunks,
+        max_cohort_chars=_review_cohort_chars(),
+        max_cohort_paths=_review_cohort_paths(),
+        max_cohorts=_review_max_cohorts(),
+        policy=_reviewability_policy(),
+    )
+    ctx = evidence.pr_context or {}
+    log.info(
+        "llm_reviewability_assessment",
+        extra={
+            "decision": assessment.decision,
+            "reviewable": assessment.reviewable,
+            "partitionable": assessment.partitionable,
+            "overall": assessment.overall,
+            "semantic_paths": assessment.semantic_paths,
+            "noise_paths": assessment.noise_paths,
+            "installation_id": installation_id,
+            "repo": ctx.get("repo"),
+            "pr_number": ctx.get("pr_number"),
+        },
+    )
+
     plan = plan_review(
         evidence.hunks,
         max_cohort_chars=_review_cohort_chars(),
         max_cohort_paths=_review_cohort_paths(),
         max_cohorts=_review_max_cohorts(),
     )
+    # Feed review planning: high-risk cohorts receive context and budget
+    # first (staged cohorts run serially, so order is budget order).
+    if plan.staged and assessment.suggested_cohorts:
+        wanted = [cohort.label for cohort in assessment.suggested_cohorts]
+        by_label: dict[str, ReviewCohort] = {}
+        for cohort in plan.cohorts:
+            by_label.setdefault(cohort.label, cohort)
+        ordered = [by_label[label] for label in wanted if label in by_label]
+        if len(ordered) == len(plan.cohorts):
+            plan = replace(plan, cohorts=tuple(ordered))
     review = _Tier1Review(
         evidence=evidence,
         installation_id=installation_id,
