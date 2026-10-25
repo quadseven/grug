@@ -926,3 +926,26 @@ def test_an_unexpected_error_resolves_the_placeholder_and_still_raises(_inline_t
 
     assert "something broke on Grug's side" in gh.comments[0]["body"]
     assert "drawing the map" not in gh.comments[0]["body"]
+
+
+def test_a_failed_publish_resolves_the_placeholder_to_a_real_message(_inline_token):
+    gh = _FakeGitHub()
+    real_patch = gh.patch
+
+    def patch_final_fails(url, **kwargs):
+        if "## Walkthrough" in kwargs["json"]["body"]:
+            raise httpx.ConnectError("down")
+        return real_patch(url, **kwargs)
+
+    with patch("httpx.get", side_effect=gh.get), \
+         patch("httpx.post", side_effect=gh.post), \
+         patch("httpx.patch", side_effect=patch_final_fails), \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", return_value=None), \
+         patch("personas.walkthrough.dispatch._self_recover"):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "publish_failed"}
+    body = gh.comments[0]["body"]
+    assert "could not write the final map" in body
+    assert "drawing the map" not in body

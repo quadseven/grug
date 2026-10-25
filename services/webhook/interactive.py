@@ -450,8 +450,9 @@ def _run_ask(
         try:
             token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
                                            "Ask Grug what? Usage: `/grug ask <question>`."))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 - cosmetic usage reply; must not fail the command
+            log.warning("interactive_ask_usage_post_failed",
+                        extra={"kind": type(e).__name__})
         return {"status": "no_op", "reason": "empty question", "verb": verb}
     if enqueue_ask is None:
         from rerun import enqueue_ask as _ea  # type: ignore
