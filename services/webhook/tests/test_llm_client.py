@@ -123,6 +123,38 @@ def test_review_diff_via_cave_coder_returns_structured_response() -> None:
     assert out.findings[0].severity == "high"
 
 
+def test_coerce_finding_category_defaults_to_general():
+    """#683: a missing category degrades to the default, never dropped."""
+    from llm_client import _coerce_finding
+    f, reason = _coerce_finding({
+        "path": "src/x.py", "line": 1, "rule": "r", "severity": "high",
+        "message": "m",
+    })
+    assert reason == ""
+    assert f.category == "general"
+
+
+def test_coerce_finding_category_invalid_degrades_to_general():
+    """An invalid category degrades to the default - the finding is kept."""
+    from llm_client import _coerce_finding
+    f, reason = _coerce_finding({
+        "path": "src/x.py", "line": 1, "rule": "r", "severity": "high",
+        "message": "m", "category": "not-a-category",
+    })
+    assert reason == ""
+    assert f.category == "general"
+
+
+def test_coerce_finding_category_valid_passthrough():
+    from llm_client import _coerce_finding
+    f, reason = _coerce_finding({
+        "path": "src/x.py", "line": 1, "rule": "r", "severity": "high",
+        "message": "m", "category": "security",
+    })
+    assert reason == ""
+    assert f.category == "security"
+
+
 def test_review_diff_empty_findings_returns_reviewed() -> None:
     findings_json = '{"findings": []}'
     response = httpx.Response(200, json=_openai_json_response(findings_json))

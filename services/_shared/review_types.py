@@ -22,6 +22,16 @@ SEVERITIES: frozenset[str] = frozenset(get_args(Severity))
 Effort = Literal["quick-win", "heavy-lift"]
 EFFORTS: frozenset[str] = frozenset(get_args(Effort))
 
+# #683: per-finding category taxonomy, set by the reviewer prompt and
+# validated on parse. Unset/invalid values degrade to DEFAULT_CATEGORY
+# ("general") - a finding is never dropped for a bad category.
+Category = Literal[
+    "correctness", "security", "stability", "data-integrity", "maintainability",
+    "general",
+]
+CATEGORIES: frozenset[str] = frozenset(get_args(Category))
+DEFAULT_CATEGORY = "general"
+
 
 # ── Activity-feed verdict + persona mapping (PRD #301; ADR-0002, ADR-0003) ────
 # Kept in this shared leaf so BOTH the write path (the persona dispatchers) and

@@ -107,3 +107,20 @@ def test_persona_mappers_reject_unknown():
         review_types.persona_for_key("bogus_persona")
     with pytest.raises(ValueError):
         review_types.key_for_persona("omen")
+
+
+# ── #683: per-finding category taxonomy ────────────────────────────────
+
+
+def test_category_vocabulary_is_the_fixed_taxonomy_plus_default():
+    assert set(get_args(review_types.Category)) == {
+        "correctness", "security", "stability", "data-integrity",
+        "maintainability", "general",
+    }
+
+
+def test_categories_frozenset_matches_the_literal():
+    assert review_types.CATEGORIES == frozenset(get_args(review_types.Category))
+    assert isinstance(review_types.CATEGORIES, frozenset)
+    assert review_types.DEFAULT_CATEGORY == "general"
+    assert review_types.DEFAULT_CATEGORY in review_types.CATEGORIES

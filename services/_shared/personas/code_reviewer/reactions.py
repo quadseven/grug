@@ -223,6 +223,7 @@ def record_ledger_learning(
     tags = record.get("finding_tags", {})
     rule_name = tags.get("rule_name", "")
     severity = tags.get("severity", "")
+    category = tags.get("category", "")
 
     from adapters.install_store import (  # type: ignore
         list_ledger_rows,
@@ -238,6 +239,7 @@ def record_ledger_learning(
         "repo": record["repo"],
         "pr": record["pr_number"],
         "severity": severity,
+        "category": category,
         "class": rule_name,
         "finding": finding_text,
         "verdict": ledger_verdict,

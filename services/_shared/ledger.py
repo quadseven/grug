@@ -35,6 +35,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from review_types import CATEGORIES, DEFAULT_CATEGORY  # shared leaf — no cycle (#250)
+
 # Verdicts that mean "the finding was REAL" (the reviewer earned the row),
 # vs the one verdict that means the reviewer was wrong.
 _ACCEPTED = frozenset({"fixed", "declined"})
@@ -62,6 +64,10 @@ class LedgerRow:
     finding_class: str
     finding: str
     verdict: str
+    # #683: per-finding category from the fixed taxonomy. Unset/invalid
+    # values degrade to DEFAULT_CATEGORY ("general") - a row is never
+    # dropped for a bad category.
+    category: str = DEFAULT_CATEGORY
     evidence: str = ""
     ts: str = ""
     commit: str | None = None
@@ -82,6 +88,12 @@ def parse_row(d: dict) -> LedgerRow | None:
     """One dict -> LedgerRow, or None if it lacks the load-bearing fields
     (a malformed/partial line must skip, not abort the ingest)."""
     try:
+        # #683: unset/invalid category degrades to DEFAULT_CATEGORY
+        # ("general") - the row is never dropped for a bad category.
+        _raw_category = str(d.get("category", DEFAULT_CATEGORY))
+        category = (
+            _raw_category if _raw_category in CATEGORIES else DEFAULT_CATEGORY
+        )
         return LedgerRow(
             repo=str(d["repo"]),
             # `pr` is optional (see LedgerRow.pr). Absent or null -> None,
@@ -90,6 +102,7 @@ def parse_row(d: dict) -> LedgerRow | None:
             pr=int(d["pr"]) if d.get("pr") is not None else None,
             reviewer=str(d["reviewer"]),
             severity=str(d.get("severity", "")).upper(),
+            category=category,
             finding_class=str(d["class"]),
             finding=str(d["finding"]),
             # Some historical rows carry the reason inline -

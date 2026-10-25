@@ -57,7 +57,7 @@ from openrouter_free_limiter import (
     is_free_tier_model,
 )
 from voice_pack import VoiceSelection, apply_voice
-from review_types import EFFORTS, SEVERITIES, Effort, Severity
+from review_types import CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, Severity
 from review_pipeline import (
     DEFAULT_MAX_COHORT_CHARS,
     DEFAULT_MAX_COHORT_PATHS,
@@ -691,6 +691,10 @@ class Finding:
     # (mirrors suggestion's None-for-absent).
     suggestion: str | None = None
     effort: Effort | None = None
+    # #683: per-finding category from the fixed taxonomy, set by the reviewer
+    # prompt. Unset/invalid values degrade to DEFAULT_CATEGORY ("general") -
+    # a finding is never dropped for a bad category.
+    category: Category = DEFAULT_CATEGORY
     # Explicit justification is required to request a cross-file anchor.
     # `evaluate_diff` additionally verifies that the exact line was supplied
     # in bounded cross-file context before accepting it.
@@ -1795,6 +1799,7 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                                 "maxLength": CAVE_MAX_SUGGESTION_CHARS,
                             },
                             "effort": {"type": "string", "enum": sorted(EFFORTS)},
+                            "category": {"type": "string", "enum": sorted(CATEGORIES)},
                             "outside_diff_reason": {
                                 "type": "string", "maxLength": MAX_FINDING_MESSAGE_CHARS,
                             },
@@ -2688,6 +2693,14 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         if isinstance(raw_effort, str) and raw_effort in EFFORTS
         else None
     )
+    # #683: category degrades to DEFAULT_CATEGORY on unset/invalid - never
+    # reject the finding for a bad category.
+    raw_category = raw.get("category")
+    category: Category = (
+        cast(Category, raw_category)
+        if isinstance(raw_category, str) and raw_category in CATEGORIES
+        else DEFAULT_CATEGORY
+    )
     raw_outside_reason = raw.get("outside_diff_reason")
     outside_diff_reason = (
         _redact_secrets(raw_outside_reason[:MAX_FINDING_MESSAGE_CHARS])
@@ -2714,7 +2727,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
             suggestion = None
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
-        suggestion=suggestion, effort=effort,
+        suggestion=suggestion, effort=effort, category=category,
         outside_diff_reason=outside_diff_reason,
     ), ""
 

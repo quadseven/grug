@@ -157,6 +157,51 @@ def test_parse_row_accepts_missing_pr_key():
     assert r is not None and r.pr is None
 
 
+# ── #683: per-finding category on the ledger row ───────────────────────
+
+
+def test_parse_row_category_defaults_to_general():
+    r = _row()
+    assert r.category == "general"
+
+
+def test_parse_row_category_carries_through():
+    r = _row(category="security")
+    assert r.category == "security"
+
+
+def test_parse_row_category_invalid_degrades_to_general():
+    """An invalid category is coerced to the default - the row is kept."""
+    d = {
+        "repo": "quadseven/grug", "pr": 1, "reviewer": "codex",
+        "severity": "HIGH", "class": "silent-failure", "finding": "x",
+        "verdict": "fixed", "category": "not-a-category",
+    }
+    r = parse_row(d)
+    assert r is not None and r.category == "general"
+
+
+def test_parse_row_category_missing_degrades_to_general():
+    """A missing category degrades to the default - the row is kept."""
+    d = {
+        "repo": "quadseven/grug", "pr": 1, "reviewer": "codex",
+        "severity": "HIGH", "class": "silent-failure", "finding": "x",
+        "verdict": "fixed",
+    }
+    r = parse_row(d)
+    assert r is not None and r.category == "general"
+
+
+def test_accepted_findings_by_class_still_groups_by_class_not_category():
+    """category is a separate axis; the class aggregation is unchanged."""
+    rows = [
+        _row(finding_class="c", category="security", finding="A", verdict="fixed"),
+        _row(finding_class="c", category="correctness", finding="B", verdict="fixed"),
+    ]
+    by_class = accepted_findings_by_class(rows)
+    assert [r.finding for r in by_class["c"]] == ["A", "B"]
+
+
 def test_ledger_digest_is_content_stable():
     """#536 LORE: the store sk digest must depend on finding CONTENT, not
     ingest order - so re-ingesting a reordered corpus heals in place."""

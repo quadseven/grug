@@ -167,6 +167,7 @@ def eval_tags(
         "file": f.file,
         "line": str(f.line),
         "severity": f.severity,
+        "category": f.category,
     }
     if origin is not None:
         tags["source_backend"] = origin.backend.value
