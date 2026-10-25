@@ -971,6 +971,22 @@ def _defer_if_budget_spent(
     )
 
 
+def _refuse_accept(
+    reason: str, *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, comment_id: object, permission: str = "",
+    association: str = "",
+) -> None:
+    """Tell the commenter once why `/grug accept-removal` was refused."""
+    from accept_removal import refuse_removal  # type: ignore
+    from github_app_auth import with_install_token_retry  # type: ignore
+
+    refuse_removal(
+        reason, owner=owner, repo=repo_name, pr_number=pr_number,
+        comment_id=comment_id, permission=permission, association=association,  # type: ignore[arg-type]
+        token_fn=lambda fn: with_install_token_retry(installation_id, fn),
+    )
+
+
 def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     action = payload.get("action", "")
     if action != "created":
@@ -1028,6 +1044,15 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         from accept_removal import acceptor_from_payload  # type: ignore
         sender_login, refused = acceptor_from_payload(payload)
         if refused:
+            # A human commenter is told why (and what works); a Bot, an App
+            # or an unconfirmed author is not, so bots never answer bots.
+            if refused == "comment author is not an owner, member or collaborator":
+                _refuse_accept(
+                    "association", installation_id=int(installation_id),
+                    owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+                    comment_id=comment_id,
+                    association=str(comment.get("author_association") or ""),
+                )
             log.info(
                 "accept_removal_refused",
                 extra={"sender": sender.get("login", ""), "owner": owner,
@@ -1068,14 +1093,33 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 allow_author=True, pr_author_login=pr_author_login,
             )
     except httpx.RequestError as e:
+        if accepting:
+            _refuse_accept(
+                "perm_lookup_failed", installation_id=int(installation_id),
+                owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+                comment_id=comment_id,
+            )
         log.warning(
             "perm_lookup_transport_failed",
             extra={"sender": sender_login, "kind": type(e).__name__},
         )
         return {"status": "skip", "reason": "perm_lookup_transport_failed"}
     if has_write is None:
+        if accepting:
+            _refuse_accept(
+                "perm_lookup_failed", installation_id=int(installation_id),
+                owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+                comment_id=comment_id,
+            )
         return {"status": "skip", "reason": "perm_lookup_failed"}
     if not has_write:
+        if accepting:
+            _refuse_accept(
+                "not_admin", installation_id=int(installation_id), owner=owner,
+                repo_name=repo_name, pr_number=int(pr_number),
+                comment_id=comment_id, permission=perm,
+                association=str(comment.get("author_association") or ""),
+            )
         log.info(
             "recheck_unauthorized",
             extra={
