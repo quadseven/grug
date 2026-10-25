@@ -129,7 +129,7 @@ from personas.code_reviewer.intent_filter import (
 )
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_degradation,
-    with_extra_findings, with_findings,
+    with_extra_findings, with_findings, is_withdrawn_finding,
 )
 from personas.code_reviewer.removed_files import (
     REMOVED_REFERENCE_CHECK_FAILED, apply_removal_acceptances,
@@ -1036,6 +1036,11 @@ def _summary_markdown(
         duplicate_paths,
     )
     defensive_note = _defensive_drop_note(defensive_dropped_count)
+    withdrawn_note = (
+        f"\\n\\n{evaluation.dropped_no_finding} withdrawn findings dropped: "
+        "reviewer concluded no finding."
+        if getattr(evaluation, "dropped_no_finding", 0) else ""
+    )
     hunt = (
         (
             "\n\nLiving Hunt: reviewing `"
@@ -1071,7 +1076,7 @@ def _summary_markdown(
             "from the ground Grug walked are published below. "
             + gate_sentence(blocking)
             + " Coverage detail is in the table above."
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + withdrawn_note
     if is_low_confidence(evaluation.degraded_reason):
         title = "WARN Elder review low confidence"
         return hunt_title(title), (
@@ -1080,7 +1085,7 @@ def _summary_markdown(
             "this pass. Grug keep the answer but not trust it. Validated "
             "markings from the rest are published below. "
             + gate_sentence(blocking)
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + withdrawn_note
     if review_phase == "deep" and is_blackout(evaluation.degraded_reason):
         # grug#848: a blackout in the deep phase is the REASONER arm's -
         # `_async_deep_decision` never starts the deep append over a
@@ -1096,7 +1101,7 @@ def _summary_markdown(
             f"- the mist: `{evaluation.degraded_reason}`. Grug not say the "
             "deeper look agreed; it never looked. "
             + gate_sentence(blocking)
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + withdrawn_note
     if evaluation.degraded_reason:
         # grug#985: when some cohorts were never opened (starved of budget),
         # the headline must not read like every cohort ran and broke.
@@ -1120,7 +1125,7 @@ def _summary_markdown(
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. "
             + gate_sentence(blocking)
-        ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note
+        ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note + withdrawn_note
     if not evaluation.findings:
         title = (
             "Elder clear - no markings"
@@ -1130,7 +1135,7 @@ def _summary_markdown(
         scope = _clean_review_scope(
             living_range, excluded_paths, oversized_paths, duplicate_paths,
         )
-        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note
+        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note + withdrawn_note
 
     blocking = sum(1 for f in evaluation.findings if f.severity in ("high", "critical"))
     title = f"Elder markings - {blocking} blocking, {len(evaluation.findings)} total"
@@ -1142,7 +1147,7 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}"
+    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}{withdrawn_note}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -2087,6 +2092,8 @@ def build_review_result(
     # findings remain visible in the check summary, where their advisory label
     # and file:line are retained, but are not submitted as invalid inline rows.
     new_findings = tuple(f for f in new_findings if f.outside_diff_reason is None)
+    # #1397: candidates the reviewer itself withdrew never become threads.
+    new_findings = tuple(f for f in new_findings if not is_withdrawn_finding(f))
     # Complexity is summary advice by default. An inline thread requires a
     # changed-line suggestion the reviewer can apply in this PR; heavy-lift
     # findings never create reply-required threads.
@@ -3772,6 +3779,11 @@ def dispatch_code_review(
             "models": list(llm_response.models_used),
             "findings_count": len(evaluation.findings),
             "dropped_hallucinations": evaluation.dropped_hallucinations,
+            "dropped_no_finding": evaluation.dropped_no_finding,
+            "dropped_withdrawn": evaluation.dropped_withdrawn,
+            "dropped_self_withdrawn": evaluation.dropped_self_withdrawn,
+            "dropped_candidates": evaluation.dropped_candidates,
+            "withdrawn_count": evaluation.withdrawn_count,
             "degraded_reason": evaluation.degraded_reason,
             # How much of the diff was actually walked, as a number the
             # eval harness (#645) can track directly instead of parsing

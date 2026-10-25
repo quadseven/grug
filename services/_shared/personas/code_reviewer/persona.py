@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import get_args
+from typing import Any, get_args
 
 from code_review_prompt import COMPLEXITY_CORRECTNESS_MARKER
 from github_checks_client import CheckConclusion
@@ -129,6 +129,10 @@ class Finding:
     # Set only for a validated cross-file snippet anchor. These findings are
     # advisory even when the model requested a higher severity.
     outside_diff_reason: str | None = None
+    # Whether the model stands behind this as a real finding (#1397). A
+    # candidate whose own verdict is negative is dropped before publication.
+    is_finding: bool = True
+    verdict: str | None = None
     # Producer attribution for ensemble findings. Excluded from equality so
     # finding identity remains (file, line, rule) rather than observability
     # metadata; dedup and publication behavior must not change with tracing.
@@ -179,6 +183,14 @@ class CodeReviewEvaluation:
     findings: tuple[Finding, ...]
     conclusion: CheckConclusion
     dropped_hallucinations: int = 0
+    # #1397: candidates the reviewer itself withdrew (verdict negative or
+    # "No finding"/"Not a defect"/"not a live defect" in the text). Counted
+    # separately so recall can still be measured.
+    dropped_no_finding: int = 0
+    dropped_withdrawn: int = 0
+    dropped_self_withdrawn: int = 0
+    dropped_candidates: int = 0
+    withdrawn_count: int = 0
     degraded_reason: str | None = None
     coverage: ReviewCoverage | None = None
 
@@ -231,6 +243,11 @@ def with_extra_findings(
         findings=combined,
         conclusion=_derive_conclusion(combined, evaluation.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
+        dropped_no_finding=evaluation.dropped_no_finding,
+        dropped_withdrawn=evaluation.dropped_withdrawn,
+        dropped_self_withdrawn=evaluation.dropped_self_withdrawn,
+        dropped_candidates=evaluation.dropped_candidates,
+        withdrawn_count=evaluation.withdrawn_count,
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
     )
@@ -249,6 +266,11 @@ def with_findings(
         findings=findings,
         conclusion=_derive_conclusion(findings, evaluation.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
+        dropped_no_finding=evaluation.dropped_no_finding,
+        dropped_withdrawn=evaluation.dropped_withdrawn,
+        dropped_self_withdrawn=evaluation.dropped_self_withdrawn,
+        dropped_candidates=evaluation.dropped_candidates,
+        withdrawn_count=evaluation.withdrawn_count,
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
     )
@@ -292,6 +314,11 @@ def with_degradation(
         findings=evaluation.findings,
         conclusion=_derive_conclusion(evaluation.findings, other.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
+        dropped_no_finding=evaluation.dropped_no_finding,
+        dropped_withdrawn=evaluation.dropped_withdrawn,
+        dropped_self_withdrawn=evaluation.dropped_self_withdrawn,
+        dropped_candidates=evaluation.dropped_candidates,
+        withdrawn_count=evaluation.withdrawn_count,
         degraded_reason=other.degraded_reason,
         coverage=other.coverage,
     )
@@ -307,6 +334,46 @@ def _capped_severity(rule: str, severity: Severity, message: str) -> Severity:
     if message.lstrip().lower().startswith(COMPLEXITY_CORRECTNESS_MARKER.lower()):
         return severity
     return "medium"
+
+
+def is_withdrawn_llm_finding(raw: Any) -> bool:
+    return _is_withdrawn_llm_finding(raw)
+
+
+def _is_withdrawn_llm_finding(raw: Any) -> bool:
+    """Whether an LLM finding withdraws itself (#1397)."""
+    is_finding = getattr(raw, "is_finding", True)
+    if is_finding is False:
+        return True
+    verdict = getattr(raw, "verdict", None)
+    if isinstance(verdict, str) and verdict.strip().lower() in {
+        "no_finding", "no-finding", "not_a_finding", "not a finding",
+        "withdrawn", "negative", "none",
+    }:
+        return True
+    message = str(getattr(raw, "message", "") or "").lower()
+    return any(p in message for p in (
+        "no finding", "not a defect", "not a live defect",
+    ))
+
+
+def is_withdrawn_finding(finding) -> bool:
+    """Public alias for the self-withdrawal check (#1397)."""
+    return _is_withdrawn_persona_finding(finding)
+
+
+def _is_withdrawn_persona_finding(finding: "Finding") -> bool:
+    if finding.is_finding is False:
+        return True
+    if isinstance(finding.verdict, str) and finding.verdict.strip().lower() in {
+        "no_finding", "no-finding", "not_a_finding", "not a finding",
+        "withdrawn", "negative", "none",
+    }:
+        return True
+    message = (finding.message or "").lower()
+    return any(p in message for p in (
+        "no finding", "not a defect", "not a live defect",
+    ))
 
 
 def _hunk_line_index(hunks: tuple[DiffHunk, ...]) -> dict[str, set[int]]:
@@ -343,7 +410,14 @@ def evaluate_diff(
     line_index = _hunk_line_index(hunks)
     kept: list[Finding] = []
     dropped = 0
+    withdrawn = 0
     for raw in llm_response.findings:
+        # #1397: drop candidates the reviewer itself withdrew before they
+        # become threads or affect the verdict. Structured field first,
+        # phrase check as backstop.
+        if _is_withdrawn_llm_finding(raw):
+            withdrawn += 1
+            continue
         allowed_lines = line_index.get(raw.path)
         outside_diff = allowed_lines is None or raw.line not in allowed_lines
         outside_reason = raw.outside_diff_reason
@@ -384,6 +458,8 @@ def evaluate_diff(
                 effort=raw.effort,
                 origins=raw.origins,
                 outside_diff_reason=outside_reason if outside_diff else None,
+                is_finding=raw.is_finding,
+                verdict=raw.verdict,
             )
         )
 
@@ -408,7 +484,12 @@ def evaluate_diff(
         # disagree within one CodeReviewEvaluation - a "success" alongside
         # degraded_reason="partial_review" is the bug this closes.
         conclusion=_derive_conclusion(kept_findings, degraded_reason),
-        dropped_hallucinations=dropped,
+        dropped_hallucinations=dropped + withdrawn,
+        dropped_no_finding=withdrawn,
+        dropped_withdrawn=withdrawn,
+        dropped_self_withdrawn=withdrawn,
+        dropped_candidates=withdrawn,
+        withdrawn_count=withdrawn,
         degraded_reason=degraded_reason,
         coverage=llm_response.coverage,
     )

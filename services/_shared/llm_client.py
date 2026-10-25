@@ -695,6 +695,11 @@ class Finding:
     # `evaluate_diff` additionally verifies that the exact line was supplied
     # in bounded cross-file context before accepting it.
     outside_diff_reason: str | None = None
+    # Whether the model stands behind this as a real finding. A candidate whose
+    # own verdict is negative (`is_finding=False` or `verdict="no_finding"`)
+    # is dropped before publication instead of rendered as a thread (#1397).
+    is_finding: bool = True
+    verdict: str | None = None
     # A duplicate candidate can be independently produced by both models. Keep
     # every source so judge and human feedback train both originating spans.
     origins: tuple[FindingOrigin, ...] = field(default_factory=tuple, compare=False)
@@ -2694,6 +2699,19 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         if isinstance(raw_outside_reason, str) and raw_outside_reason.strip()
         else None
     )
+    # Structured self-withdrawal (#1397): the model can state outright that
+    # this candidate is not a real finding. Coerce defensively.
+    raw_is_finding = raw.get("is_finding")
+    if isinstance(raw_is_finding, bool):
+        is_finding = raw_is_finding
+    elif isinstance(raw_is_finding, str):
+        is_finding = raw_is_finding.strip().lower() not in (
+            "false", "0", "no", "no_finding",
+        )
+    else:
+        is_finding = True
+    raw_verdict = raw.get("verdict")
+    verdict = raw_verdict.strip() if isinstance(raw_verdict, str) and raw_verdict.strip() else None
     # Output-side redaction at the ONE choke point: the model can ECHO a
     # secret from the diff into message/suggestion, and a posted comment
     # OUTLIVES a force-push that scrubs the diff. Every downstream surface
@@ -2716,6 +2734,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
         suggestion=suggestion, effort=effort,
         outside_diff_reason=outside_diff_reason,
+        is_finding=is_finding, verdict=verdict,
     ), ""
 
 
