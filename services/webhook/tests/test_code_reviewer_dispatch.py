@@ -2630,6 +2630,73 @@ def test_inline_comment_body_defuses_tilde_fences_in_message():
     assert "<!-- grug-rule:null-deref -->" in body
 
 
+def test_inline_comment_body_where_matches_anchor():
+    """grug#1398: the rendered `Where:` footer names the same file and line
+    as the finding's anchor (head-commit line)."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="src/x.py", line=130, severity="high", rule_name="null-deref",
+        message="Grug see a quiet grave at line 103", suggestion=None,
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "**Where:** `src/x.py:130`" in body
+    # The anchor line the comment attaches to is 130; the footer agrees.
+    assert f"**Where:** `{f.file}:{f.line}`" in body
+
+
+def test_inline_comment_body_rewrites_prechange_line_to_head_commit_line():
+    """grug#1398: a model message citing a pre-change line is published with
+    the head-commit anchor line instead of the stale number."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="todos.js", line=158, severity="medium", rule_name="null-deref",
+        message="Grug see a quiet grave at line 103", suggestion=None,
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "at line 158" in body, body
+    assert "at line 103" not in body, body
+
+
+def test_inline_comment_body_rewrites_every_line_ref_to_anchor():
+    """grug#1398: multiple stale line numbers in one message ("lines 119 and
+    116") are all rewritten to the anchor (128), so none disagree with it."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=128, severity="high", rule_name="sync-io-in-async",
+        message="Grug see lines 119 and 116 as trouble spots", suggestion=None,
+    )
+    body = cr_dispatch._inline_comment_body(f)
+    assert "lines 128 and 128" in body, body
+    assert "119" not in body, body
+    assert "116" not in body, body
+
+
+def test_inline_comment_body_chunked_review_keeps_numbers_consistent():
+    """grug#1398: a diff reviewed in more than one call (chunks) publishes one
+    finding per chunk, each citing its own head-commit anchor line in both the
+    `Where:` footer and the message prose."""
+    from personas.code_reviewer.persona import Finding
+    findings = (
+        Finding(
+            file="src/a.py", line=50, severity="high", rule_name="null-deref",
+            message="Grug see a quiet grave at line 30", suggestion=None,
+        ),
+        Finding(
+            file="src/b.py", line=90, severity="high", rule_name="null-deref",
+            message="Grug see lines 70 and 75 as trouble spots", suggestion=None,
+        ),
+    )
+    bodies = [cr_dispatch._inline_comment_body(f) for f in findings]
+    # Chunk a: anchor 50, message cited 30 (pre-change) -> rewritten to 50.
+    assert "**Where:** `src/a.py:50`" in bodies[0]
+    assert "at line 50" in bodies[0]
+    assert "line 30" not in bodies[0]
+    # Chunk b: anchor 90, message cited 70 and 75 -> both rewritten to 90.
+    assert "**Where:** `src/b.py:90`" in bodies[1]
+    assert "lines 90 and 90" in bodies[1]
+    assert "70" not in bodies[1] and "75" not in bodies[1]
+
+
 def test_dispatch_verification_kills_contradicted_finding(monkeypatch, caplog):
     """#708 wiring: a judge-approved finding whose claim the repo evidence
     contradicts (async-family rule anchored in a provably-sync def) is

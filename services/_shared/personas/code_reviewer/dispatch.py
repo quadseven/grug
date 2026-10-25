@@ -1429,7 +1429,7 @@ def _agent_prompt_block(f: Finding) -> str:
         "",
         f"In `{f.file}:{f.line}` address this {f.severity} / {cat} finding "
         f"(`{f.rule_name}`):",
-        f.message,
+        _repair_line_refs(f.message, f.line),
         f"Why it matters: {_why_it_matters(f.rule_name)}",
         "Fix focus: change only what the finding names; keep the fix "
         "minimal and line-exact; do not refactor beyond it.",
@@ -1471,6 +1471,35 @@ def _provenance_block(f: Finding) -> str:
     return _details_block("Evidence and provenance", "\n".join(lines))
 
 
+# A finding's `line` is the new-side diff line = the head-commit line the
+# comment is anchored to. The LLM is told `line` is that number, but its
+# free-form `message` may still quote a pre-change or chunk-relative line
+# number (grug#1398), so the prose can disagree with the anchor. Rewrite
+# every bare line-number reference ("line N", "lines N and M") in the
+# message so the published body cites the anchor, or no number at all.
+_LINE_REF_RE = re.compile(r"\b(lines?)\s+(\d+(?:\s+and\s+\d+)*)\b")
+
+
+def _repair_line_refs(message: str, anchor_line: int) -> str:
+    """Return `message` with each line-number reference rewritten to name
+    `anchor_line` (the head-commit line the finding is anchored to).
+
+    References already naming `anchor_line` are left alone. Other numbers
+    (PR ids, versions) are not line references and are left alone. This is
+    the publish-time repair for grug#1398: every line number in the
+    published body agrees with the line the finding is anchored to."""
+    def _rewrite(match: re.Match[str]) -> str:
+        word = match.group(1)
+        fixed = re.sub(
+            r"\d+",
+            lambda m: str(anchor_line) if int(m.group(0)) != anchor_line
+            else m.group(0),
+            match.group(2),
+        )
+        return f"{word} {fixed}"
+    return _LINE_REF_RE.sub(_rewrite, message)
+
+
 def _inline_comment_body(
     f: Finding, precedent_note: str = "", *, committable: bool = True,
 ) -> str:
@@ -1502,7 +1531,7 @@ def _inline_comment_body(
         chip += f" | {_effort_chip(f.effort)}"
     head = (
         f"{chip}\n\n"
-        f"**What Elder sees**\n\n{_defused(f.message)}\n\n"
+        f"**What Elder sees**\n\n{_defused(_repair_line_refs(f.message, f.line))}\n\n"
         f"**Why it matters**\n\n{_defused(_why_it_matters(f.rule_name))}\n\n"
         f"**Where:** `{_md_code_span(f.file)}:{f.line}`"
     )
