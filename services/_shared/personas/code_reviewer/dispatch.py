@@ -63,7 +63,7 @@ from llm_client import (
 )
 from voice_pack import VoiceSelection, entitled_voice
 from review_evidence import ElderEvidence, assemble_evidence
-from review_types import EFFORTS, SEVERITIES
+from review_types import DEFAULT_CATEGORY, EFFORTS, SEVERITIES
 from personas.review_publish import (
     DIFF_FETCH_TIMEOUT, PUBLISHABLE_DEGRADATIONS, ReviewMode, fetch_file_contents,
     fetch_pr_diff, fetch_pr_diff_with_scope, is_blackout, is_low_confidence,
@@ -1199,7 +1199,7 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     used = sum(len(x) + 1 for x in header)
     included = 0
     for f in findings:
-        cat = _category_for_rule(f.rule_name)
+        cat = _category_for_finding(f)
         entry = (
             f"- {_md_code_span(f.file)}:{f.line} "
             f"[{severity_chip(f.severity)} | {cat} | "
@@ -1348,6 +1348,14 @@ def _category_for_rule(rule_name: str) -> str:
     return _LINKED_ISSUE_RULE_CATEGORIES.get(rule_name, "general")
 
 
+def _category_for_finding(f: Finding) -> str:
+    """The reviewer-set taxonomy category (#683); an unset ("general") one
+    falls back to the rule's own category."""
+    if f.category != DEFAULT_CATEGORY:
+        return f.category
+    return _category_for_rule(f.rule_name)
+
+
 def _why_it_matters(rule_name: str) -> str:
     cat = _category_for_rule(rule_name)
     return _WHY_IT_MATTERS.get(
@@ -1423,7 +1431,7 @@ def _agent_prompt_block(f: Finding) -> str:
     from finding fields - no extra LLM call, so it can never hallucinate
     beyond what the finding already claims. Markings v2 adds a CR-style
     verify/skip/minimal meta contract shared with the consolidated prompt."""
-    cat = _category_for_rule(f.rule_name)
+    cat = _category_for_finding(f)
     content = [
         _AGENT_META_PREAMBLE,
         "",
@@ -1492,7 +1500,7 @@ def _inline_comment_body(
 
     `committable=False` renders any suggestion as fenced prose: dispatch
     passes it when `checked_suggestion` (#1149) could not verify the fix."""
-    cat = _category_for_rule(f.rule_name)
+    cat = _category_for_finding(f)
     # CR-dense header: severity chip | category | rule | effort chip
     chip = (
         f"{severity_chip(f.severity)} | _{_md_code_span(cat)}_ | "

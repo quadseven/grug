@@ -35,6 +35,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from review_types import CATEGORIES, DEFAULT_CATEGORY
+
 # Verdicts that mean "the finding was REAL" (the reviewer earned the row),
 # vs the one verdict that means the reviewer was wrong.
 _ACCEPTED = frozenset({"fixed", "declined"})
@@ -68,6 +70,9 @@ class LedgerRow:
     # #545: the reviewed PR-head SHA, when the writer captured it directly
     # (see module docstring). Optional - most historical rows predate it.
     head_sha: str | None = None
+    # #683: taxonomy category (review_types.CATEGORIES) so precedent and
+    # precision can be sliced per category. Absent or invalid -> "general".
+    category: str = DEFAULT_CATEGORY
 
     @property
     def accepted(self) -> bool:
@@ -76,6 +81,10 @@ class LedgerRow:
     @property
     def false_positive(self) -> bool:
         return self.verdict in _REJECTED
+
+
+def _category(raw: object) -> str:
+    return raw if isinstance(raw, str) and raw in CATEGORIES else DEFAULT_CATEGORY
 
 
 def parse_row(d: dict) -> LedgerRow | None:
@@ -101,6 +110,7 @@ def parse_row(d: dict) -> LedgerRow | None:
             ts=str(d.get("ts", "")),
             commit=d.get("commit"),
             head_sha=d.get("head_sha"),
+            category=_category(d.get("category")),
         )
     except (KeyError, ValueError, TypeError):
         return None

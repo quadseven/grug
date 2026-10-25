@@ -4299,3 +4299,27 @@ def test_dispatch_reviews_a_copy_when_the_head_tree_is_unreadable(monkeypatch):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
     assert reviewed_paths == [copy_path]
+
+
+def test_model_set_category_renders_as_chip_and_beats_rule_category():
+    """The reviewer-set taxonomy category replaces the rule-derived one."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=3, severity="high", rule_name="dead-code",
+        message="m", suggestion=None, category="data-integrity",
+    )
+    head = cr_dispatch._inline_comment_body(f).split("\n", 1)[0]
+    assert "_data-integrity_" in head
+    assert "maintainability" not in head
+
+
+def test_unset_category_falls_back_to_rule_category():
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=3, severity="high", rule_name="dead-code",
+        message="m", suggestion=None,
+    )
+    assert f.category == "general"
+    head = cr_dispatch._inline_comment_body(f).split("\n", 1)[0]
+    assert "_maintainability_" in head
+

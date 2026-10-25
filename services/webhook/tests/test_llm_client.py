@@ -6063,3 +6063,24 @@ def test_deep_append_keeps_a_degenerate_answer_when_the_reasoner_fails(
     assert out.findings == ()
     assert out.backend_used == Backend.OPENCODE_GO
     assert out.error.startswith("low confidence:")
+
+
+def test_coerce_finding_validates_category_and_degrades_to_general() -> None:
+    base = {"path": "a.py", "line": 1, "rule": "r", "severity": "low", "message": "m"}
+    for given, want in [
+        ("security", "security"), ("data-integrity", "data-integrity"),
+        (None, "general"), ("bogus", "general"), (["x"], "general"), ({}, "general"),
+    ]:
+        raw = dict(base) if given is None else {**base, "category": given}
+        finding, reason = lc._coerce_finding(raw)
+        assert finding is not None and reason == ""
+        assert finding.category == want
+
+
+def test_cave_schema_and_prompt_declare_category() -> None:
+    from code_review_prompt import _OUTPUT_CONTRACT
+    from review_types import CATEGORIES
+    props = lc._CAVE_FINDINGS_RESPONSE_FORMAT["json_schema"]["schema"][
+        "properties"]["findings"]["items"]["properties"]
+    assert set(props["category"]["enum"]) == CATEGORIES
+    assert '"category"' in _OUTPUT_CONTRACT

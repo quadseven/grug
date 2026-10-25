@@ -703,7 +703,9 @@ _OUTPUT_CONTRACT = (
     '{"findings": [{"path": str, "line": int, "rule": str, '
     '"severity": "low"|"medium"|"high"|"critical", "message": str, '
     '"suggestion": str (OPTIONAL), "effort": "quick-win"|"heavy-lift" '
-    '(OPTIONAL), "outside_diff_reason": str (OPTIONAL)}]}. '
+    '(OPTIONAL), "category": "correctness"|"security"|"stability"|'
+    '"data-integrity"|"maintainability"|"general" (OPTIONAL), '
+    '"outside_diff_reason": str (OPTIONAL)}]}. '
     "`rule` MUST be one of the rule names above. `line` is the new-side "
     "line number from the diff. A finding on an UNCHANGED cross-file context "
     "line is allowed only when you provide `outside_diff_reason`, naming the "
@@ -715,7 +717,11 @@ _OUTPUT_CONTRACT = (
     "diff syntax, no backticks; include it ONLY when you are confident "
     "the replacement is complete and line-exact, else omit it. `effort` "
     "estimates the fix: quick-win (small, local) or heavy-lift "
-    "(structural); omit when unsure. No prose, no markdown, no text "
+    "(structural); omit when unsure. `category` is the axis a reviewer "
+    "triages on: correctness (wrong behavior), security, stability (crashes, "
+    "availability, concurrency), data-integrity (data loss, integration "
+    "contracts), maintainability (clarity, tests, types); use general when "
+    "none fits. No prose, no markdown, no text "
     "outside the JSON object."
 )
 
