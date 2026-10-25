@@ -3199,7 +3199,9 @@ def test_clean_review_body_is_three_lines_and_has_no_empty_fold():
     # and render as nothing.
     visible = [l for l in body.splitlines()
                if l.strip() and not l.strip().startswith("<!--")]
-    assert len(visible) == 2, visible                    # verdict + PR title
+    # verdict + PR title + the grug#1429 closure sentence, which is last.
+    assert len(visible) == 3, visible
+    assert visible[-1] == "Nothing needs to change on this head."
 
 
 def test_table_and_detail_bullets_are_blank_line_separated():
