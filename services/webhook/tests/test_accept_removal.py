@@ -123,6 +123,7 @@ def _payload(
 def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin",
               head_sha: str = _SHA, store: _Store | None = None,
               perm_fail: str = "", diff: str | None = None,
+              commits: list[str] | str | None = None,
               ) -> tuple[dict[str, str], _Store]:
     store = store or _Store()
     monkeypatch.setattr(d, "is_install_allowlisted", lambda _id: True)
@@ -164,6 +165,16 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
                     response=httpx.Response(502, request=request),
                 )
             return _Resp({"permission": permission})
+        if "/pulls/42/commits" in url:
+            if commits == "fail":
+                request = httpx.Request("GET", url)
+                raise httpx.HTTPStatusError(
+                    "boom", request=request,
+                    response=httpx.Response(502, request=request),
+                )
+            logins = commits if isinstance(commits, list) else [payload["issue"]["user"]["login"]]
+            return _Resp([{"author": {"login": who}, "committer": {"login": "web-flow"}}
+                          for who in logins] if "page=1" in url else [])
         if "/pulls/42" in url and "diff" in str((k.get("headers") or {}).get("Accept")):
             return _Resp(_DELETION_DIFF if diff is None else diff)
         if "/pulls/42" in url:
@@ -633,3 +644,36 @@ def test_the_trusted_list_is_read_from_ssm_and_fails_closed(monkeypatch):
     }
     assert read("/grug/removal-acceptors", None) == frozenset()
     assert read("", "myorg:reviewer") == frozenset()
+
+
+def test_a_trusted_operator_who_pushed_to_the_pr_is_refused(monkeypatch):
+    """Separation of duties rests on who wrote the change, not only who
+    opened the PR: a commit of theirs on someone else's PR refuses them."""
+    _trust(monkeypatch, {("myorg", "reviewer")})
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association="COLLABORATOR",
+    ), permission="write", commits=["author", "Reviewer"])
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+
+
+def test_a_trusted_operator_is_refused_when_the_commits_cannot_be_read(monkeypatch):
+    _trust(monkeypatch, {("myorg", "reviewer")})
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association="COLLABORATOR",
+    ), permission="write", commits="fail")
+    assert out["status"] in ("no_op", "skip"), out
+    assert store.recorded == [] and store.enqueued == []
+
+
+def test_a_trusted_operator_needs_a_known_pr_author_and_commit_list():
+    import accept_removal
+
+    trusted = frozenset({("myorg", "reviewer")})
+    ok = {"owner": "myorg", "login": "reviewer", "trusted": trusted}
+    assert accept_removal.may_accept("COLLABORATOR", "write", pr_author="author",
+                                     commit_logins=frozenset({"author"}), **ok)
+    assert not accept_removal.may_accept("COLLABORATOR", "write", pr_author="",
+                                         commit_logins=frozenset({"author"}), **ok)
+    assert not accept_removal.may_accept("COLLABORATOR", "write", pr_author="author",
+                                         commit_logins=None, **ok)

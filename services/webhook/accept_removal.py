@@ -17,7 +17,9 @@ text, and each part failing closed when it is missing:
   authorship is not consulted: it can be spoofed.
 - the one exception: a trusted operator the owner lists in SSM for this
   owner's repos (`owner:login`, secrets_loader.get_removal_acceptors)
-  accepts with write or maintain, but never on a PR they wrote. A personal
+  accepts with write or maintain, but never on a PR they opened or on
+  which they authored or committed a commit (an unread commit list
+  refuses). A personal
   account cannot make a collaborator admin; this is how its owner shares
   the call. The list fails closed: unread, it names nobody.
 
@@ -104,19 +106,29 @@ def accept_command(path: str, head_sha: str) -> str:
 
 
 def may_accept(association: str, permission: str, *, owner: str = "", login: str = "",
-               pr_author: str = "", trusted: frozenset[tuple[str, str]] = frozenset()) -> bool:
+               pr_author: str = "", trusted: frozenset[tuple[str, str]] = frozenset(),
+               commit_logins: frozenset[str] | None = None) -> bool:
     """An admin accepts a removal: the repo's OWNER, or admin permission from
     the collaborator API, whoever wrote the PR. Beside them, a trusted
     operator the owner names for this owner's repos (`trusted`, from
     secrets_loader.get_removal_acceptors) accepts with write or maintain,
-    as a collaborator or member, on a PR someone else wrote. Anything else
-    is refused."""
+    as a collaborator or member, on a change someone else wrote: not the
+    PR's author, and not the author or committer of any of its commits
+    (`commit_logins`, lower case). An unknown PR author or an unread commit
+    list (None) refuses the trusted path."""
     if association == "OWNER" or permission == "admin":
         return True
-    return ((owner.lower(), login.lower()) in trusted
+    who = login.lower()
+    return ((owner.lower(), who) in trusted
             and association in ("COLLABORATOR", "MEMBER")
             and permission in ("write", "maintain")
-            and bool(login) and login.lower() != pr_author.lower())
+            and bool(who) and bool(pr_author) and who != pr_author.lower()
+            and commit_logins is not None and who not in commit_logins)
+
+
+def is_trusted(owner: str, login: str, trusted: frozenset[tuple[str, str]]) -> bool:
+    """Whether the owner lists this login, so its commits are worth reading."""
+    return (owner.lower(), login.lower()) in trusted
 
 
 def refusal_reply(reason: str, association: str = "", permission: str = "") -> str:

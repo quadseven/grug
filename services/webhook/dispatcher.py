@@ -650,6 +650,47 @@ def _actor_permission(
         return None
 
 
+def _pr_commit_logins(
+    installation_id: int, owner: str, repo_name: str, pr_number: int,
+) -> frozenset[str] | None:
+    """Lower-case logins that authored or committed any commit on the PR
+    (GitHub's web-flow committer excluded), up to 250 commits, or None when
+    the list could not be read, which refuses a trusted operator."""
+    from urllib.parse import quote as _q
+    from github_app_auth import with_install_token_retry  # type: ignore
+    import httpx  # type: ignore
+
+    def _read(token: str) -> frozenset[str]:
+        logins: set[str] = set()
+        for page in (1, 2, 3):
+            r = httpx.get(
+                f"https://api.github.com/repos/{_q(owner, safe='')}/"
+                f"{_q(repo_name, safe='')}/pulls/{int(pr_number)}/commits"
+                f"?per_page=100&page={page}",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            rows = r.json() or []
+            for row in rows:
+                for role in ("author", "committer"):
+                    who = str(((row or {}).get(role) or {}).get("login") or "").lower()
+                    if who and who != "web-flow":
+                        logins.add(who)
+            if len(rows) < 100:
+                break
+        return frozenset(logins)
+
+    try:
+        return with_install_token_retry(int(installation_id), _read)
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning("pr_commits_lookup_failed", extra={"pr_number": pr_number, "kind": type(e).__name__})
+        return None
+
+
 def _handle_issues(payload: dict[str, Any]) -> dict[str, str]:
     """Chief's ISSUE-time DoR advisory (epic #654 sibling; first non-PR
     review surface grug has ever had).
@@ -1083,15 +1124,23 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             # a trusted operator the owner lists in SSM accepts with write,
             # never on their own PR. No other write-level path.
             import secrets_loader  # type: ignore
-            from accept_removal import may_accept  # type: ignore
+            from accept_removal import is_trusted, may_accept  # type: ignore
             perm = _actor_permission(
                 int(installation_id), owner, repo_name, sender_login,
             )
             association = str(comment.get("author_association") or "")
+            trusted = secrets_loader.get_removal_acceptors()
+            # A trusted operator's commits are read only for a listed login,
+            # so admins and everyone else cost no extra request.
+            commit_logins = (
+                _pr_commit_logins(int(installation_id), owner, repo_name, int(pr_number))
+                if perm not in (None, "admin") and association != "OWNER"
+                and is_trusted(owner, sender_login, trusted) else frozenset()
+            )
             has_write = None if perm is None else may_accept(
                 association, perm, owner=owner, login=sender_login,
-                pr_author=pr_author_login or "",
-                trusted=secrets_loader.get_removal_acceptors(),
+                pr_author=pr_author_login or "", trusted=trusted,
+                commit_logins=commit_logins,
             )
         else:
             has_write = _actor_has_write(
