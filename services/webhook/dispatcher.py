@@ -1027,6 +1027,29 @@ def _defer_if_budget_spent(
     )
 
 
+def _answer_pr_fetch_failed(
+    cmd, *, installation_id: int, owner: str, repo_name: str, pr_number: int,
+) -> None:
+    """Answer an Elder re-run command whose PR could not be read (grug#1430).
+
+    Without the PR there is no head to queue against, so the command cannot
+    be kept; it is answered instead of vanishing, which is what made people
+    fire the same command again. Other verbs keep their own handling."""
+    from grug_commands import ELDER_RERUN_VERBS  # type: ignore
+
+    if cmd.verb not in ELDER_RERUN_VERBS:
+        return
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from interactive import _reply  # type: ignore
+
+    _reply(
+        lambda fn: with_install_token_retry(installation_id, fn),
+        owner, repo_name, pr_number,
+        f"Grug could not read this PR from GitHub, so the command was not "
+        f"queued. Comment `/grug {cmd.verb}` again.",
+    )
+
+
 def _refuse_accept(
     reason: str, *, installation_id: int, owner: str, repo_name: str,
     pr_number: int, comment_id: object, permission: str = "",
@@ -1250,6 +1273,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             "recheck_pr_fetch_failed",
             extra={"pr_number": pr_number, "status": e.response.status_code},
         )
+        _answer_pr_fetch_failed(
+            cmd, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
+        )
         return {"status": "skip", "reason": "pr_fetch_failed"}
     except httpx.RequestError as e:
         # Transport-level failure (timeout, DNS, connection-reset).
@@ -1257,6 +1284,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         log.warning(
             "recheck_pr_fetch_transport_failed",
             extra={"pr_number": pr_number, "kind": type(e).__name__},
+        )
+        _answer_pr_fetch_failed(
+            cmd, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
         )
         return {"status": "skip", "reason": "pr_fetch_transport_failed"}
 
