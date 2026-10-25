@@ -2750,3 +2750,195 @@ def test_the_sign_stays_when_the_check_has_not_concluded(monkeypatch, caplog):
         )
     assert cleared is False
     assert "reviewing_label_clear_refused" not in caplog.text
+
+
+# --- grug#1430: comment-triggered runs are queued per PR, never dropped -----
+
+
+def _command_job(**over) -> str:
+    base = {"persona": "code_reviewer", "comment_id": 901, "queued_at": 1_000.0}
+    base.update(over)
+    return _job(**base)
+
+
+def _command_fixture(monkeypatch, *, running=False, last_run=None, lookup_raises=False):
+    """Stub the PR fetch, the Elder check state, the command-run store and
+    Elder itself; return (dispatch, requeue, recorded)."""
+    monkeypatch.setattr(rerun, "_now", lambda: 1_100.0)
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get", lambda tok, url: _pr_data(head_sha="abc123"))
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    monkeypatch.setattr(rerun, "_elder_running_on", lambda *a: running)
+    monkeypatch.setattr(rerun, "_mark_reviewing_label", lambda **k: True)
+    monkeypatch.setattr(rerun, "_clear_reviewing_label", lambda **k: True)
+
+    def _lookup(**_k):
+        if lookup_raises:
+            raise RuntimeError("db down")
+        return last_run
+
+    recorded = []
+    monkeypatch.setattr("adapters.install_store.get_elder_command_run", _lookup)
+    monkeypatch.setattr(
+        "adapters.install_store.record_elder_command_run",
+        lambda **k: recorded.append(k),
+    )
+    dispatch = MagicMock()
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+    requeue = MagicMock()
+    monkeypatch.setattr(rerun, "enqueue_rerun", requeue)
+    return dispatch, requeue, recorded
+
+
+def test_command_jobs_get_a_dedup_id_per_comment(monkeypatch):
+    """Two different comments for the same PR are two different jobs: the
+    plain (install, repo, pr, persona) id would let SQS collapse the second
+    into the first for 5 minutes and drop it silently."""
+    sent = []
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/jobs.fifo")
+    monkeypatch.setattr(rerun, "_now", lambda: 1_234.0)
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kw: sent.append(kw))
+    for cid in (1, 2):
+        rerun.enqueue_rerun(
+            install_id=11, repo="myorg/myrepo", pr_number=7,
+            persona="code_reviewer", comment_id=cid,
+        )
+    ids = [m["MessageDeduplicationId"] for m in sent]
+    assert ids[0] != ids[1]
+    assert all(i != "11:myorg/myrepo:7:code_reviewer" and len(i) <= 128 for i in ids)
+    # same group: commands for one PR stay in order
+    assert sent[0]["MessageGroupId"] == sent[1]["MessageGroupId"]
+    body = json.loads(sent[0]["MessageBody"])
+    assert body["comment_id"] == 1 and body["queued_at"] == 1_234.0
+
+
+def test_a_deferred_command_keeps_a_dedup_id_per_comment(monkeypatch):
+    sent = []
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/jobs.fifo")
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kw: sent.append(kw))
+    for cid in (1, 2):
+        rerun.enqueue_rerun(
+            install_id=11, repo="myorg/myrepo", pr_number=7,
+            persona="code_reviewer", not_before=5_000.0, comment_id=cid,
+        )
+    assert sent[0]["MessageDeduplicationId"] != sent[1]["MessageDeduplicationId"]
+
+
+def test_a_command_is_held_while_an_elder_review_runs_on_the_head(monkeypatch):
+    """The command waits behind the review in flight: it is requeued with a
+    short not_before, keeping its comment, its queued_at and the hold start,
+    and Elder is not dispatched a second time."""
+    dispatch, requeue, recorded = _command_fixture(monkeypatch, running=True)
+    status = rerun._run_one(_command_job(), message_id="m-1")
+    assert status == "rerun_held_behind_review"
+    dispatch.assert_not_called()
+    assert recorded == []
+    kw = requeue.call_args.kwargs
+    assert kw["comment_id"] == 901 and kw["queued_at"] == 1_000.0
+    assert kw["hold_started_at"] == 1_100.0
+    assert kw["not_before"] == 1_100.0 + rerun._COMMAND_HOLD_POLL_SECONDS
+    assert kw["requeue_of"] == "m-1"
+    assert kw["persona"] == "code_reviewer"
+
+
+def test_a_held_command_keeps_its_first_hold_start(monkeypatch):
+    _, requeue, _ = _command_fixture(monkeypatch, running=True)
+    rerun._run_one(_command_job(hold_started_at=1_050.0), message_id="m-2")
+    assert requeue.call_args.kwargs["hold_started_at"] == 1_050.0
+
+
+def test_a_held_command_runs_once_the_review_ends(monkeypatch):
+    dispatch, requeue, recorded = _command_fixture(monkeypatch, running=False)
+    status = rerun._run_one(_command_job(hold_started_at=1_050.0), message_id="m-3")
+    assert status == "dispatched"
+    dispatch.assert_called_once()
+    requeue.assert_not_called()
+    assert recorded == [{
+        "install_id": 11, "repo": "myorg/myrepo", "pr_number": 7,
+        "head_sha": "abc123", "started_at": 1_100.0,
+    }]
+
+
+def test_a_held_command_runs_when_the_hold_cap_passes(monkeypatch):
+    """A check stuck in progress with no worker must not hold a command
+    forever: past the cap the command runs."""
+    dispatch, requeue, _ = _command_fixture(monkeypatch, running=True)
+    started = 1_100.0 - rerun._COMMAND_HOLD_MAX_SECONDS
+    status = rerun._run_one(_command_job(hold_started_at=started), message_id="m-4")
+    assert status == "dispatched"
+    dispatch.assert_called_once()
+    requeue.assert_not_called()
+
+
+def test_a_command_served_by_a_later_command_run_is_coalesced(monkeypatch):
+    """A command-triggered run of this same head started after the command
+    was queued: it already read everything, so the command completes as
+    coalesced without a second review."""
+    dispatch, requeue, _ = _command_fixture(
+        monkeypatch, running=True,
+        last_run={"head_sha": "abc123", "started_at": 1_005.0},
+    )
+    assert rerun._run_one(_command_job(), message_id="m-5") == "rerun_coalesced"
+    dispatch.assert_not_called()
+    requeue.assert_not_called()
+
+
+@pytest.mark.parametrize("last_run", [
+    {"head_sha": "abc123", "started_at": 999.0},   # started before the command
+    {"head_sha": "other", "started_at": 1_005.0},  # a different head
+    None,
+])
+def test_a_command_not_served_by_an_earlier_run_still_runs(monkeypatch, last_run):
+    dispatch, _, _ = _command_fixture(monkeypatch, last_run=last_run)
+    assert rerun._run_one(_command_job(), message_id="m-6") == "dispatched"
+    dispatch.assert_called_once()
+
+
+def test_a_command_run_lookup_failure_runs_the_review(monkeypatch):
+    """A store error is not "served": a repeat review beats a lost one."""
+    dispatch, _, _ = _command_fixture(monkeypatch, lookup_raises=True)
+    assert rerun._run_one(_command_job(), message_id="m-7") == "dispatched"
+    dispatch.assert_called_once()
+
+
+def test_a_failed_hold_requeue_raises_so_the_command_is_redelivered(monkeypatch):
+    """A hold that cannot requeue must not drop the command: it raises, and
+    SQS redelivers the original message."""
+    _, requeue, _ = _command_fixture(monkeypatch, running=True)
+    requeue.side_effect = RuntimeError("queue down")
+    with pytest.raises(RuntimeError):
+        rerun._run_one(_command_job(), message_id="m-8")
+
+
+def test_a_plain_rerun_is_neither_held_nor_recorded(monkeypatch):
+    """Self-recovery and api reruns carry no comment: they keep today's
+    behaviour and never touch the command gate."""
+    dispatch, requeue, recorded = _command_fixture(monkeypatch, running=True)
+    status = rerun._run_one(_job(persona="code_reviewer"), message_id="m-9")
+    assert status == "dispatched"
+    dispatch.assert_called_once()
+    requeue.assert_not_called()
+    assert recorded == []
+
+
+def test_a_requeued_deferred_command_keeps_its_identity():
+    with patch.object(rerun, "enqueue_rerun") as enq:
+        rerun._hold_or_requeue_deferred(
+            {
+                "install_id": 11, "repo": "myorg/myrepo", "pr_number": 7,
+                "persona": "code_reviewer", "not_before": 9_000.0,
+                "comment_id": 901, "queued_at": 1_000.0,
+            },
+            600.0, 2, "msg-1",
+        )
+    kw = enq.call_args.kwargs
+    assert kw["comment_id"] == 901 and kw["queued_at"] == 1_000.0
+
+
+def test_elder_running_on_reads_an_unreadable_listing_as_not_running(monkeypatch):
+    def _boom(iid, fn):
+        raise RuntimeError("token mint failed")
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", _boom)
+    assert rerun._elder_running_on(11, "o", "r", "abc") is False
+

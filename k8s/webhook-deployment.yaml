@@ -232,6 +232,9 @@ spec:
             - {name: GRUG_SHARED_BENCHES, value: "true"}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
+            # Trusted operators who may accept a guarded removal beside an admin
+            # (owner:login pairs, plain String; secrets_loader.get_removal_acceptors).
+            - {name: GRUG_REMOVAL_ACCEPTORS_SSM, value: /grug/removal-acceptors}
             # In-cluster spark-gateway for the evidence-scoped judge. Keep the
             # role assignment identical on both Elder-capable workloads.
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}

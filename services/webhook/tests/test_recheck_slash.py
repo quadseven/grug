@@ -639,6 +639,64 @@ def test_grug_improve_that_is_not_rate_limited_still_runs(_no_install_lookups, m
     enq.assert_not_called()
 
 
+def _forbidden_get(*_a: object, **_kw: object):
+    request = httpx.Request("GET", "https://api.github.com/repos/myorg/myrepo/pulls/42")
+    response = httpx.Response(403, request=request)
+    raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+
+def _timeout_get(*_a: object, **_kw: object):
+    raise httpx.ReadTimeout("github.com slow")
+
+
+@pytest.mark.parametrize("verb", ["improve", "resume", "review"])
+@pytest.mark.parametrize("fetch,reason", [
+    (_forbidden_get, "pr_fetch_failed"),
+    (_timeout_get, "pr_fetch_transport_failed"),
+])
+def test_an_elder_command_whose_pr_fetch_fails_is_answered(
+    _no_install_lookups, monkeypatch, verb, fetch, reason,
+):
+    """grug#1430: a PR fetch that fails leaves no head to queue against, so
+    the command is ANSWERED ("comment again") instead of skipped in silence."""
+    import interactive
+
+    payload = _comment_payload(body=f"/grug {verb}", sender_login="alice", pr_author="alice")
+    http = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", http)
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=fetch), \
+         patch("rerun.enqueue_rerun") as enq:
+        out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "skip" and out["reason"] == reason
+    enq.assert_not_called()
+    bodies = [str(p.get("body", "")) for p in http.posts]
+    assert len(bodies) == 1
+    assert "could not read this PR" in bodies[0]
+    assert f"/grug {verb}` again" in bodies[0]
+
+
+def test_a_recheck_whose_pr_fetch_fails_keeps_its_own_handling(
+    _no_install_lookups, monkeypatch,
+):
+    """Only Elder re-run verbs get the new answer; Chief's recheck is not
+    changed by grug#1430."""
+    import interactive
+
+    payload = _comment_payload(body="/grug recheck", sender_login="alice", pr_author="alice")
+    http = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", http)
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=_forbidden_get):
+        out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "skip"
+    assert http.posts == []
+
+
 def test_budget_reset_epoch_defers_when_the_budget_is_low(monkeypatch):
     """grug#1270: below the floor of the installation's hourly budget, a
     re-run waits for the reset instead of spending what is left."""

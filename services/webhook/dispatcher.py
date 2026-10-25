@@ -650,6 +650,62 @@ def _actor_permission(
         return None
 
 
+# GitHub's pull request commits endpoint returns at most this many commits,
+# so a list this long may be cut short.
+_PR_COMMITS_CAP = 250
+
+
+def _pr_commit_logins(
+    installation_id: int, owner: str, repo_name: str, pr_number: int,
+) -> frozenset[str] | None:
+    """Lower-case logins that authored or committed any commit on the PR
+    (GitHub's web-flow committer excluded), or None, which refuses a trusted
+    operator: the list could not be read, it reached GitHub's 250-commit cap
+    on that endpoint (so it may be cut short), or a commit's author or
+    committer maps to no GitHub login (an unlinked identity could be anyone). Git metadata can still name another person's
+    linked address; push-actor proof is out of scope, since the owner
+    chooses whom to trust."""
+    from urllib.parse import quote as _q
+    from github_app_auth import with_install_token_retry  # type: ignore
+    import httpx  # type: ignore
+
+    def _read(token: str) -> frozenset[str] | None:
+        logins: set[str] = set()
+        total = 0
+        for page in (1, 2, 3):
+            r = httpx.get(
+                f"https://api.github.com/repos/{_q(owner, safe='')}/"
+                f"{_q(repo_name, safe='')}/pulls/{int(pr_number)}/commits"
+                f"?per_page=100&page={page}",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            rows = r.json() or []
+            total += len(rows)
+            if total >= _PR_COMMITS_CAP:
+                return None
+            for row in rows:
+                for role in ("author", "committer"):
+                    who = str(((row or {}).get(role) or {}).get("login") or "").lower()
+                    if not who:
+                        return None
+                    if who != "web-flow":
+                        logins.add(who)
+            if len(rows) < 100:
+                return frozenset(logins)
+        return None
+
+    try:
+        return with_install_token_retry(int(installation_id), _read)
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning("pr_commits_lookup_failed", extra={"pr_number": pr_number, "kind": type(e).__name__})
+        return None
+
+
 def _handle_issues(payload: dict[str, Any]) -> dict[str, str]:
     """Chief's ISSUE-time DoR advisory (epic #654 sibling; first non-PR
     review surface grug has ever had).
@@ -971,6 +1027,29 @@ def _defer_if_budget_spent(
     )
 
 
+def _answer_pr_fetch_failed(
+    cmd, *, installation_id: int, owner: str, repo_name: str, pr_number: int,
+) -> None:
+    """Answer an Elder re-run command whose PR could not be read (grug#1430).
+
+    Without the PR there is no head to queue against, so the command cannot
+    be kept; it is answered instead of vanishing, which is what made people
+    fire the same command again. Other verbs keep their own handling."""
+    from grug_commands import ELDER_RERUN_VERBS  # type: ignore
+
+    if cmd.verb not in ELDER_RERUN_VERBS:
+        return
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from interactive import _reply  # type: ignore
+
+    _reply(
+        lambda fn: with_install_token_retry(installation_id, fn),
+        owner, repo_name, pr_number,
+        f"Grug could not read this PR from GitHub, so the command was not "
+        f"queued. Comment `/grug {cmd.verb}` again.",
+    )
+
+
 def _refuse_accept(
     reason: str, *, installation_id: int, owner: str, repo_name: str,
     pr_number: int, comment_id: object, permission: str = "",
@@ -1079,14 +1158,28 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
 
     try:
         if accepting:
-            # grug#1405: only an admin accepts a removal, whoever wrote
-            # the PR. No PR-author shortcut, and no write-level path.
-            from accept_removal import may_accept  # type: ignore
+            # #1405: an admin accepts a removal, whoever wrote the PR;
+            # a trusted operator the owner lists in SSM accepts with write,
+            # never on their own PR. No other write-level path.
+            import secrets_loader  # type: ignore
+            from accept_removal import is_trusted, may_accept  # type: ignore
             perm = _actor_permission(
                 int(installation_id), owner, repo_name, sender_login,
             )
             association = str(comment.get("author_association") or "")
-            has_write = None if perm is None else may_accept(association, perm)
+            trusted = secrets_loader.get_removal_acceptors()
+            # A trusted operator's commits are read only for a listed login,
+            # so admins and everyone else cost no extra request.
+            commit_logins = (
+                _pr_commit_logins(int(installation_id), owner, repo_name, int(pr_number))
+                if perm not in (None, "admin") and association != "OWNER"
+                and is_trusted(owner, sender_login, trusted) else frozenset()
+            )
+            has_write = None if perm is None else may_accept(
+                association, perm, owner=owner, login=sender_login,
+                pr_author=pr_author_login or "", trusted=trusted,
+                commit_logins=commit_logins,
+            )
         else:
             has_write = _actor_has_write(
                 int(installation_id), owner, repo_name, sender_login,
@@ -1180,6 +1273,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             "recheck_pr_fetch_failed",
             extra={"pr_number": pr_number, "status": e.response.status_code},
         )
+        _answer_pr_fetch_failed(
+            cmd, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
+        )
         return {"status": "skip", "reason": "pr_fetch_failed"}
     except httpx.RequestError as e:
         # Transport-level failure (timeout, DNS, connection-reset).
@@ -1187,6 +1284,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         log.warning(
             "recheck_pr_fetch_transport_failed",
             extra={"pr_number": pr_number, "kind": type(e).__name__},
+        )
+        _answer_pr_fetch_failed(
+            cmd, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
         )
         return {"status": "skip", "reason": "pr_fetch_transport_failed"}
 
