@@ -23,15 +23,19 @@ spec:
   # #701). Per-pod GRUG_RERUN_WORKERS halved 6->3 so TOTAL in-flight Elder
   # concurrency is unchanged - this buys availability, not throughput.
   # RollingUpdate (was Recreate): with 2 replicas Recreate would kill both
-  # on every deploy. Surge-free (maxSurge 0, maxUnavailable 1): a surge pod
-  # would briefly run 3 pods = 9 workers, exceeding the 6-worker budget the
-  # halved GRUG_RERUN_WORKERS exists to hold (CodeRabbit, PR #704); replacing
-  # one pod at a time instead dips to 3 workers for the rollout window while
-  # the queue buffers, and always keeps a live pod.
+  # on every deploy. Surge-first (maxSurge 1, maxUnavailable 0, grug#1275):
+  # a rollout never runs with fewer than the normal 2 ready consumers, so
+  # review capacity holds through a deploy. A surge pod briefly runs 3
+  # pods = 9 workers, above the 6-worker budget the halved
+  # GRUG_RERUN_WORKERS exists to hold (CodeRabbit, PR #704) - accepted for
+  # the rollout window because duplicate work is prevented by the
+  # Postgres owner-token claim leases (a contended acquire returns busy)
+  # and per-PR SQS FIFO serialization, while a capacity dip is exactly
+  # what stranded reviews in the incident #1275 follows up.
   replicas: 2
   strategy:
     type: RollingUpdate
-    rollingUpdate: {maxUnavailable: 1, maxSurge: 0}
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
   selector:
     matchLabels: {app: grug-consumer}
   template:
@@ -49,11 +53,16 @@ spec:
       # (k8s/smasher-trial-namespace.yaml + ADR-0013) with none in `grug`.
       serviceAccountName: grug-smasher-launcher
       automountServiceAccountToken: true
-      # 60s (default 30): shutdown budget = 15s shared thread-join + the
-      # orphaned-claim release sweep (#607). The sweep MUST complete before
-      # SIGKILL or a killed Elder review's claim bounces redeliveries off
-      # "claim busy" while the PR waits on its REQUIRED check (grug#515).
-      terminationGracePeriodSeconds: 60
+      # Sized to the review deadline (grug#1275): GRUG_REVIEW_JOB_TIMEOUT_S
+      # is 800s, so grace = 800 + the 15s shared thread-join + the bounded
+      # orphaned-claim release sweep (#607) + margin = 900s. On SIGTERM the
+      # consumer stops polling at once; in-flight reviews then either
+      # finish inside this window or are handed back - SQS leases reset to
+      # visible and snapshot claims released - well before SIGKILL. The
+      # sweep MUST complete before SIGKILL or a killed Elder review's
+      # claim bounces redeliveries off "claim busy" while the PR waits on
+      # its REQUIRED check (grug#515).
+      terminationGracePeriodSeconds: 900
       nodeSelector:
         kubernetes.io/arch: arm64
       # Same soft spread pattern as webhook/api (#700): bias the pair across
@@ -107,6 +116,14 @@ spec:
         - name: consumer
           image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
           imagePullPolicy: Always
+          # grug#1275: drain before SIGTERM - the preStop sleep lets the
+          # endpoint/controller path settle while the pod is being removed
+          # from rotation, then SIGTERM stops polling and the grace period
+          # above covers finishing or handing back in-flight reviews.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]
           command: ["python", "-m", "datadog_switch", "python", "consumer.py"]
           envFrom:
             - secretRef: {name: grug-secrets}

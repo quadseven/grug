@@ -166,16 +166,16 @@ def test_reconcile_repo_dispatches_only_for_the_missing_persona():
     )
 
 
-def test_reconcile_repo_sweeps_a_stuck_run_and_still_skips_it_as_present():
+def test_reconcile_repo_sweeps_a_stuck_run_and_requeues_it_with_the_missing():
     """A persona can be simultaneously STUCK (sweep it) while another is
     fully absent (dispatch for that one) - the two halves of one pass.
 
-    Deliberate: a swept persona is NOT re-dispatched in the same cycle.
-    `present` means "a check-run with this name exists", regardless of its
-    status - a closed-by-sweep failure is a real, visible verdict the
-    author can act on (push a new commit), not a silence the reconciler
-    needs to paper over. Auto-retrying it here would risk an unbounded
-    loop if the same persona keeps timing out every attempt."""
+    grug#1275 supersedes the #947 no-retry rule for Elder/Chief: the
+    swept Elder is re-queued in the SAME single dispatch that covers the
+    missing Chief, so neither persona is skipped. The loop risk #947
+    cited is bounded structurally: the sweep completes the orphaned
+    run (it can never be flagged stuck again) and the re-queued review
+    starts a new run with a fresh deadline."""
     pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
     stuck_run = {"id": 9, "name": "Grug - Elder", "status": "in_progress", "started_at": _iso(200)}
     with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
@@ -187,12 +187,14 @@ def test_reconcile_repo_sweeps_a_stuck_run_and_still_skips_it_as_present():
 
     assert swept == 1
     mock_patch.assert_called_once()
-    assert dispatched == 1, "tpm is fully absent and must still be dispatched"
+    assert dispatched == 1, "one dispatch covers the missing tpm and the re-queued Elder"
+    mock_dispatch.assert_called_once()
     _, kwargs = mock_dispatch.call_args
-    assert kwargs["skip_personas"] == frozenset({"code_reviewer"}), (
-        "code_reviewer already has a check-run (now being swept) - it "
-        "counts as present and must not also be dispatched"
+    assert kwargs["skip_personas"] == frozenset(), (
+        "tpm is missing and code_reviewer is being re-queued after its "
+        "sweep - neither may be skipped"
     )
+    assert kwargs["delivery_id"] == "restart-recovery:o/r:9"
 
 
 def test_reconcile_repo_one_pr_failure_does_not_abort_the_rest():
@@ -266,3 +268,73 @@ def test_reconcile_installs_emits_stuck_count_metric_summed_across_repos():
                       lambda metric, value, **_kw: emitted.append((metric, value))):
         reconciler.reconcile_installs([1])
     assert emitted == [("grug.check_run.stuck_count", 3.0)]
+
+
+def test_reconcile_repo_requeues_a_stuck_elder_once_after_sweeping_it():
+    """grug#1275: a stuck Elder run past the review deadline is swept AND
+    re-queued exactly once in the same pass - the requeue is keyed by the
+    orphaned run's id, and sweeping makes that run completed, so a later
+    pass listing the same head can never flag (or re-queue) it again.
+    No PR comment is posted: the requeue goes through dispatch, which
+    re-runs the persona's check, not a comment."""
+    pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
+    stuck_run = {"id": 9, "name": "Grug - Elder", "status": "in_progress", "started_at": _iso(200)}
+    chief_run = {"name": "Grug - Chief", "status": "completed"}
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
+         patch("check_run_reconciler.expected_personas", return_value=[_CHIEF, _ELDER]), \
+         patch("check_run_reconciler.list_check_runs_for_ref", return_value=[stuck_run, chief_run]), \
+         patch("check_run_reconciler.patch_check_run") as mock_patch, \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        dispatched, swept = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
+    assert swept == 1
+    assert dispatched == 1
+    mock_patch.assert_called_once()
+    mock_dispatch.assert_called_once()
+    _, kwargs = mock_dispatch.call_args
+    assert kwargs["skip_personas"] == frozenset({"tpm"})
+    assert kwargs["delivery_id"] == "restart-recovery:o/r:9"
+
+
+def test_reconcile_repo_does_not_requeue_a_stuck_non_elder_chief_run():
+    """grug#1275 scope: only Elder/Chief stuck runs are re-queued. Any
+    other persona's stuck run is still swept to a failure, not retried."""
+    guard = _spec("guard", "Grug - Guard")
+    pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
+    stuck_run = {"id": 11, "name": "Grug - Guard", "status": "in_progress", "started_at": _iso(200)}
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
+         patch("check_run_reconciler.expected_personas", return_value=[guard]), \
+         patch("check_run_reconciler.list_check_runs_for_ref", return_value=[stuck_run]), \
+         patch("check_run_reconciler.patch_check_run"), \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        dispatched, swept = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
+    assert (dispatched, swept) == (0, 1)
+    mock_dispatch.assert_not_called()
+
+
+def test_restart_recovery_flow_requeues_once_and_then_leaves_the_new_run_alone():
+    """grug#1275 acceptance drill, at the poller seam: a review was started
+    (in_progress Elder run), the consumers rolled mid-review and the run
+    was orphaned past its deadline. Pass 1 sweeps it and re-queues once;
+    pass 2 sees the swept run completed and the re-queued review's FRESH
+    in_progress run - and does nothing. The PR gets its Elder conclusion
+    from the re-queued run with no manual command and no second requeue."""
+    pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
+    orphaned = {"id": 9, "name": "Grug - Elder", "status": "in_progress", "started_at": _iso(200)}
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
+         patch("check_run_reconciler.expected_personas", return_value=[_ELDER]), \
+         patch("check_run_reconciler.list_check_runs_for_ref", return_value=[orphaned]), \
+         patch("check_run_reconciler.patch_check_run"), \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        assert reconciler.reconcile_repo("tok", 1, "o", "r", 2) == (1, 1)
+    assert mock_dispatch.call_count == 1
+
+    swept = {"id": 9, "name": "Grug - Elder", "status": "completed", "conclusion": "failure", "started_at": _iso(200)}
+    fresh = {"id": 10, "name": "Grug - Elder", "status": "in_progress", "started_at": _iso(1)}
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
+         patch("check_run_reconciler.expected_personas", return_value=[_ELDER]), \
+         patch("check_run_reconciler.list_check_runs_for_ref", return_value=[swept, fresh]), \
+         patch("check_run_reconciler.patch_check_run") as mock_patch2, \
+         patch("dispatcher.dispatch") as mock_dispatch2:
+        assert reconciler.reconcile_repo("tok", 1, "o", "r", 2) == (0, 0)
+    mock_dispatch2.assert_not_called()
+    mock_patch2.assert_not_called()

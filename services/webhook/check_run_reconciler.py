@@ -16,7 +16,9 @@ one, so an orphaned run - Elder's own, mid-review 503 - hangs indefinitely,
 reading as "work in progress" to every human and every piece of tooling.
 Closes any of grug's OWN check-runs (matched by name, never a third-party
 run on the same commit) past a bounded age with `conclusion: failure` and
-a body that says plainly that it errored.
+a body that says plainly that it errored. For Elder and Chief - the runs a
+consumer restart can orphan mid-review - the same pass also re-queues the
+persona exactly once (grug#1275; see `reconcile_repo`).
 
 Store-driven targeting (`check_run_reconcile_enabled`), same opt-in shape
 as dep_watch/pulse/reopen_watch (codex PR #489's rationale: no
@@ -112,6 +114,11 @@ def expected_personas(installation_id: int, repo_id: int) -> list[persona_regist
 
 _ALL_CHECK_RUN_NAMES = frozenset(spec.check_run_name for spec in persona_registry.REGISTRY)
 
+# grug#1275: only Elder and Chief stuck runs are re-queued after a sweep -
+# they are the review verdicts a restart can orphan mid-flight. Every
+# other persona's stuck run is swept to a failure and left alone.
+_REQUEUE_CHECK_RUN_NAMES = frozenset({"Grug - Elder", "Grug - Chief"})
+
 
 def _split_missing_present_stuck(
     runs: list[dict[str, Any]], expected: list[persona_registry.PersonaSpec],
@@ -121,11 +128,10 @@ def _split_missing_present_stuck(
     - missing: expected personas with no check-run on this head at all
     - present_keys: expected personas that already have SOME check-run
       (skip_personas) - by NAME only, any status. A run this same call
-      flags as `stuck` still counts as present: sweeping it to
-      `conclusion: failure` is itself a real, visible verdict the author
-      can act on, not a silence needing a same-cycle auto-retry. Retrying
-      here would risk an unbounded loop if the persona keeps timing out
-      on identical input every attempt.
+      flags as `stuck` still counts as present HERE; `reconcile_repo`
+      separately decides whether a stuck Elder/Chief persona is
+      re-queued once after its sweep (grug#1275) - that decision, and
+      its once-only argument, live there, not in this split.
     - stuck: grug's OWN check-runs (any registry name, not just `expected` -
       a persona disabled AFTER it started must still get its stuck run
       swept) sitting `in_progress` past the age bound
@@ -246,15 +252,42 @@ def reconcile_repo(
                     },
                 )
 
-            if not missing:
+            # grug#1275: a stuck Elder/Chief run is not only swept - it is
+            # re-queued ONCE, in this same pass, through dispatch (which
+            # re-runs the check; no PR comment is posted). Once is
+            # structural, not a stored flag: sweeping completed the
+            # orphaned run, so no later pass can flag that run stuck
+            # again, and the delivery_id is keyed by the orphaned run's
+            # own id. The re-queued review creates a NEW run with a fresh
+            # started_at, so it gets a full review deadline before it
+            # could ever be flagged itself. Other personas' stuck runs
+            # stay sweep-only (the #947 behaviour).
+            stuck_names = {str(run.get("name") or "") for run in stuck}
+            requeue = [
+                spec for spec in expected
+                if spec.check_run_name in stuck_names
+                and spec.check_run_name in _REQUEUE_CHECK_RUN_NAMES
+            ]
+            to_run = {spec.key for spec in missing} | {spec.key for spec in requeue}
+            if not to_run:
                 continue
             payload = _synthetic_pull_request_payload(
                 installation_id, owner, repo, repo_id, pr,
             )
+            if requeue:
+                run_ids = ",".join(sorted(
+                    str(run.get("id")) for run in stuck
+                    if str(run.get("name") or "") in _REQUEUE_CHECK_RUN_NAMES
+                ))
+                delivery_id = f"restart-recovery:{owner}/{repo}:{run_ids}"
+            else:
+                delivery_id = f"reconcile:{owner}/{repo}:{head_sha}"
             dispatch(
                 "pull_request", payload,
-                delivery_id=f"reconcile:{owner}/{repo}:{head_sha}",
-                skip_personas=present_keys,
+                delivery_id=delivery_id,
+                skip_personas=frozenset(
+                    key for key in present_keys if key not in to_run
+                ),
             )
             dispatched += 1
             log.info(
@@ -263,6 +296,7 @@ def reconcile_repo(
                     "installation_id": installation_id, "owner": owner, "repo": repo,
                     "pr_number": pr_number, "head_sha": head_sha[:8],
                     "missing_personas": [spec.key for spec in missing],
+                    "requeued_personas": [spec.key for spec in requeue],
                 },
             )
         except Exception as e:  # noqa: BLE001 — one PR must not abort the repo pass

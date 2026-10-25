@@ -37,6 +37,9 @@ metadata:
   name: grug-consumer
   namespace: grug
 spec:
-  minAvailable: 1
+  # grug#1275: unlike the other budgets, the consumer's is maxUnavailable: 0 -
+  # a voluntary disruption (drain, rollout) may never take review capacity
+  # below the full replica count; an eviction waits for a replacement.
+  maxUnavailable: 0
   selector:
     matchLabels: {app: grug-consumer}
