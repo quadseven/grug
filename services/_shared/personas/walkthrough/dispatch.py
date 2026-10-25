@@ -158,7 +158,7 @@ def _upsert_comment(
     repo: str,
     pr_number: int,
     body: str,
-) -> None:
+) -> int | None:
     existing = _find_marker_comment(token, owner, repo, pr_number)
     if existing is not None:
         httpx.patch(
@@ -167,13 +167,36 @@ def _upsert_comment(
             headers=_headers(token),
             timeout=_TIMEOUT,
         ).raise_for_status()
+        return existing
     else:
-        httpx.post(
+        response = httpx.post(
             f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
             json={"body": body},
             headers=_headers(token),
             timeout=_TIMEOUT,
-        ).raise_for_status()
+        )
+        response.raise_for_status()
+        try:
+            return int(response.json()["id"])
+        except (ValueError, KeyError, TypeError):
+            return None
+
+
+def _placeholder_body() -> str:
+    return f"{MARKER}\n\nGrug read the PR. Teller is drawing the map now..."
+
+
+def _resolve_placeholder_failure(
+    installation_id: int, owner: str, repo: str, pr_number: int, phase: str,
+) -> None:
+    body = f"{MARKER}\n\nGrug could not finish Teller's walkthrough ({phase}). Try again later."
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: _upsert_comment(token, owner, repo, pr_number, body),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
+        log.warning("walkthrough_failure_comment_failed", extra={"kind": type(e).__name__})
 
 
 def _log_fetch_failed(
@@ -280,6 +303,16 @@ def dispatch_walkthrough_review(
     started_at = hunt_recorder.now()
 
     try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: _upsert_comment(
+                token, owner, repo_name, pull_number, _placeholder_body()
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
+        log.warning("walkthrough_placeholder_failed", extra={"kind": type(e).__name__})
+
+    try:
         diff_text = with_install_token_retry(
             installation_id,
             lambda token: _fetch_pr_diff(token, owner, repo_name, pull_number),
@@ -293,6 +326,7 @@ def dispatch_walkthrough_review(
             repo_name=repo_name,
             pull_number=pull_number,
         )
+        _resolve_placeholder_failure(installation_id, owner, repo_name, pull_number, "diff fetch")
         _self_recover(installation_id, owner, repo_name, pull_number)
         return {"persona": "walkthrough", "result": "fetch_failed"}
 
@@ -314,6 +348,7 @@ def dispatch_walkthrough_review(
             repo_name=repo_name,
             pull_number=pull_number,
         )
+        _resolve_placeholder_failure(installation_id, owner, repo_name, pull_number, "file fetch")
         _self_recover(installation_id, owner, repo_name, pull_number)
         return {"persona": "walkthrough", "result": "fetch_failed"}
     if files_truncated:

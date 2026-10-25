@@ -103,6 +103,50 @@ def test_dispatch_posts_new_comment_when_no_marker_exists(monkeypatch):
     assert mock_rcv.call_args.kwargs["conclusion"] == "success"
 
 
+def test_placeholder_precedes_summary_and_is_patched_in_place(monkeypatch):
+    monkeypatch.setattr(wt_dispatch, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    calls = []
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/files"):
+            return _files_response([{"filename": "x.py", "additions": 1, "deletions": 0}])
+        if "/comments" in url:
+            comments = ([{"id": 42, "body": calls[-1][2]["body"],
+                          "performed_via_github_app": {"id": 1}}] if calls else [])
+            r = MagicMock(spec=httpx.Response)
+            r.raise_for_status = MagicMock()
+            r.json = MagicMock(return_value=comments)
+            return r
+        return _diff_response()
+
+    def fake_post(url, **kwargs):
+        calls.append(("POST", url, kwargs["json"]))
+        r = MagicMock(spec=httpx.Response)
+        r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value={"id": 42})
+        return r
+
+    def fake_patch(url, **kwargs):
+        calls.append(("PATCH", url, kwargs["json"]))
+        r = MagicMock(spec=httpx.Response)
+        r.raise_for_status = MagicMock()
+        return r
+
+    def summarize(*args, **kwargs):
+        assert calls and calls[0][0] == "POST"
+        assert "drawing the map" in calls[0][2]["body"]
+        return None
+
+    with patch("httpx.get", side_effect=fake_get), patch("httpx.post", side_effect=fake_post), \
+         patch("httpx.patch", side_effect=fake_patch), \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", side_effect=summarize):
+        wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert [call[0] for call in calls] == ["POST", "PATCH"]
+    assert "/issues/comments/42" in calls[1][1]
+
+
 def test_dispatch_records_the_walkthrough_in_the_canonical_review_session(monkeypatch):
     """#1207: the published summary and related hunts also land in the PR's
     review session, which the Hunt Board renders."""
