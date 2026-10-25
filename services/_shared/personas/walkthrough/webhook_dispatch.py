@@ -13,8 +13,8 @@ function (this shared module is also importable by the api service,
 where the loop never runs).
 
 Walkthrough is opt-in per PR: it only runs when the PR has the
-`grug:walkthrough` label (added via `/grug walkthrough` command) or
-when the persona is explicitly enabled for the repo via config.
+`grug:walkthrough` label, which can be added via the `/grug walkthrough`
+comment command.
 """
 
 from __future__ import annotations
