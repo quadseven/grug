@@ -439,6 +439,128 @@ def run_command(
     return result
 
 
+def _run_ask(
+    verb: str, arg: str, *, install_id: int, owner: str, repo: str,
+    pr_number: int, comment_id: int, token_fn, enqueue_ask, claim,
+    eyes_reaction_id: int,
+) -> dict[str, str]:
+    """Queue `/grug ask`; the consumer answers (see `_execute_command`)."""
+    repo_full = f"{owner}/{repo}"
+    if not arg:
+        try:
+            token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
+                                           "Ask Grug what? Usage: `/grug ask <question>`."))
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "no_op", "reason": "empty question", "verb": verb}
+    if enqueue_ask is None:
+        from rerun import enqueue_ask as _ea  # type: ignore
+        enqueue_ask = _ea
+    try:
+        # The heavy LLM Q&A runs in the CONSUMER (async), not here - the
+        # webhook must ACK fast. The consumer redacts + answers + replies.
+        enqueue_ask(install_id=install_id, repo=repo_full, pr_number=pr_number,
+                    comment_id=comment_id, question=arg,
+                    reaction_id=eyes_reaction_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning("interactive_ask_enqueue_failed", extra={"kind": type(e).__name__})
+        return {"status": "skip", "reason": "enqueue_failed", "verb": verb}
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": verb}
+    return {"status": "dispatched", "verb": verb}
+
+
+def _learnings_list(repo_full: str, *, owner: str, repo: str, pr_number: int,
+                     token_fn) -> dict[str, str]:
+    """Post the repo's active learnings, newest first."""
+    try:
+        rows = _wake_learnings_list(repo_full)
+    except Exception as e:  # noqa: BLE001
+        log.warning("interactive_learnings_list_failed",
+                    extra={"kind": type(e).__name__})
+        rows = []
+    lines = [f"Grug's remembered markings for `{repo_full}` (active, newest first):"]
+    for row in reversed(rows):
+        text = str(row.get("text", "")).strip()
+        digest = _learning_digest(text)
+        scope = str(row.get("scope_path", "")).strip()
+        scope_txt = f", scoped to `{_escape_html(scope)}`" if scope else ""
+        lines.append(
+            f"- `{digest}`: {_escape_html(text)}{scope_txt} | "
+            f"taught by `{_escape_html(str(row.get('author', '')))}` on PR #{row.get('source_pr', 0)} | "
+            f"used {int(row.get('usage_count', 0) or 0)}"
+        )
+    if not rows:
+        lines.append("(none)")
+    lines.append("")
+    lines.append("Use `/grug learnings delete <digest>` to forget one.")
+    body = "\n".join(lines)
+    try:
+        token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
+    except Exception:  # noqa: BLE001 - the list is read-only; a failed post is cosmetic
+        log.warning("interactive_learnings_list_post_failed")
+    return {"status": "dispatched", "verb": "learnings", "sub": "list"}
+
+
+def _learnings_delete(rest: str, verb: str, *, repo_full: str, owner: str,
+                      repo: str, pr_number: int, comment_id: int, token_fn,
+                      claim) -> dict[str, str]:
+    """Forget one learning by digest."""
+    if not rest:
+        try:
+            token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
+                                           "Usage: `/grug learnings delete <digest>`."))
+        except Exception:  # noqa: BLE001, S110 - cosmetic reply; a failed post must not fail the command
+            pass
+        return {"status": "no_op", "reason": "missing digest", "verb": verb}
+    digest = rest.strip().strip("`")
+    removed = False
+    if claim(f"learnings:{comment_id}"):
+        try:
+            removed = _wake_learnings_delete(repo_full, digest)
+        except Exception as e:  # noqa: BLE001
+            log.warning("interactive_learnings_delete_failed",
+                        extra={"digest": digest, "kind": type(e).__name__})
+    if removed:
+        body = f"Forgot marking `{digest}` on `{repo_full}`."
+    else:
+        body = f"No such marking `{digest}` on `{repo_full}`."
+    try:
+        token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
+    except Exception:  # noqa: BLE001, S110 - cosmetic reply; a failed post must not fail the command
+        pass
+    return {"status": "dispatched", "verb": "learnings", "sub": "delete"}
+
+
+def _run_learnings(
+    verb: str, arg: str, *, owner: str, repo: str, pr_number: int,
+    comment_id: int, token_fn, claim,
+) -> dict[str, str]:
+    """`/grug learnings list|delete <digest>` (see `_execute_command`)."""
+    repo_full = f"{owner}/{repo}"
+    parts = arg.split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if sub == "list":
+        return _learnings_list(repo_full, owner=owner, repo=repo,
+                               pr_number=pr_number, token_fn=token_fn)
+
+    if sub == "delete":
+        return _learnings_delete(
+            rest, verb, repo_full=repo_full, owner=owner, repo=repo,
+            pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
+            claim=claim,
+        )
+
+    try:
+        token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
+                                       "Usage: `/grug learnings list` or `/grug learnings delete <digest>`."))
+    except Exception:  # noqa: BLE001, S110 - cosmetic reply; a failed post must not fail the command
+        pass
+    return {"status": "no_op", "reason": "unknown learnings sub-command", "verb": verb}
+
+
 def _execute_command(
     verb: str, arg: str, *, install_id: int, owner: str, repo: str,
     pr_number: int, comment_id: int, token_fn, enqueue=None, enqueue_ask=None,
@@ -482,7 +604,6 @@ def _execute_command(
             head_sha=head_sha, defer_until=defer_until,
         )
 
-    repo_full = f"{owner}/{repo}"
     if verb in ("improve", "test-gaps"):
         return _run_persona_rerun(
             verb, install_id=install_id, owner=owner, repo=repo,
@@ -492,95 +613,18 @@ def _execute_command(
         )
 
     if verb == "ask":
-        if not arg:
-            try:
-                token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
-                                               "Ask Grug what? Usage: `/grug ask <question>`."))
-            except Exception:  # noqa: BLE001
-                pass
-            return {"status": "no_op", "reason": "empty question", "verb": verb}
-        if enqueue_ask is None:
-            from rerun import enqueue_ask as _ea  # type: ignore
-            enqueue_ask = _ea
-        try:
-            # The heavy LLM Q&A runs in the CONSUMER (async), not here - the
-            # webhook must ACK fast. The consumer redacts + answers + replies.
-            enqueue_ask(install_id=install_id, repo=repo_full, pr_number=pr_number,
-                        comment_id=comment_id, question=arg,
-                        reaction_id=eyes_reaction_id)
-        except Exception as e:  # noqa: BLE001
-            log.warning("interactive_ask_enqueue_failed", extra={"kind": type(e).__name__})
-            return {"status": "skip", "reason": "enqueue_failed", "verb": verb}
-        if not claim(f"grugcmd:{comment_id}"):
-            return {"status": "no_op", "reason": "comment already handled", "verb": verb}
-        return {"status": "dispatched", "verb": verb}
+        return _run_ask(
+            verb, arg, install_id=install_id, owner=owner, repo=repo,
+            pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
+            enqueue_ask=enqueue_ask, claim=claim,
+            eyes_reaction_id=eyes_reaction_id,
+        )
 
     if verb == "learnings":
-        parts = arg.split(None, 1)
-        sub = parts[0].lower() if parts else ""
-        rest = parts[1].strip() if len(parts) > 1 else ""
-
-        if sub == "list":
-            try:
-                rows = _wake_learnings_list(repo_full)
-            except Exception as e:  # noqa: BLE001
-                log.warning("interactive_learnings_list_failed",
-                            extra={"kind": type(e).__name__})
-                rows = []
-            lines = [f"Grug's remembered markings for `{repo_full}` (active, newest first):"]
-            for row in reversed(rows):
-                text = str(row.get("text", "")).strip()
-                digest = _learning_digest(text)
-                scope = str(row.get("scope_path", "")).strip()
-                scope_txt = f", scoped to `{_escape_html(scope)}`" if scope else ""
-                lines.append(
-                    f"- `{digest}`: {_escape_html(text)}{scope_txt} | "
-                    f"taught by `{_escape_html(str(row.get('author', '')))}` on PR #{row.get('source_pr', 0)} | "
-                    f"used {int(row.get('usage_count', 0) or 0)}"
-                )
-            if not rows:
-                lines.append("(none)")
-            lines.append("")
-            lines.append("Use `/grug learnings delete <digest>` to forget one.")
-            body = "\n".join(lines)
-            try:
-                token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
-            except Exception:  # noqa: BLE001 - the list is read-only; a failed post is cosmetic
-                log.warning("interactive_learnings_list_post_failed")
-            return {"status": "dispatched", "verb": "learnings", "sub": "list"}
-
-        if sub == "delete":
-            if not rest:
-                try:
-                    token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
-                                                   "Usage: `/grug learnings delete <digest>`."))
-                except Exception:  # noqa: BLE001, S110 - cosmetic reply; a failed post must not fail the command
-                    pass
-                return {"status": "no_op", "reason": "missing digest", "verb": verb}
-            digest = rest.strip().strip("`")
-            removed = False
-            if claim(f"learnings:{comment_id}"):
-                try:
-                    removed = _wake_learnings_delete(repo_full, digest)
-                except Exception as e:  # noqa: BLE001
-                    log.warning("interactive_learnings_delete_failed",
-                                extra={"digest": digest, "kind": type(e).__name__})
-            if removed:
-                body = f"Forgot marking `{digest}` on `{repo_full}`."
-            else:
-                body = f"No such marking `{digest}` on `{repo_full}`."
-            try:
-                token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
-            except Exception:  # noqa: BLE001, S110 - cosmetic reply; a failed post must not fail the command
-                pass
-            return {"status": "dispatched", "verb": "learnings", "sub": "delete"}
-
-        try:
-            token_fn(lambda t: _post_reply(t, owner, repo, pr_number,
-                                           "Usage: `/grug learnings list` or `/grug learnings delete <digest>`."))
-        except Exception:  # noqa: BLE001, S110 - cosmetic reply; a failed post must not fail the command
-            pass
-        return {"status": "no_op", "reason": "unknown learnings sub-command", "verb": verb}
+        return _run_learnings(
+            verb, arg, owner=owner, repo=repo, pr_number=pr_number,
+            comment_id=comment_id, token_fn=token_fn, claim=claim,
+        )
 
     return {"status": "no_op", "reason": f"unknown verb {verb}", "verb": verb}
 

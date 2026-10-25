@@ -357,18 +357,10 @@ def dispatch_walkthrough_review(
     return result
 
 
-def _walk(payload: dict[str, Any]) -> dict[str, str]:
-    """The walkthrough pass itself; see `dispatch_walkthrough_review`."""
-    pr = payload["pull_request"]
-    repo = payload["repository"]
-    installation = payload["installation"]
-    owner = repo["owner"]["login"]
-    repo_name = repo["name"]
-    pull_number = int(pr["number"])
-    head_sha = pr["head"]["sha"]
-    installation_id = int(installation["id"])
-    started_at = hunt_recorder.now()
-
+def _fetch_inputs(
+    installation_id: int, owner: str, repo_name: str, pull_number: int
+) -> tuple[str, list[FileStat], bool] | None:
+    """The diff and file list, or None after logging and self-recovering."""
     try:
         diff_text = with_install_token_retry(
             installation_id,
@@ -384,7 +376,7 @@ def _walk(payload: dict[str, Any]) -> dict[str, str]:
             pull_number=pull_number,
         )
         _self_recover(installation_id, owner, repo_name, pull_number)
-        return {"persona": "walkthrough", "result": "fetch_failed"}
+        return None
 
     try:
         files, files_truncated = with_install_token_retry(
@@ -405,7 +397,7 @@ def _walk(payload: dict[str, Any]) -> dict[str, str]:
             pull_number=pull_number,
         )
         _self_recover(installation_id, owner, repo_name, pull_number)
-        return {"persona": "walkthrough", "result": "fetch_failed"}
+        return None
     if files_truncated:
         # GitHub's own /files cap is 3000 - well above our _MAX_FILE_PAGES
         # bound - so a monorepo migration or generated-file dump can
@@ -420,7 +412,22 @@ def _walk(payload: dict[str, Any]) -> dict[str, str]:
             },
         )
 
-    lines_changed = sum(f.additions + f.deletions for f in files)
+    return diff_text, files, files_truncated
+
+
+def _summarize_walk(
+    diff_text: str,
+    files: list[FileStat],
+    files_truncated: bool,
+    *,
+    installation_id: int,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    head_sha: str,
+) -> tuple[str, list[FileStat], str | None, bool]:
+    """(summary, files, model_effort, degraded); falls back to a deterministic
+    summary when the LLM pass fails."""
     degraded = False
     llm_summary = None
     try:
@@ -471,6 +478,38 @@ def _walk(payload: dict[str, Any]) -> dict[str, str]:
             "deterministic summary."
         )
         model_effort = None
+
+    return summary, files, model_effort, degraded
+
+
+def _walk(payload: dict[str, Any]) -> dict[str, str]:
+    """The walkthrough pass itself; see `dispatch_walkthrough_review`."""
+    pr = payload["pull_request"]
+    repo = payload["repository"]
+    installation = payload["installation"]
+    owner = repo["owner"]["login"]
+    repo_name = repo["name"]
+    pull_number = int(pr["number"])
+    head_sha = pr["head"]["sha"]
+    installation_id = int(installation["id"])
+    started_at = hunt_recorder.now()
+
+    fetched = _fetch_inputs(installation_id, owner, repo_name, pull_number)
+    if fetched is None:
+        return {"persona": "walkthrough", "result": "fetch_failed"}
+    diff_text, files, files_truncated = fetched
+
+    lines_changed = sum(f.additions + f.deletions for f in files)
+    summary, files, model_effort, degraded = _summarize_walk(
+        diff_text,
+        files,
+        files_truncated,
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+        head_sha=head_sha,
+    )
 
     effort = estimate_effort(
         file_count=len(files),
