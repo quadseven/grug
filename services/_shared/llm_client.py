@@ -71,6 +71,7 @@ from reviewability import (
     ReviewabilityAssessment,
     ReviewabilityPolicy,
     assess_reviewability,
+    dimension_score,
 )
 from review_evidence import Hunk, ElderEvidence, seal
 from datadog_switch import datadog_enabled
@@ -5247,6 +5248,10 @@ def review_diff(
             "overall": assessment.overall,
             "semantic_paths": assessment.semantic_paths,
             "noise_paths": assessment.noise_paths,
+            "dimension_scores": {
+                dim.name: dimension_score(assessment, dim.name)
+                for dim in assessment.dimensions
+            },
             "installation_id": installation_id,
             "repo": ctx.get("repo"),
             "pr_number": ctx.get("pr_number"),
