@@ -14,8 +14,9 @@ def _ctx(payload, *, head_sha="headsha"):
     from personas.registry import PullRequestContext
 
     return PullRequestContext(
-        installation_id=1, owner="o", repo_name="r", head_sha=head_sha,
-        pr_number=5, pr_body="", payload=payload, delivery_id="d", blocking=False,
+        installation_id=1, owner="o", repo_name="r", repo_id=7777,
+        head_sha=head_sha, pr_number=5, pr_body="", payload=payload,
+        delivery_id="d", blocking=False,
     )
 
 

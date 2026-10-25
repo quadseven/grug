@@ -249,7 +249,7 @@ _DEFAULT_PERSONA_CONFIG = {
     "pulse_enabled": False,
     "pulse_comment_nudge_enabled": False,  # #656: suggested-fix replies on stale threads
     "smasher_enabled": False,  # execution tracer (#469): opt-in per repo
-    "walkthrough_enabled": True,  # Teller PR-walkthrough comment (#554)
+    "walkthrough_enabled": False,  # Teller PR-walkthrough comment (#554) - opt-in per PR or per repo
 }
 
 

@@ -480,6 +480,7 @@ def _handle_pull_request(
             installation_id=int(installation_id),
             owner=owner,
             repo_name=repo_name,
+            repo_id=int(repo_id) if repo_id is not None else None,
             head_sha=head_sha,
             pr_number=int(pr_number),
             pr_body=pr_body,

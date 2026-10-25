@@ -342,13 +342,14 @@ def test_pull_request_dispatches_all_personas_independently():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("adapters.install_store.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": True}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
                return_value={"persona": "tpm", "result": "pass"}), \
-patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq, \
-          patch("async_dispatch.enqueue_guard_review", return_value=True) as mock_guard_enq, \
-          patch("async_dispatch.enqueue_smasher_review", return_value=True) as mock_smasher_enq, \
-          patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
+         patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq, \
+         patch("async_dispatch.enqueue_guard_review", return_value=True) as mock_guard_enq, \
+         patch("async_dispatch.enqueue_smasher_review", return_value=True) as mock_smasher_enq, \
+         patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
         out = dispatch("pull_request", _full_pr_payload(with_walkthrough_label=True))
 
@@ -371,7 +372,8 @@ def test_pull_request_walkthrough_opt_in_required_without_label():
     Without it, the persona returns opt_in_required instead of queued."""
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
-         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": False}), \
+         patch("adapters.install_store.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
                return_value={"persona": "tpm", "result": "pass"}), \
@@ -394,6 +396,50 @@ def test_pull_request_walkthrough_opt_in_required_without_label():
     mock_teller_enq.assert_not_called()
 
 
+def test_pull_request_walkthrough_runs_when_repo_config_enabled():
+    """Walkthrough runs without the label when repo config has walkthrough_enabled=True."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": True}), \
+         patch("adapters.install_store.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": True}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
+         patch("async_dispatch.enqueue_elder_review", return_value=True), \
+         patch("async_dispatch.enqueue_guard_review", return_value=True), \
+         patch("async_dispatch.enqueue_smasher_review", return_value=True), \
+         patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        # No label, but config enabled
+        out = dispatch("pull_request", _full_pr_payload(with_walkthrough_label=False))
+
+    assert out["status"] == "dispatched"
+    assert out["personas"][4] == {"persona": "walkthrough", "result": "queued"}
+    mock_teller_enq.assert_called_once()
+
+
+def test_pull_request_walkthrough_runs_with_label_even_when_config_disabled():
+    """Walkthrough runs with the label even when repo config has walkthrough_enabled=False."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": False}), \
+         patch("adapters.install_store.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
+         patch("async_dispatch.enqueue_elder_review", return_value=True), \
+         patch("async_dispatch.enqueue_guard_review", return_value=True), \
+         patch("async_dispatch.enqueue_smasher_review", return_value=True), \
+         patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        # Label present = runs regardless of config
+        out = dispatch("pull_request", _full_pr_payload(with_walkthrough_label=True))
+
+    assert out["status"] == "dispatched"
+    assert out["personas"][4] == {"persona": "walkthrough", "result": "queued"}
+    mock_teller_enq.assert_called_once()
+
+
 def test_pull_request_tpm_failure_does_not_skip_elder_enqueue():
     """One persona failing must not skip the other — independence is
     the load-bearing property. With #272, "Elder runs" means "Elder is
@@ -401,6 +447,7 @@ def test_pull_request_tpm_failure_does_not_skip_elder_enqueue():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("adapters.install_store.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
                return_value={"persona": "tpm", "result": "publish_failed"}), \
@@ -423,6 +470,7 @@ def test_pull_request_tpm_evaluator_exception_does_not_skip_elder_enqueue():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("adapters.install_store.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": False}), \
          patch("personas.tpm.persona.evaluate_pull_request",
                side_effect=RuntimeError("evaluator regression")), \
          patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq:
@@ -442,6 +490,7 @@ def test_pull_request_elder_enqueue_failure_does_not_skip_tpm_status():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("adapters.install_store.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
                return_value={"persona": "tpm", "result": "pass"}), \
@@ -460,6 +509,7 @@ def test_pull_request_durable_enqueue_error_propagates_for_retry():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("adapters.install_store.get_repo_config", return_value={"code_reviewer_blocking": False, "walkthrough_enabled": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation") as mock_pub, \
          patch("async_dispatch.enqueue_elder_review",
@@ -483,6 +533,7 @@ def test_pull_request_threads_delivery_id_to_enqueue():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": True}), \
+         patch("adapters.install_store.get_repo_config", return_value={"code_reviewer_blocking": True, "walkthrough_enabled": False}), \
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
                return_value={"persona": "tpm", "result": "pass"}), \

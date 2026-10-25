@@ -14,7 +14,8 @@ where the loop never runs).
 
 Walkthrough is opt-in per PR: it only runs when the PR has the
 `grug:walkthrough` label (added via `/grug walkthrough` command) or
-when the persona is explicitly enabled for the repo via config.
+when the persona is explicitly enabled for the repo via config
+(`walkthrough_enabled`).
 """
 
 from __future__ import annotations
@@ -45,10 +46,16 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
     (Teller has no `blocking_flag`) - carried through only to match the
     shared enqueue signature.
 
-    Walkthrough only runs if the PR has the opt-in label. This makes
-    Teller an opt-in persona per PR rather than running on every PR.
+    Walkthrough runs if the repo has `walkthrough_enabled` config OR
+    if the PR has the opt-in label. This makes Teller an opt-in persona
+    per PR by default, but repos can enable it globally via config.
     """
-    if not _has_opt_in_label(ctx.payload):
+    from adapters.install_store import get_repo_config  # lazy: webhook-only + cold-start
+
+    repo_config = get_repo_config(ctx.installation_id, ctx.repo_id)
+    walkthrough_enabled = repo_config.get("walkthrough_enabled", False)
+
+    if not walkthrough_enabled and not _has_opt_in_label(ctx.payload):
         log.info(
             "walkthrough_opt_in_missing",
             extra={

@@ -74,9 +74,9 @@ def _ctx(*, action: str = "synchronize", after: bool = True, head: str = "a" * 4
         payload["before"] = "b" * 40
         payload["after"] = head
     return PullRequestContext(
-        installation_id=9, owner="o", repo_name="r", head_sha=head,
-        pr_number=7, pr_body="", payload=payload, delivery_id="d-1",
-        blocking=True,
+        installation_id=9, owner="o", repo_name="r", repo_id=7777,
+        head_sha=head, pr_number=7, pr_body="", payload=payload,
+        delivery_id="d-1", blocking=True,
     )
 
 

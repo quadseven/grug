@@ -141,6 +141,7 @@ class PullRequestContext:
     installation_id: int
     owner: str
     repo_name: str
+    repo_id: int | None
     head_sha: str
     pr_number: int
     pr_body: str
@@ -301,7 +302,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         # the roster/Activity-feed identity record_check_verdict carries.
         check_run_name=CHECK_TELLER,
         enabled_flag="walkthrough_enabled",
-        enabled_default=True,  # trial-harvest gap 1: default ON (#554, #522)
+        enabled_default=False,  # opt-in by default (#1356)
         blocking_flag=None,
         blocking_default=False,
         dispatch_style="async",  # summary LLM call + comment upsert I/O

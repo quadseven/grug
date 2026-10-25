@@ -68,8 +68,9 @@ def _warder_ctx(payload, *, blocking=False):
     from personas.registry import PullRequestContext
 
     return PullRequestContext(
-        installation_id=1, owner="o", repo_name="r", head_sha="headsha",
-        pr_number=5, pr_body="", payload=payload, delivery_id="d", blocking=blocking,
+        installation_id=1, owner="o", repo_name="r", repo_id=7777,
+        head_sha="headsha", pr_number=5, pr_body="", payload=payload,
+        delivery_id="d", blocking=blocking,
     )
 
 
