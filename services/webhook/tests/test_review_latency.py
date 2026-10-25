@@ -111,7 +111,7 @@ def test_main_exits_2_without_backends(monkeypatch):
 def test_llmobs_export_noop_when_disabled(monkeypatch):
     """Default (no env) must not require ddtrace or ship anything."""
     from review_latency import llmobs_export as le
-    from sast_benchmark.backends import BenchBackend
+    from review_latency.bench_backends import BenchBackend
 
     # Reset module latch so this test controls enablement.
     monkeypatch.setattr(le, "_enabled", False)
@@ -137,7 +137,7 @@ def test_llmobs_export_noop_when_disabled(monkeypatch):
 def test_llmobs_trial_span_submits_span_and_evals(monkeypatch):
     """When enabled, trial_span wraps the call and submits parse_ok + complete_s."""
     from review_latency import llmobs_export as le
-    from sast_benchmark.backends import BenchBackend
+    from review_latency.bench_backends import BenchBackend
 
     annotate_calls: list[dict] = []
     eval_calls: list[dict] = []
@@ -268,7 +268,7 @@ def test_llmobs_trial_span_propagates_caller_exception(monkeypatch):
     the o11y guard or masked by contextlib's 'generator didn't stop after
     throw()') and the span must still be closed with the error info."""
     from review_latency import llmobs_export as le
-    from sast_benchmark.backends import BenchBackend
+    from review_latency.bench_backends import BenchBackend
 
     monkeypatch.setenv("GRUG_BENCH_LLMOBS", "1")
     llm_kwargs, exits = _install_fake_llmobs(monkeypatch, le)
@@ -335,7 +335,7 @@ def test_run_one_stream_transport_failure_finishes_span_then_retries(monkeypatch
         rn.httpx, "stream",
         MagicMock(side_effect=httpx.ConnectError("stream-hostile")),
     )
-    from sast_benchmark.backends import BenchBackend
+    from review_latency.bench_backends import BenchBackend
 
     backend = BenchBackend(name="cave", url="http://x", model="m", api_key="")
     fixture = rn.LatencyFixture(

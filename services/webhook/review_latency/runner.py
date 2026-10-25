@@ -16,7 +16,7 @@ from typing import Sequence
 import httpx
 
 from llm_client import _parse_response  # noqa: PLC2701 - Elder path on purpose
-from sast_benchmark.backends import BenchBackend
+from .bench_backends import BenchBackend
 
 from .fixtures import LatencyFixture
 from .llmobs_export import trial_span

@@ -21,18 +21,15 @@ SERVICE_DIR = Path(__file__).resolve().parent.parent  # services/webhook/
 _BASIC_CONFIG_RE = re.compile(r"\blogging\.basicConfig\(")
 
 # Files allowed to call basicConfig() directly, with the reason each is safe:
-# - one-off developer CLI tools (sast_benchmark, elder_eval, review_latency
-#   __main__.py entrypoints) are run locally/in CI for ad hoc analysis, never
-#   deployed as a long-running k8s workload DD scrapes for status-based
-#   alerting.
+# - review_latency __main__.py entrypoint is run locally/in CI for ad hoc
+#   analysis, never deployed as a long-running k8s workload DD scrapes for
+#   status-based alerting.
 # - smasher's trial_worker/trial_deps/trial_fetch run INSIDE the locked-down,
 #   ephemeral sandbox Job (#469, ADR-0013) on the BYON node class, where DD
 #   stdout-scraping is a known-unreliable channel (kubelet:10250 i/o
 #   timeout) - the real output channel is the pod termination message, not
 #   stdout, so fixing their log format wouldn't fix anything DD-side.
 _ALLOWLIST_RELATIVE = (
-    "sast_benchmark/__main__.py",
-    "elder_eval/__main__.py",
     "review_latency/__main__.py",
     "personas/smasher/trial_worker.py",
     "personas/smasher/trial_deps.py",

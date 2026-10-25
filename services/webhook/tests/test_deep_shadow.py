@@ -16,14 +16,11 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-import yaml
 
 import deep_shadow
 import llm_client as lc
-from elder_eval import gate
 from llm_client import Backend, Hunk
 from review_evidence import assemble_evidence
-from sast_benchmark import backends
 
 _GATEWAY = "http://cave.test"
 _VLLM = "http://deep-vllm.test"
@@ -249,92 +246,6 @@ def test_an_unknown_mode_resolves_to_off(monkeypatch, caplog) -> None:
     with caplog.at_level(logging.WARNING):
         assert deep_shadow.resolve_deep_arm() is None
     assert any(r.message == "deep_arm_mode_unknown" for r in caplog.records)
-
-
-# --- the eval gate (cutover to `serve`) ------------------------------------
-
-_K8S = Path(__file__).resolve().parents[3] / "k8s"
-_REVIEW_DEPLOYMENTS = ("consumer-deployment.yaml", "webhook-deployment.yaml")
-
-
-def _entry(model: str, catch: float, noise: float, cases: int = 17, errored=()) -> dict:
-    return {
-        "model": model,
-        "served_models": {model: cases},
-        "overall_catch": catch,
-        "noise_rate": noise,
-        "cases_scored": cases,
-        "errored_cases": list(errored),
-    }
-
-
-def _baseline(**backends: dict) -> dict:
-    return {"prompt_sha": "x", "backends": backends}
-
-
-_CAVE = _entry("qwen3-coder-next:q8_0", catch=0.17, noise=0.0)
-
-
-def test_gate_passes_a_candidate_no_worse_than_the_incumbent() -> None:
-    baseline = _baseline(cave=_CAVE, **{"deep-shadow": _entry(_VLLM_MODEL, 0.25, 0.0)})
-    assert gate.deep_cutover_regressions(baseline, _VLLM_MODEL) == []
-
-
-def test_gate_refuses_without_a_recorded_candidate() -> None:
-    (reason,) = gate.deep_cutover_regressions(_baseline(cave=_CAVE), _VLLM_MODEL)
-    assert "deep-shadow" in reason
-
-
-@pytest.mark.parametrize(
-    ("candidate", "needle"),
-    [
-        (_entry("another-model", 0.25, 0.0), "measured another-model"),
-        (_entry(_VLLM_MODEL, 0.10, 0.0), "overall_catch"),
-        (_entry(_VLLM_MODEL, 0.25, 0.20), "noise_rate"),
-        (_entry(_VLLM_MODEL, 0.25, 0.0, cases=9), "cases_scored"),
-        (_entry(_VLLM_MODEL, 0.25, 0.0, errored=("case-1",)), "errored"),
-    ],
-)
-def test_gate_refuses_a_candidate_that_regresses(candidate, needle) -> None:
-    baseline = _baseline(cave=_CAVE, **{"deep-shadow": candidate})
-    reasons = gate.deep_cutover_regressions(baseline, _VLLM_MODEL)
-    assert any(needle in r for r in reasons), reasons
-
-
-def _manifest_env(name: str) -> dict[str, str | None]:
-    docs = [d for d in yaml.safe_load_all((_K8S / name).read_text()) if d]
-    (dep,) = [d for d in docs if d.get("kind") == "Deployment"]
-    (container,) = [c for c in dep["spec"]["template"]["spec"]["containers"] if c.get("env")][:1]
-    return {e["name"]: e.get("value") for e in container["env"]}
-
-
-@pytest.mark.parametrize("name", _REVIEW_DEPLOYMENTS)
-def test_a_committed_serve_mode_has_passed_the_eval_gate(name) -> None:
-    env = _manifest_env(name)
-    mode = (env.get("GRUG_DEEP_ARM_MODE") or "off").strip().lower()
-    assert mode in {"off", "shadow", "serve"}, mode
-    if mode == "serve":
-        regressions = gate.deep_cutover_regressions(
-            gate.load_baseline(), env.get("GRUG_DEEP_SHADOW_MODEL") or "",
-        )
-        assert regressions == [], regressions
-
-
-def test_deep_arm_settings_match_across_review_deployments() -> None:
-    consumer, webhook = (_manifest_env(n) for n in _REVIEW_DEPLOYMENTS)
-    for key in ("GRUG_DEEP_ARM_MODE", "GRUG_DEEP_SHADOW_URL", "GRUG_DEEP_SHADOW_MODEL"):
-        assert consumer.get(key) == webhook.get(key), key
-
-
-def test_the_deep_shadow_bench_backend_sends_the_production_body(monkeypatch) -> None:
-    for var in ("OPENROUTER_KEY", "POOLSIDE_KEY", "CAVE_URL"):
-        monkeypatch.delenv(f"GRUG_BENCH_{var}", raising=False)
-    monkeypatch.setenv("GRUG_BENCH_DEEP_SHADOW_URL", f"{_VLLM}/v1/chat/completions")
-    monkeypatch.setenv("GRUG_BENCH_DEEP_SHADOW_MODEL", _VLLM_MODEL)
-    (bench,) = backends.configured_backends()
-    assert bench.name == gate.DEEP_CANDIDATE
-    assert bench.model == _VLLM_MODEL
-    assert bench.extra_body == lc.DEEP_VLLM_EXTRA_BODY
 
 
 def test_a_cancelled_review_is_not_shadowed(monkeypatch) -> None:

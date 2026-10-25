@@ -28,7 +28,7 @@ import sys
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional, Sequence
 
-from sast_benchmark.backends import BenchBackend
+from .bench_backends import BenchBackend
 
 from .scoring import TrialResult
 

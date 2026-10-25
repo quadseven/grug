@@ -41,7 +41,7 @@ import os
 import sys
 from pathlib import Path
 
-from sast_benchmark.backends import BenchBackend
+from .bench_backends import BenchBackend
 
 from .fixtures import default_fixtures
 from .llmobs_export import _DEFAULT_ML_APP, flush, maybe_enable
