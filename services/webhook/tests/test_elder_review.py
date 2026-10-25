@@ -419,6 +419,20 @@ def test_lease_abort_never_raises_and_close_unregisters(monkeypatch):
     assert er.release_active_review_claims() == 0
 
 
+def test_lease_acquire_releases_and_unregisters_when_heartbeat_fails(monkeypatch):
+    from personas.code_reviewer import elder_review as er
+
+    def boom(_args):
+        raise RuntimeError("thread start failed")
+
+    store = _FakeStore()
+    monkeypatch.setattr(er, "start_review_claim_heartbeat", boom)
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        _lease(monkeypatch, store)
+    assert store.calls == ["acquire", "release"]
+    assert er.release_active_review_claims() == 0
+
+
 def test_shutdown_sweep_releases_an_unclosed_lease(monkeypatch):
     store = _FakeStore()
     er, (_, lease) = _lease(monkeypatch, store)
