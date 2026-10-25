@@ -56,6 +56,7 @@ from personas.code_reviewer.degraded_gate import (
 )
 from personas.code_reviewer.elder_review import (
     ReviewClaimLease,
+    Transition,
     _MAX_ELDER_SETTLE_SECONDS,
     decide_redrive,
     review_eligible,
@@ -1951,7 +1952,7 @@ def _run_hot_review(
         current_head = str((after.get("head") or {}).get("sha") or "")
         current_snapshot_id = review_snapshot_id_from_pr(after)
         if not review_eligible(after):
-            lease.release("during settle")
+            lease.settle(Transition.RELEASE, "during settle")
             log.info(
                 "elder_review_ineligible_after_settle",
                 extra={
@@ -1975,7 +1976,7 @@ def _run_hot_review(
                 current_head_sha=current_head,
                 job_redrive_count=int(job.get("redrive_count", 0)),
             )
-            lease.release("for stale snapshot")
+            lease.settle(Transition.RELEASE, "for stale snapshot")
             log.info(
                 "elder_review_stale_snapshot_cancelled",
                 extra={
@@ -2082,7 +2083,7 @@ def _run_hot_review(
                     if review_eligible(latest)
                     else False
                 )
-                lease.release("during dispatch")
+                lease.settle(Transition.RELEASE, "during dispatch")
                 if not review_eligible(latest):
                     return "pr_ineligible"
                 return "stale_snapshot" if redrived else "intent_drift_exhausted"
@@ -2093,7 +2094,7 @@ def _run_hot_review(
                 # moment the PR is reopened/marked ready, before the freshly
                 # scheduled review posts. Leave the check pending; the
                 # ready_for_review/reopen enqueue completes it via a real review.
-                lease.release("during dispatch")
+                lease.settle(Transition.RELEASE, "during dispatch")
                 return "pr_ineligible"
             result_status = result.get("result")
             if result_status == "publish_failed":
@@ -2136,7 +2137,7 @@ def _run_hot_review(
                     raise RuntimeError(
                         "Elder fail-open completion did not land (freshness outage)"
                     )
-                lease.complete("after fail-open", release_fallback=True)
+                lease.settle(Transition.COMPLETE_OR_RELEASE, "after fail-open")
                 return "fail_open_freshness"
             if result_status == "skipped" and degraded_reason in _RETRYABLE_SKIP_REASONS:
                 # Model/content-side transient (backend outage, unparseable
@@ -2175,7 +2176,7 @@ def _run_hot_review(
                         "Elder fail-open completion did not land "
                         f"(skip: {degraded_reason or 'unknown'})"
                     )
-                lease.complete("after fail-open skip", release_fallback=True)
+                lease.settle(Transition.COMPLETE_OR_RELEASE, "after fail-open skip")
                 return f"fail_open_{degraded_reason or 'skipped'}"
             if (
                 result_status not in {"pass", "fail", "skipped", "review_rejected"}
@@ -2184,7 +2185,7 @@ def _run_hot_review(
                 raise RuntimeError(
                     f"Elder review returned unexpected result: {result_status!r}"
                 )
-            lease.complete("during review")
+            lease.settle(Transition.COMPLETE, "during review")
     except Exception:
         lease.abort()
         raise

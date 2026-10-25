@@ -349,6 +349,61 @@ def test_durable_review_claim_expiry_allows_safe_takeover(pg):
     assert store.complete_review_claim(**claim, owner_token="worker-new") is True
 
 
+def test_elder_lease_lifecycle_against_real_store(pg):
+    """ReviewClaimLease end to end over real Postgres: acquire blocks a rival,
+    complete dedupes, and a released snapshot is retakeable."""
+    from personas.code_reviewer.elder_review import (
+        ReviewClaimLease,
+        Transition,
+        release_active_review_claims,
+    )
+
+    claim = dict(
+        install_id=7,
+        repo="quadseven/grug",
+        pr_number=12,
+        persona="code_reviewer",
+        head_sha="snapshot-elder-lease",
+    )
+    status, lease = ReviewClaimLease.acquire(claim)
+    assert status == "acquired" and lease is not None
+    assert ReviewClaimLease.acquire(claim) == ("busy", None)
+    lease.settle(Transition.RELEASE, "test")
+    lease.close()
+
+    status, lease = ReviewClaimLease.acquire(claim)
+    assert status == "acquired" and lease is not None
+    lease.settle(Transition.COMPLETE, "test")
+    lease.close()
+    assert ReviewClaimLease.acquire(claim) == ("completed", None)
+    assert release_active_review_claims() == 0
+
+
+def test_elder_shutdown_sweep_releases_real_claim(pg):
+    """A claim whose handler never ran its exit is freed by the sweep."""
+    from personas.code_reviewer.elder_review import (
+        ReviewClaimLease,
+        release_active_review_claims,
+    )
+
+    claim = dict(
+        install_id=7,
+        repo="quadseven/grug",
+        pr_number=13,
+        persona="code_reviewer",
+        head_sha="snapshot-elder-sweep",
+    )
+    status, lease = ReviewClaimLease.acquire(claim)
+    assert status == "acquired" and lease is not None
+    assert release_active_review_claims() == 1
+    lease.abort()
+    status, retaken = ReviewClaimLease.acquire(claim)
+    assert status == "acquired" and retaken is not None
+    retaken.abort()
+    retaken.close()
+    lease.close()
+
+
 def test_claim_delivery_concurrent_exactly_one_winner(pg):
     """The reason this suite needs REAL Postgres: N racing claimants,
     exactly one True."""

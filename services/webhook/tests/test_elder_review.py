@@ -425,3 +425,39 @@ def test_shutdown_sweep_releases_an_unclosed_lease(monkeypatch):
     assert er.release_active_review_claims() == 1
     assert store.calls == ["acquire", "release"]
     lease.abort()
+
+
+@pytest.mark.parametrize(
+    ("name", "kwargs", "expected_calls"),
+    [
+        ("COMPLETE", {}, ["acquire", "complete"]),
+        ("COMPLETE_OR_RELEASE", {"complete": False}, ["acquire", "complete", "release"]),
+        ("RELEASE", {}, ["acquire", "release"]),
+    ],
+)
+def test_settle_applies_each_enumerated_transition(
+    monkeypatch, name, kwargs, expected_calls,
+):
+    """Every Transition member maps to exactly one store sequence."""
+    store = _FakeStore(**kwargs)
+    er, (_, lease) = _lease(monkeypatch, store)
+    lease.settle(er.Transition[name], "test")
+    lease.close()
+    assert store.calls == expected_calls
+
+
+def test_settle_covers_every_transition(monkeypatch):
+    from personas.code_reviewer import elder_review as er
+
+    assert {t.name for t in er.Transition} == {
+        "COMPLETE", "COMPLETE_OR_RELEASE", "RELEASE",
+    }
+
+
+def test_consumer_shutdown_sweep_routes_through_lifecycle_module(monkeypatch):
+    """consumer.py holds no sweep of its own: it calls the module's."""
+    import consumer
+    from personas.code_reviewer import elder_review as er
+
+    monkeypatch.setattr(er, "release_active_review_claims", lambda: 7)
+    assert consumer._release_active_review_claims() == 7

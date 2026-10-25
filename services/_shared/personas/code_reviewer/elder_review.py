@@ -11,6 +11,7 @@ unit-testable without mocking SQS or psycopg at depth.
 
 from __future__ import annotations
 
+import enum
 import hashlib
 import json
 import logging
@@ -304,6 +305,21 @@ class ReviewClaimLost(RuntimeError):
     """The claim lease was taken over or expired before a terminal transition."""
 
 
+class Transition(enum.Enum):
+    """Every way an owned claim can end inside the handler.
+
+    COMPLETE: the snapshot was reviewed (or fail-open closed it), so
+    duplicates skip it. COMPLETE_OR_RELEASE: as COMPLETE, but a lost
+    completion falls back to release so the snapshot redrives rather than
+    hanging until lease expiry. RELEASE: hand the snapshot back (stale
+    snapshot redrive, ineligible PR) so a later attempt can take it.
+    """
+
+    COMPLETE = "complete"
+    COMPLETE_OR_RELEASE = "complete_or_release"
+    RELEASE = "release"
+
+
 class ReviewClaimLease:
     """One owned Elder snapshot claim, from acquire to terminal transition.
 
@@ -369,6 +385,16 @@ class ReviewClaimLease:
         if not install_store.release_review_claim(**self.args):
             raise ReviewClaimLost(
                 f"Elder claim settlement failed {reason}"
+            )
+
+    def settle(self, transition: Transition, reason: str) -> None:
+        """Apply one enumerated terminal transition (the only exit callers use)."""
+        if transition is Transition.RELEASE:
+            self.release(reason)
+        else:
+            self.complete(
+                reason,
+                release_fallback=transition is Transition.COMPLETE_OR_RELEASE,
             )
 
     def abort(self) -> None:
