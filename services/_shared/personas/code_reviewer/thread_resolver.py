@@ -54,7 +54,7 @@ query($owner: String!, $repo: String!, $pr: Int!, $after: String,
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          id isResolved isOutdated
+          id isResolved isOutdated resolvedBy { login }
           comments(first: $perThread) {
             totalCount
             nodes {

@@ -21,7 +21,7 @@ import os
 from dataclasses import dataclass
 
 from personas.code_reviewer.diff_parser import DiffHunk
-from personas.code_reviewer.persona import Finding
+from personas.code_reviewer.persona import Budget, Finding
 
 # Defaults chosen from common linter conventions (radon/flake8-cognitive):
 # cyclomatic > 15 is "high", cognitive > 25 is "hard to follow". Env-tunable
@@ -246,6 +246,13 @@ def _complexity_finding(
         ),
         effort="quick-win" if material else None,
         complexity_function=name,
+        budgets=tuple(
+            Budget(metric, value, cap)
+            for metric, value, cap in (
+                ("cyclomatic", cyclo, cyclo_cap), ("cognitive", cog, cog_cap),
+            )
+            if value > cap
+        ),
     )
 
 

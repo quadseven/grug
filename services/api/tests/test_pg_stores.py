@@ -1664,6 +1664,28 @@ def test_an_expired_removal_acceptance_is_replaced_not_merged(pg):
 
 
 # ---------------------------------------------------------------------------
+# Last command-triggered Elder run per PR (grug#1430)
+# ---------------------------------------------------------------------------
+
+
+def test_elder_command_run_keeps_the_latest_start_per_pr(pg):
+    from adapters import pg_install_store as store
+
+    pr = dict(install_id=7, repo="o/r", pr_number=3)
+    assert store.get_elder_command_run(**pr) is None
+    store.record_elder_command_run(**pr, head_sha="sha-a", started_at=100.5)
+    store.record_elder_command_run(**pr, head_sha="sha-b", started_at=200.0)
+    assert store.get_elder_command_run(**pr) == {"head_sha": "sha-b", "started_at": 200.0}
+    # another PR and another install see nothing
+    assert store.get_elder_command_run(install_id=7, repo="o/r", pr_number=4) is None
+    assert store.get_elder_command_run(install_id=8, repo="o/r", pr_number=3) is None
+    # a headless run is not recorded
+    store.record_elder_command_run(
+        install_id=7, repo="o/r", pr_number=5, head_sha="", started_at=1.0)
+    assert store.get_elder_command_run(install_id=7, repo="o/r", pr_number=5) is None
+
+
+# ---------------------------------------------------------------------------
 # Hunt Board review session: compare-and-swap row per PR (grug#1207)
 # ---------------------------------------------------------------------------
 
