@@ -55,7 +55,7 @@ jobs:
       - name: 01. Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: 02. Install uv
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8
       - name: 03. Infra unit tests
         working-directory: infra/pulumi
         run: uv run --with pytest pytest tests/ -q
@@ -81,7 +81,7 @@ jobs:
           PULUMI_BACKEND_URL: ${{ secrets.PULUMI_BACKEND_URL }}
         run: pulumi login "$PULUMI_BACKEND_URL"
       - name: 05a. Install uv
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8
       - name: 05b. Verify Python + uv
         run: |
           python3 --version

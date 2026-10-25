@@ -40,22 +40,21 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: quadseven/infra-public
-          ref: efd2c4ed4d011064a353bec181685088faf29eb0
+          ref: a7003146e7894370b9cd1720fe424277a2a46fe8
           path: .hygiene/infra-public
           persist-credentials: false
 
       # The scanned-file count is asserted, not just the exit status: a glob
-      # that silently matched nothing would also print "clean". 18 is what the
-      # pinned linter counted when #1278 widened the trigger (18 workflows, no
-      # .sh); a pin whose linter also counts the three action.yml files reads
-      # higher. Lower it only when workflows are actually removed.
+      # that silently matched nothing would also print "clean". 21 is what the
+      # pinned linter counts at this pin (18 workflows + 3 composite
+      # action.yml, no .sh). Lower it only when workflows are actually removed.
       - name: 03. Lint workflows
         run: |
           set -euo pipefail
           out=$(python3 .hygiene/infra-public/.github/scripts/workflow_hygiene.py) || { echo "$out"; exit 1; }
           echo "$out"
           n=$(printf '%s\n' "$out" | sed -n 's/.*clean (\([0-9][0-9]*\) files checked).*/\1/p')
-          if [ -z "$n" ] || [ "$n" -lt 18 ]; then
-            echo "::error::workflow-hygiene scanned ${n:-no} files, expected at least 18 - a sweep that matches nothing must not pass as clean"
+          if [ -z "$n" ] || [ "$n" -lt 21 ]; then
+            echo "::error::workflow-hygiene scanned ${n:-no} files, expected at least 21 - a sweep that matches nothing must not pass as clean"
             exit 1
           fi
