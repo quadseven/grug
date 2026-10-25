@@ -680,3 +680,43 @@ def test_classify_finds_thumbs_down_among_many_reactions():
     'first N' slicing can't reintroduce the miss."""
     reactions = [{"content": "heart"}] * 40 + [{"content": "-1"}]
     assert cr_reactions._classify_reactions(reactions) == "false_positive"
+
+
+def test_record_reaction_learning_logs_reaction_learning_written(monkeypatch, caplog):
+    from adapters import install_store
+
+    monkeypatch.setattr(install_store, "put_ledger_row", lambda row: None)
+    monkeypatch.setattr(install_store, "list_ledger_rows", lambda repo: [])
+    monkeypatch.setattr(install_store, "put_repo_practices", lambda repo, data: None)
+    monkeypatch.setattr(install_store, "put_repo_exemplars", lambda repo, data: None)
+
+    with caplog.at_level("INFO"):
+        ok = cr_reactions._record_reaction_learning(
+            _learning_record(comment_id=5), "confirmed",
+        )
+    assert ok is True
+    rec = [r for r in caplog.records if r.message == "reaction_learning_written"]
+    assert len(rec) == 1
+    assert rec[0].comment_id == 5
+    assert rec[0].verdict == "declined"
+    assert getattr(rec[0], "class") == "null-deref"
+
+
+def test_poll_and_annotate_logs_learning_writes_count(monkeypatch, _patch_store, caplog):
+    _patch_annotate(monkeypatch)
+    learned = MagicMock(return_value=True)
+    monkeypatch.setattr(cr_reactions, "_record_reaction_learning", learned)
+    monkeypatch.setattr(
+        cr_reactions, "_has_write_permission", lambda *args: True,
+    )
+    resp = MagicMock(spec=httpx.Response)
+    resp.raise_for_status = MagicMock()
+    resp.json = MagicMock(return_value=[{"content": "+1", "user": {"login": "alice"}}])
+    with caplog.at_level("INFO"), patch("httpx.get", return_value=resp):
+        cr_reactions.poll_and_annotate(
+            [_learning_record(comment_id=5)], install_id=1, fetch_token=lambda: "tok",
+        )
+    cycle = [r for r in caplog.records if r.message == "reaction_poll_cycle"]
+    assert len(cycle) == 1
+    assert cycle[0].learned == 1
+    assert cycle[0].submitted == 1
