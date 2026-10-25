@@ -2979,6 +2979,21 @@ def test_an_abandoned_run_that_cannot_be_closed_still_gets_a_fresh_review(monkey
     requeue.assert_not_called()
 
 
+def test_an_abandoned_run_with_no_id_is_not_patched_but_still_superseded(monkeypatch):
+    """A listing row with no id cannot be closed; the command still runs a
+    fresh review and Grug still says why."""
+    replies, patched = [], []
+    run = _elder_run(rerun._ELDER_RUN_ABANDONED_SECONDS + 5)
+    del run["id"]
+    dispatch, _, _ = _command_fixture(
+        monkeypatch, run=run, replies=replies, patched=patched,
+    )
+    assert rerun._run_one(_command_job(), message_id="m-13") == "dispatched"
+    dispatch.assert_called_once()
+    assert patched == []
+    assert len(replies) == 1
+
+
 @pytest.mark.parametrize("run", [
     _elder_run(60),                                  # a live review
     _elder_run(0, status="queued"),                  # queued, not started

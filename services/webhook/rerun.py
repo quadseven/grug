@@ -1514,19 +1514,26 @@ def _supersede_abandoned_run(
             "this commit, whose check replaces this one."
         ),
     )
-    try:
-        with_install_token_retry(
-            install_id,
-            lambda tok: patch_check_run(
-                tok, owner, repo_name, int(run["id"]), result,
-            ),
-        )
-    except Exception as error:  # noqa: BLE001 - the fresh review replaces it anyway
+    run_id = run.get("id")
+    if not isinstance(run_id, int):
+        # A listing row with no usable id cannot be PATCHed; the fresh
+        # review's own check still replaces it.
         log.warning(
-            "rerun_command_abandoned_close_failed",
-            extra={"repo": f"{owner}/{repo_name}", "pr": pr_number,
-                   "kind": type(error).__name__},
+            "rerun_command_abandoned_close_skipped",
+            extra={"repo": f"{owner}/{repo_name}", "pr": pr_number},
         )
+    else:
+        try:
+            with_install_token_retry(
+                install_id,
+                lambda tok: patch_check_run(tok, owner, repo_name, run_id, result),
+            )
+        except Exception as error:  # noqa: BLE001 - the fresh review replaces it anyway
+            log.warning(
+                "rerun_command_abandoned_close_failed",
+                extra={"repo": f"{owner}/{repo_name}", "pr": pr_number,
+                       "kind": type(error).__name__},
+            )
     _answer_command(
         install_id=install_id, owner=owner, repo_name=repo_name,
         pr_number=pr_number,
