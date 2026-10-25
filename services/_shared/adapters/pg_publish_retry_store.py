@@ -84,7 +84,7 @@ def list_due_publish_retries(limit: int) -> list[str]:
               AND (data->>'lease_expires_at')::bigint <= %(now)s
             ORDER BY (data->>'next_attempt_at')::bigint, sk
             LIMIT %(limit)s
-            """,
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
             {"pk": PUBLISH_RETRY_PK, "now": _now(), "limit": max(0, int(limit))},
         ).fetchall()
     return [row[0] for row in rows]
@@ -111,7 +111,7 @@ def claim_publish_retry(
               AND (data->>'next_attempt_at')::bigint <= %(now)s
               AND (data->>'lease_expires_at')::bigint <= %(now)s
             RETURNING data
-            """,
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
             {
                 "pk": PUBLISH_RETRY_PK, "sk": key, "owner": owner_token,
                 "expires": now + max(1, int(lease_seconds)), "now": now,
