@@ -7,7 +7,7 @@ files table, and the full comment assembly. No LLM, no network.
 
 from __future__ import annotations
 
-from personas.walkthrough.effort import effort_label, estimate_effort
+from personas.walkthrough.effort import estimate_effort, effort_label
 from personas.walkthrough.mermaid import build_diagram
 from personas.walkthrough.render import (
     MARKER,
@@ -168,7 +168,7 @@ def test_walkthrough_body_email_rendering_pins_no_heading_no_table_row_no_mermai
     assert "Shape of the change" not in body
 
 
-def test_walkthrough_body_carries_marker_summary_list_effort():
+def test_walkthrough_body_carries_marker_summary_table_diagram_effort():
     files = [FileStat(path="x.py", additions=2, deletions=0, summary="tweak")]
     body = walkthrough_body(
         summary="Adds a guard clause.",
@@ -185,8 +185,6 @@ def test_walkthrough_body_carries_marker_summary_list_effort():
     assert "x.py" in body
     assert "tweak" in body
     assert "- `x.py` (+2/-0) - tweak" in body
-    assert "```mermaid" not in body
-    assert "Shape of the change" not in body
     assert "quick" in body
     assert "aaaaaaaaaaaa" in body  # truncated head sha
     # Detail is collapsed by default (short PR timeline).
@@ -232,6 +230,18 @@ def test_walkthrough_body_no_diagram_and_no_files_omits_the_section_silently():
     assert "Shape of the change" not in body
 
 
+def test_walkthrough_body_no_diagram_with_files_states_a_degradation_reason():
+    """T1386: The mermaid 'Shape of the change' diagram never reaches the
+    email comment; it is left out of the comment entirely."""
+    files = [FileStat(path="a.py", additions=1, deletions=0)]
+    body = walkthrough_body(
+        summary="s", files=files, diagram=None, effort="quick",
+        head_sha="b" * 40, degraded=False,
+    )
+    assert "```mermaid" not in body
+    assert "Shape of the change" not in body
+
+
 def test_walkthrough_body_diagram_never_reaches_comment():
     """T1386: The mermaid 'Shape of the change' diagram never reaches the
     email comment; it is left out of the comment entirely."""
@@ -242,13 +252,6 @@ def test_walkthrough_body_diagram_never_reaches_comment():
     )
     assert "```mermaid" not in body
     assert "Shape of the change" not in body
-
-    body_no_diag = walkthrough_body(
-        summary="s", files=files, diagram=None, effort="quick",
-        head_sha="b" * 40, degraded=False,
-    )
-    assert "```mermaid" not in body_no_diag
-    assert "Shape of the change" not in body_no_diag
 
 
 def test_walkthrough_body_degraded_says_so_honestly():
@@ -293,7 +296,7 @@ def test_walkthrough_body_not_truncated_by_default():
 # --- output sanitization: mentions + table-breaking chars (round 4, codex) -
 
 
-def test_changed_files_table_handles_pipe_in_summary_without_table():
+def test_changed_files_table_escapes_pipe_in_plain_summary_cell():
     files = [FileStat(path="a.py", additions=1, deletions=0,
                        summary="fixes | breaks the table")]
     table = changed_files_table(files)
