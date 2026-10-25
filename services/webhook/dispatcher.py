@@ -971,6 +971,71 @@ def _defer_if_budget_spent(
     )
 
 
+def _handle_grug_walkthrough(
+    *, installation_id: int, owner: str, repo_name: str, pr_number: int,
+    comment_id: int, token_fn,
+) -> dict[str, str]:
+    """Handle `/grug walkthrough` - add the opt-in label to the PR.
+
+    This allows the Teller walkthrough to run on this PR. The label is
+    `grug:walkthrough`. Idempotent - adding an existing label is a no-op.
+    """
+    import httpx  # type: ignore
+    from urllib.parse import quote as _q
+
+    def _add_label(token: str) -> dict[str, Any]:
+        r = httpx.post(
+            f"https://api.github.com/repos/{_q(owner, safe='')}/"
+            f"{_q(repo_name, safe='')}/issues/{int(pr_number)}/labels",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"labels": ["grug:walkthrough"]},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    try:
+        token_fn(_add_label)
+    except httpx.HTTPStatusError as e:
+        log.warning(
+            "grug_walkthrough_label_failed",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": pr_number,
+                "status": e.response.status_code,
+            },
+        )
+        return {"status": "skip", "reason": "label_add_failed"}
+    except httpx.RequestError as e:
+        log.warning(
+            "grug_walkthrough_label_transport_failed",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": pr_number,
+                "kind": type(e).__name__,
+            },
+        )
+        return {"status": "skip", "reason": "label_add_transport_failed"}
+
+    log.info(
+        "grug_walkthrough_opt_in",
+        extra={
+            "installation_id": installation_id,
+            "owner": owner,
+            "repo": repo_name,
+            "pr_number": pr_number,
+        },
+    )
+    return {"status": "ok", "trigger": "walkthrough", "result": "opt_in_added"}
+
+
 def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     action = payload.get("action", "")
     if action != "created":
@@ -1154,6 +1219,13 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # Interactive commands (#528) reuse the SAME gating above (allowlist +
     # tpm + author-or-write-collaborator), then branch to their own actions.
     # recheck keeps the original DoR-re-evaluate path below.
+    if cmd.verb == "walkthrough":
+        return _handle_grug_walkthrough(
+            installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
+            comment_id=int(comment_id) if comment_id is not None else 0,
+            token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+        )
     if cmd.verb != "recheck":
         from interactive import run_command  # type: ignore
         return run_command(

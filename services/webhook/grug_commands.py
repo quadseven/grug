@@ -15,6 +15,7 @@ delete` which forgets a taught preference):
   /grug learnings list list the repo's remembered markings (usage counts)
   /grug learnings delete <digest>  forget one remembered marking by digest
   /grug accept-removal <path> <sha>  accept one deleted guard path on head <sha> (#1405)
+  /grug walkthrough    opt in to Teller walkthrough on this PR
 """
 
 from __future__ import annotations
@@ -26,14 +27,14 @@ from dataclasses import dataclass
 # line in a longer comment; the verb is a known token, everything after is
 # the arg (only `ask`, `learnings` and `accept-removal` consume it). Case-insensitive.
 _CMD_RE = re.compile(
-    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings|accept-removal|accept_removal)\b[ \t]*(.*)$",
+    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings|accept-removal|accept_removal|walkthrough)\b[ \t]*(.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 
 _CANON = {"test_gaps": "test-gaps", "accept_removal": "accept-removal"}
 VERBS = frozenset({
     "recheck", "improve", "ask", "test-gaps", "resume", "review", "learnings",
-    "accept-removal",
+    "accept-removal", "walkthrough",
 })
 
 # The verbs that start an ELDER re-run. They are the ones that must not
