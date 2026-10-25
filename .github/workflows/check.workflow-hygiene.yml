@@ -53,7 +53,7 @@ jobs:
           set -euo pipefail
           out=$(python3 .hygiene/infra-public/.github/scripts/workflow_hygiene.py) || { echo "$out"; exit 1; }
           echo "$out"
-          n=$(printf '%s\n' "$out" | sed -n 's/.*clean (\([0-9][0-9]*\) files checked).*/\1/p')
+          n=$(printf '%s\n' "$out" | sed -n 's/.*clean (\([0-9][0-9]*\) files checked.*/\1/p')
           if [ -z "$n" ] || [ "$n" -lt 21 ]; then
             echo "::error::workflow-hygiene scanned ${n:-no} files, expected at least 21 - a sweep that matches nothing must not pass as clean"
             exit 1
