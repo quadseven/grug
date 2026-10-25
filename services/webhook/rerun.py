@@ -1534,7 +1534,10 @@ def _supersede_abandoned_run(
                 extra={"repo": f"{owner}/{repo_name}", "pr": pr_number,
                        "kind": type(error).__name__},
             )
-    _answer_command(
+    # Not raised on a miss: a redelivery would find the run already closed
+    # and could start a second review. The fresh review's own check and
+    # board comment are the fallback sign; the miss is logged.
+    if not _answer_command(
         install_id=install_id, owner=owner, repo_name=repo_name,
         pr_number=pr_number,
         body=(
@@ -1542,7 +1545,12 @@ def _supersede_abandoned_run(
             f"progress for {minutes} minutes with no worker. Grug marked it "
             "abandoned and started a fresh review for the queued command."
         ),
-    )
+    ):
+        log.warning(
+            "rerun_command_abandoned_reply_failed",
+            extra={"repo": f"{owner}/{repo_name}", "pr": pr_number,
+                   "head_sha": head_sha[:8]},
+        )
 
 
 def _command_already_served(
@@ -1608,7 +1616,10 @@ def _command_queue_status(
         return None
     now = _now()
     age = _run_age_seconds(run, now)
-    if age is not None and age >= _ELDER_RUN_ABANDONED_SECONDS:
+    # Strictly past the cutoff, as the sweeper reads it. A held command was
+    # queued after its run started, so the run's age always passes the
+    # cutoff before the hold reaches the same cap.
+    if age is not None and age > _ELDER_RUN_ABANDONED_SECONDS:
         # grug#1447: the run lost its worker; waiting on it is waiting on
         # nothing. Close it and run the command now.
         log.warning(

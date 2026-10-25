@@ -2994,7 +2994,19 @@ def test_an_abandoned_run_with_no_id_is_not_patched_but_still_superseded(monkeyp
     assert len(replies) == 1
 
 
+def test_a_failed_supersede_reply_is_logged_and_the_review_still_runs(monkeypatch, caplog):
+    dispatch, _, _ = _command_fixture(
+        monkeypatch, run=_elder_run(rerun._ELDER_RUN_ABANDONED_SECONDS + 5),
+    )
+    monkeypatch.setattr(rerun, "_answer_command", lambda **k: False)
+    with caplog.at_level(logging.WARNING):
+        assert rerun._run_one(_command_job(), message_id="m-14") == "dispatched"
+    dispatch.assert_called_once()
+    assert "rerun_command_abandoned_reply_failed" in caplog.text
+
+
 @pytest.mark.parametrize("run", [
+    _elder_run(rerun._ELDER_RUN_ABANDONED_SECONDS),  # exactly at the cutoff
     _elder_run(60),                                  # a live review
     _elder_run(0, status="queued"),                  # queued, not started
     {"id": 55, "name": "x", "status": "in_progress"},  # no started_at
