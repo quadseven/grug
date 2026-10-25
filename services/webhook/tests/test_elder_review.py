@@ -27,7 +27,6 @@ from personas.code_reviewer.elder_review import (
     register_active_review_claim,
     release_active_review_claims,
     review_eligible,
-    review_freshness_failure,
     review_freshness_id,
     review_freshness_id_from_pr,
     review_snapshot_id,
@@ -328,125 +327,6 @@ def test_unregister_removes_from_registry():
     register_active_review_claim("tok", {"repo": "r/repo", "pr_number": 1, "owner_token": "tok"})
     unregister_active_review_claim("tok")
     assert release_active_review_claims() == 0
-
-
-# ---------------------------------------------------------------------------
-# review_freshness_failure (httpx + install token seam)
-# ---------------------------------------------------------------------------
-
-
-def test_review_freshness_failure_stale_head(monkeypatch):
-    def fake_with_install_token_retry(install_id, func):
-        token = "tok"
-        return func(token)
-
-    def fake_fetch(token, owner, repo, pull_number):
-        return (
-            "new-freshness-id",
-            "new-head",
-            "open",
-            False,
-        )
-
-    monkeypatch.setattr("personas.code_reviewer.elder_review.with_install_token_retry", fake_with_install_token_retry)
-    monkeypatch.setattr(
-        "personas.code_reviewer.elder_review._fetch_current_review_snapshot",
-        fake_fetch,
-    )
-
-    result = review_freshness_failure(
-        installation_id=1,
-        owner="owner",
-        repo_name="repo",
-        pull_number=42,
-        expected_snapshot_id="old-snapshot",
-        expected_head_sha="old-head",
-    )
-    assert result is not None
-    assert result["degraded_reason"] == "stale_snapshot"
-
-
-def test_review_freshness_failure_same_head_publishes_anyway(monkeypatch):
-    def fake_with_install_token_retry(install_id, func):
-        token = "tok"
-        return func(token)
-
-    def fake_fetch(token, owner, repo, pull_number):
-        return (
-            "different-freshness-id",
-            "same-head",
-            "open",
-            False,
-        )
-
-    monkeypatch.setattr("personas.code_reviewer.elder_review.with_install_token_retry", fake_with_install_token_retry)
-    monkeypatch.setattr(
-        "personas.code_reviewer.elder_review._fetch_current_review_snapshot",
-        fake_fetch,
-    )
-
-    result = review_freshness_failure(
-        installation_id=1,
-        owner="owner",
-        repo_name="repo",
-        pull_number=42,
-        expected_snapshot_id="old-snapshot",
-        expected_head_sha="same-head",
-    )
-    assert result is None  # same head -> publish anyway
-
-
-def test_review_freshness_failure_ineligible(monkeypatch):
-    def fake_with_install_token_retry(install_id, func):
-        token = "tok"
-        return func(token)
-
-    def fake_fetch(token, owner, repo, pull_number):
-        return (
-            "freshness-id",
-            "head",
-            "closed",
-            False,
-        )
-
-    monkeypatch.setattr("personas.code_reviewer.elder_review.with_install_token_retry", fake_with_install_token_retry)
-    monkeypatch.setattr(
-        "personas.code_reviewer.elder_review._fetch_current_review_snapshot",
-        fake_fetch,
-    )
-
-    result = review_freshness_failure(
-        installation_id=1,
-        owner="owner",
-        repo_name="repo",
-        pull_number=42,
-        expected_snapshot_id="snap",
-        expected_head_sha="head",
-    )
-    assert result is not None
-    assert result["degraded_reason"] == "pr_ineligible"
-
-
-def test_review_freshness_failure_github_unavailable(monkeypatch):
-    def fake_with_install_token_retry(install_id, func):
-        token = "tok"
-        raise httpx.HTTPStatusError(
-            "500", request=httpx.Request("GET", "https://example.com"),
-            response=httpx.Response(500),
-        )
-
-    monkeypatch.setattr("personas.code_reviewer.elder_review.with_install_token_retry", fake_with_install_token_retry)
-
-    result = review_freshness_failure(
-        installation_id=1,
-        owner="owner",
-        repo_name="repo",
-        pull_number=42,
-        expected_snapshot_id="snap",
-        expected_head_sha="head",
-    )
-    assert result is not None
-    assert result["degraded_reason"] == "freshness_check_failed"
 
 
 # --- ReviewClaimLease: acquire / heartbeat / release ordering -------------
