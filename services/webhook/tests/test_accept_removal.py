@@ -172,8 +172,10 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
                     "boom", request=request,
                     response=httpx.Response(502, request=request),
                 )
+            if commits == "long":
+                return _Resp([{"author": {"login": "author"}, "committer": {"login": "author"}}] * 100)
             logins = commits if isinstance(commits, list) else [payload["issue"]["user"]["login"]]
-            return _Resp([{"author": {"login": who}, "committer": {"login": "web-flow"}}
+            return _Resp([{"author": {"login": who} if who else None, "committer": {"login": "web-flow"}}
                           for who in logins] if "page=1" in url else [])
         if "/pulls/42" in url and "diff" in str((k.get("headers") or {}).get("Accept")):
             return _Resp(_DELETION_DIFF if diff is None else diff)
@@ -677,3 +679,15 @@ def test_a_trusted_operator_needs_a_known_pr_author_and_commit_list():
                                          commit_logins=frozenset({"author"}), **ok)
     assert not accept_removal.may_accept("COLLABORATOR", "write", pr_author="author",
                                          commit_logins=None, **ok)
+
+
+@pytest.mark.parametrize("commits", [["author", ""], "long"])
+def test_an_unlinked_commit_author_or_a_truncated_list_refuses_a_trusted_operator(monkeypatch, commits):
+    """A commit whose author maps to no login could be anyone, and a list
+    that does not end within the pages read is not a full list."""
+    _trust(monkeypatch, {("myorg", "reviewer")})
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association="COLLABORATOR",
+    ), permission="write", commits=commits)
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []

@@ -654,13 +654,17 @@ def _pr_commit_logins(
     installation_id: int, owner: str, repo_name: str, pr_number: int,
 ) -> frozenset[str] | None:
     """Lower-case logins that authored or committed any commit on the PR
-    (GitHub's web-flow committer excluded), up to 250 commits, or None when
-    the list could not be read, which refuses a trusted operator."""
+    (GitHub's web-flow committer excluded), or None, which refuses a trusted
+    operator: the list could not be read, it did not end within 300 commits,
+    or a commit's author or committer maps to no GitHub login (an unlinked
+    identity could be anyone). Git metadata can still name another person's
+    linked address; push-actor proof is out of scope, since the owner
+    chooses whom to trust."""
     from urllib.parse import quote as _q
     from github_app_auth import with_install_token_retry  # type: ignore
     import httpx  # type: ignore
 
-    def _read(token: str) -> frozenset[str]:
+    def _read(token: str) -> frozenset[str] | None:
         logins: set[str] = set()
         for page in (1, 2, 3):
             r = httpx.get(
@@ -678,11 +682,13 @@ def _pr_commit_logins(
             for row in rows:
                 for role in ("author", "committer"):
                     who = str(((row or {}).get(role) or {}).get("login") or "").lower()
-                    if who and who != "web-flow":
+                    if not who:
+                        return None
+                    if who != "web-flow":
                         logins.add(who)
             if len(rows) < 100:
-                break
-        return frozenset(logins)
+                return frozenset(logins)
+        return None
 
     try:
         return with_install_token_retry(int(installation_id), _read)
