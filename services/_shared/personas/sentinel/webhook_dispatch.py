@@ -65,6 +65,11 @@ MARKER = "<!-- grug-sentinel:abandoned-review -->"
 # reason as _HIGH_SEVERITY; Elder's GraphQL form, without the [bot] suffix,
 # is personas.code_reviewer.thread_resolver._BOT_LOGIN.
 _ELDER_BOT_LOGIN = "grug-tribe[bot]"
+# List of agent bot logins that count as handled findings when they reply.
+# Configured via GRUG_AGENT_REPLY_BOTS environment variable; empty list
+# means no agent bot replies are counted as handled (only human replies and
+# Elder's "Fixed in" replies).
+_AGENT_REPLY_BOTS = os.getenv("GRUG_AGENT_REPLY_BOTS", "").split()
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -153,12 +158,14 @@ def _is_own_bot(comment: dict, own_app_id: str) -> bool:
 
 
 def _replied_to_comment_ids(token: str, owner: str, repo: str, pr_number: int) -> set[int]:
-    """Finding comments handled by a human reply or Elder's latest Fixed in.
+    """Finding comments handled by a human reply, Elder's latest Fixed in, or
+    a configured agent bot reply.
 
     REST review comments do not expose GraphQL's `isResolved`, so use the
     reply chain as the per-finding addressed signal. Elder's own reply counts
     only when it is the newest comment in the thread and starts with
-    `Fixed in`; other bot replies remain unhandled.
+    `Fixed in`; other bot replies are unhandled unless they match a configured
+    agent bot login.
     """
     own_app_id = get_app_id()
     comments_by_id: dict[int, dict] = {}
@@ -198,12 +205,23 @@ def _replied_to_comment_ids(token: str, owner: str, repo: str, pr_number: int) -
     handled: set[int] = set()
     for root_id, replies in replies_by_root.items():
         human_replied = any(str((reply.get("user") or {}).get("type", "")) != "Bot" for reply in replies)
+
+        # Check for Elder's own "Fixed in" reply
         latest = max(replies, key=lambda comment: int(comment["id"]))
         elder_fixed = (
             _is_own_bot(latest, own_app_id)
             and (latest.get("body") or "").lstrip().lower().startswith("fixed in ")
         )
-        if human_replied or elder_fixed:
+
+        # Check for configured agent bot reply
+        agent_bot_replied = False
+        for reply in replies:
+            reply_user = reply.get("user") or {}
+            if reply_user.get("type") == "Bot" and reply_user.get("login") in _AGENT_REPLY_BOTS:
+                agent_bot_replied = True
+                break
+
+        if human_replied or elder_fixed or agent_bot_replied:
             handled.add(root_id)
     return handled
 
