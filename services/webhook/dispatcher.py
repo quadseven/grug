@@ -1079,14 +1079,20 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
 
     try:
         if accepting:
-            # grug#1405: only an admin accepts a removal, whoever wrote
-            # the PR. No PR-author shortcut, and no write-level path.
+            # #1405: an admin accepts a removal, whoever wrote the PR;
+            # a trusted operator the owner lists in SSM accepts with write,
+            # never on their own PR. No other write-level path.
+            import secrets_loader  # type: ignore
             from accept_removal import may_accept  # type: ignore
             perm = _actor_permission(
                 int(installation_id), owner, repo_name, sender_login,
             )
             association = str(comment.get("author_association") or "")
-            has_write = None if perm is None else may_accept(association, perm)
+            has_write = None if perm is None else may_accept(
+                association, perm, owner=owner, login=sender_login,
+                pr_author=pr_author_login or "",
+                trusted=secrets_loader.get_removal_acceptors(),
+            )
         else:
             has_write = _actor_has_write(
                 int(installation_id), owner, repo_name, sender_login,

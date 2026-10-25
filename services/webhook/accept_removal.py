@@ -15,6 +15,11 @@ text, and each part failing closed when it is missing:
   collaborator permission API. Write or maintain is refused, whether or
   not they wrote the PR, and so is a failed permission lookup. Git
   authorship is not consulted: it can be spoofed.
+- the one exception: a trusted operator the owner lists in SSM for this
+  owner's repos (`owner:login`, secrets_loader.get_removal_acceptors)
+  accepts with write or maintain, but never on a PR they wrote. A personal
+  account cannot make a collaborator admin; this is how its owner shares
+  the call. The list fails closed: unread, it names nobody.
 
 The command names the head the admin reviewed (the full 40-character SHA
 that Elder's finding prints), and it counts only while that is still the
@@ -98,11 +103,20 @@ def accept_command(path: str, head_sha: str) -> str:
     return f"/grug accept-removal {path} {head_sha}"
 
 
-def may_accept(association: str, permission: str) -> bool:
-    """Only an admin accepts a removal: the repo's OWNER, or admin
-    permission from the collaborator API. Write, maintain and anything
-    else are refused, whoever wrote the PR."""
-    return association == "OWNER" or permission == "admin"
+def may_accept(association: str, permission: str, *, owner: str = "", login: str = "",
+               pr_author: str = "", trusted: frozenset[tuple[str, str]] = frozenset()) -> bool:
+    """An admin accepts a removal: the repo's OWNER, or admin permission from
+    the collaborator API, whoever wrote the PR. Beside them, a trusted
+    operator the owner names for this owner's repos (`trusted`, from
+    secrets_loader.get_removal_acceptors) accepts with write or maintain,
+    as a collaborator or member, on a PR someone else wrote. Anything else
+    is refused."""
+    if association == "OWNER" or permission == "admin":
+        return True
+    return ((owner.lower(), login.lower()) in trusted
+            and association in ("COLLABORATOR", "MEMBER")
+            and permission in ("write", "maintain")
+            and bool(login) and login.lower() != pr_author.lower())
 
 
 def refusal_reply(reason: str, association: str = "", permission: str = "") -> str:
@@ -110,17 +124,19 @@ def refusal_reply(reason: str, association: str = "", permission: str = "") -> s
     work. Empty when the commenter gets no reply (a Bot, an App or an
     unconfirmed author: replying to those could start a loop)."""
     how = (
-        "Ask a repo admin to comment `/grug accept-removal <path> <head-sha>` "
+        "Ask a repo admin or a trusted operator to comment "
+        "`/grug accept-removal <path> <head-sha>` "
         "(Elder's finding prints the exact command)."
     )
     if reason == "not_admin":
         return (
-            "Only a repo admin can accept a removal; your permission here is "
+            "Only a repo admin, or a trusted operator on a PR they did not write, "
+            "can accept a removal; your permission here is "
             f"{permission or 'unknown'}. Grug recorded nothing. " + how
         )
     if reason == "association":
         return (
-            "Only a repo admin can accept a removal; this comment's author is "
+            "Only a repo admin or a trusted operator can accept a removal; this comment's author is "
             f"{(association or 'not a member of this repo').lower()} here. "
             "Grug recorded nothing. " + how
         )

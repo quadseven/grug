@@ -513,10 +513,9 @@ def test_a_non_admin_is_told_why_and_what_works(monkeypatch, association, permis
     ), permission=permission)
     assert out["status"] == "no_op", out
     assert len(store.replies) == 1, store.replies
-    assert f"only a repo admin can accept a removal; your permission here is {permission}" in (
-        store.replies[0].lower()
-    )
-    assert "ask a repo admin" in store.replies[0].lower()
+    assert ("only a repo admin, or a trusted operator on a pr they did not write, can accept a "
+            f"removal; your permission here is {permission}") in store.replies[0].lower()
+    assert "ask a repo admin or a trusted operator" in store.replies[0].lower()
     assert store.recorded == [] and store.enqueued == []
 
 
@@ -571,3 +570,66 @@ def test_an_unreadable_diff_records_nothing_and_says_so(monkeypatch):
     assert out["status"] == "skip", out
     assert store.recorded == [] and store.enqueued == []
     assert len(store.replies) == 1 and "could not read" in store.replies[0]
+
+
+# Trusted operators. A personal account's repos cannot grant a collaborator
+# admin, so the owner names extra logins (owner:login pairs, in SSM) who may
+# accept a removal with write access, on a PR someone else wrote.
+
+
+def _trust(monkeypatch, pairs: set[tuple[str, str]]) -> None:
+    import secrets_loader
+
+    monkeypatch.setattr(secrets_loader, "get_removal_acceptors", lambda: frozenset(pairs))
+
+
+@pytest.mark.parametrize("permission", ["write", "maintain"])
+def test_a_trusted_operator_with_write_may_accept_someone_elses_pr(monkeypatch, permission):
+    _trust(monkeypatch, {("myorg", "reviewer")})
+    out, store = _dispatch(monkeypatch, _payload(
+        login="Reviewer", pr_author="author", association="COLLABORATOR",
+    ), permission=permission)
+    assert out["status"] == "dispatched", out
+    assert store.recorded and store.recorded[0]["accepted_by"] == "Reviewer"
+
+
+@pytest.mark.parametrize(("pairs", "login", "pr_author", "permission"), [
+    ({("otherorg", "reviewer")}, "reviewer", "author", "write"),  # trusted for another owner
+    ({("myorg", "reviewer")}, "reviewer", "reviewer", "write"),  # their own PR
+    ({("myorg", "reviewer")}, "reviewer", "author", "read"),  # no write access
+    ({("myorg", "someone")}, "reviewer", "author", "write"),  # not listed
+])
+def test_a_trusted_operator_is_refused_outside_its_grant(
+    monkeypatch, pairs, login, pr_author, permission,
+):
+    _trust(monkeypatch, pairs)
+    out, store = _dispatch(monkeypatch, _payload(
+        login=login, pr_author=pr_author, association="COLLABORATOR",
+    ), permission=permission)
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+
+
+def test_the_trusted_list_is_read_from_ssm_and_fails_closed(monkeypatch):
+    import secrets_loader
+
+    class _Ssm:
+        def __init__(self, value: str | None) -> None:
+            self.value = value
+
+        def get_parameter(self, Name: str) -> dict[str, Any]:
+            if self.value is None:
+                raise RuntimeError("ParameterNotFound")
+            return {"Parameter": {"Value": self.value}}
+
+    def read(env: str, value: str | None) -> frozenset[tuple[str, str]]:
+        monkeypatch.setenv("GRUG_REMOVAL_ACCEPTORS_SSM", env)
+        monkeypatch.setattr(secrets_loader, "_ssm", _Ssm(value))
+        secrets_loader.get_removal_acceptors.cache_clear()
+        return secrets_loader.get_removal_acceptors()
+
+    assert read("/grug/removal-acceptors", "MyOrg:Reviewer, other:login\nbad bad: :x a:b:c") == {
+        ("myorg", "reviewer"), ("other", "login"),
+    }
+    assert read("/grug/removal-acceptors", None) == frozenset()
+    assert read("", "myorg:reviewer") == frozenset()
