@@ -1026,6 +1026,66 @@ def resume_elder(*, install_id: int, repo: str, pr_number: int) -> bool:
     return any(sk == paused_sk and live for sk, live in rows)
 
 
+# --- Last command-triggered Elder run per PR (grug#1430) ------------------
+# A `/grug improve` queued behind a review in flight is SERVED by any
+# command-triggered Elder run of the same head that started after it was
+# posted: that run read every change the commenter made. One row per PR
+# holds the latest such start, so the rerun consumer can coalesce a burst of
+# commands into one review instead of running the same review N times.
+
+_ELDER_COMMAND_RUN_TTL_SECONDS = 86400
+
+
+def _elder_command_run_sk(repo: str, pr_number: int) -> str:
+    return f"ELDER#CMDRUN#{repo}#{int(pr_number)}"
+
+
+def record_elder_command_run(
+    *, install_id: int, repo: str, pr_number: int, head_sha: str,
+    started_at: float,
+) -> None:
+    """Record that a command-triggered Elder run of `head_sha` started at
+    `started_at` (epoch seconds). Raises on a database error; the caller
+    treats the record as best-effort (a missing row only costs a repeat
+    review, never a lost one)."""
+    if not head_sha:
+        return
+    ttl = int(datetime.now(timezone.utc).timestamp() + _ELDER_COMMAND_RUN_TTL_SECONDS)
+    attrs = {
+        "repo": repo, "pr_number": int(pr_number), "head_sha": head_sha,
+        "started_at": float(started_at),
+    }
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": _elder_command_run_sk(repo, pr_number),
+                "data": encode_attrs(attrs),
+                "ttl": ttl,
+            },
+        )
+
+
+def get_elder_command_run(
+    *, install_id: int, repo: str, pr_number: int,
+) -> dict[str, Any] | None:
+    """The latest command-triggered Elder run on this PR as
+    {"head_sha", "started_at"}, or None. Raises on a database error."""
+    item = _get_item(_inst_pk(install_id), _elder_command_run_sk(repo, pr_number))
+    if not item or not item.get("head_sha"):
+        return None
+    return {
+        "head_sha": str(item["head_sha"]),
+        "started_at": float(item.get("started_at") or 0),
+    }
+
+
 # --- Accepted guard removals: one row per PR head (grug#1405) -------------
 # `/grug accept-removal <path>` from a trusted maintainer answers a
 # `removed-guarded-path` finding. The head SHA is part of the key, so an

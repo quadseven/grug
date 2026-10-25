@@ -214,6 +214,9 @@ def enqueue_rerun(
     not_before: float = 0.0,
     requeue_of: str = "",
     dedup_key: str = "",
+    comment_id: int = 0,
+    queued_at: float = 0.0,
+    hold_started_at: float = 0.0,
 ) -> None:
     """Send a `RerunJob` to `grug-rerun-jobs` (the webhook-side producer used by
     Elder self-recovery, #418). Same job shape + FIFO dedup as the api producer:
@@ -234,7 +237,15 @@ def enqueue_rerun(
     `dedup_key` (grug#1405) gives a job that must run even right after
     another re-run of the same PR its own dedup id: `/grug accept-removal`
     records state the earlier job never read, so collapsing into it would
-    leave the check stale."""
+    leave the check stale.
+
+    `comment_id` (grug#1430) marks a COMMAND job: one a `/grug` comment
+    asked for. It gets its own dedup id per comment, so a second command is
+    never collapsed into the first by SQS, and it carries `queued_at` (when
+    the command was queued; stamped now when not given) so the consumer can
+    hold it behind a review in flight and coalesce it with a run that
+    already served it. `hold_started_at` is when the consumer first held it,
+    which bounds the hold."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
     job: dict[str, Any] = {
@@ -244,6 +255,12 @@ def enqueue_rerun(
         "pr_number": pr_number,
         "persona": persona,
     }
+    if comment_id:
+        job["comment_id"] = int(comment_id)
+        job["queued_at"] = float(queued_at or _now())
+        if hold_started_at:
+            job["hold_started_at"] = float(hold_started_at)
+        dedup_key = dedup_key or f"cmd{int(comment_id)}"
     dedup_id = f"{install_id}:{repo}:{pr_number}:{persona}"
     if not_before > 0:
         job["not_before"] = float(not_before)
@@ -252,6 +269,8 @@ def enqueue_rerun(
         material = f"{dedup_id}\x1fnotbefore{int(not_before)}"
         if requeue_of:
             material += f"\x1frequeue{requeue_of}"
+        if dedup_key:
+            material += f"\x1fkey{dedup_key}"
         dedup_id = "rerun:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
     elif dedup_key:
         material = f"{dedup_id}\x1fkey{dedup_key}"
@@ -269,6 +288,7 @@ def enqueue_rerun(
         extra={
             "install_id": install_id, "repo": repo, "pr": pr_number,
             "persona": persona, "not_before": int(not_before),
+            "comment_id": int(comment_id),
         },
     )
 
@@ -1234,6 +1254,19 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
         # Teller has no blocking mode (comment-only, no blocking_flag).
         dispatch_walkthrough_review(payload, blocking=False)
     else:
+        # grug#1430: a command job waits behind a review in flight, and a
+        # command an earlier run already served completes as coalesced.
+        head_sha = str((pr.get("head") or {}).get("sha") or "")
+        queued = _command_queue_status(
+            job, install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number, head_sha=head_sha, message_id=message_id,
+        )
+        if queued:
+            return queued
+        _record_command_run(
+            job, install_id=install_id, repo_full=repo_full,
+            pr_number=pr_number, head_sha=head_sha, started_at=_now(),
+        )
         # Elder re-run: the `grug:reviewing` label rides it (grug#1270).
         _dispatch_elder_rerun(
             payload, install_id=install_id, owner=owner, repo_name=repo_name,
@@ -1384,6 +1417,149 @@ def _deferred_rerun_status(
     return _hold_or_requeue_deferred(job, remaining, receive_count, message_id)
 
 
+def _command_fields(job: dict[str, Any]) -> dict[str, Any]:
+    """The command identity a requeued copy of `job` must keep (grug#1430):
+    the same comment, the same `queued_at`, the same hold start."""
+    if not job.get("comment_id"):
+        return {}
+    return {
+        "comment_id": int(job["comment_id"]),
+        "queued_at": float(job.get("queued_at", 0) or 0),
+        "hold_started_at": float(job.get("hold_started_at", 0) or 0),
+    }
+
+
+# grug#1430: a command job waits behind an Elder review in flight on the
+# same head, polled this often, for at most this long from the first hold -
+# a check stuck in progress with no worker must not hold a command forever.
+_COMMAND_HOLD_POLL_SECONDS = 60
+_COMMAND_HOLD_MAX_SECONDS = 1800
+
+
+def _elder_running_on(install_id: int, owner: str, repo_name: str, head_sha: str) -> bool:
+    """True while an Elder check on `head_sha` is queued or in progress.
+    An unreadable listing is NOT a review in flight: holding on a guess
+    could hold the command until the cap for nothing."""
+    from review_label import elder_check_state  # type: ignore
+
+    try:
+        state = with_install_token_retry(
+            install_id,
+            lambda tok: elder_check_state(
+                token=tok, owner=owner, repo=repo_name, head_sha=head_sha,
+            ),
+        )
+    except Exception as error:  # noqa: BLE001 - unreadable reads as not running
+        log.warning(
+            "rerun_command_check_state_failed",
+            extra={"repo": f"{owner}/{repo_name}", "kind": type(error).__name__},
+        )
+        return False
+    return state == "running"
+
+
+def _command_already_served(
+    job: dict[str, Any], *, install_id: int, repo_full: str, pr_number: int,
+    head_sha: str,
+) -> bool:
+    """True when a command-triggered Elder run of this same head started
+    after this command was queued: that run read everything the commenter
+    changed, so a second review would only repeat it. A store error is NOT
+    served - a repeat review beats a lost one."""
+    from adapters.install_store import get_elder_command_run  # type: ignore
+
+    queued_at = float(job.get("queued_at", 0) or 0)
+    if queued_at <= 0 or not head_sha:
+        return False
+    try:
+        last = get_elder_command_run(
+            install_id=install_id, repo=repo_full, pr_number=pr_number,
+        )
+    except Exception as error:  # noqa: BLE001 - not served on a store error
+        log.warning(
+            "rerun_command_run_lookup_failed",
+            extra={"repo": repo_full, "pr": pr_number, "kind": type(error).__name__},
+        )
+        return False
+    return bool(
+        last and last["head_sha"] == head_sha and last["started_at"] >= queued_at
+    )
+
+
+def _command_queue_status(
+    job: dict[str, Any], *, install_id: int, owner: str, repo_name: str,
+    pr_number: int, head_sha: str, message_id: str,
+) -> str | None:
+    """Coalesce or hold a COMMAND job (grug#1430), or None to run it now.
+
+    - coalesced: a command-triggered run of this head that started after the
+      command was queued already served it; the job completes without a
+      second review.
+    - held: an Elder review is in flight on this head. The job goes back on
+      the queue (its own group, so it stays behind the in-flight work) with
+      a short `not_before`, keeping its identity, until that review ends or
+      the hold cap passes. It is never dropped: a failed requeue raises, and
+      SQS redelivers the original."""
+    if not job.get("comment_id"):
+        return None
+    repo_full = f"{owner}/{repo_name}"
+    coords = {"repo": repo_full, "pr": pr_number, "head_sha": head_sha[:8],
+              "comment_id": int(job["comment_id"])}
+    if _command_already_served(
+        job, install_id=install_id, repo_full=repo_full, pr_number=pr_number,
+        head_sha=head_sha,
+    ):
+        log.info("rerun_command_coalesced", extra=coords)
+        return "rerun_coalesced"
+    if not head_sha or not _elder_running_on(install_id, owner, repo_name, head_sha):
+        return None
+    now = _now()
+    hold_started = float(job.get("hold_started_at", 0) or 0) or now
+    if now - hold_started >= _COMMAND_HOLD_MAX_SECONDS:
+        log.warning(
+            "rerun_command_hold_cap_reached",
+            extra={**coords, "held_s": int(now - hold_started)},
+        )
+        return None
+    fields = _command_fields(job)
+    fields["hold_started_at"] = hold_started
+    enqueue_rerun(
+        install_id=install_id, repo=repo_full, pr_number=pr_number,
+        persona=str(job.get("persona", "elder")),
+        not_before=now + _COMMAND_HOLD_POLL_SECONDS,
+        requeue_of=message_id or uuid.uuid4().hex,
+        **fields,
+    )
+    log.info(
+        "rerun_command_held_behind_review",
+        extra={**coords, "held_s": int(now - hold_started)},
+    )
+    return "rerun_held_behind_review"
+
+
+def _record_command_run(
+    job: dict[str, Any], *, install_id: int, repo_full: str, pr_number: int,
+    head_sha: str, started_at: float,
+) -> None:
+    """Record a command-triggered Elder run's start, so commands queued
+    before it coalesce into it (grug#1430). Best-effort: a missing row only
+    costs a repeat review."""
+    if not job.get("comment_id") or not head_sha:
+        return
+    from adapters.install_store import record_elder_command_run  # type: ignore
+
+    try:
+        record_elder_command_run(
+            install_id=install_id, repo=repo_full, pr_number=pr_number,
+            head_sha=head_sha, started_at=started_at,
+        )
+    except Exception as error:  # noqa: BLE001 - best-effort coalescing record
+        log.warning(
+            "rerun_command_run_record_failed",
+            extra={"repo": repo_full, "pr": pr_number, "kind": type(error).__name__},
+        )
+
+
 def _hold_or_requeue_deferred(
     job: dict[str, Any], remaining: float, receive_count: int, message_id: str,
 ) -> str:
@@ -1404,6 +1580,7 @@ def _hold_or_requeue_deferred(
         persona=str(job.get("persona", "elder")),
         not_before=float(job.get("not_before", 0) or 0),
         requeue_of=message_id,
+        **_command_fields(job),
     )
     log.info(
         "rerun_deferred_requeued",
