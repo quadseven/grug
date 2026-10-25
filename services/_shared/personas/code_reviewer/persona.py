@@ -98,6 +98,18 @@ def _snippet_has_line(snippet: str, line: int) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class Budget:
+    """A measured limit a finding is over (grug#1429): the current value,
+    the limit it must meet, and the unit both are in. The review renders it
+    as the exact number to hit instead of "make it smaller"."""
+
+    metric: str
+    current: float
+    limit: float
+    unit: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class Finding:
     """Persona-level finding posted as a GitHub inline review comment.
 
@@ -135,6 +147,12 @@ class Finding:
     origins: tuple[FindingOrigin, ...] = field(
         default_factory=tuple, compare=False, repr=False,
     )
+    # grug#1429: measured limits this finding is over, rendered as current ->
+    # limit (budget left). Set by deterministic producers that measured them.
+    budgets: tuple[Budget, ...] = field(default=(), compare=False)
+    # grug#1429: the check's own output line, quoted verbatim in the review
+    # when the finding came from a deterministic check (ruff, opengrep).
+    check_output: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         assert self.line >= 1, (
