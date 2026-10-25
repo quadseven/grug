@@ -1,0 +1,1 @@
+The original test's behavior was intentionally changed to match grug#1275: orphaned Elder/Chief runs are re-queued with a delivery_id, not swept and skipped. The new test has 3 assertions covering the new behavior.
