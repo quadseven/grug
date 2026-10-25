@@ -379,14 +379,14 @@ def test_inline_comment_body_exposes_bounded_model_provenance():
 
 
 def test_precedent_notes_for_is_best_effort_on_store_failure(monkeypatch):
-    """A ledger fetch failure yields {} - a review is never blocked by
+    """A ledger fetch failure yields ({}, {}) - a review is never blocked by
     missing precedent (the finding just posts without its citation)."""
     def _boom(repo, *a, **k):
         raise RuntimeError("store down")
     monkeypatch.setattr("adapters.install_store.list_ledger_rows", _boom, raising=False)
     from personas.code_reviewer.persona import Finding
     findings = (Finding(file="x.py", line=1, severity="high", rule_name="r", message="m", suggestion=None),)
-    assert cr_dispatch._precedent_notes_for("o/r", findings) == {}
+    assert cr_dispatch._precedent_notes_for("o/r", findings) == ({}, {})
 
 
 def test_precedent_notes_for_cites_matching_ledger_row(monkeypatch):
@@ -404,7 +404,7 @@ def test_precedent_notes_for_cites_matching_ledger_row(monkeypatch):
     from personas.code_reviewer.persona import Finding
     f = Finding(file="services/webhook/consumer.py", line=42, severity="high",
                 rule_name="sync-io-in-async", message="m", suggestion=None)
-    notes = cr_dispatch._precedent_notes_for("o/r", (f,))
+    notes, _precisions = cr_dispatch._precedent_notes_for("o/r", (f,))
     key = finding_key(f.file, f.line, f.rule_name)
     assert key in notes
     assert "#400" in notes[key]
@@ -2243,7 +2243,7 @@ def test_partial_review_stays_advisory_but_publishes_validated_findings():
     # ... while Elder's BLOCK mode fails closed on it (grug#1212).
     elder = plan_publish(evaluation, mode="blocking", degraded_fails_closed=True)
     assert (elder.conclusion, elder.event) == ("failure", "COMMENT")
-    result, posted_findings = cr_dispatch.build_review_result(
+    result, posted_findings, _muted = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
     )
     assert result is not None
@@ -2272,7 +2272,7 @@ def test_outside_diff_findings_remain_summary_only():
         findings=(finding,), conclusion="success",
     )
 
-    result, posted = cr_dispatch.build_review_result(
+    result, posted, _muted = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
     )
 
@@ -2299,7 +2299,7 @@ def test_complexity_without_split_is_summary_only_and_other_kind_still_threads()
         findings=(complexity, correctness), conclusion="failure",
     )
 
-    result, posted = cr_dispatch.build_review_result(
+    result, posted, _muted = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
     )
     assert result is not None
@@ -2318,7 +2318,7 @@ def test_complexity_with_concrete_split_can_thread_at_medium_or_lower():
         suggestion="Extract the new branch into _validate_payload().", effort="quick-win",
     )
     evaluation = CodeReviewEvaluation(findings=(finding,), conclusion="success")
-    result, posted = cr_dispatch.build_review_result(
+    result, posted, _muted = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
     )
     assert result is not None
@@ -2953,7 +2953,7 @@ def test_deep_review_includes_matching_precedent_citation(monkeypatch):
     captured = {}
     monkeypatch.setattr(
         cr_dispatch, "build_review_result",
-        lambda evaluation, **kwargs: captured.update(kwargs) or (None, ()),
+        lambda evaluation, **kwargs: captured.update(kwargs) or (None, (), {}),
     )
     cr_dispatch._publish_deep_review(
         CodeReviewEvaluation(findings=(finding,), conclusion="success"),
@@ -4115,8 +4115,8 @@ def test_review_body_carries_the_persona_tag():
         ),),
         conclusion="success",
     )
-    elder, _ = cr_dispatch.build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
-    guard, _ = cr_dispatch.build_review_result(
+    elder, _, _ = cr_dispatch.build_review_result(evaluation, head_sha="a" * 40, event="COMMENT")
+    guard, _, _ = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT", persona="guard",
     )
     assert _ELDER_TAG in elder.body
@@ -4143,7 +4143,7 @@ def test_low_confidence_review_publishes_findings_and_says_low_confidence():
         degraded_reason="low_confidence_review",
     )
 
-    result, posted_findings = cr_dispatch.build_review_result(
+    result, posted_findings, _muted = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
     )
     assert result is not None

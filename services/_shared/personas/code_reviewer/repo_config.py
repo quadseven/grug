@@ -26,11 +26,17 @@ import yaml
 
 CONFIG_PATH = ".grug.yaml"
 
-_KNOWN_KEYS = frozenset({"ignore", "path_instructions", "min_inline_severity"})
+_KNOWN_KEYS = frozenset({
+    "ignore", "path_instructions", "min_inline_severity",
+    "elder_mute_locked_classes", "elder_mute_min_labeled", "elder_mute_below_precision",
+})
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 # Bounds so one file cannot blow the prompt budget.
 _MAX_INSTRUCTIONS = 20
 _MAX_INSTRUCTION_CHARS = 2000
+# Elder muting defaults.
+_ELDER_MUTE_MIN_LABELED_DEFAULT = 20
+_ELDER_MUTE_BELOW_PRECISION_DEFAULT = 0.2
 
 
 @dataclass(frozen=True)
@@ -44,6 +50,9 @@ class RepoConfig:
     ignore: tuple[str, ...] = ()
     path_instructions: tuple[PathInstruction, ...] = ()
     min_inline_severity: str | None = None
+    elder_mute_locked_classes: tuple[str, ...] = ()
+    elder_mute_min_labeled: int = _ELDER_MUTE_MIN_LABELED_DEFAULT
+    elder_mute_below_precision: float = _ELDER_MUTE_BELOW_PRECISION_DEFAULT
     problems: tuple[str, ...] = ()
 
 
@@ -126,7 +135,37 @@ def parse_repo_config(text: str | None) -> RepoConfig:
             problems.append(
                 "`min_inline_severity` must be one of low, medium, high, critical"
             )
-    return RepoConfig(ignore, instructions, floor, tuple(problems))
+
+    # Elder muting config
+    locked = ()
+    if "elder_mute_locked_classes" in data:
+        locked = _string_list(data["elder_mute_locked_classes"], "elder_mute_locked_classes", problems)
+
+    min_labeled = _ELDER_MUTE_MIN_LABELED_DEFAULT
+    if "elder_mute_min_labeled" in data:
+        raw = data["elder_mute_min_labeled"]
+        if isinstance(raw, int) and raw >= 0:
+            min_labeled = raw
+        else:
+            problems.append("`elder_mute_min_labeled` must be a non-negative integer")
+
+    below_precision = _ELDER_MUTE_BELOW_PRECISION_DEFAULT
+    if "elder_mute_below_precision" in data:
+        raw = data["elder_mute_below_precision"]
+        if isinstance(raw, (int, float)) and 0.0 <= raw <= 1.0:
+            below_precision = float(raw)
+        else:
+            problems.append("`elder_mute_below_precision` must be a number between 0.0 and 1.0")
+
+    return RepoConfig(
+        ignore=ignore,
+        path_instructions=instructions,
+        min_inline_severity=floor,
+        elder_mute_locked_classes=locked,
+        elder_mute_min_labeled=min_labeled,
+        elder_mute_below_precision=below_precision,
+        problems=tuple(problems),
+    )
 
 
 @lru_cache(maxsize=256)

@@ -78,7 +78,7 @@ from personas.code_reviewer.diff_parser import (
     split_reviewable_hunks, split_tree_copy_hunks,
 )
 from personas.code_reviewer.precedent import (
-    class_precision, match_precedent, render_precedent_note,
+    ClassPrecision, class_precision, match_precedent, render_precedent_note,
 )
 from personas.code_reviewer.claim_check import (
     filter_novel_claim_findings,
@@ -1012,6 +1012,7 @@ def _summary_markdown(
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
     defensive_dropped_count: int = 0,
     blocking: bool = False,
+    muted_classes: tuple[tuple[str, int, int, float], ...] = (),
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -1031,6 +1032,8 @@ def _summary_markdown(
     `blocking` (grug#1212) is the repo's Elder mode. It only changes what a
     degraded summary says about the merge: in BLOCK mode a degraded review
     fails closed, so "merge not blocked" would be false there.
+    `muted_classes` is a tuple of (class_name, accepted, rejected, precision)
+    for classes that were muted due to low precision.
     """
     held = _review_transparency(
         evaluation, suppressed_count, excluded_paths, oversized_paths,
@@ -1143,7 +1146,26 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}"
+    summary = f"{legend}{table}{_maintainability_notes(evaluation)}"
+    if muted_classes:
+        muted_lines = ["\n\n## Muted Classes (Low Precision)"]
+        muted_lines.append(
+            "These finding classes have low measured precision and do not post inline comments. "
+            "Critical severity findings of these classes still post inline and block."
+        )
+        muted_lines.append("")
+        muted_lines.append(
+            "| Class | Accepted | Rejected | Precision |"
+        )
+        muted_lines.append(
+            "|---|---|---|---|"
+        )
+        for cls, accepted, rejected, precision in muted_classes:
+            muted_lines.append(
+                f"| `{cls}` | {accepted} | {rejected} | {precision:.0%} |"
+            )
+        summary += "\n".join(muted_lines)
+    summary += f"{held}{hunt}{defensive_note}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -2019,11 +2041,11 @@ def _lead_if_degraded(summary: str, evaluation: CodeReviewEvaluation) -> str:
 
 def _precedent_notes_for(
     repo_full: str, findings: "tuple[Finding, ...] | list[Finding]",
-) -> dict[str, str]:
+) -> tuple[dict[str, str], dict[str, ClassPrecision]]:
     """Ledger-grounded precedent note per finding, keyed by finding_key (#555).
 
-    Best-effort: any store/parse failure yields {} so a review is never blocked
-    by a missing or slow ledger - the finding just posts without its citation.
+    Returns (notes, precisions). Best-effort: any store/parse failure yields
+    ({}, {}) so a review is never blocked by a missing or slow ledger.
     """
     try:
         from adapters.install_store import list_ledger_rows  # type: ignore
@@ -2032,7 +2054,7 @@ def _precedent_notes_for(
         raw = list_ledger_rows(repo_full) or []
         rows = [r for r in (parse_row(d) for d in raw) if r is not None]
         if not rows:
-            return {}
+            return {}, {}
         precisions = class_precision(rows)
         out: dict[str, str] = {}
         for f in findings:
@@ -2046,10 +2068,10 @@ def _precedent_notes_for(
             )
             if note:
                 out[finding_key(f.file, f.line, f.rule_name)] = note
-        return out
+        return out, precisions
     except Exception as e:  # noqa: BLE001 - precedent is enrichment, never load-bearing
         log.info("precedent_notes_unavailable", extra={"repo": repo_full, "kind": type(e).__name__})
-        return {}
+        return {}, {}
 
 
 def _checked_comment_body(f: Finding, file_text: str, precedent_note: str) -> str:
@@ -2061,22 +2083,99 @@ def _checked_comment_body(f: Finding, file_text: str, precedent_note: str) -> st
     return _inline_comment_body(replace(f, suggestion=checked), precedent_note)
 
 
+def _muted_classes(
+    findings: tuple[Finding, ...],
+    precedent_notes: dict[str, str],
+    repo_config: RepoConfig | None,
+) -> set[str]:
+    """Return the set of finding classes that should be muted (no inline comment).
+
+    A class is muted when:
+    - It has at least `elder_mute_min_labeled` labeled findings in the ledger
+    - Its precision is below `elder_mute_below_precision`
+    - It is NOT in `elder_mute_locked_classes`
+
+    `precedent_notes` is keyed by finding_key and contains the rendered precedent
+    note which includes precision info. We need the raw ClassPrecision data, so
+    we re-compute it from the ledger rows that were used to generate the notes.
+    """
+    if repo_config is None:
+        return set()
+
+    locked = set(repo_config.elder_mute_locked_classes)
+    if not locked and repo_config.elder_mute_min_labeled <= 0:
+        # Muting effectively disabled
+        return set()
+
+    # The precedent_notes dict doesn't carry the raw ClassPrecision data.
+    # We need to fetch it from the ledger again. But _precedent_notes_for
+    # already computed it - we can't easily pass it through without changing
+    # the function signature significantly. For now, we'll compute it from
+    # the findings' rule_names by re-fetching the ledger (which is cached).
+
+    # Since we can't easily get the precisions here without refactoring
+    # _precedent_notes_for, we'll return empty for now and handle muting
+    # in the caller where we have access to the precisions.
+    # TODO: Refactor to pass precisions through or compute once.
+    return set()
+
+
+def _compute_muted_classes(
+    findings: tuple[Finding, ...],
+    precisions: dict[str, ClassPrecision],
+    repo_config: RepoConfig | None,
+) -> set[str]:
+    """Return the set of finding classes that should be muted (no inline comment).
+
+    A class is muted when:
+    - It has at least `elder_mute_min_labeled` labeled findings in the ledger
+    - Its precision is below `elder_mute_below_precision`
+    - It is NOT in `elder_mute_locked_classes`
+    """
+    if repo_config is None:
+        return set()
+
+    locked = set(repo_config.elder_mute_locked_classes)
+    min_labeled = repo_config.elder_mute_min_labeled
+    below_precision = repo_config.elder_mute_below_precision
+
+    if min_labeled <= 0:
+        # Muting effectively disabled
+        return set()
+
+    muted: set[str] = set()
+    for f in findings:
+        cls = f.rule_name
+        if cls in locked:
+            continue
+        prec = precisions.get(cls)
+        if prec is not None and prec.labeled >= min_labeled and prec.precision < below_precision:
+            muted.add(cls)
+    return muted
+
+
 def build_review_result(
     evaluation: CodeReviewEvaluation, *, head_sha: str, event: ReviewEvent,
     prior_keys: frozenset[str] = frozenset(),
     precedent_notes: dict[str, str] | None = None,
     repo_config: RepoConfig | None = None,
     file_contents: dict[str, str] | None = None,
+    precedent_precisions: dict[str, ClassPrecision] | None = None,
     persona: str = "elder",
-) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
-    """Build the ReviewResult, or (None, ()) if nothing NEW to post.
+) -> tuple[ReviewResult | None, tuple[Finding, ...], set[str]]:
+    """Build the ReviewResult, or (None, (), set()) if nothing NEW to post.
+
+    Returns (review_result, new_findings, muted_classes).
+    `muted_classes` is the set of finding classes that were muted (no inline
+    comment) due to low precision. Critical findings of muted classes are NOT
+    muted - they still post inline and block.
 
     Skips entirely on fully degraded responses. A partial staged review still
     publishes its validated findings, but stays advisory. `prior_keys`
     (non-empty only on a synchronize/reopened push) dedups findings already commented
     on unchanged lines (#189) — so a re-review doesn't flood the PR with
     duplicate inline comments. If every finding was already posted,
-    returns (None, ()) (nothing new). NOTE: dedup affects only the inline
+    returns (None, (), set()) (nothing new). NOTE: dedup affects only the inline
     REVIEW; the check-run summary/conclusion still reflect ALL current
     findings (the bugs are still there).
 
@@ -2091,7 +2190,7 @@ def build_review_result(
     offered as a committable block only after `checked_suggestion` (#1149)
     verifies it against that text; a file with no loaded text gets prose."""
     if evaluation.degraded_reason not in (None, "", *PUBLISHABLE_DEGRADATIONS):
-        return None, ()
+        return None, (), set()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
     # GitHub inline review comments must anchor to the PR diff. Outside-diff
     # findings remain visible in the check summary, where their advisory label
@@ -2111,8 +2210,20 @@ def build_review_result(
         new_findings = tuple(
             f for f in new_findings if meets_inline_floor(f.severity, repo_config)
         )
-    if not new_findings:
-        return None, ()
+
+    # Compute muted classes from precedent precisions
+    precisions = precedent_precisions or {}
+    muted_classes = _compute_muted_classes(new_findings, precisions, repo_config)
+
+    # Filter out non-critical findings of muted classes from inline comments.
+    # Critical findings of muted classes still post inline and block.
+    inline_findings = tuple(
+        f for f in new_findings
+        if f.rule_name not in muted_classes or f.severity == "critical"
+    )
+
+    if not inline_findings:
+        return None, (), muted_classes
     notes = precedent_notes or {}
     texts = file_contents or {}
     comments = tuple(
@@ -2123,7 +2234,7 @@ def build_review_result(
                 notes.get(finding_key(f.file, f.line, f.rule_name), ""),
             ),
         )
-        for f in new_findings
+        for f in inline_findings
     )
     return ReviewResult(
         commit_id=head_sha,
@@ -2135,7 +2246,7 @@ def build_review_result(
             + f"\n\n{_REVIEW_PERSONA_TAG.format(persona)}"
         ),
         comments=comments,
-    ), new_findings
+    ), inline_findings, muted_classes
 
 
 def _comment_record_origins(
@@ -3548,6 +3659,24 @@ def dispatch_code_review(
     tier1_phase: Literal["tier1", "deep", "dual"] = (
         "tier1" if depth_now == "tiered" else "dual"
     )
+
+    # Compute muted classes for the summary (needs precisions from ledger).
+    # Do this before _summary_markdown so the summary can list muted classes.
+    precedent_notes_for_summary, precedent_precisions_for_summary = (
+        _precedent_notes_for(f"{owner}/{repo_name}", evaluation.findings)
+        if evaluation.findings
+        and evaluation.degraded_reason in (None, "", *PUBLISHABLE_DEGRADATIONS)
+        else ({}, {})
+    )
+    muted_classes_set = _compute_muted_classes(
+        evaluation.findings, precedent_precisions_for_summary, repo_config
+    )
+    muted_classes = tuple(
+        (cls, prec.accepted, prec.rejected, prec.precision)
+        for cls in muted_classes_set
+        if (prec := precedent_precisions_for_summary.get(cls)) is not None
+    )
+
     title, summary = _summary_markdown(
         evaluation, suppressed_count=len(suppressed),
         excluded_paths=excluded_paths,
@@ -3558,6 +3687,7 @@ def dispatch_code_review(
         review_phase=tier1_phase,
         defensive_dropped_count=defensive_dropped_count,
         blocking=blocking,
+        muted_classes=muted_classes,
     )
     summary = _intent_paragraph(pr_context) + summary
     if ruff_policy_dropped:
@@ -3632,16 +3762,16 @@ def dispatch_code_review(
         )
     # Only pay the ledger fetch when there is something to annotate. A fully
     # degraded eval publishes no inline review; a partial staged review does.
-    precedent_notes = (
+    precedent_notes, precedent_precisions = (
         _precedent_notes_for(f"{owner}/{repo_name}", evaluation.findings)
         if evaluation.findings
         and evaluation.degraded_reason in (None, "", *PUBLISHABLE_DEGRADATIONS)
-        else {}
+        else ({}, {})
     )
-    review_result, posted_findings = build_review_result(
+    review_result, posted_findings, muted_classes = build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
         precedent_notes=precedent_notes, repo_config=repo_config,
-        file_contents=file_contents,
+        file_contents=file_contents, precedent_precisions=precedent_precisions,
     )
     review_resp: dict[str, Any] | None = None
     if review_result is not None:
@@ -4564,10 +4694,10 @@ def _publish_deep_review(
     """
     if not novel_deep:
         return
-    precedent_notes = _precedent_notes_for(
+    precedent_notes, precedent_precisions = _precedent_notes_for(
         f"{owner}/{repo_name}", deep_eval.findings,
     )
-    review_result, posted_findings = build_review_result(
+    review_result, posted_findings, muted_classes = build_review_result(
         deep_eval,
         head_sha=head_sha,
         event=event,
@@ -4575,6 +4705,7 @@ def _publish_deep_review(
         precedent_notes=precedent_notes,
         repo_config=repo_config,
         file_contents=file_contents,
+        precedent_precisions=precedent_precisions,
     )
     if review_result is None:
         return
@@ -4857,6 +4988,22 @@ def _async_deep_append_if_needed(
     # ground the deep arm never finished walking.
     combined = with_degradation(combined, deep_eval)
 
+    # Compute muted classes for the deep append summary.
+    precedent_notes_deep, precedent_precisions_deep = (
+        _precedent_notes_for(f"{owner}/{repo_name}", combined.findings)
+        if combined.findings
+        and combined.degraded_reason in (None, "", *PUBLISHABLE_DEGRADATIONS)
+        else ({}, {})
+    )
+    muted_classes_set_deep = _compute_muted_classes(
+        combined.findings, precedent_precisions_deep, repo_config
+    )
+    muted_classes_deep = tuple(
+        (cls, prec.accepted, prec.rejected, prec.precision)
+        for cls in muted_classes_set_deep
+        if (prec := precedent_precisions_deep.get(cls)) is not None
+    )
+
     outcome = plan_publish(combined, mode=mode, degraded_fails_closed=True)
     conclusion, event = outcome.conclusion, outcome.event
     title, summary = _summary_markdown(
@@ -4866,6 +5013,7 @@ def _async_deep_append_if_needed(
         living_baseline_rejected=living_baseline_rejected,
         review_phase="deep",
         blocking=blocking,
+        muted_classes=muted_classes_deep,
     )
     summary = _intent_paragraph(pr_context) + summary
     summary += config_note
