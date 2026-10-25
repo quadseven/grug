@@ -515,3 +515,77 @@ def test_resume_while_elder_runs_does_not_queue_a_second_review(monkeypatch):
     assert res["status"] == "no_op" and res["reason"] == "already_reviewing"
     assert enq == []
 
+
+
+# --- #695: eyes on receipt, final sign on resolve -----------------------------
+
+
+class _ReactionHttp:
+    """Records the reaction calls `comment_reactions` makes."""
+
+    HTTPError = Exception
+
+    def __init__(self):
+        self.calls = []
+
+    def post(self, url, **kw):
+        self.calls.append(("post", url.rsplit("/reactions", 1)[0][-12:], kw["json"]["content"]))
+        r = _R()
+        r.json = lambda: {"id": 500 + len(self.calls)}
+        return r
+
+    def delete(self, url, **kw):
+        self.calls.append(("delete", url.rsplit("/", 1)[1]))
+        return _R()
+
+
+def test_slash_command_gets_eyes_then_thumbs_up(monkeypatch):
+    import comment_reactions
+
+    http = _ReactionHttp()
+    monkeypatch.setattr(comment_reactions, "httpx", http)
+    monkeypatch.setattr(interactive, "httpx", _FakeHttp())
+    _elder_state(monkeypatch)
+    interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=9, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: None, head_sha=_HEAD,
+    )
+    assert [c[:1] + c[2:] for c in http.calls if c[0] == "post"] == [
+        ("post", "eyes"), ("post", "+1"),
+    ]
+    assert ("delete", "501") in http.calls  # the eyes reaction came off
+
+
+def test_failed_command_ends_on_thumbs_down(monkeypatch):
+    import comment_reactions
+
+    http = _ReactionHttp()
+    monkeypatch.setattr(comment_reactions, "httpx", http)
+    monkeypatch.setattr(interactive, "httpx", _FakeHttp())
+
+    def boom(**k):
+        raise RuntimeError("queue down")
+
+    res = interactive.run_command(
+        "test-gaps", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=9, token_fn=_tok, claim=lambda k: True, enqueue=boom,
+    )
+    assert res["status"] == "skip"
+    assert [c[2] for c in http.calls if c[0] == "post"] == ["eyes", "-1"]
+
+
+def test_ask_keeps_eyes_and_hands_the_reaction_to_the_consumer(monkeypatch):
+    import comment_reactions
+
+    http = _ReactionHttp()
+    monkeypatch.setattr(comment_reactions, "httpx", http)
+    monkeypatch.setattr(interactive, "httpx", _FakeHttp())
+    asks = []
+    interactive.run_command(
+        "ask", "why?", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=9, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: None, enqueue_ask=lambda **k: asks.append(k),
+    )
+    assert [c[2] for c in http.calls if c[0] == "post"] == ["eyes"]
+    assert asks[0]["reaction_id"] == 501

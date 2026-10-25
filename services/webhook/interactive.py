@@ -15,6 +15,10 @@ comment_id so a re-delivered webhook doesn't double-act.
 - accept-removal <path>  -> record a trusted maintainer accepting one deleted
   guard path on the current head, then re-run Elder (grug#1405)
 
+#695 - every command comment gets an `eyes` reaction on receipt, swapped for
+`+1` (or `-1` on failure) when the command resolves. `/grug ask` hands the
+`eyes` reaction id to the consumer, which swaps it once the answer lands.
+
 grug#1270 - an Elder re-run now (a) is refused while one is already running
 on the same head, (b) puts the `grug:reviewing` label on the PR while it
 runs, and (c) is KEPT (deferred to the GitHub budget's reset) instead of
@@ -27,6 +31,7 @@ import logging
 import os
 from urllib.parse import quote as _q
 
+import comment_reactions  # type: ignore
 import httpx  # type: ignore
 
 from adapters.pg_install_store import _learning_digest  # type: ignore
@@ -377,11 +382,68 @@ def _run_persona_rerun(
     return {"status": "dispatched", "verb": verb, "persona": persona}
 
 
+def _react(token_fn, fn, *args) -> int | None:
+    """Run one best-effort reaction call. The reaction is a sign, never the
+    work: whatever goes wrong is logged and the command carries on."""
+    try:
+        return token_fn(lambda t: fn(t, *args))
+    except Exception as e:  # noqa: BLE001 - a missing sign must not fail the command
+        log.warning("interactive_reaction_failed", extra={"kind": type(e).__name__})
+        return None
+
+
+def _final_sign(verb: str, result: dict[str, str]) -> str | None:
+    """The reaction a finished command ends on, or None to keep `eyes`.
+
+    `/grug ask` is answered later by the consumer, which owns its final
+    sign; every other verb is finished once the webhook has acted."""
+    if verb == "ask" and result.get("status") == "dispatched":
+        return None
+    return comment_reactions.FAILED if result.get("status") == "skip" else comment_reactions.DONE
+
+
 def run_command(
+    verb: str, arg: str, *, owner: str, repo: str, comment_id: int, token_fn,
+    **kwargs,
+) -> dict[str, str]:
+    """React `eyes` to the command comment the moment it is heard, run it,
+    and swap the sign for `+1` (or `-1` when it failed) once it resolves
+    (#695). The arguments are `_execute_command`'s. A delivery with no
+    comment id has nothing to react to and runs bare."""
+    if not comment_id:
+        return _execute_command(
+            verb, arg, owner=owner, repo=repo, comment_id=comment_id,
+            token_fn=token_fn, **kwargs,
+        )
+    eyes = _react(
+        token_fn, comment_reactions.add_reaction, owner, repo, comment_id,
+        comment_reactions.EYES,
+    )
+    try:
+        result = _execute_command(
+            verb, arg, owner=owner, repo=repo, comment_id=comment_id,
+            token_fn=token_fn, eyes_reaction_id=eyes or 0, **kwargs,
+        )
+    except Exception:
+        _react(
+            token_fn, comment_reactions.swap_reaction, owner, repo, comment_id,
+            eyes, comment_reactions.FAILED,
+        )
+        raise
+    sign = _final_sign(verb, result)
+    if sign:
+        _react(
+            token_fn, comment_reactions.swap_reaction, owner, repo, comment_id,
+            eyes, sign,
+        )
+    return result
+
+
+def _execute_command(
     verb: str, arg: str, *, install_id: int, owner: str, repo: str,
     pr_number: int, comment_id: int, token_fn, enqueue=None, enqueue_ask=None,
     claim=None, resume=None, is_paused=None, head_sha: str = "",
-    defer_until: float = 0.0, actor: str = "",
+    defer_until: float = 0.0, actor: str = "", eyes_reaction_id: int = 0,
 ) -> dict[str, str]:
     """Execute a gated command. All heavy work is ASYNC via the rerun lane -
     the webhook only enqueues (fast) so the delivery ACK never blocks on an
@@ -444,7 +506,8 @@ def run_command(
             # The heavy LLM Q&A runs in the CONSUMER (async), not here - the
             # webhook must ACK fast. The consumer redacts + answers + replies.
             enqueue_ask(install_id=install_id, repo=repo_full, pr_number=pr_number,
-                        comment_id=comment_id, question=arg)
+                        comment_id=comment_id, question=arg,
+                        reaction_id=eyes_reaction_id)
         except Exception as e:  # noqa: BLE001
             log.warning("interactive_ask_enqueue_failed", extra={"kind": type(e).__name__})
             return {"status": "skip", "reason": "enqueue_failed", "verb": verb}

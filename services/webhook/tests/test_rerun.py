@@ -2026,7 +2026,8 @@ def test_run_ask_neutralizes_mention_in_posted_answer(monkeypatch):
     posted = []
     monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
     monkeypatch.setattr(rerun, "_gh_get_text", lambda _token, _url, accept=None: "diff --git a b")
-    monkeypatch.setattr(rerun, "_gh_post", lambda _token, _url, body: posted.append(body))
+    monkeypatch.setattr(rerun, "_gh_post", lambda _token, _url, body: posted.append(body) or 7)
+    monkeypatch.setattr(rerun, "_gh_patch", lambda _token, _url, body: posted.append(body))
     monkeypatch.setattr(
         "llm_client.answer_pr_question",
         lambda _q, _diff, _iid, pr_context=None: "ping @cait to review this",
@@ -2037,7 +2038,7 @@ def test_run_ask_neutralizes_mention_in_posted_answer(monkeypatch):
 
     assert result == "answered"
     assert posted, "expected a comment to be posted"
-    body = posted[0]["body"]
+    body = posted[-1]["body"]
     assert "@cait" not in body
     assert f"@{_ZWSP}cait" in body
 
@@ -2048,7 +2049,8 @@ def test_run_ask_no_answer_falls_back_without_crashing_on_none(monkeypatch):
     posted = []
     monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
     monkeypatch.setattr(rerun, "_gh_get_text", lambda _token, _url, accept=None: "diff --git a b")
-    monkeypatch.setattr(rerun, "_gh_post", lambda _token, _url, body: posted.append(body))
+    monkeypatch.setattr(rerun, "_gh_post", lambda _token, _url, body: posted.append(body) or 7)
+    monkeypatch.setattr(rerun, "_gh_patch", lambda _token, _url, body: posted.append(body))
     monkeypatch.setattr(
         "llm_client.answer_pr_question",
         lambda _q, _diff, _iid, pr_context=None: None,
@@ -2058,7 +2060,7 @@ def test_run_ask_no_answer_falls_back_without_crashing_on_none(monkeypatch):
     result = rerun._run_ask(11, "o/r", 7, "who should review this?")
 
     assert result == "ask_no_answer"
-    assert "thinking-rock is tired" in posted[0]["body"]
+    assert "thinking-rock is tired" in posted[-1]["body"]
 
 
 # --- #716 follow-up: the staleness watch must not kill live work ------------
@@ -2750,3 +2752,66 @@ def test_the_sign_stays_when_the_check_has_not_concluded(monkeypatch, caplog):
         )
     assert cleared is False
     assert "reviewing_label_clear_refused" not in caplog.text
+
+
+# --- #695: /grug ask placeholder, update in place, failure resolution --------
+
+
+def _ask_seams(monkeypatch, answer):
+    events = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get_text", lambda _t, _u, accept=None: "diff --git a b")
+    monkeypatch.setattr(
+        rerun, "_gh_post",
+        lambda _t, url, body: events.append(("POST", url, body["body"])) or 77,
+    )
+    monkeypatch.setattr(
+        rerun, "_gh_patch", lambda _t, url, body: events.append(("PATCH", url, body["body"])),
+    )
+    monkeypatch.setattr(
+        rerun.comment_reactions, "swap_reaction",
+        lambda _t, _o, _r, cid, old, sign: events.append(("REACT", cid, old, sign)),
+    )
+    monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
+
+    def fake_answer(*a, **k):
+        events.append(("LLM",))
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr("llm_client.answer_pr_question", fake_answer)
+    return events
+
+
+def test_run_ask_posts_a_placeholder_before_the_llm_and_patches_the_same_comment(monkeypatch):
+    events = _ask_seams(monkeypatch, "because")
+
+    assert rerun._run_ask(11, "o/r", 7, "why?", comment_id=55, reaction_id=9) == "answered"
+
+    kinds = [e[0] for e in events]
+    assert kinds == ["POST", "LLM", "PATCH", "REACT"]
+    assert "grug-ask:55" in events[0][2] and "thinking" in events[0][2]
+    assert events[2][1].endswith("/issues/comments/77")  # the id the POST returned
+    assert "because" in events[2][2]
+    assert events[3] == ("REACT", 55, 9, "+1")
+
+
+def test_run_ask_failure_resolves_the_placeholder_and_still_raises(monkeypatch):
+    events = _ask_seams(monkeypatch, RuntimeError("model down"))
+
+    with pytest.raises(RuntimeError):
+        rerun._run_ask(11, "o/r", 7, "why?", comment_id=55, reaction_id=9)
+
+    assert [e[0] for e in events] == ["POST", "LLM", "PATCH", "REACT"]
+    assert "thinking-rock is tired" in events[2][2]
+    assert events[3][3] == "-1"
+
+
+def test_run_ask_without_an_answer_resolves_to_a_real_message_and_thumbs_down(monkeypatch):
+    events = _ask_seams(monkeypatch, None)
+
+    assert rerun._run_ask(11, "o/r", 7, "why?", comment_id=55, reaction_id=9) == "ask_no_answer"
+
+    assert "thinking-rock is tired" in events[2][2]
+    assert events[3][3] == "-1"

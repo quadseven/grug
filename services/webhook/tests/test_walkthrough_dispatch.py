@@ -206,8 +206,12 @@ def test_dispatch_posts_nothing_when_the_pr_closed_before_publish(monkeypatch):
         out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
 
     assert out == {"persona": "walkthrough", "result": "skipped_closed"}
-    mock_post.assert_not_called()
     mock_patch.assert_not_called()
+    # No walkthrough is published, and the status resolves to a real
+    # message instead of sitting on 'still working' (#695).
+    bodies = [c.kwargs["json"]["body"] for c in mock_post.call_args_list]
+    assert bodies and all("## Walkthrough" not in b for b in bodies)
+    assert "put the map down" in bodies[-1]
 
 
 def test_dispatch_still_posts_when_the_state_read_fails(monkeypatch):
@@ -415,7 +419,8 @@ def test_dispatch_files_fetch_failure_is_phase_tagged(monkeypatch, caplog):
         out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
 
     assert out == {"persona": "walkthrough", "result": "fetch_failed"}
-    mock_post.assert_not_called()
+    bodies = [c.kwargs["json"]["body"] for c in mock_post.call_args_list]
+    assert bodies and all("## Walkthrough" not in b for b in bodies)
     assert any(
         getattr(r, "phase", None) == "files" for r in caplog.records
     ), "expected a phase='files' fetch-failure log line"
@@ -717,7 +722,7 @@ def test_find_marker_comment_ignores_user_authored_decoy(monkeypatch):
     with patch("httpx.get", side_effect=fake_get):
         result = wt_dispatch._find_marker_comment("tok", "o", "r", 1)
 
-    assert result == 222
+    assert result["id"] == 222
 
 
 def test_dispatch_ignores_decoy_marker_and_posts_fresh_comment(monkeypatch):
@@ -781,4 +786,143 @@ def test_find_marker_comment_ignores_different_app_decoy(monkeypatch):
     with patch("httpx.get", side_effect=fake_get):
         result = wt_dispatch._find_marker_comment("tok", "o", "r", 1)
 
-    assert result == 222
+    assert result["id"] == 222
+
+
+# --- #695: bot-comment lifecycle (placeholder, update in place, history) ----
+
+
+class _FakeGitHub:
+    """An in-memory PR comment thread behind the httpx seam, so a test can
+    follow ONE comment from placeholder to final content."""
+
+    def __init__(self, comments=None, fail_diff=False):
+        self.comments = comments if comments is not None else []
+        self.fail_diff = fail_diff
+        self.calls: list[tuple[str, int]] = []  # (verb, comment id)
+
+    def _response(self, payload):
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value=payload)
+        return r
+
+    def get(self, url, **kwargs):
+        if url.endswith("/files"):
+            return self._response(
+                [{"filename": "new.py", "additions": 2, "deletions": 0}]
+            )
+        if "/comments" in url:
+            return self._response(self.comments)
+        if self.fail_diff:
+            raise httpx.ConnectError("down")
+        if kwargs["headers"]["Accept"] == "application/vnd.github+json":
+            return self._response({"state": "open"})
+        return _diff_response()
+
+    def post(self, url, **kwargs):
+        comment = {
+            "id": 42, "body": kwargs["json"]["body"],
+            "performed_via_github_app": {"id": 1},
+        }
+        self.comments.append(comment)
+        self.calls.append(("POST", 42))
+        return self._response(comment)
+
+    def patch(self, url, **kwargs):
+        cid = int(url.rsplit("/", 1)[1])
+        for c in self.comments:
+            if c["id"] == cid:
+                c["body"] = kwargs["json"]["body"]
+        self.calls.append(("PATCH", cid))
+        return self._response({})
+
+    def run(self, summarize):
+        with patch("httpx.get", side_effect=self.get), \
+             patch("httpx.post", side_effect=self.post), \
+             patch("httpx.patch", side_effect=self.patch), \
+             patch("personas.walkthrough.dispatch.record_check_verdict"), \
+             patch("llm_client.summarize_pr", side_effect=summarize):
+            return wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+
+@pytest.fixture
+def _inline_token(monkeypatch):
+    monkeypatch.setattr(wt_dispatch, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+
+
+def test_placeholder_posts_before_the_llm_call_and_the_same_comment_is_patched(_inline_token):
+    gh = _FakeGitHub()
+    seen_at_llm_call = []
+
+    def summarize(*args, **kwargs):
+        seen_at_llm_call.append([dict(c) for c in gh.comments])
+        return None
+
+    gh.run(summarize)
+
+    # Before the LLM call: exactly one comment, already posted, saying "working".
+    assert len(seen_at_llm_call[0]) == 1
+    assert "drawing the map" in seen_at_llm_call[0][0]["body"]
+    # After: that SAME comment id was PATCHed to the final content - no second POST.
+    assert gh.calls == [("POST", 42), ("PATCH", 42)]
+    assert len(gh.comments) == 1
+    assert "## Walkthrough" in gh.comments[0]["body"]
+    assert "drawing the map" not in gh.comments[0]["body"]
+
+
+def test_a_rerun_keeps_the_last_walkthrough_collapsed_with_resolved_files(_inline_token):
+    first = _FakeGitHub()
+    first.run(lambda *a, **k: None)
+    # The first run walked new.py; the next run walks a different file.
+    gh = _FakeGitHub(comments=first.comments)
+
+    def files_now(url, **kwargs):
+        if url.endswith("/files"):
+            return gh._response([{"filename": "other.py", "additions": 1, "deletions": 0}])
+        return _FakeGitHub.get(gh, url, **kwargs)
+
+    with patch("httpx.get", side_effect=files_now), \
+         patch("httpx.post", side_effect=gh.post), \
+         patch("httpx.patch", side_effect=gh.patch), \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", return_value=None):
+        wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    body = gh.comments[0]["body"]
+    assert gh.calls == [("PATCH", 42), ("PATCH", 42)]  # status, then final: one comment
+    assert "<summary>Previous walkthrough" in body
+    assert "`new.py` - resolved (no longer in the change)" in body
+    assert "other.py" in body
+
+
+def test_a_failed_fetch_resolves_the_placeholder_to_a_real_message(_inline_token):
+    gh = _FakeGitHub(fail_diff=True)
+
+    with patch("httpx.get", side_effect=gh.get), \
+         patch("httpx.post", side_effect=gh.post), \
+         patch("httpx.patch", side_effect=gh.patch), \
+         patch("personas.walkthrough.dispatch._self_recover"):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "fetch_failed"}
+    assert gh.calls == [("POST", 42), ("PATCH", 42)]
+    body = gh.comments[0]["body"]
+    assert "could not finish the walkthrough" in body
+    assert "drawing the map" not in body
+
+
+def test_an_unexpected_error_resolves_the_placeholder_and_still_raises(_inline_token):
+    gh = _FakeGitHub()
+
+    with patch("httpx.get", side_effect=gh.get), \
+         patch("httpx.post", side_effect=gh.post), \
+         patch("httpx.patch", side_effect=gh.patch), \
+         patch("llm_client.summarize_pr", return_value=None), \
+         patch("personas.walkthrough.mermaid.build_diagram", side_effect=ValueError("boom")):
+        with pytest.raises(ValueError):
+            wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert "something broke on Grug's side" in gh.comments[0]["body"]
+    assert "drawing the map" not in gh.comments[0]["body"]

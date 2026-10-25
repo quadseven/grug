@@ -380,3 +380,35 @@ def test_assets_already_linked_by_posted_comments_stay_shipped():
     assets = Path(__file__).resolve().parents[3] / "web" / "public" / "assets"
     for name in ("grug_teller.png",):
         assert (assets / name).is_file(), name
+
+
+# --- #695: status line + previous-run record ---------------------------------
+
+
+def test_with_status_keeps_the_last_results_and_replaces_the_old_status():
+    from personas.walkthrough.render import MARKER, with_status
+
+    body = with_status(None, "first")
+    assert body.startswith(MARKER) and "first" in body
+    again = with_status(body + "\n## Walkthrough\nold", "second")
+    assert "second" in again and "first" not in again
+    assert "## Walkthrough\nold" in again
+    assert again.count(MARKER) == 1
+
+
+def test_previous_run_round_trips_and_tolerates_garbage():
+    from personas.walkthrough.render import (
+        FileStat, previous_run, walkthrough_body,
+    )
+    from personas.walkthrough.effort import estimate_effort
+
+    files = [FileStat(path="a.py", additions=1, deletions=0)]
+    body = walkthrough_body(
+        summary="did a thing", files=files, diagram=None,
+        effort=estimate_effort(file_count=1, lines_changed=1, model_effort=None),
+        head_sha="b" * 40, degraded=False,
+    )
+    prev = previous_run(body)
+    assert prev is not None and prev.paths == ("a.py",) and prev.head_sha == "b" * 40
+    assert previous_run("<!-- grug-teller:record:!!!! -->") is None
+    assert previous_run(None) is None

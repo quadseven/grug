@@ -9,6 +9,9 @@ data and the (possibly degraded) summary.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import re
 from dataclasses import dataclass
 
@@ -35,6 +38,16 @@ REVIEW_BADGE = (
 _MAX_TABLE_ROWS = 60
 _MAX_SUMMARY_CHARS = 2000
 _MAX_FILE_SUMMARY_CHARS = 160
+
+# Lifecycle (#695): one comment is one evolving document. A status line
+# (carrying STATUS_TAG) says what the run is doing right now; the final body
+# carries none. RECORD_PREFIX opens a hidden record of the run, so the next
+# run can show what changed since.
+STATUS_TAG = "<!-- grug-teller:status -->"
+RECORD_PREFIX = "<!-- grug-teller:record:"
+_RECORD_RE = re.compile(r"<!-- grug-teller:record:([A-Za-z0-9_=-]+) -->")
+_MAX_RECORD_FILES = 500
+_MAX_RECORD_SUMMARY = 600
 
 _HEADING_RE = re.compile(r"^(#{1,6})(\s)", re.MULTILINE)
 
@@ -121,6 +134,86 @@ def changed_files_table(files: list[FileStat]) -> str:
     return table
 
 
+@dataclass(frozen=True)
+class PreviousRun:
+    """What the last walkthrough said: the head it walked, its summary, and
+    the files it listed. Read back from the hidden record in its comment."""
+
+    head_sha: str
+    summary: str
+    paths: tuple[str, ...]
+
+
+def status_line(text: str) -> str:
+    return f"> {text} {STATUS_TAG}"
+
+
+def with_status(existing: str | None, text: str) -> str:
+    """Return `existing` with its status line replaced by `text`, or a fresh
+    marker + status body when there is no comment yet. Everything else in an
+    existing comment (the last results, the record) stays, so a re-run shows
+    'working' on top of the last walkthrough instead of erasing it."""
+    line = status_line(text)
+    if not existing:
+        return f"{MARKER}\n\n{line}"
+    kept = [ln for ln in existing.split("\n") if STATUS_TAG not in ln]
+    if kept and kept[0].strip() == MARKER:
+        return "\n".join([kept[0], "", line, *kept[1:]])
+    return "\n".join([MARKER, "", line, *kept])
+
+
+def _encode_record(head_sha: str, summary: str, paths: list[str]) -> str:
+    raw = json.dumps(
+        {
+            "sha": head_sha[:40],
+            "summary": summary[:_MAX_RECORD_SUMMARY],
+            "files": paths[:_MAX_RECORD_FILES],
+        },
+        separators=(",", ":"),
+    )
+    token = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+    return f"{RECORD_PREFIX}{token} -->"
+
+
+def previous_run(body: str | None) -> PreviousRun | None:
+    """Read the hidden record out of a walkthrough comment body. None when
+    the comment has no record (first run, or a placeholder/failure only) or
+    the record does not parse - an unreadable record just means no history."""
+    match = _RECORD_RE.search(body or "")
+    if not match:
+        return None
+    try:
+        data = json.loads(base64.urlsafe_b64decode(match.group(1)))
+        files = [str(f) for f in data["files"]][:_MAX_RECORD_FILES]
+        return PreviousRun(
+            head_sha=str(data["sha"]),
+            summary=str(data["summary"]),
+            paths=tuple(files),
+        )
+    except (binascii.Error, ValueError, KeyError, TypeError):
+        return None
+
+
+def _previous_section(previous: PreviousRun, current: list[FileStat]) -> str:
+    """Collapsed record of the last run. A file it listed that the change no
+    longer touches is marked resolved, never silently dropped."""
+    now = {f.path for f in current}
+    shown = previous.paths[:_MAX_TABLE_ROWS]
+    lines = [
+        _escape_html(_neutralize_headings(_neutralize_mentions(previous.summary))),
+        "",
+        "Files in that walkthrough:",
+        "",
+    ]
+    for path in shown:
+        mark = "still in the change" if path in now else "resolved (no longer in the change)"
+        lines.append(f"- `{_escape_code_span_cell(path)}` - {mark}")
+    cut = len(previous.paths) - len(shown)
+    if cut > 0:
+        lines.append(f"- (+{cut} more not shown)")
+    return _details(f"Previous walkthrough (`{previous.head_sha[:12]}`)", "\n".join(lines))
+
+
 def _details(summary: str, body: str) -> str:
     """Collapsible block. Keeps the default PR view short; expand for detail."""
     return f"<details>\n<summary>{summary}</summary>\n\n{body}\n\n</details>"
@@ -137,6 +230,7 @@ def walkthrough_body(
     files_truncated: bool = False,
     related: list | None = None,
     pr_url: str | None = None,
+    previous: PreviousRun | None = None,
 ) -> str:
     """Assemble a short walkthrough comment (default-collapsed detail).
 
@@ -159,6 +253,9 @@ def walkthrough_body(
     prose posts under the app's own installation-token identity.
     `pr_url` is where the full review is (the PR's Checks tab); when
     provided it's rendered as a badge-image button after the header.
+    `previous` is the last run read from this same comment (#695): it is
+    kept as a collapsed section with its files marked resolved or still
+    present, and a hidden record of THIS run is appended for the next one.
     """
     parts = [MARKER, TELLER_PORTRAIT_IMG, "", "## Walkthrough", ""]
     parts.append(
@@ -220,6 +317,11 @@ def walkthrough_body(
             )
         )
 
+    if previous is not None:
+        parts.append("")
+        parts.append(_previous_section(previous, files))
+
     parts.append("")
     parts.append(f"_Last walked at `{head_sha[:12]}`._")
+    parts.append(_encode_record(head_sha, summary, [f.path for f in files]))
     return "\n".join(parts)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
@@ -21,7 +22,14 @@ from github_app_auth import get_app_id, with_install_token_retry
 
 from personas import hunt_recorder
 from personas.walkthrough.effort import estimate_effort
-from personas.walkthrough.render import MARKER, FileStat, walkthrough_body
+from personas.walkthrough.render import (
+    MARKER,
+    FileStat,
+    PreviousRun,
+    previous_run,
+    walkthrough_body,
+    with_status,
+)
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.walkthrough")
 
@@ -111,7 +119,7 @@ def _find_marker_comment(
     owner: str,
     repo: str,
     pr_number: int,
-) -> int | None:
+) -> dict[str, Any] | None:
     # `performed_via_github_app` is populated server-side ONLY for comments
     # created via a GitHub App installation token - a human contributor
     # cannot set it. But a bare non-null check only proves "some GitHub
@@ -138,7 +146,7 @@ def _find_marker_comment(
             if not app or str(app.get("id")) != own_app_id:
                 continue
             if MARKER in (c.get("body") or ""):
-                return int(c["id"])
+                return c
         if len(batch) < 100:
             return None
         page += 1
@@ -157,23 +165,67 @@ def _upsert_comment(
     owner: str,
     repo: str,
     pr_number: int,
-    body: str,
-) -> None:
+    make_body: Callable[[dict[str, Any] | None], str],
+) -> int | None:
+    """Find-by-marker -> PATCH, else POST. `make_body` gets the existing
+    comment (None on the first run) so the new body can build on it. Returns
+    the comment id, so a placeholder and its final content provably share
+    one comment (#695)."""
     existing = _find_marker_comment(token, owner, repo, pr_number)
     if existing is not None:
         httpx.patch(
-            f"{_API}/repos/{_repo_path(owner, repo)}/issues/comments/{existing}",
-            json={"body": body},
+            f"{_API}/repos/{_repo_path(owner, repo)}/issues/comments/{existing['id']}",
+            json={"body": make_body(existing)},
             headers=_headers(token),
             timeout=_TIMEOUT,
         ).raise_for_status()
-    else:
-        httpx.post(
-            f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
-            json={"body": body},
-            headers=_headers(token),
-            timeout=_TIMEOUT,
-        ).raise_for_status()
+        return int(existing["id"])
+    resp = httpx.post(
+        f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
+        json={"body": make_body(None)},
+        headers=_headers(token),
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    try:
+        return int(resp.json()["id"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def _existing_previous(existing: dict[str, Any] | None) -> PreviousRun | None:
+    return previous_run(existing.get("body") if existing else None)
+
+
+def _set_status(
+    installation_id: int, owner: str, repo: str, pr_number: int, text: str,
+) -> bool:
+    """Say what Teller is doing in the PR's one walkthrough comment (#695).
+
+    The status line goes on top of whatever the comment already holds, so a
+    re-run shows 'working' over the last walkthrough instead of erasing it.
+    Best-effort: a refused write is logged and the run goes on; True when
+    the status landed."""
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: _upsert_comment(
+                token, owner, repo, pr_number,
+                lambda existing: with_status(
+                    existing.get("body") if existing else None, text,
+                ),
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
+        log.warning(
+            "walkthrough_status_failed",
+            extra={
+                "pr": f"{owner}/{repo}#{pr_number}",
+                "kind": type(e).__name__,
+            },
+        )
+        return False
+    return True
 
 
 def _log_fetch_failed(
@@ -256,6 +308,18 @@ def _emit_degraded_metric(degraded: bool) -> None:
         )
 
 
+_WORKING = "Grug read the PR. Teller is drawing the map now..."
+_FAILED = (
+    "Teller could not finish the walkthrough this time ({why}). "
+    "Grug will try again; comment `/grug improve` to nudge."
+)
+_STATUS_BY_RESULT = {
+    "fetch_failed": _FAILED.format(why="could not read the PR from GitHub"),
+    "publish_failed": _FAILED.format(why="could not write the final map"),
+    "skipped_closed": "This PR is closed, so Teller put the map down.",
+}
+
+
 def dispatch_walkthrough_review(
     payload: dict[str, Any],
     *,
@@ -267,8 +331,34 @@ def dispatch_walkthrough_review(
     every HTTPStatusError/RequestError/RuntimeError from the diff/files
     fetch or the comment publish degrades to a logged, structured result
     (fetch_failed/publish_failed), matching Smasher's dispatch guard for
-    the token-exchange RuntimeError case."""
+    the token-exchange RuntimeError case.
+
+    Lifecycle (#695): a status line goes into the PR's walkthrough comment
+    BEFORE any heavy work, and the final content PATCHes that same comment.
+    Every way out that publishes nothing (a degrade result, a closed PR, an
+    unexpected raise) resolves the status to a real message, so the comment
+    is never left on 'still working'."""
     del blocking  # advisory-only persona; kept for the shared call contract
+    pr_ref = (
+        int(payload["installation"]["id"]),
+        payload["repository"]["owner"]["login"],
+        payload["repository"]["name"],
+        int(payload["pull_request"]["number"]),
+    )
+    _set_status(*pr_ref, _WORKING)
+    try:
+        result = _walk(payload)
+    except Exception:
+        _set_status(*pr_ref, _FAILED.format(why="something broke on Grug's side"))
+        raise
+    status = _STATUS_BY_RESULT.get(result["result"])
+    if status is not None:
+        _set_status(*pr_ref, status)
+    return result
+
+
+def _walk(payload: dict[str, Any]) -> dict[str, str]:
+    """The walkthrough pass itself; see `dispatch_walkthrough_review`."""
     pr = payload["pull_request"]
     repo = payload["repository"]
     installation = payload["installation"]
@@ -440,22 +530,25 @@ def dispatch_walkthrough_review(
     # walkthrough is a comment on the PR page, so linking that page only
     # reloaded it.
     pr_url = f"https://github.com/{owner}/{repo_name}/pull/{pull_number}/checks"
-    body = walkthrough_body(
-        summary=summary,
-        files=files,
-        diagram=diagram,
-        effort=effort,
-        head_sha=head_sha,
-        degraded=degraded,
-        files_truncated=files_truncated,
-        related=related,
-        pr_url=pr_url,
-    )
+
+    def build_body(existing: dict[str, Any] | None) -> str:
+        return walkthrough_body(
+            summary=summary,
+            files=files,
+            diagram=diagram,
+            effort=effort,
+            head_sha=head_sha,
+            degraded=degraded,
+            files_truncated=files_truncated,
+            related=related,
+            pr_url=pr_url,
+            previous=_existing_previous(existing),
+        )
 
     try:
         with_install_token_retry(
             installation_id,
-            lambda token: _upsert_comment(token, owner, repo_name, pull_number, body),
+            lambda token: _upsert_comment(token, owner, repo_name, pull_number, build_body),
         )
     except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
         log.warning(

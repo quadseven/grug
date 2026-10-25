@@ -35,6 +35,7 @@ from urllib.parse import quote
 import boto3
 import httpx
 
+import comment_reactions
 from adapters.install_store import get_repo_config, is_elder_paused  # type: ignore
 from github_app_auth import get_app_id, with_install_token_retry
 from github_checks_client import (
@@ -607,11 +608,16 @@ def enqueue_review(
 # The static TPM check is requestable but logged + skipped below (deliberate).
 
 
-def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, question: str) -> None:
+def enqueue_ask(
+    *, install_id: int, repo: str, pr_number: int, comment_id: int, question: str,
+    reaction_id: int = 0,
+) -> None:
     """Enqueue a `/grug ask` job (#528) so the heavy LLM Q&A runs in the
     consumer, NOT inline in the webhook ACK path. Dedup keys on comment_id
     (each question is distinct - unlike a persona rerun), so a re-delivered
-    comment collapses but two different questions do not."""
+    comment collapses but two different questions do not. `reaction_id` is
+    the `eyes` reaction on the question comment, which the consumer swaps
+    for the final sign once the answer lands (#695)."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
     _sqs.send_message(
@@ -620,6 +626,7 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
             "schema_version": SCHEMA_VERSION, "kind": "ask",
             "install_id": install_id, "repo": repo, "pr_number": pr_number,
             "comment_id": comment_id, "question": question,
+            "reaction_id": reaction_id,
         }),
         MessageGroupId=_ask_group_id(install_id, repo, pr_number),
         MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:ask:{comment_id}",
@@ -701,8 +708,26 @@ def _gh_get_text(token: str, url: str, *, accept: str) -> str:
     return resp.text
 
 
-def _gh_post(token: str, url: str, json_body: dict[str, Any]) -> None:
+def _gh_post(token: str, url: str, json_body: dict[str, Any]) -> int | None:
+    """POST and return the created object's id (None when GitHub sent none)."""
     resp = httpx.post(
+        url, json=json_body,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    try:
+        return int(resp.json()["id"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+_ASK_WORKING = "Grug read your question. Grug thinking on the diff now..."
+_ASK_FAILED = "Grug could not answer that right now (the thinking-rock is tired). Try again."
+
+
+def _gh_patch(token: str, url: str, json_body: dict[str, Any]) -> None:
+    resp = httpx.patch(
         url, json=json_body,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
         timeout=_FETCH_TIMEOUT,
@@ -710,49 +735,129 @@ def _gh_post(token: str, url: str, json_body: dict[str, Any]) -> None:
     resp.raise_for_status()
 
 
-def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> str:
-    """Answer a /grug ask question in the consumer (async, #528). Fetches the
-    diff, runs the JSON-constrained Q&A over the REDACTED question + diff, and
-    posts the answer as a reply. Records an activity row. Never raises past
-    the job (a bad answer degrades to a fallback reply)."""
-    from urllib.parse import quote as _q
-    from llm_client import _redact_secrets, answer_pr_question  # type: ignore
+def _ask_marker(comment_id: int) -> str:
+    return f"<!-- grug-ask:{comment_id} -->"
+
+
+def _post_ask_placeholder(token: str, comments_url: str, comment_id: int) -> int | None:
+    """Post the 'still working' comment BEFORE the LLM call (#695). Returns its
+    id so the final answer PATCHes the same comment. A refused post is logged
+    and answered with None: the answer then posts fresh, as it always did."""
+    try:
+        return _gh_post(
+            token, comments_url,
+            {"body": f"{_ask_marker(comment_id)}\n{_ASK_WORKING}"},
+        )
+    except httpx.HTTPError as e:
+        log.warning("ask_placeholder_failed", extra={"kind": type(e).__name__})
+        return None
+
+
+def _publish_ask(
+    token: str, api: str, pr_number: int, placeholder_id: int | None,
+    comment_id: int, body: str,
+) -> None:
+    """Resolve the ask: PATCH the placeholder when there is one, else POST."""
+    payload = {"body": f"{_ask_marker(comment_id)}\n{body}"}
+    if placeholder_id is None:
+        _gh_post(token, f"{api}/issues/{pr_number}/comments", payload)
+        return
+    _gh_patch(token, f"{api}/issues/comments/{placeholder_id}", payload)
+
+
+def _resolve_ask_failure(
+    token: str, api: str, pr_number: int, placeholder_id: int | None, comment_id: int,
+) -> None:
+    """Turn a placeholder into the failure message before the job re-raises.
+    A refused write is logged, so it can not mask the error that got us here."""
+    try:
+        _publish_ask(token, api, pr_number, placeholder_id, comment_id, _ASK_FAILED)
+    except httpx.HTTPError as e:
+        log.warning("ask_failure_resolve_failed", extra={"kind": type(e).__name__})
+
+
+def _finish_ask_reaction(
+    install_id: int, repo_full: str, comment_id: int, reaction_id: int, sign: str,
+) -> None:
+    """Swap the question comment's `eyes` for the final sign (#695). Best
+    effort: `comment_reactions` logs and answers None rather than raising."""
+    if not comment_id:
+        return
+    owner, _, repo_name = repo_full.partition("/")
+    try:
+        with_install_token_retry(
+            install_id,
+            lambda token: comment_reactions.swap_reaction(
+                token, owner, repo_name, comment_id, reaction_id or None, sign,
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 - a missing sign must not fail the job
+        log.warning("ask_reaction_failed", extra={"kind": type(e).__name__})
+
+
+def _answer_ask(q: str, diff: str, install_id: int, repo_full: str, pr_number: int) -> str | None:
+    from llm_client import answer_pr_question  # type: ignore
     from markdown_safety import neutralize_mentions  # type: ignore
+    answer = answer_pr_question(
+        q,
+        diff,
+        install_id,
+        pr_context={
+            "installation_id": install_id,
+            "repo": repo_full,
+            "pr_number": pr_number,
+        },
+    )
+    # The answer is model-authored over an attacker-influenceable diff,
+    # posted under Grug's own installation-token authority - a live
+    # @mention in it would notify a real GitHub user as if Grug itself
+    # pinged them (#561, same class as Teller's #554 round-4 fix).
+    return neutralize_mentions(answer) if answer else answer
+
+
+def _run_ask(
+    install_id: int, repo_full: str, pr_number: int, question: str,
+    comment_id: int = 0, reaction_id: int = 0,
+) -> str:
+    """Answer a /grug ask question in the consumer (async, #528).
+
+    Lifecycle (#695): a marker-tagged placeholder is posted FIRST, then the
+    diff is fetched and the JSON-constrained Q&A runs over the REDACTED
+    question + diff, and the SAME comment is PATCHed to the answer. A failure
+    anywhere resolves the placeholder to a real failure message before it
+    re-raises, so the comment is never left on 'still working'. The question
+    comment's `eyes` reaction ends on `+1` (answered) or `-1` (not)."""
+    from urllib.parse import quote as _q
+    from llm_client import _redact_secrets  # type: ignore
     from observability import emit_gauge  # type: ignore
     owner, _, repo_name = repo_full.partition("/")
     q = _redact_secrets(question)
+    api = f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+    placeholder: dict[str, int | None] = {"id": None}  # survives a token retry
 
     def _do(token: str) -> str:
-        diff = _gh_get_text(
-            token,
-            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/pulls/{pr_number}",
-            accept="application/vnd.github.v3.diff",
-        )
-        answer = answer_pr_question(
-            q,
-            diff,
-            install_id,
-            pr_context={
-                "installation_id": install_id,
-                "repo": repo_full,
-                "pr_number": pr_number,
-            },
-        )
-        # The answer is model-authored over an attacker-influenceable diff,
-        # posted under Grug's own installation-token authority - a live
-        # @mention in it would notify a real GitHub user as if Grug itself
-        # pinged them (#561, same class as Teller's #554 round-4 fix).
-        safe_answer = neutralize_mentions(answer) if answer else answer
+        if placeholder["id"] is None:
+            placeholder["id"] = _post_ask_placeholder(
+                token, f"{api}/issues/{pr_number}/comments", comment_id)
+        try:
+            diff = _gh_get_text(token, f"{api}/pulls/{pr_number}",
+                                accept="application/vnd.github.v3.diff")
+            safe_answer = _answer_ask(q, diff, install_id, repo_full, pr_number)
+        except Exception:
+            _resolve_ask_failure(token, api, pr_number, placeholder["id"], comment_id)
+            raise
         body = (f"{safe_answer}\n\n*(Grug answered from the PR diff - may be wrong; verify.)*"
-                if safe_answer else
-                "Grug could not answer that right now (the thinking-rock is tired). Try again.")
-        _gh_post(
-            token,
-            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/issues/{pr_number}/comments",
-            {"body": body},
-        )
-        return "answered" if answer else "ask_no_answer"
-    result = with_install_token_retry(install_id, _do)
+                if safe_answer else _ASK_FAILED)
+        _publish_ask(token, api, pr_number, placeholder["id"], comment_id, body)
+        return "answered" if safe_answer else "ask_no_answer"
+
+    sign = comment_reactions.FAILED
+    try:
+        result = with_install_token_retry(install_id, _do)
+        if result == "answered":
+            sign = comment_reactions.DONE
+    finally:
+        _finish_ask_reaction(install_id, repo_full, comment_id, reaction_id, sign)
     try:
         emit_gauge("grug.interactive.ask", 1)
     except Exception:  # noqa: BLE001
@@ -1163,7 +1268,11 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     repo_full = str(job["repo"])  # "owner/name"
     pr_number = int(job["pr_number"])
     if job.get("kind") == "ask":
-        return _run_ask(install_id, repo_full, pr_number, str(job.get("question", "")))
+        return _run_ask(
+            install_id, repo_full, pr_number, str(job.get("question", "")),
+            comment_id=int(job.get("comment_id", 0) or 0),
+            reaction_id=int(job.get("reaction_id", 0) or 0),
+        )
     if job.get("kind") == "learn":
         # A deferred job (every classifier backend was rate limited) arrives
         # at once; FIFO queues have no per-message delay. Hold it until due.
