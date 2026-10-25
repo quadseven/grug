@@ -424,7 +424,9 @@ def run_command(
             verb, arg, owner=owner, repo=repo, comment_id=comment_id,
             token_fn=token_fn, eyes_reaction_id=eyes or 0, **kwargs,
         )
-    except Exception:
+    except Exception as e:
+        log.error("interactive_command_failed",
+                  extra={"verb": verb, "kind": type(e).__name__})
         _react(
             token_fn, comment_reactions.swap_reaction, owner, repo, comment_id,
             eyes, comment_reactions.FAILED,

@@ -589,3 +589,29 @@ def test_ask_keeps_eyes_and_hands_the_reaction_to_the_consumer(monkeypatch):
     )
     assert [c[2] for c in http.calls if c[0] == "post"] == ["eyes"]
     assert asks[0]["reaction_id"] == 501
+
+
+def test_command_crash_is_logged_signed_failed_and_reraised(monkeypatch, caplog):
+    """A fault in the command is logged by kind, the sign flips to
+    thumbs-down, and the fault still propagates (#695)."""
+    swaps = []
+
+    def boom(*a, **k):
+        raise ValueError("kaboom")
+
+    monkeypatch.setattr(interactive, "_execute_command", boom)
+    monkeypatch.setattr(interactive, "_react", lambda tf, fn, *a: swaps.append(a) or 7)
+    with caplog.at_level("ERROR"):
+        try:
+            interactive.run_command(
+                "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+                comment_id=5, token_fn=_tok,
+            )
+            raised = False
+        except ValueError:
+            raised = True
+    assert raised
+    assert "interactive_command_failed" in caplog.text
+    kinds = [r.kind for r in caplog.records if r.getMessage() == "interactive_command_failed"]
+    assert kinds == ["ValueError"]
+    assert swaps[-1][-1] == interactive.comment_reactions.FAILED
