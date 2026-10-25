@@ -173,7 +173,9 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
                     response=httpx.Response(502, request=request),
                 )
             if commits == "long":
-                return _Resp([{"author": {"login": "author"}, "committer": {"login": "author"}}] * 100)
+                # GitHub caps this endpoint at 250: pages of 100, 100 and 50.
+                rows = 50 if "page=3" in url else 100
+                return _Resp([{"author": {"login": "author"}, "committer": {"login": "author"}}] * rows)
             logins = commits if isinstance(commits, list) else [payload["issue"]["user"]["login"]]
             return _Resp([{"author": {"login": who} if who else None, "committer": {"login": "web-flow"}}
                           for who in logins] if "page=1" in url else [])

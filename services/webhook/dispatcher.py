@@ -650,14 +650,19 @@ def _actor_permission(
         return None
 
 
+# GitHub's pull request commits endpoint returns at most this many commits,
+# so a list this long may be cut short.
+_PR_COMMITS_CAP = 250
+
+
 def _pr_commit_logins(
     installation_id: int, owner: str, repo_name: str, pr_number: int,
 ) -> frozenset[str] | None:
     """Lower-case logins that authored or committed any commit on the PR
     (GitHub's web-flow committer excluded), or None, which refuses a trusted
-    operator: the list could not be read, it did not end within 300 commits,
-    or a commit's author or committer maps to no GitHub login (an unlinked
-    identity could be anyone). Git metadata can still name another person's
+    operator: the list could not be read, it reached GitHub's 250-commit cap
+    on that endpoint (so it may be cut short), or a commit's author or
+    committer maps to no GitHub login (an unlinked identity could be anyone). Git metadata can still name another person's
     linked address; push-actor proof is out of scope, since the owner
     chooses whom to trust."""
     from urllib.parse import quote as _q
@@ -666,6 +671,7 @@ def _pr_commit_logins(
 
     def _read(token: str) -> frozenset[str] | None:
         logins: set[str] = set()
+        total = 0
         for page in (1, 2, 3):
             r = httpx.get(
                 f"https://api.github.com/repos/{_q(owner, safe='')}/"
@@ -679,6 +685,9 @@ def _pr_commit_logins(
             )
             r.raise_for_status()
             rows = r.json() or []
+            total += len(rows)
+            if total >= _PR_COMMITS_CAP:
+                return None
             for row in rows:
                 for role in ("author", "committer"):
                     who = str(((row or {}).get(role) or {}).get("login") or "").lower()
