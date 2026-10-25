@@ -26,6 +26,7 @@ def _spec(key: str, check_run_name: str) -> PersonaSpec:
         missing_repo_policy="enabled",
         events=("pull_request",),
         dispatch_module=f"personas.{key}.webhook_dispatch",
+        posts_pr_check_run=True,
     )
 
 
@@ -46,6 +47,87 @@ def test_expected_personas_filters_by_enablement_and_event():
          ):
         out = reconciler.expected_personas(1, 2)
     assert [spec.key for spec in out] == ["tpm"]
+
+
+_GUARD = _spec("guard", "Grug - Guard")
+
+
+def test_expected_personas_with_default_config_returns_only_real_check_posters():
+    """Acceptance: with default enablement the expected set is Chief,
+    Elder and Guard only - comment-only personas (Teller, Sentinel),
+    closed-only personas (Warder, Sentinel) and scheduled personas
+    (Pulse) never post a check-run on an open PR, so expecting them
+    re-dispatches every open PR on every tick."""
+    defaults = {spec.key: spec.enabled_default for spec in reconciler.persona_registry.REGISTRY}
+    with patch(
+        "check_run_reconciler.is_persona_enabled",
+        side_effect=lambda _iid, _rid, key: defaults[key],
+    ):
+        out = reconciler.expected_personas(1, 2)
+    assert [spec.key for spec in out] == ["tpm", "code_reviewer", "guard"]
+
+
+def test_expected_personas_includes_smasher_when_enabled():
+    """Smasher posts a real check-run and acts on synchronize, so it is
+    expected once enabled; every other persona stays out even when its
+    enablement flag is on."""
+    with patch(
+        "check_run_reconciler.is_persona_enabled",
+        side_effect=lambda _iid, _rid, _key: True,
+    ):
+        out = reconciler.expected_personas(1, 2)
+    assert [spec.key for spec in out] == ["tpm", "code_reviewer", "guard", "smasher"]
+
+
+def test_expected_personas_excludes_comment_only_and_closed_only_specs():
+    """The two non-posting shapes, pinned at the spec level: a persona
+    with posts_pr_check_run unset (comment-only, however it is enabled)
+    and a persona that only acts on `closed` (so a `synchronize`
+    re-dispatch can never make it post on an open PR)."""
+    import dataclasses
+
+    comment_only = dataclasses.replace(
+        _CHIEF, key="walkthrough", canonical="walkthrough",
+        enabled_flag="walkthrough_enabled", posts_pr_check_run=False,
+    )
+    closed_only = dataclasses.replace(
+        _ELDER, key="warder", canonical="warder",
+        enabled_flag="warder_enabled", actions=("closed",),
+    )
+    registry = [_CHIEF, comment_only, closed_only]
+    with patch.object(reconciler.persona_registry, "REGISTRY", tuple(registry)), \
+         patch("check_run_reconciler.is_persona_enabled", return_value=True):
+        out = reconciler.expected_personas(1, 2)
+    assert [spec.key for spec in out] == ["tpm"]
+
+
+def test_reconcile_repo_fully_checked_pr_dispatches_nothing_twice():
+    """Acceptance: an open PR whose head already has Chief, Elder and
+    Guard runs is fully checked - two consecutive poller ticks dispatch
+    nothing and log no check_run_reconcile_dispatched for it."""
+    pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
+    runs = [
+        {"name": "Grug - Chief", "status": "completed"},
+        {"name": "Grug - Elder", "status": "completed"},
+        {"name": "Grug - Guard", "status": "completed"},
+    ]
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
+         patch("check_run_reconciler.expected_personas", return_value=[_CHIEF, _ELDER, _GUARD]), \
+         patch("check_run_reconciler.list_check_runs_for_ref", return_value=runs), \
+         patch("check_run_reconciler.patch_check_run") as mock_patch, \
+         patch.object(reconciler.log, "info") as mock_log_info, \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        first = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
+        second = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
+    assert first == (0, 0)
+    assert second == (0, 0)
+    mock_dispatch.assert_not_called()
+    mock_patch.assert_not_called()
+    dispatched_logs = [
+        call for call in mock_log_info.call_args_list
+        if call.args and call.args[0] == "check_run_reconcile_dispatched"
+    ]
+    assert dispatched_logs == []
 
 
 def test_split_missing_present_stuck_separates_missing_from_present():

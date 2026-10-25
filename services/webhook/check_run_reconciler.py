@@ -98,14 +98,23 @@ def _list_open_pull_requests(token: str, owner: str, repo: str) -> list[dict[str
 
 
 def expected_personas(installation_id: int, repo_id: int) -> list[persona_registry.PersonaSpec]:
-    """Personas that would post a check-run on an ordinary `pull_request`
-    dispatch to this repo right now - the same enablement rule
-    `_handle_pull_request` applies, so "expected" here means exactly what
-    a healthy webhook would have produced, never a stricter or looser set."""
+    """Personas that would post a check-run on an open PR in this repo
+    right now. A persona counts only when it posts a real check-run
+    (`posts_pr_check_run`), acts on the `synchronize` action this
+    reconciler re-dispatches, and is enabled - the same rules a healthy
+    webhook dispatch applies, narrowed to real check posters.
+
+    Comment-only personas (Teller, Sentinel) and closed-only personas
+    (Warder, Sentinel) never post a check-run on an open PR, and the
+    scheduled Pulse personas post none at all. Expecting any of them
+    reports them missing forever and re-dispatches every open PR on
+    every poller tick (grug#1431)."""
     return [
         spec
         for spec in persona_registry.REGISTRY
         if "pull_request" in spec.events
+        and "synchronize" in spec.actions
+        and spec.posts_pr_check_run
         and is_persona_enabled(installation_id, repo_id, spec.key)
     ]
 
