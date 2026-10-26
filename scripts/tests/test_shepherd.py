@@ -633,6 +633,82 @@ def test_parse_bot_surfaces_from_github_data():
     assert surfaces.total_findings == 4
 
 
+def test_parse_bot_surfaces_ignores_clean_or_human_items():
+    threads = [
+        {
+            "id": "thread-resolved",
+            "isResolved": True,
+            "comments": {
+                "nodes": [
+                    {"author": {"login": "grug-tribe[bot]"}, "body": "resolved nit"}
+                ]
+            },
+        },
+        {
+            "id": "thread-no-bot",
+            "isResolved": False,
+            "comments": {
+                "nodes": [
+                    {"author": {"login": "human-reviewer"}, "body": "human nit"}
+                ]
+            },
+        },
+    ]
+    reviews = [
+        {
+            "id": "rev-approved",
+            "user": {"login": "coderabbitai[bot]", "type": "Bot"},
+            "body": "looks great!",
+            "state": "APPROVED",
+        },
+        {
+            "id": "rev-human",
+            "user": {"login": "human-reviewer", "type": "User"},
+            "body": "changes requested",
+            "state": "CHANGES_REQUESTED",
+        },
+    ]
+    check_runs = [
+        {
+            "name": "Grug - Chief",
+            "status": "completed",
+            "conclusion": "success",
+            "app": {"slug": "grug-tribe"},
+        },
+        {
+            "name": "external-ci",
+            "status": "completed",
+            "conclusion": "failure",
+            "app": {"slug": ""},
+        },
+    ]
+    issue_comments = [
+        {
+            "id": "ic-human",
+            "user": {"login": "human-reviewer", "type": "User"},
+            "body": "just a comment",
+        },
+        {
+            "id": "ic-empty",
+            "user": {"login": "datadog[bot]", "type": "Bot"},
+            "body": "   ",
+        },
+    ]
+
+    surfaces = parse_bot_surfaces(
+        threads_data=threads,
+        reviews_data=reviews,
+        check_runs_data=check_runs,
+        issue_comments_data=issue_comments,
+    )
+    assert len(surfaces.unresolved_review_threads) == 1
+    assert surfaces.unresolved_review_threads[0].bot_name == "bot"
+    assert surfaces.unresolved_review_threads[0].identifier == "thread-no-bot"
+    assert len(surfaces.unanswered_review_bodies) == 0
+    assert len(surfaces.non_passing_bot_check_runs) == 0
+    assert len(surfaces.issue_comments) == 0
+
+
 def test_format_duration_windows():
     assert format_duration(None) == "not ready"
     assert format_duration(0.0) == "0s"

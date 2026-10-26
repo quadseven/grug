@@ -290,7 +290,7 @@ def main(service: str = "webhook", *args: str) -> int:
 
     When called with a service name ('webhook', etc.), checks deployment status.
     When called with 'pr-queue' (or flags), reports the PR queue across CI and
-    bot surfaces. Takes no action on any PR — reports only.
+    bot surfaces. Takes no action on any PR -- reports only.
     """
     if service == "pr-queue" or service.startswith("--"):
         import argparse
@@ -618,7 +618,7 @@ def build_pr_queue(
 def format_queue_report(queue: list[PRQueueItem]) -> str:
     """Format the PR queue into an honest human-readable report.
 
-    Takes no action on any PR — reports only, does not merge or modify.
+    Takes no action on any PR -- reports only, does not merge or modify.
     """
     lines = ["Shepherd PR Queue (ordered by ready longest):"]
     if not queue:
@@ -723,49 +723,45 @@ def parse_ci_checks(
     return checks
 
 
-def parse_bot_surfaces(
-    threads_data: list[dict],
-    reviews_data: list[dict],
-    check_runs_data: list[dict],
-    issue_comments_data: list[dict],
-) -> BotSurfaces:
-    """Parse raw GitHub data into findings on all four bot comment surfaces."""
-    unresolved_threads: list[BotFinding] = []
-    unanswered_reviews: list[BotFinding] = []
-    non_passing_checks: list[BotFinding] = []
-    issue_comments: list[BotFinding] = []
+def _find_thread_bot_author_and_msg(comments_nodes: list[dict]) -> tuple[str, str]:
+    for c in comments_nodes:
+        author_login = ((c.get("author") or {}).get("login") or "").lower()
+        if author_login.endswith("[bot]") or author_login.startswith("grug-"):
+            return author_login, str(c.get("body") or "")
+    return "bot", ""
 
-    # 1. Unresolved review threads
+
+def _parse_unresolved_threads(threads_data: list[dict]) -> list[BotFinding]:
+    unresolved_threads: list[BotFinding] = []
     for t in threads_data:
         if not t.get("isResolved"):
             t_id = str(t.get("id") or "")
             comments_nodes = (t.get("comments") or {}).get("nodes") or []
-            bot_name = "bot"
-            msg = ""
-            for c in comments_nodes:
-                author_login = ((c.get("author") or {}).get("login") or "").lower()
-                if author_login.endswith("[bot]") or author_login.startswith("grug-"):
-                    bot_name = author_login
-                    msg = str(c.get("body") or "")
-                    break
+            bot_name, msg = _find_thread_bot_author_and_msg(comments_nodes)
             unresolved_threads.append(BotFinding("review_thread", t_id, bot_name, msg))
+    return unresolved_threads
 
-    # 2. Unanswered review bodies
+
+def _is_bot_account(user: dict) -> bool:
+    login = (user.get("login") or "").lower()
+    return user.get("type") == "Bot" or login.endswith("[bot]")
+
+
+def _parse_unanswered_reviews(reviews_data: list[dict]) -> list[BotFinding]:
+    unanswered_reviews: list[BotFinding] = []
     for r in reviews_data:
         u = r.get("user") or {}
-        u_login = (u.get("login") or "").lower()
-        u_type = u.get("type") or ""
         body = (r.get("body") or "").strip()
         state = (r.get("state") or "").upper()
-        if (
-            (u_type == "Bot" or u_login.endswith("[bot]"))
-            and body
-            and state != "APPROVED"
-        ):
+        if _is_bot_account(u) and body and state != "APPROVED":
             r_id = str(r.get("id") or "")
+            u_login = (u.get("login") or "").lower()
             unanswered_reviews.append(BotFinding("review_body", r_id, u_login, body))
+    return unanswered_reviews
 
-    # 3. Non-passing bot check-runs
+
+def _parse_non_passing_bot_check_runs(check_runs_data: list[dict]) -> list[BotFinding]:
+    non_passing_checks: list[BotFinding] = []
     for cr in check_runs_data:
         app_slug = ((cr.get("app") or {}).get("slug") or "").lower()
         name = str(cr.get("name") or "")
@@ -782,22 +778,35 @@ def parse_bot_surfaces(
                     f"{name}: status={status}, conclusion={conclusion}",
                 )
             )
+    return non_passing_checks
 
-    # 4. Issue-level bot comments
+
+def _parse_issue_bot_comments(issue_comments_data: list[dict]) -> list[BotFinding]:
+    issue_comments: list[BotFinding] = []
     for ic in issue_comments_data:
         u = ic.get("user") or {}
-        u_login = (u.get("login") or "").lower()
-        u_type = u.get("type") or ""
         body = (ic.get("body") or "").strip()
-        if (u_type == "Bot" or u_login.endswith("[bot]")) and body:
+        if _is_bot_account(u) and body:
             ic_id = str(ic.get("id") or "")
+            u_login = (u.get("login") or "").lower()
             issue_comments.append(BotFinding("issue_comment", ic_id, u_login, body))
+    return issue_comments
 
+
+def parse_bot_surfaces(
+    threads_data: list[dict],
+    reviews_data: list[dict],
+    check_runs_data: list[dict],
+    issue_comments_data: list[dict],
+) -> BotSurfaces:
+    """Parse raw GitHub data into findings on all four bot comment surfaces."""
     return BotSurfaces(
-        unresolved_review_threads=tuple(unresolved_threads),
-        unanswered_review_bodies=tuple(unanswered_reviews),
-        non_passing_bot_check_runs=tuple(non_passing_checks),
-        issue_comments=tuple(issue_comments),
+        unresolved_review_threads=tuple(_parse_unresolved_threads(threads_data)),
+        unanswered_review_bodies=tuple(_parse_unanswered_reviews(reviews_data)),
+        non_passing_bot_check_runs=tuple(
+            _parse_non_passing_bot_check_runs(check_runs_data)
+        ),
+        issue_comments=tuple(_parse_issue_bot_comments(issue_comments_data)),
     )
 
 
@@ -944,7 +953,7 @@ def report_shepherd_pr_queue(
 ) -> str:
     """Fetch all open PRs, evaluate state, track ready duration, and report queue.
 
-    Takes no action on any PR — reports only, does not merge or modify.
+    Takes no action on any PR -- reports only, does not merge or modify.
     """
     current_time = now if now is not None else datetime.now(timezone.utc).timestamp()
     open_prs_info = fetch_open_prs(repo, runner=runner)
