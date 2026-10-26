@@ -695,9 +695,38 @@ class Finding:
     # `evaluate_diff` additionally verifies that the exact line was supplied
     # in bounded cross-file context before accepting it.
     outside_diff_reason: str | None = None
+    # grug#1397: the model's own structured verdict. True when it sent
+    # `"is_finding": false`, i.e. it looked at this candidate and concluded
+    # there is nothing wrong. `evaluate_diff` drops it before publication.
+    withdrawn: bool = False
     # A duplicate candidate can be independently produced by both models. Keep
     # every source so judge and human feedback train both originating spans.
     origins: tuple[FindingOrigin, ...] = field(default_factory=tuple, compare=False)
+
+
+# grug#1397 backstop for a model that ignores `is_finding`: the candidate's
+# message ENDS by withdrawing itself ("... Not dead. No finding."). Only the
+# last sentence counts, so a real finding that merely mentions the words
+# earlier ("no finding of a caller ... so this leaks") still posts.
+_WITHDRAWN_TAIL = re.compile(
+    r"^(?:so |thus |therefore )?(?:"
+    r"no finding|not a finding|no real finding|"
+    r"not an? (?:live |real )?(?:defect|bug|issue)"
+    r")(?: here)?[.!]*$",
+    re.IGNORECASE,
+)
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def is_withdrawn_finding(finding: "Finding") -> bool:
+    """Whether the reviewer itself withdrew this candidate (grug#1397).
+
+    The structured `is_finding: false` verdict decides first; the phrase
+    check on the message's final sentence is only a backstop."""
+    if finding.withdrawn:
+        return True
+    sentences = [s for s in _SENTENCE_SPLIT.split(finding.message.strip()) if s]
+    return bool(sentences) and bool(_WITHDRAWN_TAIL.match(sentences[-1].strip()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1798,6 +1827,7 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                             "outside_diff_reason": {
                                 "type": "string", "maxLength": MAX_FINDING_MESSAGE_CHARS,
                             },
+                            "is_finding": {"type": "boolean"},
                         },
                         "required": ["path", "line", "rule", "severity", "message"],
                         "additionalProperties": False,
@@ -2694,6 +2724,9 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         if isinstance(raw_outside_reason, str) and raw_outside_reason.strip()
         else None
     )
+    # grug#1397: only a real JSON `false` withdraws. A malformed value
+    # (string, null) degrades to "still a finding", never the reverse.
+    withdrawn = raw.get("is_finding") is False
     # Output-side redaction at the ONE choke point: the model can ECHO a
     # secret from the diff into message/suggestion, and a posted comment
     # OUTLIVES a force-push that scrubs the diff. Every downstream surface
@@ -2715,7 +2748,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
         suggestion=suggestion, effort=effort,
-        outside_diff_reason=outside_diff_reason,
+        outside_diff_reason=outside_diff_reason, withdrawn=withdrawn,
     ), ""
 
 
@@ -4000,6 +4033,15 @@ def _merge_review_findings(
                 if origin_key not in origin_keys:
                     origins.append(origin)
                     origin_keys.add(origin_key)
+
+            # grug#1397: when one model withdrew this candidate and the
+            # other stands behind it, keep the live one whole. Merging would
+            # risk carrying the withdrawn text or flag onto a real finding.
+            current_out = is_withdrawn_finding(current)
+            if current_out != is_withdrawn_finding(finding):
+                live = finding if current_out else current
+                merged[key] = replace(live, origins=tuple(origins))
+                continue
 
             current_rank = _SEVERITY_RANK[current.severity]
             incoming_rank = _SEVERITY_RANK[finding.severity]

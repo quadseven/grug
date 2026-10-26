@@ -880,6 +880,13 @@ def _review_transparency(
         if suppressed_count
         else ""
     )
+    if evaluation.dropped_withdrawn:
+        # grug#1397: say how many candidates were dropped because the
+        # reviewer's own text ruled them out, so the drop is never silent.
+        lines += (
+            f"\n\nGrug dropped {evaluation.dropped_withdrawn} candidate(s) "
+            "the reviewer itself withdrew (its own verdict said no finding)."
+        )
     coverage = evaluation.coverage
     if coverage is not None:
         lines += _coverage_lines(coverage)
@@ -3799,6 +3806,7 @@ def dispatch_code_review(
             "models": list(llm_response.models_used),
             "findings_count": len(evaluation.findings),
             "dropped_hallucinations": evaluation.dropped_hallucinations,
+            "dropped_withdrawn": evaluation.dropped_withdrawn,
             "degraded_reason": evaluation.degraded_reason,
             # How much of the diff was actually walked, as a number the
             # eval harness (#645) can track directly instead of parsing
