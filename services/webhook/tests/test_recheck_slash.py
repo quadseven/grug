@@ -18,13 +18,17 @@ Covers:
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
+import yaml
 
 import dispatcher as d
 import personas.tpm.persona as tpm_persona
+
+_K8S = Path(__file__).resolve().parents[3] / "k8s"
 
 
 def _comment_payload(
@@ -838,4 +842,20 @@ def test_unknown_app_bot_is_refused_with_a_reply(
     assert len(http.posts) == 1
     body = str(http.posts[0].get("body", ""))
     assert "refused" in body and "/grug improve" in body
+
+
+# --- production wiring --------------------------------------------------------
+
+def test_deployed_allowed_app_bot_logins_is_not_empty():
+    """The webhook deployment must list at least one allowed App bot login,
+    else an allowed-App /grug improve is dropped exactly as the ticket's Why
+    describes (empty = feature off)."""
+    docs = [doc for doc in yaml.safe_load_all((_K8S / "webhook-deployment.yaml").read_text()) if doc]
+    (deploy,) = [doc for doc in docs if doc.get("kind") == "Deployment"]
+    (container,) = deploy["spec"]["template"]["spec"]["containers"]
+    env = {entry["name"]: entry.get("value") for entry in container.get("env", [])}
+    value = env.get("GRUG_ALLOWED_APP_BOT_LOGINS", "")
+    assert value, "GRUG_ALLOWED_APP_BOT_LOGINS must be set on the webhook container"
+    logins = {name.lower() for name in value.replace(",", " ").split()}
+    assert {"loom-brain[bot]", "loom-station[bot]", "loom-lanes[bot]"} <= logins
 
