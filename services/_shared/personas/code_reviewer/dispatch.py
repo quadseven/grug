@@ -1008,6 +1008,20 @@ def _defensive_drop_note(count: int) -> str:
     return f"\n\n{count} defensive findings dropped: no reachable caller named"
 
 
+def _muted_classes_section(muted_stats: dict[str, tuple[int, int]]) -> str:
+    """Render the muted classes section for the board/summary."""
+    if not muted_stats:
+        return ""
+    lines = ["\n\n## Muted finding classes"]
+    lines.append(
+        "These classes have low measured precision and are not posted inline. "
+        "Critical findings of these classes still post inline and block."
+    )
+    for cls, (fixed, labeled) in sorted(muted_stats.items()):
+        lines.append(f"- `{cls}`: muted - fixed in {fixed} of {labeled} past findings")
+    return "\n".join(lines)
+
+
 def _summary_markdown(
     evaluation: CodeReviewEvaluation,
     *,
@@ -1020,6 +1034,7 @@ def _summary_markdown(
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
     defensive_dropped_count: int = 0,
     blocking: bool = False,
+    muted_stats: dict[str, tuple[int, int]] | None = None,
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -1039,6 +1054,8 @@ def _summary_markdown(
     `blocking` (grug#1212) is the repo's Elder mode. It only changes what a
     degraded summary says about the merge: in BLOCK mode a degraded review
     fails closed, so "merge not blocked" would be false there.
+    `muted_stats` maps muted class -> (fixed_count, labeled_count) for the
+    muted classes board section.
     """
     held = _review_transparency(
         evaluation, suppressed_count, excluded_paths, oversized_paths,
@@ -1151,7 +1168,8 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}"
+    muted_section = _muted_classes_section(muted_stats) if muted_stats else ""
+    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{muted_section}{held}{hunt}{defensive_note}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -2063,6 +2081,49 @@ def _precedent_notes_for(
         return {}
 
 
+def _muted_classes(
+    repo_full: str, repo_config: RepoConfig | None,
+) -> tuple[set[str], dict[str, tuple[int, int]]]:
+    """Compute muted finding classes from the ledger.
+
+    A class is muted when:
+      - It has >= elder_mute_min_labeled labeled findings in the ledger
+      - Its precision (accepted / labeled) is < elder_mute_below_precision
+      - It is NOT in elder_mute_locked_classes
+
+    Returns (muted_class_names, class_stats) where class_stats maps
+    class -> (fixed_count, labeled_count) for board rendering.
+    """
+    if repo_config is None:
+        return set(), {}
+    try:
+        from adapters.install_store import list_ledger_rows  # type: ignore
+        from ledger import parse_row
+
+        raw = list_ledger_rows(repo_full) or []
+        rows = [r for r in (parse_row(d) for d in raw) if r is not None]
+        if not rows:
+            return set(), {}
+        precisions = class_precision(rows)
+        locked = set(repo_config.elder_mute_locked_classes)
+        min_labeled = repo_config.elder_mute_min_labeled
+        below_precision = repo_config.elder_mute_below_precision
+
+        muted: set[str] = set()
+        stats: dict[str, tuple[int, int]] = {}
+        for cls, cp in precisions.items():
+            if cls in locked:
+                continue
+            if cp.labeled >= min_labeled and cp.precision < below_precision:
+                muted.add(cls)
+                # Count accepted (fixed) vs labeled for the board
+                stats[cls] = (cp.accepted, cp.labeled)
+        return muted, stats
+    except Exception as e:  # noqa: BLE001 - muting is enrichment, never load-bearing
+        log.info("muted_classes_unavailable", extra={"repo": repo_full, "kind": type(e).__name__})
+        return set(), {}
+
+
 def _checked_comment_body(f: Finding, file_text: str, precedent_note: str) -> str:
     """Inline body whose committable block, if any, passed `checked_suggestion`.
     A fix that fails the check still renders, as prose under "Fix"."""
@@ -2078,6 +2139,7 @@ def build_review_result(
     precedent_notes: dict[str, str] | None = None,
     repo_config: RepoConfig | None = None,
     file_contents: dict[str, str] | None = None,
+    muted_classes: set[str] | None = None,
     persona: str = "elder",
 ) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
     """Build the ReviewResult, or (None, ()) if nothing NEW to post.
@@ -2121,6 +2183,14 @@ def build_review_result(
         # summary (built from the full evaluation) but get no inline comment.
         new_findings = tuple(
             f for f in new_findings if meets_inline_floor(f.severity, repo_config)
+        )
+    # Finding class muting: classes with >= min_labeled and precision < threshold
+    # stop posting inline (appear only in board/Elder summary), EXCEPT critical
+    # findings which still post inline and block.
+    if muted_classes:
+        new_findings = tuple(
+            f for f in new_findings
+            if f.rule_name not in muted_classes or f.severity == "critical"
         )
     if not new_findings:
         return None, ()
@@ -3559,6 +3629,14 @@ def dispatch_code_review(
     tier1_phase: Literal["tier1", "deep", "dual"] = (
         "tier1" if depth_now == "tiered" else "dual"
     )
+    # Compute muted classes for the check-run summary (board/Elder summary)
+    repo_full = f"{owner}/{repo_name}"
+    muted_classes, muted_stats = (
+        _muted_classes(repo_full, repo_config)
+        if evaluation.findings
+        and evaluation.degraded_reason in (None, "", *PUBLISHABLE_DEGRADATIONS)
+        else (set(), {})
+    )
     title, summary = _summary_markdown(
         evaluation, suppressed_count=len(suppressed),
         excluded_paths=excluded_paths,
@@ -3569,6 +3647,7 @@ def dispatch_code_review(
         review_phase=tier1_phase,
         defensive_dropped_count=defensive_dropped_count,
         blocking=blocking,
+        muted_stats=muted_stats,
     )
     summary = _intent_paragraph(pr_context) + summary
     if ruff_policy_dropped:
@@ -3643,8 +3722,9 @@ def dispatch_code_review(
         )
     # Only pay the ledger fetch when there is something to annotate. A fully
     # degraded eval publishes no inline review; a partial staged review does.
+    repo_full = f"{owner}/{repo_name}"
     precedent_notes = (
-        _precedent_notes_for(f"{owner}/{repo_name}", evaluation.findings)
+        _precedent_notes_for(repo_full, evaluation.findings)
         if evaluation.findings
         and evaluation.degraded_reason in (None, "", *PUBLISHABLE_DEGRADATIONS)
         else {}
@@ -3652,7 +3732,7 @@ def dispatch_code_review(
     review_result, posted_findings = build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
         precedent_notes=precedent_notes, repo_config=repo_config,
-        file_contents=file_contents,
+        file_contents=file_contents, muted_classes=muted_classes,
     )
     review_resp: dict[str, Any] | None = None
     if review_result is not None:
@@ -4565,6 +4645,8 @@ def _publish_deep_review(
     file_contents: dict[str, str] | None = None,
     action: str = "review",
     linked_issues: tuple[int, ...] = (),
+    muted_classes: set[str] | None = None,
+    muted_stats: dict[str, tuple[int, int]] | None = None,
 ) -> None:
     """Publish the async deep review's novel findings as a GitHub review.
 
@@ -4587,6 +4669,7 @@ def _publish_deep_review(
         precedent_notes=precedent_notes,
         repo_config=repo_config,
         file_contents=file_contents,
+        muted_classes=muted_classes,
     )
     if review_result is None:
         return
@@ -4869,6 +4952,15 @@ def _async_deep_append_if_needed(
     # ground the deep arm never finished walking.
     combined = with_degradation(combined, deep_eval)
 
+    # Compute muted classes for the deep check-run summary (board/Elder summary)
+    repo_full = f"{owner}/{repo_name}"
+    _, muted_stats = (
+        _muted_classes(repo_full, repo_config)
+        if combined.findings
+        and combined.degraded_reason in (None, "", *PUBLISHABLE_DEGRADATIONS)
+        else (set(), {})
+    )
+
     outcome = plan_publish(combined, mode=mode, degraded_fails_closed=True)
     conclusion, event = outcome.conclusion, outcome.event
     title, summary = _summary_markdown(
@@ -4878,6 +4970,7 @@ def _async_deep_append_if_needed(
         living_baseline_rejected=living_baseline_rejected,
         review_phase="deep",
         blocking=blocking,
+        muted_stats=muted_stats,
     )
     summary = _intent_paragraph(pr_context) + summary
     summary += config_note
@@ -4949,6 +5042,8 @@ def _async_deep_append_if_needed(
         file_contents=evidence.file_contents,
         action=action,
         linked_issues=pinned_issues,
+        muted_classes=muted_classes,
+        muted_stats=muted_stats,
     )
     _submit_deep_evals(
         deep_graded,

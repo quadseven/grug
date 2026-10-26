@@ -9,6 +9,8 @@ from personas.code_reviewer.precedent import (
     match_precedent,
     render_precedent_note,
 )
+from personas.code_reviewer.repo_config import RepoConfig
+from personas.code_reviewer.dispatch import _muted_classes
 
 
 def _row(pr, cls, verdict, *, path="services/webhook/consumer.py", finding="x", ts=""):
@@ -161,3 +163,94 @@ class TestRenderNote:
             finding_class="brand-new", finding_path="x.py", ledger_rows=[],
         )
         assert render_precedent_note(m) == ""
+
+
+class TestMutedClasses:
+    def _make_config(self, **overrides) -> RepoConfig:
+        return RepoConfig(
+            elder_mute_min_labeled=20,
+            elder_mute_below_precision=0.2,
+            elder_mute_locked_classes=("locked-class",),
+            **overrides,
+        )
+
+    def _mock_ledger_rows(self, rows, monkeypatch):
+        """Mock list_ledger_rows to return the test rows as dicts."""
+        raw = []
+        for r in rows:
+            raw.append({
+                "repo": r.repo,
+                "pr": r.pr,
+                "reviewer": r.reviewer,
+                "severity": r.severity,
+                "class": r.finding_class,
+                "finding": r.finding,
+                "verdict": r.verdict,
+                "evidence": r.evidence,
+                "ts": r.ts,
+                "commit": r.commit,
+                "head_sha": r.head_sha,
+            })
+        monkeypatch.setattr("adapters.install_store.list_ledger_rows", lambda _: raw)
+
+    def test_class_with_high_labeled_low_precision_gets_muted(self, monkeypatch):
+        """Class with >= 20 labeled and precision < 0.2 is muted."""
+        rows = [
+            _row(i, "noisy-rule", "fixed" if i <= 4 else "false-positive")
+            for i in range(1, 25)
+        ]
+        self._mock_ledger_rows(rows, monkeypatch)
+        config = self._make_config()
+        muted, stats = _muted_classes("quadseven/grug", config)
+        assert "noisy-rule" in muted
+        assert stats["noisy-rule"] == (4, 24)
+
+    def test_class_below_min_labeled_not_muted(self, monkeypatch):
+        """Class with < 20 labeled never gets muted regardless of precision."""
+        rows = [
+            _row(i, "rare-rule", "false-positive")
+            for i in range(1, 10)  # Only 9 labeled
+        ]
+        self._mock_ledger_rows(rows, monkeypatch)
+        config = self._make_config()
+        muted, _ = _muted_classes("quadseven/grug", config)
+        assert "rare-rule" not in muted
+
+    def test_class_above_precision_threshold_not_muted(self, monkeypatch):
+        """Class with >= 20 labeled but precision >= 0.2 is not muted."""
+        rows = [
+            _row(i, "ok-rule", "fixed" if i <= 6 else "false-positive")
+            for i in range(1, 25)  # 24 labeled, 6 accepted = 0.25 precision
+        ]
+        self._mock_ledger_rows(rows, monkeypatch)
+        config = self._make_config()
+        muted, _ = _muted_classes("quadseven/grug", config)
+        assert "ok-rule" not in muted
+
+    def test_locked_class_never_muted(self, monkeypatch):
+        """Locked classes are never muted even with low precision."""
+        rows = [
+            _row(i, "locked-class", "false-positive")
+            for i in range(1, 30)  # 29 labeled, 0 accepted = 0 precision
+        ]
+        self._mock_ledger_rows(rows, monkeypatch)
+        config = self._make_config()
+        muted, _ = _muted_classes("quadseven/grug", config)
+        assert "locked-class" not in muted
+
+    def test_muted_stats_returned_for_board(self, monkeypatch):
+        """Stats dict contains (fixed, labeled) for board rendering."""
+        rows = [
+            _row(i, "muted-rule", "fixed" if i <= 3 else "false-positive")
+            for i in range(1, 25)  # 24 labeled, 3 accepted
+        ]
+        self._mock_ledger_rows(rows, monkeypatch)
+        config = self._make_config()
+        _, stats = _muted_classes("quadseven/grug", config)
+        assert stats["muted-rule"] == (3, 24)
+
+    def test_no_repo_config_returns_empty(self):
+        """Without RepoConfig, no classes are muted."""
+        muted, stats = _muted_classes("quadseven/grug", None)
+        assert muted == set()
+        assert stats == {}

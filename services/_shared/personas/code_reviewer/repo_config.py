@@ -26,7 +26,14 @@ import yaml
 
 CONFIG_PATH = ".grug.yaml"
 
-_KNOWN_KEYS = frozenset({"ignore", "path_instructions", "min_inline_severity"})
+_KNOWN_KEYS = frozenset({
+    "ignore",
+    "path_instructions",
+    "min_inline_severity",
+    "elder_mute_min_labeled",
+    "elder_mute_below_precision",
+    "elder_mute_locked_classes",
+})
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 # Bounds so one file cannot blow the prompt budget.
 _MAX_INSTRUCTIONS = 20
@@ -44,6 +51,9 @@ class RepoConfig:
     ignore: tuple[str, ...] = ()
     path_instructions: tuple[PathInstruction, ...] = ()
     min_inline_severity: str | None = None
+    elder_mute_min_labeled: int = 20
+    elder_mute_below_precision: float = 0.2
+    elder_mute_locked_classes: tuple[str, ...] = ()
     problems: tuple[str, ...] = ()
 
 
@@ -126,7 +136,28 @@ def parse_repo_config(text: str | None) -> RepoConfig:
             problems.append(
                 "`min_inline_severity` must be one of low, medium, high, critical"
             )
-    return RepoConfig(ignore, instructions, floor, tuple(problems))
+    mute_min_labeled: int = 20
+    if "elder_mute_min_labeled" in data:
+        raw = data["elder_mute_min_labeled"]
+        if isinstance(raw, int) and raw >= 0:
+            mute_min_labeled = raw
+        else:
+            problems.append("`elder_mute_min_labeled` must be a non-negative integer")
+    mute_below_precision: float = 0.2
+    if "elder_mute_below_precision" in data:
+        raw = data["elder_mute_below_precision"]
+        if isinstance(raw, (int, float)) and 0 <= raw <= 1:
+            mute_below_precision = float(raw)
+        else:
+            problems.append("`elder_mute_below_precision` must be a number between 0 and 1")
+    mute_locked_classes: tuple[str, ...] = ()
+    if "elder_mute_locked_classes" in data:
+        raw = data["elder_mute_locked_classes"]
+        if isinstance(raw, list) and all(isinstance(v, str) and v.strip() for v in raw):
+            mute_locked_classes = tuple(v.strip() for v in raw)
+        else:
+            problems.append("`elder_mute_locked_classes` must be a list of non-empty strings")
+    return RepoConfig(ignore, instructions, floor, mute_min_labeled, mute_below_precision, mute_locked_classes, tuple(problems))
 
 
 @lru_cache(maxsize=256)
