@@ -572,10 +572,10 @@ def test_a_headless_command_answer_failure_leaves_it_unclaimed(monkeypatch):
 
 
 def test_fix_routes_to_fix_module(monkeypatch):
-    """`/grug fix` is routed to fix.run_fix with the right arguments."""
+    """`/grug fix` is routed to autofix.run_fix with the right arguments."""
     fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
     called = {}
-    import fix as fix_module
+    import autofix as fix_module
 
     def fake_run_fix(*, install_id, owner, repo, pr_number,
                      head_sha, token_fn, **_k):
@@ -599,7 +599,7 @@ def test_fix_claims_before_running(monkeypatch):
     """A redelivered /grug fix comment is not run twice (claim first)."""
     fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
     claimed = []
-    import fix as fix_module
+    import autofix as fix_module
 
     def fake_run_fix(*, install_id, owner, repo, pr_number, comment_id,
                      head_sha, token_fn, **_k):
@@ -619,3 +619,23 @@ def test_fix_is_not_an_elder_rerun_verb():
     """fix must not be in ELDER_RERUN_VERBS - it is not budget-deferred."""
     from grug_commands import ELDER_RERUN_VERBS
     assert "fix" not in ELDER_RERUN_VERBS
+
+
+def test_fix_crash_is_answered_not_a_webhook_500(monkeypatch):
+    """The comment is claimed before run_fix runs, so GitHub never redelivers
+    it. A raise inside run_fix must be answered on the PR and returned as a
+    skip, never propagated into a webhook 500 that drops the command."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    import autofix as fix_module
+
+    def boom(**_k):
+        raise RuntimeError("git data api exploded")
+
+    monkeypatch.setattr(fix_module, "run_fix", boom)
+    res = interactive.run_command(
+        "fix", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=5, token_fn=_tok, claim=lambda k: True, head_sha="a" * 40,
+    )
+    assert res == {"status": "skip", "reason": "fix_failed", "verb": "fix"}
+    replies = [c for c in fake.calls if c[0] == "post"]
+    assert replies and "/grug fix" in replies[0][2]["body"]

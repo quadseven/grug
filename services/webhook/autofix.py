@@ -29,6 +29,12 @@ _API = "https://api.github.com"
 _TIMEOUT = 15.0
 _BOT_NAME = "grug-tribe[bot]"
 _BOT_EMAIL = "grug-tribe[bot]@users.noreply.github.com"
+_DEFAULT_MODE = "100644"
+
+
+class CommitRefused(Exception):
+    """The commit must not be made; the message is the reason shown to the
+    maintainer (a fork PR, or a head that moved since the command)."""
 
 
 class _FixCandidate:
@@ -146,7 +152,7 @@ def _default_apply_commit(
         return token_fn(lambda t: _do_commit(
             t, owner, repo, head_sha, changes, message, pr_number, _req,
         ))
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError) as e:
         log.warning("fix_commit_failed", extra={"kind": type(e).__name__})
         return None
 
@@ -155,7 +161,8 @@ def _do_commit(
     token: str, owner: str, repo: str, head_sha: str,
     changes: dict[str, str], message: str, pr_number: int, _req,
 ) -> str:
-    """Actual GitHub Git Data API sequence. Raises on failure."""
+    """Actual GitHub Git Data API sequence. Raises on failure, and raises
+    CommitRefused before any write when the commit must not be made."""
     import base64
     from urllib.parse import quote
     base_url = f"{_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
@@ -163,12 +170,15 @@ def _do_commit(
     # Learn the PR's head branch name so we can update the ref.
     pr_resp = _req(token, "GET", f"{base_url}/pulls/{int(pr_number)}")
     pr_resp.raise_for_status()
-    head_ref = pr_resp.json()["head"]["ref"]
+    head = pr_resp.json()["head"]
+    head_ref = head["ref"]
+    _refuse_unsafe_head(head, owner=owner, repo=repo, head_sha=head_sha)
 
     # Get the head commit's tree.
     commit_resp = _req(token, "GET", f"{base_url}/git/commits/{head_sha}")
     commit_resp.raise_for_status()
     base_tree_sha = commit_resp.json()["tree"]["sha"]
+    modes = _file_modes(token, base_url, base_tree_sha, changes, _req)
 
     # Create blobs for every changed file.
     blob_shas: dict[str, str] = {}
@@ -181,7 +191,8 @@ def _do_commit(
 
     # Build a new tree on top of the base tree with the changed files swapped.
     tree_entries = [
-        {"path": path, "mode": "100644", "type": "blob", "sha": blob_shas[path]}
+        {"path": path, "mode": modes.get(path, _DEFAULT_MODE), "type": "blob",
+         "sha": blob_shas[path]}
         for path in changes
     ]
     tree_resp = _req(token, "POST", f"{base_url}/git/trees",
@@ -204,11 +215,47 @@ def _do_commit(
     # Update the branch ref to the new commit.
     ref_resp = _req(
         token, "PATCH",
-        f"{base_url}/git/ref/heads/{quote(head_ref, safe='')}",
+        f"{base_url}/git/refs/heads/{quote(head_ref, safe='/')}",
         json={"sha": new_commit_sha, "force": False},
     )
     ref_resp.raise_for_status()
     return new_commit_sha
+
+
+def _refuse_unsafe_head(
+    head: dict[str, Any], *, owner: str, repo: str, head_sha: str,
+) -> None:
+    """Raise CommitRefused unless the PR branch lives in this repo and still
+    points at `head_sha`.
+
+    A fork PR's `head.ref` names a branch in the FORK: updating
+    `heads/<ref>` here would move this repo's own branch of that name
+    instead (a fork PR from `main` would fast-forward this repo's `main`).
+    A head that moved means the suggestions were checked against old text.
+    """
+    full_name = str(((head.get("repo") or {}).get("full_name")) or "")
+    if full_name.lower() != f"{owner}/{repo}".lower():
+        raise CommitRefused(
+            "this PR comes from a fork, and Grug only commits to branches in this repo"
+        )
+    if str(head.get("sha") or "") != head_sha:
+        raise CommitRefused(
+            "the PR head moved since the command; comment `/grug fix` again"
+        )
+
+
+def _file_modes(
+    token: str, base_url: str, tree_sha: str, changes: dict[str, str], _req,
+) -> dict[str, str]:
+    """The current git mode of each changed path, so an executable file
+    stays executable. A path the listing does not show keeps the default."""
+    resp = _req(token, "GET", f"{base_url}/git/trees/{tree_sha}?recursive=1")
+    resp.raise_for_status()
+    entries = resp.json().get("tree") or []
+    return {
+        e["path"]: e["mode"] for e in entries
+        if e.get("path") in changes and e.get("type") == "blob" and e.get("mode")
+    }
 
 
 def _prepare_changes(
@@ -222,8 +269,11 @@ def _prepare_changes(
     trailing_newline: dict[str, bool] = {}
     patched_lines: set[tuple[str, int]] = set()
 
+    texts: dict[str, str | None] = {}
     for rec in candidates:
-        file_text = fetch_file(token_fn, owner, repo, rec.path, head_sha)
+        if rec.path not in texts:
+            texts[rec.path] = fetch_file(token_fn, owner, repo, rec.path, head_sha)
+        file_text = texts[rec.path]
         if file_text is None:
             skipped.append((rec, "could not read the file at this head"))
             continue
@@ -283,14 +333,16 @@ def _commit_and_report(
             ],
         }
 
-    new_head = apply_commit(
-        token_fn, owner, repo, head_sha, changes,
-        f"Apply grug autofix suggestions on PR #{pr_number}", pr_number,
-    )
+    refused = "commit could not be created"
+    try:
+        new_head = apply_commit(
+            token_fn, owner, repo, head_sha, changes,
+            f"Apply grug autofix suggestions on PR #{pr_number}", pr_number,
+        )
+    except CommitRefused as e:
+        new_head, refused = None, str(e)
     if new_head is None:
-        failed = skipped + [
-            (finding, "commit could not be created") for finding in applied
-        ]
+        failed = skipped + [(finding, refused) for finding in applied]
         reply(_build_reply([], failed))
         return {
             "verb": "fix", "status": "skip", "reason": "commit_failed",

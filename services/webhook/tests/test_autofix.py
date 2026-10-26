@@ -1,7 +1,7 @@
 """Tests for /grug fix (epic #1311, v1 autofix).
 
 Covers:
-- run_fix routes to the fix module and claims the comment
+- run_fix routes to the autofix module and claims the comment
 - no review session -> skip with a reply
 - no open committable findings -> no_op with a reply
 - open findings with suggestions that apply -> one commit, applied listed
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import fix
+import autofix
 import review_session as rs
 
 
@@ -62,7 +62,7 @@ def test_open_committable_findings_filters_state_and_suggestion():
         _rec(state="open", suggestion=None),  # no suggestion
         _rec(state="open", suggestion="y = 3"),
     ])
-    out = fix._open_committable_findings(session)
+    out = autofix._open_committable_findings(session)
     assert len(out) == 2
     assert all(f.suggestion for f in out)
     assert all(f.state == "open" for f in out)
@@ -73,17 +73,17 @@ def test_fix_still_applies_returns_replacement():
         path="a.py", line=2, suggestion="x = 2", message="set x to 2",
     )
     file_text = "x = 1\ny = 2\n"
-    assert fix._fix_still_applies(rec, file_text) == "x = 2"
+    assert autofix._fix_still_applies(rec, file_text) == "x = 2"
 
 
 def test_fix_still_applies_none_when_line_out_of_range():
     rec = _make_finding_record(path="a.py", line=99, suggestion="x = 2")
-    assert fix._fix_still_applies(rec, "x = 1\n") is None
+    assert autofix._fix_still_applies(rec, "x = 1\n") is None
 
 
 def test_fix_still_applies_none_when_no_suggestion():
     rec = _make_finding_record(path="a.py", line=1, suggestion=None)
-    assert fix._fix_still_applies(rec, "x = 1\n") is None
+    assert autofix._fix_still_applies(rec, "x = 1\n") is None
 
 
 def _run_fix(**overrides):
@@ -93,7 +93,7 @@ def _run_fix(**overrides):
         head_sha="a" * 40, token_fn=lambda fn: fn("tok"),
     )
     kwargs.update(overrides)
-    return fix.run_fix(**kwargs)
+    return autofix.run_fix(**kwargs)
 
 
 def test_run_fix_no_session_skips_and_replies():
@@ -286,3 +286,125 @@ def test_run_fix_commit_failure_reports_all_skipped():
 class _FakeHttp:
     def __init__(self):
         self.calls = []
+
+
+# --- the Git Data API commit sequence ---------------------------------------
+
+
+class _Resp:
+    def __init__(self, data):
+        self._data = data
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._data
+
+
+def _fake_req(pr, tree_entries, calls, truncated=False):
+    """A `_req` seam answering the Git Data API calls `_do_commit` makes."""
+    def _req(token, method, url, json=None):
+        calls.append((method, url, json))
+        if method == "GET" and "/pulls/" in url:
+            return _Resp(pr)
+        if method == "GET" and "/git/commits/" in url:
+            return _Resp({"tree": {"sha": "basetree"}})
+        if method == "GET" and "/git/trees/" in url:
+            return _Resp({"tree": tree_entries, "truncated": truncated})
+        if url.endswith("/git/blobs"):
+            return _Resp({"sha": "blob1"})
+        if url.endswith("/git/trees"):
+            return _Resp({"sha": "newtree"})
+        if url.endswith("/git/commits"):
+            return _Resp({"sha": "newcommit"})
+        return _Resp({})
+    return _req
+
+
+def _pr(full_name="o/r", sha="a" * 40, ref="feature"):
+    return {"head": {"ref": ref, "sha": sha, "repo": {"full_name": full_name}}}
+
+
+def test_do_commit_refuses_a_fork_pr_and_never_moves_a_base_branch():
+    """A fork PR's head ref names a branch in the FORK. Updating
+    `heads/<ref>` in the base repo would move the base repo's own branch of
+    that name (a fork PR from `main` would fast-forward the base `main`)."""
+    calls = []
+    try:
+        autofix._do_commit(
+            "t", "o", "r", "a" * 40, {"a.py": "x = 2\n"}, "msg", 9,
+            _fake_req(_pr(full_name="stranger/r", ref="main"), [], calls),
+        )
+    except autofix.CommitRefused as e:
+        assert "fork" in str(e)
+    else:
+        raise AssertionError("fork PR was not refused")
+    assert all(method == "GET" for method, _, _ in calls)
+
+
+def test_do_commit_refuses_when_the_head_moved():
+    calls = []
+    try:
+        autofix._do_commit(
+            "t", "o", "r", "a" * 40, {"a.py": "x = 2\n"}, "msg", 9,
+            _fake_req(_pr(sha="b" * 40), [], calls),
+        )
+    except autofix.CommitRefused as e:
+        assert "moved" in str(e)
+    else:
+        raise AssertionError("stale head was not refused")
+    assert all(method == "GET" for method, _, _ in calls)
+
+
+def test_do_commit_keeps_the_file_mode_and_attributes_the_bot():
+    calls = []
+    new = autofix._do_commit(
+        "t", "o", "r", "a" * 40, {"bin/run.sh": "echo 2\n"}, "msg", 9,
+        _fake_req(_pr(), [{"path": "bin/run.sh", "mode": "100755",
+                           "type": "blob"}], calls),
+    )
+    assert new == "newcommit"
+    tree_post = next(j for m, u, j in calls if m == "POST" and u.endswith("/git/trees"))
+    assert tree_post["tree"][0]["mode"] == "100755"
+    commit_post = next(j for m, u, j in calls if m == "POST" and u.endswith("/git/commits"))
+    assert commit_post["author"]["name"] == "grug-tribe[bot]"
+    assert commit_post["parents"] == ["a" * 40]
+    ref_patch = next((u, j) for m, u, j in calls if m == "PATCH")
+    assert ref_patch[0].endswith("/git/refs/heads/feature")
+    assert ref_patch[1] == {"sha": "newcommit", "force": False}
+
+
+def test_run_fix_reports_a_refused_commit_reason():
+    rec = _make_finding_record(path="a.py", line=1, suggestion="x = 2")
+
+    def apply(*_args):
+        raise autofix.CommitRefused("this PR comes from a fork")
+
+    posted = []
+    res = _run_fix(
+        get_session=lambda *_: _FakeSession([rec]),
+        fetch_file=lambda *_a: "x = 1\n",
+        apply_commit=apply,
+        post_reply=lambda b: posted.append(b) or True,
+    )
+    assert res["status"] == "skip" and res["reason"] == "commit_failed"
+    assert res["skipped"][0]["reason"] == "this PR comes from a fork"
+    assert "this PR comes from a fork" in posted[0]
+
+
+def test_run_fix_reads_each_file_once():
+    first = _make_finding_record(path="a.py", line=1, suggestion="x = 2", rule="r1")
+    second = _make_finding_record(path="a.py", line=2, suggestion="y = 3", rule="r2")
+    reads = []
+
+    def fetch(token_fn, owner, repo, path, ref):
+        reads.append(path)
+        return "x = 1\ny = 2\n"
+
+    _run_fix(
+        get_session=lambda *_: _FakeSession([first, second]),
+        fetch_file=fetch, apply_commit=lambda *a: "newhead",
+        post_reply=lambda b: True,
+    )
+    assert reads == ["a.py"]
