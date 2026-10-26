@@ -171,30 +171,34 @@ def test_reconcile_repo_sweeps_a_stuck_run_and_requeues_it_with_the_missing():
     fully absent (dispatch for that one) - the two halves of one pass.
 
     grug#1275 supersedes the #947 no-retry rule for Elder/Chief: the
-    swept Elder is re-queued in the SAME single dispatch that covers the
-    missing Chief, so neither persona is skipped. The loop risk #947
-    cited is bounded structurally: the sweep completes the orphaned
-    run (it can never be flagged stuck again) and the re-queued review
-    starts a new run with a fresh deadline."""
+    swept Elder is re-queued on the durable rerun lane while the missing
+    Chief still gets its inline dispatch. The loop risk #947 cited is
+    bounded structurally: the sweep completes the orphaned run (it can
+    never be flagged stuck again) and the re-queued review starts a new
+    run with a fresh deadline."""
     pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
     stuck_run = {"id": 9, "name": "Grug - Elder", "status": "in_progress", "started_at": _iso(200)}
     with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
          patch("check_run_reconciler.expected_personas", return_value=[_CHIEF, _ELDER]), \
          patch("check_run_reconciler.list_check_runs_for_ref", return_value=[stuck_run]), \
          patch("check_run_reconciler.patch_check_run") as mock_patch, \
+         patch("rerun.enqueue_rerun") as mock_enqueue, \
          patch("dispatcher.dispatch") as mock_dispatch:
         dispatched, swept = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
 
-    assert swept == 1
+    assert (dispatched, swept) == (1, 1)
     mock_patch.assert_called_once()
-    assert dispatched == 1, "one dispatch covers the missing tpm and the re-queued Elder"
+    mock_enqueue.assert_called_once_with(
+        install_id=1, repo="o/r", pr_number=5, persona="elder",
+        dedup_key="restart-recovery:9",
+    )
     mock_dispatch.assert_called_once()
     _, kwargs = mock_dispatch.call_args
-    assert kwargs["skip_personas"] == frozenset(), (
-        "tpm is missing and code_reviewer is being re-queued after its "
-        "sweep - neither may be skipped"
+    assert kwargs["skip_personas"] == frozenset({"code_reviewer"}), (
+        "Elder rides the rerun lane - the inline dispatch is for the "
+        "missing Chief only"
     )
-    assert kwargs["delivery_id"] == "restart-recovery:o/r:9"
+    assert kwargs["delivery_id"] == "reconcile:o/r:abc"
 
 
 def test_reconcile_repo_sweeps_a_stuck_run_and_still_skips_it_as_present():
@@ -302,11 +306,10 @@ def test_reconcile_installs_emits_stuck_count_metric_summed_across_repos():
 
 def test_reconcile_repo_requeues_a_stuck_elder_once_after_sweeping_it():
     """grug#1275: a stuck Elder run past the review deadline is swept AND
-    re-queued exactly once in the same pass - the requeue is keyed by the
-    orphaned run's id, and sweeping makes that run completed, so a later
-    pass listing the same head can never flag (or re-queue) it again.
-    No PR comment is posted: the requeue goes through dispatch, which
-    re-runs the persona's check, not a comment."""
+    re-queued exactly once in the same pass, on the durable rerun lane (the
+    `/grug improve` path, run by the consumers - not a thread inside the
+    poller CronJob). The SQS dedup key is the orphaned run's id. No PR
+    comment is posted, and the swept run says a fresh review is coming."""
     pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
     stuck_run = {"id": 9, "name": "Grug - Elder", "status": "in_progress", "started_at": _iso(200)}
     chief_run = {"name": "Grug - Chief", "status": "completed"}
@@ -314,15 +317,59 @@ def test_reconcile_repo_requeues_a_stuck_elder_once_after_sweeping_it():
          patch("check_run_reconciler.expected_personas", return_value=[_CHIEF, _ELDER]), \
          patch("check_run_reconciler.list_check_runs_for_ref", return_value=[stuck_run, chief_run]), \
          patch("check_run_reconciler.patch_check_run") as mock_patch, \
+         patch("rerun.enqueue_rerun") as mock_enqueue, \
          patch("dispatcher.dispatch") as mock_dispatch:
         dispatched, swept = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
-    assert swept == 1
-    assert dispatched == 1
+    assert (dispatched, swept) == (1, 1)
     mock_patch.assert_called_once()
+    result = mock_patch.call_args.args[4]
+    assert result.conclusion == "failure"
+    assert "re-queued a fresh review" in result.summary
+    mock_enqueue.assert_called_once()
+    assert mock_enqueue.call_args.kwargs["persona"] == "elder"
+    assert mock_enqueue.call_args.kwargs["dedup_key"] == "restart-recovery:9"
+    mock_dispatch.assert_not_called()
+
+
+def test_reconcile_repo_requeues_a_stuck_chief_inline_keyed_by_its_run():
+    """grug#1275: Chief has no rerun lane, so a stuck Chief is re-queued
+    through the inline dispatch - not skipped as present - under a delivery
+    id keyed by the orphaned run, never the per-head reconcile key."""
+    pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
+    stuck_run = {"id": 21, "name": "Grug - Chief", "status": "in_progress", "started_at": _iso(200)}
+    elder_run = {"name": "Grug - Elder", "status": "completed"}
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
+         patch("check_run_reconciler.expected_personas", return_value=[_CHIEF, _ELDER]), \
+         patch("check_run_reconciler.list_check_runs_for_ref", return_value=[stuck_run, elder_run]), \
+         patch("check_run_reconciler.patch_check_run"), \
+         patch("rerun.enqueue_rerun") as mock_enqueue, \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        assert reconciler.reconcile_repo("tok", 1, "o", "r", 2) == (1, 1)
+    mock_enqueue.assert_not_called()
     mock_dispatch.assert_called_once()
     _, kwargs = mock_dispatch.call_args
-    assert kwargs["skip_personas"] == frozenset({"tpm"})
-    assert kwargs["delivery_id"] == "restart-recovery:o/r:9"
+    assert kwargs["skip_personas"] == frozenset({"code_reviewer"})
+    assert kwargs["delivery_id"] == "restart-recovery:o/r:21"
+
+
+def test_reconcile_repo_a_failed_elder_requeue_still_sweeps_honestly():
+    """A rerun-queue send failure must not abort the pass or leave the run
+    hanging: the run is still swept, but as a plain failure that asks for a
+    push - it never promises a re-review that was not queued."""
+    pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
+    stuck_run = {"id": 9, "name": "Grug - Elder", "status": "in_progress", "started_at": _iso(200)}
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
+         patch("check_run_reconciler.expected_personas", return_value=[_ELDER]), \
+         patch("check_run_reconciler.list_check_runs_for_ref", return_value=[stuck_run]), \
+         patch("check_run_reconciler.patch_check_run") as mock_patch, \
+         patch("rerun.enqueue_rerun", side_effect=RuntimeError("no queue")), \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        assert reconciler.reconcile_repo("tok", 1, "o", "r", 2) == (0, 1)
+    mock_patch.assert_called_once()
+    summary = mock_patch.call_args.args[4].summary
+    assert "Push a new commit" in summary
+    assert "re-queued" not in summary
+    mock_dispatch.assert_not_called()
 
 
 def test_reconcile_repo_does_not_requeue_a_stuck_non_elder_chief_run():
@@ -334,11 +381,14 @@ def test_reconcile_repo_does_not_requeue_a_stuck_non_elder_chief_run():
     with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
          patch("check_run_reconciler.expected_personas", return_value=[guard]), \
          patch("check_run_reconciler.list_check_runs_for_ref", return_value=[stuck_run]), \
-         patch("check_run_reconciler.patch_check_run"), \
+         patch("check_run_reconciler.patch_check_run") as mock_patch, \
+         patch("rerun.enqueue_rerun") as mock_enqueue, \
          patch("dispatcher.dispatch") as mock_dispatch:
         dispatched, swept = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
     assert (dispatched, swept) == (0, 1)
+    assert "Push a new commit" in mock_patch.call_args.args[4].summary
     mock_dispatch.assert_not_called()
+    mock_enqueue.assert_not_called()
 
 
 def test_restart_recovery_flow_requeues_once_and_then_leaves_the_new_run_alone():
@@ -354,9 +404,11 @@ def test_restart_recovery_flow_requeues_once_and_then_leaves_the_new_run_alone()
          patch("check_run_reconciler.expected_personas", return_value=[_ELDER]), \
          patch("check_run_reconciler.list_check_runs_for_ref", return_value=[orphaned]), \
          patch("check_run_reconciler.patch_check_run"), \
+         patch("rerun.enqueue_rerun") as mock_enqueue, \
          patch("dispatcher.dispatch") as mock_dispatch:
         assert reconciler.reconcile_repo("tok", 1, "o", "r", 2) == (1, 1)
-    assert mock_dispatch.call_count == 1
+    assert mock_enqueue.call_count == 1
+    mock_dispatch.assert_not_called()
 
     swept = {"id": 9, "name": "Grug - Elder", "status": "completed", "conclusion": "failure", "started_at": _iso(200)}
     fresh = {"id": 10, "name": "Grug - Elder", "status": "in_progress", "started_at": _iso(1)}
@@ -364,7 +416,9 @@ def test_restart_recovery_flow_requeues_once_and_then_leaves_the_new_run_alone()
          patch("check_run_reconciler.expected_personas", return_value=[_ELDER]), \
          patch("check_run_reconciler.list_check_runs_for_ref", return_value=[swept, fresh]), \
          patch("check_run_reconciler.patch_check_run") as mock_patch2, \
+         patch("rerun.enqueue_rerun") as mock_enqueue2, \
          patch("dispatcher.dispatch") as mock_dispatch2:
         assert reconciler.reconcile_repo("tok", 1, "o", "r", 2) == (0, 0)
+    mock_enqueue2.assert_not_called()
     mock_dispatch2.assert_not_called()
     mock_patch2.assert_not_called()

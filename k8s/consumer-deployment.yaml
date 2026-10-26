@@ -56,12 +56,15 @@ spec:
       # Sized to the review deadline (grug#1275): GRUG_REVIEW_JOB_TIMEOUT_S
       # is 800s, so grace = 800 + the 15s shared thread-join + the bounded
       # orphaned-claim release sweep (#607) + margin = 900s. On SIGTERM the
-      # consumer stops polling at once; in-flight reviews then either
-      # finish inside this window or are handed back - SQS leases reset to
-      # visible and snapshot claims released - well before SIGKILL. The
-      # sweep MUST complete before SIGKILL or a killed Elder review's
-      # claim bounces redeliveries off "claim busy" while the PR waits on
-      # its REQUIRED check (grug#515).
+      # consumer stops polling at once, gives running work the 15s join,
+      # then hands every in-flight review back - SQS lease reset to visible
+      # and snapshot claim released - so another consumer redoes it. The
+      # long grace is the ceiling, not the expected wait: it keeps SIGKILL
+      # from ever landing inside that hand-back. The sweep MUST complete
+      # before SIGKILL or a killed Elder review's claim bounces
+      # redeliveries off "claim busy" while the PR waits on its REQUIRED
+      # check (grug#515). A run the hand-back still misses is swept and
+      # re-queued once by the poller's check-run reconciler.
       terminationGracePeriodSeconds: 900
       nodeSelector:
         kubernetes.io/arch: arm64
@@ -116,14 +119,11 @@ spec:
         - name: consumer
           image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
           imagePullPolicy: Always
-          # grug#1275: drain before SIGTERM - the preStop sleep lets the
-          # endpoint/controller path settle while the pod is being removed
-          # from rotation, then SIGTERM stops polling and the grace period
-          # above covers finishing or handing back in-flight reviews.
-          lifecycle:
-            preStop:
-              exec:
-                command: ["sh", "-c", "sleep 10"]
+          # grug#1275: deliberately NO preStop hook. This pod has no Service
+          # or endpoints to drain, so a preStop sleep would only keep it
+          # polling (taking new reviews) after the kubelet decided to stop
+          # it. SIGTERM goes straight to consumer.py, which stops polling at
+          # once and hands in-flight reviews back (see the grace comment).
           command: ["python", "-m", "datadog_switch", "python", "consumer.py"]
           envFrom:
             - secretRef: {name: grug-secrets}
