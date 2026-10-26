@@ -63,6 +63,9 @@ ALLOWED_IN_EVALUATE_DIFF: frozenset[str] = frozenset({
     # grug#1398: rewrites a pre-change alias of the anchor line in the
     # message from the hunks already in hand (regex + hunk walk; no IO).
     "align_line_refs",
+    # grug#1398: repairs a model-written Where reference to the anchor
+    # (regex only; no IO).
+    "repair_where_refs",
     # grug#813/#707: the conclusion-derivation rule, single-sourced so
     # evaluate_diff/with_extra_findings/with_findings cannot drift into
     # three different answers (severity in -> conclusion out; no IO).

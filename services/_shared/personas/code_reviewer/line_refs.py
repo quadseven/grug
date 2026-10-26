@@ -82,3 +82,35 @@ def align_line_refs(
         return f"{m.group('path')}:{fix(m.group('num'))}"
 
     return _PATH_REF_RE.sub(path_ref, _LINE_WORD_REF_RE.sub(word_ref, message))
+
+
+# A model-written location label: "Where:", "**Where:**", "**Where**:",
+# then the reference it names - "`path:N`", "path:N", or "line N".
+_WHERE_REF_RE = re.compile(
+    r"(?P<label>\*{0,2}Where\*{0,2}:\*{0,2}\s*)"
+    r"(?P<tick>`?)(?:(?P<path>[\w./-]+):(?P<num>\d+)|(?P<word>[Ll]ine)\s+(?P<lnum>\d+))"
+    r"(?P=tick)"
+)
+
+
+def repair_where_refs(message: str, path: str, line: int) -> str:
+    """`message` with every model-written Where reference set to the anchor.
+
+    grug#1398 publish-time check: the rendered `**Where:**` footer names the
+    anchor, so a Where the model wrote into its own text that names any
+    other location contradicts it. Unlike `align_line_refs`, which keeps
+    any number that might be a real line, a Where label is a claim about
+    THIS finding's location, so it is repaired to `path:line` (or `line N`
+    for the `line N` form) whatever it said. Pure and idempotent."""
+    if not message or "here" not in message:
+        return message
+
+    def fix(m: re.Match[str]) -> str:
+        tick = m.group("tick")
+        if m.group("word"):
+            return f"{m.group('label')}{tick}{m.group('word')} {line}{tick}"
+        cited = m.group("path")
+        ref = f"{cited}:{line}" if _same_file(cited, path) else f"{path}:{line}"
+        return f"{m.group('label')}{tick}{ref}{tick}"
+
+    return _WHERE_REF_RE.sub(fix, message)

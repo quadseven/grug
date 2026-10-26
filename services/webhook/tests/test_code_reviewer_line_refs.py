@@ -13,7 +13,7 @@ from llm_client import Finding as LlmFinding
 from llm_client import Hunk as LlmHunk
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer.diff_parser import parse_diff, pre_change_aliases
-from personas.code_reviewer.line_refs import align_line_refs
+from personas.code_reviewer.line_refs import align_line_refs, repair_where_refs
 from personas.code_reviewer.persona import evaluate_diff
 from review_pipeline import plan_review
 
@@ -191,3 +191,44 @@ def test_chunked_review_keeps_numbers_consistent() -> None:
     )
     for comment in result.comments:
         assert _where(comment.body) == f"{comment.path}:{comment.line}"
+
+
+def test_model_where_naming_another_line_is_repaired_at_publish() -> None:
+    """The ticket's live case: a finding anchored at 158 whose own text says
+    `**Where:** todos.js:151`. 151 is no pre-change alias, so the line map
+    keeps it; the publish-time check still repairs the Where to the anchor,
+    so the rendered body names one location only."""
+    evaluation = _review(
+        _finding("**Where:** `todos.js:151` reads grave before load"),
+    )
+    (f,) = evaluation.findings
+    assert f.message == "**Where:** `todos.js:130` reads grave before load"
+    result, _ = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT",
+    )
+    (comment,) = result.comments
+    wheres = re.findall(r"Where:\*\* `([^`]+)`", comment.body)
+    assert wheres and {w.split(":")[-1] for w in wheres} == {"130"}
+    assert "src/todos.js:130" in wheres
+    assert "151" not in comment.body
+
+
+def test_inline_body_repairs_where_even_without_evaluate_diff() -> None:
+    """The check lives in the publish path itself: a Finding that never
+    went through evaluate_diff still renders a Where matching its anchor."""
+    (base,) = _review(_finding("x")).findings
+    from dataclasses import replace
+    f = replace(base, message="Where: line 151 and Where: `other.js:9`; see line 151")
+    body = cr_dispatch._inline_comment_body(f)
+    assert "Where: line 130 and Where: `src/todos.js:130`; see line 151" in body
+
+
+def test_repair_where_refs_is_narrow_and_idempotent() -> None:
+    msg = "Where: `todos.js:130` ok; the guard at line 90 stays"
+    assert repair_where_refs(msg, "src/todos.js", 130) == msg
+    fixed = repair_where_refs("**Where**: todos.js:7", "src/todos.js", 130)
+    assert fixed == "**Where**: todos.js:130"
+    assert repair_where_refs(fixed, "src/todos.js", 130) == fixed
+    assert repair_where_refs("nowhere near line 7", "src/todos.js", 130) == (
+        "nowhere near line 7"
+    )

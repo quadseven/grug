@@ -92,6 +92,7 @@ from personas.code_reviewer.analyzers import (
     run_analyzers,
 )
 from personas.code_reviewer.suggestion import checked_suggestion
+from personas.code_reviewer.line_refs import repair_where_refs
 from markdown_safety import neutralize_mentions
 from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
 from personas.code_reviewer.cross_file import (
@@ -1503,7 +1504,10 @@ def _inline_comment_body(
         chip += f" | {_effort_chip(f.effort)}"
     head = (
         f"{chip}\n\n"
-        f"**What Elder sees**\n\n{_defused(f.message)}\n\n"
+        # grug#1398 publish-time check: a Where the model wrote into the
+        # message names the anchor, the same line the footer renders.
+        f"**What Elder sees**\n\n"
+        f"{_defused(repair_where_refs(f.message, f.file, f.line))}\n\n"
         f"**Why it matters**\n\n{_defused(_why_it_matters(f.rule_name))}\n\n"
         f"**Where:** `{_md_code_span(f.file)}:{f.line}`"
     )
