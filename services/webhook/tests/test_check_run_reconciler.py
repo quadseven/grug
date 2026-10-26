@@ -197,6 +197,36 @@ def test_reconcile_repo_sweeps_a_stuck_run_and_requeues_it_with_the_missing():
     assert kwargs["delivery_id"] == "restart-recovery:o/r:9"
 
 
+def test_reconcile_repo_sweeps_a_stuck_run_and_still_skips_it_as_present():
+    """A persona can be simultaneously STUCK (sweep it) while another is
+    fully absent (dispatch for that one) - the two halves of one pass.
+
+    Deliberate: a swept persona outside Elder/Chief is NOT re-dispatched
+    in the same cycle (grug#1275 re-queues only those two). `present`
+    means "a check-run with this name exists", regardless of its status -
+    a closed-by-sweep failure is a real, visible verdict the author can
+    act on (push a new commit), not a silence the reconciler needs to
+    paper over."""
+    guard = _spec("guard", "Grug - Guard")
+    pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
+    stuck_run = {"id": 9, "name": "Grug - Guard", "status": "in_progress", "started_at": _iso(200)}
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
+         patch("check_run_reconciler.expected_personas", return_value=[_CHIEF, guard]), \
+         patch("check_run_reconciler.list_check_runs_for_ref", return_value=[stuck_run]), \
+         patch("check_run_reconciler.patch_check_run") as mock_patch, \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        dispatched, swept = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
+
+    assert swept == 1
+    mock_patch.assert_called_once()
+    assert dispatched == 1, "tpm is fully absent and must still be dispatched"
+    _, kwargs = mock_dispatch.call_args
+    assert kwargs["skip_personas"] == frozenset({"guard"}), (
+        "guard already has a check-run (now being swept) - it "
+        "counts as present and must not also be dispatched"
+    )
+
+
 def test_reconcile_repo_one_pr_failure_does_not_abort_the_rest():
     good_pr = {"number": 1, "head": {"sha": "aaa"}, "body": ""}
     bad_pr = {"number": 2, "head": {"sha": "bbb"}, "body": ""}

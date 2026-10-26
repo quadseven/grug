@@ -238,53 +238,19 @@ def reconcile_repo(
             runs = list_check_runs_for_ref(token, owner, repo, head_sha)
             expected = expected_personas(installation_id, repo_id)
             missing, present_keys, stuck = _split_missing_present_stuck(runs, expected)
-
-            for run in stuck:
-                _close_stuck_run(token, owner, repo, run)
-                swept += 1
-                log.info(
-                    "check_run_swept_stuck",
-                    extra={
-                        "installation_id": installation_id, "owner": owner, "repo": repo,
-                        "pr_number": pr_number, "head_sha": head_sha[:8],
-                        "check_run_name": run.get("name"),
-                        "started_at": run.get("started_at"),
-                    },
-                )
-
-            # grug#1275: a stuck Elder/Chief run is not only swept - it is
-            # re-queued ONCE, in this same pass, through dispatch (which
-            # re-runs the check; no PR comment is posted). Once is
-            # structural, not a stored flag: sweeping completed the
-            # orphaned run, so no later pass can flag that run stuck
-            # again, and the delivery_id is keyed by the orphaned run's
-            # own id. The re-queued review creates a NEW run with a fresh
-            # started_at, so it gets a full review deadline before it
-            # could ever be flagged itself. Other personas' stuck runs
-            # stay sweep-only (the #947 behaviour).
-            stuck_names = {str(run.get("name") or "") for run in stuck}
-            requeue = [
-                spec for spec in expected
-                if spec.check_run_name in stuck_names
-                and spec.check_run_name in _REQUEUE_CHECK_RUN_NAMES
-            ]
+            swept += _sweep_stuck_runs(
+                token, installation_id, owner, repo, pr_number, head_sha, stuck,
+            )
+            requeue = _requeue_specs(expected, stuck)
             to_run = {spec.key for spec in missing} | {spec.key for spec in requeue}
             if not to_run:
                 continue
             payload = _synthetic_pull_request_payload(
                 installation_id, owner, repo, repo_id, pr,
             )
-            if requeue:
-                run_ids = ",".join(sorted(
-                    str(run.get("id")) for run in stuck
-                    if str(run.get("name") or "") in _REQUEUE_CHECK_RUN_NAMES
-                ))
-                delivery_id = f"restart-recovery:{owner}/{repo}:{run_ids}"
-            else:
-                delivery_id = f"reconcile:{owner}/{repo}:{head_sha}"
             dispatch(
                 "pull_request", payload,
-                delivery_id=delivery_id,
+                delivery_id=_recovery_delivery_id(owner, repo, head_sha, requeue, stuck),
                 skip_personas=frozenset(
                     key for key in present_keys if key not in to_run
                 ),
@@ -308,6 +274,60 @@ def reconcile_repo(
                 },
             )
     return dispatched, swept
+
+
+def _sweep_stuck_runs(
+    token: str, installation_id: int, owner: str, repo: str,
+    pr_number: int, head_sha: str, stuck: list[dict[str, Any]],
+) -> int:
+    """Close every stuck run out and log it. Returns how many were swept."""
+    for run in stuck:
+        _close_stuck_run(token, owner, repo, run)
+        log.info(
+            "check_run_swept_stuck",
+            extra={
+                "installation_id": installation_id, "owner": owner, "repo": repo,
+                "pr_number": pr_number, "head_sha": head_sha[:8],
+                "check_run_name": run.get("name"),
+                "started_at": run.get("started_at"),
+            },
+        )
+    return len(stuck)
+
+
+def _requeue_specs(
+    expected: list[persona_registry.PersonaSpec], stuck: list[dict[str, Any]],
+) -> list[persona_registry.PersonaSpec]:
+    """grug#1275: a stuck Elder/Chief run is not only swept - it is
+    re-queued ONCE, in the same pass, through dispatch (which re-runs the
+    check; no PR comment is posted). Once is structural, not a stored
+    flag: sweeping completed the orphaned run, so no later pass can flag
+    that run stuck again, and the delivery_id is keyed by the orphaned
+    run's own id. The re-queued review creates a NEW run with a fresh
+    started_at, so it gets a full review deadline before it could ever be
+    flagged itself. Other personas' stuck runs stay sweep-only (the #947
+    behaviour)."""
+    stuck_names = {str(run.get("name") or "") for run in stuck}
+    return [
+        spec for spec in expected
+        if spec.check_run_name in stuck_names
+        and spec.check_run_name in _REQUEUE_CHECK_RUN_NAMES
+    ]
+
+
+def _recovery_delivery_id(
+    owner: str, repo: str, head_sha: str,
+    requeue: list[persona_registry.PersonaSpec], stuck: list[dict[str, Any]],
+) -> str:
+    """Key a re-queue by the orphaned runs' ids (so it dedupes per run);
+    a plain missing-persona dispatch keeps the per-head reconcile key."""
+    if not requeue:
+        return f"reconcile:{owner}/{repo}:{head_sha}"
+    run_ids = ",".join(sorted(
+        str(run.get("id")) for run in stuck
+        if str(run.get("name") or "") in _REQUEUE_CHECK_RUN_NAMES
+    ))
+    return f"restart-recovery:{owner}/{repo}:{run_ids}"
 
 
 def _emit_stuck_check_run_metric(count: int) -> None:
