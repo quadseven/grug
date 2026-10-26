@@ -204,6 +204,7 @@ class CodeReviewEvaluation:
     # or a message ending "No finding."). Never published, never counted
     # toward the verdict, but counted here so recall stays measurable.
     dropped_withdrawn: int = 0
+    tier_served: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -257,6 +258,7 @@ def with_extra_findings(
         dropped_withdrawn=evaluation.dropped_withdrawn,
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
+        tier_served=evaluation.tier_served,
     )
 
 
@@ -276,6 +278,7 @@ def with_findings(
         dropped_withdrawn=evaluation.dropped_withdrawn,
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
+        tier_served=evaluation.tier_served,
     )
 
 
@@ -320,6 +323,7 @@ def with_degradation(
         dropped_withdrawn=evaluation.dropped_withdrawn,
         degraded_reason=other.degraded_reason,
         coverage=other.coverage,
+        tier_served=evaluation.tier_served or other.tier_served,
     )
 
 
@@ -364,6 +368,7 @@ def evaluate_diff(
             conclusion="neutral",
             degraded_reason=llm_response.kind,
             coverage=llm_response.coverage,
+            tier_served=getattr(llm_response, "tier_served", None),
         )
 
     line_index = _hunk_line_index(hunks)
@@ -449,4 +454,5 @@ def evaluate_diff(
         dropped_withdrawn=withdrawn,
         degraded_reason=degraded_reason,
         coverage=llm_response.coverage,
+        tier_served=getattr(llm_response, "tier_served", None),
     )

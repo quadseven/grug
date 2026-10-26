@@ -1045,6 +1045,11 @@ def _summary_markdown(
         duplicate_paths,
     )
     defensive_note = _defensive_drop_note(defensive_dropped_count)
+    tier_note = (
+        f"\n\nTier served: `{evaluation.tier_served}`."
+        if getattr(evaluation, "tier_served", None)
+        else ""
+    )
     hunt = (
         (
             "\n\nLiving Hunt: reviewing `"
@@ -1080,7 +1085,7 @@ def _summary_markdown(
             "from the ground Grug walked are published below. "
             + gate_sentence(blocking)
             + " Coverage detail is in the table above."
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + tier_note
     if is_low_confidence(evaluation.degraded_reason):
         title = "WARN Elder review low confidence"
         return hunt_title(title), (
@@ -1089,7 +1094,7 @@ def _summary_markdown(
             "this pass. Grug keep the answer but not trust it. Validated "
             "markings from the rest are published below. "
             + gate_sentence(blocking)
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + tier_note
     if review_phase == "deep" and is_blackout(evaluation.degraded_reason):
         # grug#848: a blackout in the deep phase is the REASONER arm's -
         # `_async_deep_decision` never starts the deep append over a
@@ -1105,7 +1110,7 @@ def _summary_markdown(
             f"- the mist: `{evaluation.degraded_reason}`. Grug not say the "
             "deeper look agreed; it never looked. "
             + gate_sentence(blocking)
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + tier_note
     if evaluation.degraded_reason:
         # grug#985: when some cohorts were never opened (starved of budget),
         # the headline must not read like every cohort ran and broke.
@@ -1129,7 +1134,7 @@ def _summary_markdown(
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. "
             + gate_sentence(blocking)
-        ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note
+        ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note + tier_note
     if not evaluation.findings:
         title = (
             "Elder clear - no markings"
@@ -1139,7 +1144,7 @@ def _summary_markdown(
         scope = _clean_review_scope(
             living_range, excluded_paths, oversized_paths, duplicate_paths,
         )
-        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note
+        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note + tier_note
 
     blocking = sum(1 for f in evaluation.findings if f.severity in ("high", "critical"))
     title = f"Elder markings - {blocking} blocking, {len(evaluation.findings)} total"
@@ -1151,7 +1156,7 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}"
+    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}{tier_note}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -1641,6 +1646,7 @@ def worth_an_email(evaluation: CodeReviewEvaluation) -> bool:
 def _stack_detail_lines(
     review_phase: str, living_range: str, suppressed_count: int,
     head_sha: str = "", base_sha: str = "",
+    tier_served: str | None = None,
 ) -> str:
     """The two facts a skeptical reader asks for: what was looked at, and what
     was withheld. Everything else that used to live here was cut as noise.
@@ -1662,6 +1668,8 @@ def _stack_detail_lines(
     )
     if scope:
         lines.append(f"- Looked at: {scope}")
+    if tier_served:
+        lines.append(f"- Tier served: `{tier_served}`")
     if suppressed_count:
         lines.append(f"- Grug swallow {suppressed_count} weak thought(s).")
     return "\n".join(lines)
@@ -1848,6 +1856,7 @@ def _review_stack_body(
         table,
         _stack_detail_lines(
             review_phase, living_range, suppressed_count, head_sha, base_sha,
+            tier_served=getattr(evaluation, "tier_served", None),
         ),
     ] if p)
     if detail:
