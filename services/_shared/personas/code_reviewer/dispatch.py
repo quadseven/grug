@@ -92,6 +92,7 @@ from personas.code_reviewer.analyzers import (
     run_analyzers,
 )
 from personas.code_reviewer.suggestion import checked_suggestion
+from personas.code_reviewer.line_refs import repair_where_refs
 from markdown_safety import neutralize_mentions
 from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
 from personas.code_reviewer.cross_file import (
@@ -880,6 +881,13 @@ def _review_transparency(
         if suppressed_count
         else ""
     )
+    if evaluation.dropped_withdrawn:
+        # grug#1397: say how many candidates were dropped because the
+        # reviewer's own text ruled them out, so the drop is never silent.
+        lines += (
+            f"\n\nGrug dropped {evaluation.dropped_withdrawn} candidate(s) "
+            "the reviewer itself withdrew (its own verdict said no finding)."
+        )
     coverage = evaluation.coverage
     if coverage is not None:
         lines += _coverage_lines(coverage)
@@ -1503,7 +1511,10 @@ def _inline_comment_body(
         chip += f" | {_effort_chip(f.effort)}"
     head = (
         f"{chip}\n\n"
-        f"**What Elder sees**\n\n{_defused(f.message)}\n\n"
+        # grug#1398 publish-time check: a Where the model wrote into the
+        # message names the anchor, the same line the footer renders.
+        f"**What Elder sees**\n\n"
+        f"{_defused(repair_where_refs(f.message, f.file, f.line))}\n\n"
         f"**Why it matters**\n\n{_defused(_why_it_matters(f.rule_name))}\n\n"
         f"**Where:** `{_md_code_span(f.file)}:{f.line}`"
     )
@@ -3812,6 +3823,7 @@ def dispatch_code_review(
             "models": list(llm_response.models_used),
             "findings_count": len(evaluation.findings),
             "dropped_hallucinations": evaluation.dropped_hallucinations,
+            "dropped_withdrawn": evaluation.dropped_withdrawn,
             "degraded_reason": evaluation.degraded_reason,
             # How much of the diff was actually walked, as a number the
             # eval harness (#645) can track directly instead of parsing
