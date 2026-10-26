@@ -628,6 +628,9 @@ class Backend(str, Enum):
     # free cloud models only, never a Spark. The last cloud chain tier, ahead
     # of the Cave.
     FREE_POOL = "free-pool"
+    # The operator's own subscription plans run headless (Claude Code / Codex)
+    # as the last-resort fallback after self-hosted and free tiers fail (grug#1276).
+    SUBSCRIPTION = "subscription"
 
 
 # `Severity` + `SEVERITIES` now live in the shared leaf `review_types` (#250)
@@ -818,13 +821,17 @@ class LlmReviewResponse:
         posts an advisory check-run with the error.
       - `"all_failed"`: every backend errored. Caller posts a
         "skipped" advisory check-run.
+      - `"subscription_limit_reached"`: daily subscription cap reached.
+        Review ends degraded with this reason, never paid (grug#1276).
 
-    Keeping all four states in one dataclass instead of a true union
+    Keeping all states in one dataclass instead of a true union
     keeps the call sites cheap (one isinstance check vs many) at the
     cost of mildly redundant `Optional[...]` fields. Acceptable v1.
     """
 
-    kind: Literal["no_diff", "reviewed", "parse_failed", "all_failed"]
+    kind: Literal[
+        "no_diff", "reviewed", "parse_failed", "all_failed", "subscription_limit_reached",
+    ]
     findings: tuple[Finding, ...] = field(default_factory=tuple)
     backend_used: Optional[Backend] = None
     model_name: Optional[str] = None
@@ -844,6 +851,8 @@ class LlmReviewResponse:
     # "model (reason)" labels in ladder order. Set only on a failed chunk, so
     # a neutral check can name what was tried instead of a bare `all_failed`.
     attempts: tuple[str, ...] = field(default_factory=tuple)
+    # grug#1276: which tier served this review ("self-hosted", "free-pool", "subscription").
+    tier_served: Optional[str] = None
 
 
 # grug#1196: one failed model call inside a chunk's ladder walk.
@@ -923,6 +932,95 @@ def _opencode_go_extra_body(model: str, wire: str) -> dict:
     return {"thinking": {"type": "disabled"}}
 
 
+# Operator subscription fallback (grug#1276)
+_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS = 40.0
+_subscription_cap_lock = threading.Lock()
+_subscription_daily_calls: dict[str, int] = {}
+
+
+def _subscription_daily_cap() -> int:
+    try:
+        val = int(os.getenv("GRUG_SUBSCRIPTION_DAILY_CAP", "50"))
+        return max(0, val)
+    except (ValueError, TypeError):
+        return 50
+
+
+def _subscription_today_key() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _subscription_calls_today() -> int:
+    with _subscription_cap_lock:
+        return _subscription_daily_calls.get(_subscription_today_key(), 0)
+
+
+def _is_subscription_cap_reached() -> bool:
+    return _subscription_calls_today() >= _subscription_daily_cap()
+
+
+def _record_subscription_call() -> None:
+    with _subscription_cap_lock:
+        key = _subscription_today_key()
+        _subscription_daily_calls[key] = _subscription_daily_calls.get(key, 0) + 1
+
+
+def _subscription_url() -> str:
+    explicit = os.getenv("GRUG_SUBSCRIPTION_URL", "").strip()
+    if explicit:
+        return explicit
+    base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
+    if base:
+        return f"{base}/subscription/v1/chat/completions"
+    return ""
+
+
+def _subscription_model() -> str:
+    return os.getenv("GRUG_SUBSCRIPTION_MODEL", "").strip() or "claude-code"
+
+
+def _subscription_fallback_enabled() -> bool:
+    """Opt-in: True when GRUG_SUBSCRIPTION_FALLBACK is true or GRUG_SUBSCRIPTION_URL is set (grug#1276)."""
+    if os.getenv("GRUG_SUBSCRIPTION_FALLBACK", "").strip().lower() in ("1", "true", "yes"):
+        return bool(_subscription_url())
+    return bool(os.getenv("GRUG_SUBSCRIPTION_URL", "").strip())
+
+
+def _validate_subscription_key(key: str) -> None:
+    """Ensure subscription fallback uses headless subscription lanes, never
+    pay-per-token API keys (e.g. sk-ant-*, sk-*)."""
+    if key.startswith("sk-") or "api-key" in key.lower():
+        raise _BackendConfigError(
+            "subscription backend must use headless subscription lanes, never pay-per-token API keys"
+        )
+
+
+def _subscription_fallback_config() -> BackendConfig | None:
+    """Operator's subscription plan run headless as the last resort."""
+    if not _subscription_fallback_enabled():
+        return None
+    url = _subscription_url()
+    if not url:
+        return None
+    model = _subscription_model()
+    return BackendConfig(
+        backend=Backend.SUBSCRIPTION,
+        url=url,
+        model=model,
+        key_loader=lambda: "in-cluster",
+        extra_headers={
+            "User-Agent": "grug/1.0 (+https://grug.lol)",
+            "X-Spark-Priority": "interactive",
+            "X-Spark-Caller": "grug-elder-subscription",
+            "X-Loom-Lane-Type": "subscription-headless",
+        },
+        timeout_seconds=_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS,
+        retry_attempts=1,
+        transport_retry_attempts=1,
+    )
+
+
 # Single source of truth for per-backend dispatch data. Adding a third
 # backend = one new entry; review_diff's "try every backend" loop
 # generalizes without touching the type-design.
@@ -967,6 +1065,21 @@ _BACKEND_CONFIGS: dict[Backend, BackendConfig] = {
         extra_headers={"User-Agent": "grug/1.0 (+https://grug.lol)"},
         dynamic_headers={"x-opencode-session": lambda: str(uuid.uuid4())},
         wire=cast('Literal["chat", "responses"]', _OPENCODE_GO_WIRE),
+    ),
+    Backend.SUBSCRIPTION: BackendConfig(
+        backend=Backend.SUBSCRIPTION,
+        url=_subscription_url(),
+        model=_subscription_model(),
+        key_loader=lambda: "in-cluster",
+        extra_headers={
+            "User-Agent": "grug/1.0 (+https://grug.lol)",
+            "X-Spark-Priority": "interactive",
+            "X-Spark-Caller": "grug-elder-subscription",
+            "X-Loom-Lane-Type": "subscription-headless",
+        },
+        timeout_seconds=_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS,
+        retry_attempts=1,
+        transport_retry_attempts=1,
     ),
 }
 
@@ -1261,7 +1374,7 @@ def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
 # paid "total limit" refusals and 139 OpenRouter free per-day 429s, each one
 # spent cohort time before a working backend was reached. An open breaker is
 # shared with every pod and survives a restart (`shared_benches`, grug#1286).
-_PROVIDER_POOLS = ("free", "paid")
+_PROVIDER_POOLS = ("free", "paid", "subscription")
 _SPENT_LIMIT_MARKERS = (
     "usage limit", "quota", "credit", "key limit", "total limit", "spend limit",
 )
@@ -1290,6 +1403,8 @@ def _backend_pool(backend: Backend, model: str) -> str:
         return "free"
     if backend == Backend.FREE_POOL:
         return "free"
+    if backend == Backend.SUBSCRIPTION:
+        return "subscription"
     return "paid"
 
 
@@ -1980,6 +2095,53 @@ def _usable_saas_fallback_backends() -> tuple[Backend, ...]:
     )
 
 
+def _free_provider_fallback_configs() -> list[BackendConfig]:
+    """Free provider fallback configs in fixed order:
+    1. The gateway's free provider pool (`_free_pool_chain_config()`), if available
+    2. Usable free SaaS fallback backends (Poolside, OpenRouter free) via `_saas_overload_fallback_config`
+    """
+    configs: list[BackendConfig] = []
+    pool = _free_pool_chain_config()
+    if pool is not None and _backend_usable(pool.backend, pool.model):
+        configs.append(pool)
+    for backend in _usable_saas_fallback_backends():
+        configs.append(_saas_overload_fallback_config(backend))
+    return configs
+
+
+def _emit_tier_served_metric(tier: str, backend: str, model: str) -> None:
+    try:
+        from observability import emit_count  # type: ignore
+        emit_count(
+            "grug.elder.tier_served", 1,
+            {"tier": tier, "backend": backend, "model": model},
+        )
+    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
+        log.debug("tier_served_metric_failed", extra={"kind": type(e).__name__})
+
+
+def _emit_last_resort_metric(tier: str, backend: str, model: str) -> None:
+    try:
+        from observability import emit_count  # type: ignore
+        emit_count(
+            "grug.elder.last_resort_call", 1,
+            {"tier": tier, "backend": backend, "model": model},
+        )
+    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
+        log.debug("last_resort_metric_failed", extra={"kind": type(e).__name__})
+
+
+def _emit_subscription_cap_metric() -> None:
+    try:
+        from observability import emit_count  # type: ignore
+        emit_count(
+            "grug.elder.subscription_cap_reached", 1,
+            {"tier": "subscription"},
+        )
+    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
+        log.debug("subscription_cap_metric_failed", extra={"kind": type(e).__name__})
+
+
 # A backend that answers with one of these is not busy - it is UNUSABLE, and
 # no amount of retrying or falling back changes that. 401/403 = the key is
 # wrong or revoked. 402 = the bill is unpaid. 404 = the endpoint or model name
@@ -2510,6 +2672,8 @@ def _call_backend(
         raise _BackendConfigError(
             f"{config.backend.value} key_loader returned empty string"
         )
+    if config.backend == Backend.SUBSCRIPTION:
+        _validate_subscription_key(key)
 
     body = _build_request_body(config, messages)
     headers = _merged_headers(config, key)
@@ -4364,6 +4528,7 @@ def _merge_cohort_responses(
             if response.kind == "reviewed"
             and response.error.startswith("partial review:")
         ]
+        tier_served = next((r.tier_served for r in responses if r.tier_served), None)
         return LlmReviewResponse(
             kind="reviewed",
             findings=_merge_review_findings(successful),
@@ -4377,7 +4542,15 @@ def _merge_cohort_responses(
                 responses,
             ),
             coverage=coverage,
+            tier_served=tier_served,
         )
+
+    sub_limit = next(
+        (r for r in responses if r.kind == "subscription_limit_reached"),
+        None,
+    )
+    if sub_limit is not None:
+        return replace(sub_limit, coverage=coverage)
 
     parse_failed = next(
         (response for response in responses if response.kind == "parse_failed"),
@@ -4390,10 +4563,12 @@ def _merge_cohort_responses(
         errors = f"{errors or 'all review cohorts failed'}; models tried: " + (
             ", ".join(coverage.failed_models)
         )
+    tier_served = next((r.tier_served for r in responses if r.tier_served), None)
     return LlmReviewResponse(
         kind="all_failed",
         error=errors or "all review cohorts failed",
         coverage=coverage,
+        tier_served=tier_served,
     )
 
 
@@ -6190,6 +6365,7 @@ def _cloud_tier_success(
         review_span_context=outcome.span_context,
         pr_context=pr_context, hunks=hunks,
     )
+    _emit_tier_served_metric("free-pool", backend.value, outcome.model)
     return LlmReviewResponse(
         kind="reviewed",
         findings=tuple(
@@ -6201,6 +6377,7 @@ def _cloud_tier_success(
         backends_used=(backend,),
         models_used=(outcome.model,),
         error=_truncation_error((backend,) if outcome.truncated else ()),
+        tier_served="free-pool",
     )
 
 
@@ -6460,7 +6637,7 @@ def _review_diff_dispatch(
         # Total cloud failure: fall through, unconditionally, to the exact
         # path every "cave" deployment runs - "if that fails, use my local
         # sparks" (the operator, 2026-08-27) is not itself configurable away.
-    response = _review_diff_dispatch_cave_primary(
+    response = route_elder_model_call(
         evidence, installation_id, voice, cancel_event, review_map,
     )
     if low_confidence is not None and response.kind in ("all_failed", "parse_failed"):
@@ -6478,6 +6655,225 @@ def _review_diff_dispatch(
         )
         return low_confidence
     return response
+
+
+def _run_free_provider_fallback(
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    hunks: list[Hunk],
+    pr_context: Optional[PrContext],
+    installation_id: int,
+) -> tuple[Optional[LlmReviewResponse], Optional[tuple[Backend, Optional[str], str]], str]:
+    """Tier 2: Try free provider pool in fixed order (gateway free pool, then free SaaS)."""
+    first_parse_fail: Optional[tuple[Backend, Optional[str], str]] = None
+    last_error = ""
+    for config in _free_provider_fallback_configs():
+        backend = config.backend
+        attempt = _run_llm_attempt(
+            backend=backend,
+            config=config,
+            messages=messages,
+            variant=variant,
+            pr_tags=pr_tags,
+            transport_log_event="llm_saas_overload_fallback_transport_failed",
+        )
+        if attempt.error_kind in ("config", "transport"):
+            last_error = attempt.error_text or ""
+            continue
+        resp = attempt.raw_response
+        assert resp is not None
+        findings = attempt.findings
+        model = attempt.model
+        err = attempt.error_text or ""
+        span_context = attempt.span_context
+        if not err:
+            resolved_model = model or config.model
+            log.info(
+                "llm_saas_overload_fallback_used",
+                extra={"backend": backend.value, "installation_id": installation_id},
+            )
+            log.info(
+                "elder_last_resort_tier_served",
+                extra={
+                    "tier": "free-pool",
+                    "backend": backend.value,
+                    "model": resolved_model,
+                    "installation_id": installation_id,
+                },
+            )
+            _emit_tier_served_metric("free-pool", backend.value, resolved_model)
+            _emit_last_resort_metric("free-pool", backend.value, resolved_model)
+            origin = _finding_origin(
+                backend=backend,
+                model=resolved_model,
+                review_span_context=span_context,
+                pr_context=pr_context,
+                hunks=hunks,
+            )
+            return (
+                LlmReviewResponse(
+                    kind="reviewed",
+                    findings=tuple(
+                        replace(finding, origins=(origin,)) for finding in findings
+                    ),
+                    backend_used=backend,
+                    model_name=resolved_model,
+                    review_span_context=span_context,
+                    backends_used=(backend,),
+                    models_used=(resolved_model,),
+                    error=_attempt_truncation_error(attempt),
+                    tier_served="free-pool",
+                ),
+                first_parse_fail,
+                "",
+            )
+        if resp.status_code == 200:
+            log.warning(
+                "llm_response_parse_failed",
+                extra={"backend": backend.value, "model": model, "error": err},
+            )
+            if first_parse_fail is None:
+                first_parse_fail = (backend, model, err)
+            last_error = f"{backend.value}: parse_failed: {err}"
+            continue
+        _log_backend_failure(
+            backend_value=backend.value,
+            status=resp.status_code,
+            error=err,
+            error_message=_backend_error_message(resp),
+        )
+        last_error = f"{backend.value}: {err}"
+    return None, first_parse_fail, last_error
+
+
+def _run_subscription_fallback(
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    hunks: list[Hunk],
+    pr_context: Optional[PrContext],
+    installation_id: int,
+) -> Optional[LlmReviewResponse]:
+    """Tier 3: Try operator's subscription fallback as last resort (grug#1276)."""
+    sub_config = _subscription_fallback_config()
+    if sub_config is None or not _backend_usable(sub_config.backend, sub_config.model):
+        return None
+
+    if _is_subscription_cap_reached():
+        log.warning(
+            "elder_subscription_cap_reached",
+            extra={
+                "tier": "subscription",
+                "calls_today": _subscription_calls_today(),
+                "daily_cap": _subscription_daily_cap(),
+                "installation_id": installation_id,
+            },
+        )
+        _emit_subscription_cap_metric()
+        return LlmReviewResponse(
+            kind="subscription_limit_reached",
+            error="subscription limit reached",
+            tier_served="subscription",
+        )
+
+    attempt = _run_llm_attempt(
+        backend=Backend.SUBSCRIPTION,
+        config=sub_config,
+        messages=messages,
+        variant=variant,
+        pr_tags=pr_tags,
+        transport_log_event="llm_subscription_fallback_transport_failed",
+    )
+    if attempt.error_kind in ("config", "transport"):
+        return LlmReviewResponse(
+            kind="all_failed",
+            error=attempt.error_text or "subscription transport error",
+            tier_served="subscription",
+        )
+    resp = attempt.raw_response
+    assert resp is not None
+    findings = attempt.findings
+    model = attempt.model
+    err = attempt.error_text or ""
+    span_context = attempt.span_context
+
+    if resp.status_code == 429 or _is_spent_quota_refusal(resp):
+        log.warning(
+            "elder_subscription_cap_reached",
+            extra={
+                "tier": "subscription",
+                "status": resp.status_code,
+                "error": err,
+                "installation_id": installation_id,
+            },
+        )
+        _emit_subscription_cap_metric()
+        return LlmReviewResponse(
+            kind="subscription_limit_reached",
+            error="subscription limit reached",
+            tier_served="subscription",
+        )
+
+    if not err:
+        resolved_model = model or sub_config.model
+        _record_subscription_call()
+        log.info(
+            "elder_last_resort_tier_served",
+            extra={
+                "tier": "subscription",
+                "backend": Backend.SUBSCRIPTION.value,
+                "model": resolved_model,
+                "installation_id": installation_id,
+            },
+        )
+        _emit_tier_served_metric("subscription", Backend.SUBSCRIPTION.value, resolved_model)
+        _emit_last_resort_metric("subscription", Backend.SUBSCRIPTION.value, resolved_model)
+        origin = _finding_origin(
+            backend=Backend.SUBSCRIPTION,
+            model=resolved_model,
+            review_span_context=span_context,
+            pr_context=pr_context,
+            hunks=hunks,
+        )
+        return LlmReviewResponse(
+            kind="reviewed",
+            findings=tuple(
+                replace(finding, origins=(origin,)) for finding in findings
+            ),
+            backend_used=Backend.SUBSCRIPTION,
+            model_name=resolved_model,
+            review_span_context=span_context,
+            backends_used=(Backend.SUBSCRIPTION,),
+            models_used=(resolved_model,),
+            error=_attempt_truncation_error(attempt),
+            tier_served="subscription",
+        )
+
+    if resp.status_code == 200:
+        log.warning(
+            "llm_response_parse_failed",
+            extra={"backend": Backend.SUBSCRIPTION.value, "model": model, "error": err},
+        )
+        return LlmReviewResponse(
+            kind="parse_failed",
+            backend_used=Backend.SUBSCRIPTION,
+            model_name=model or sub_config.model,
+            error=err,
+            tier_served="subscription",
+        )
+
+    _log_backend_failure(
+        backend_value=Backend.SUBSCRIPTION.value,
+        status=resp.status_code,
+        error=err,
+        error_message=_backend_error_message(resp),
+    )
+    return LlmReviewResponse(
+        kind="all_failed",
+        error=f"{Backend.SUBSCRIPTION.value}: {err}",
+        tier_served="subscription",
+    )
 
 
 def _review_diff_dispatch_cave_primary(
@@ -6613,6 +7009,7 @@ def _review_diff_dispatch_cave_primary(
                 truncated=outcome.truncated,
             ))
             if early_exit:
+                _emit_tier_served_metric("self-hosted", backend.value, resolved_model)
                 return LlmReviewResponse(
                     kind="reviewed",
                     findings=successes[0].findings,
@@ -6622,6 +7019,7 @@ def _review_diff_dispatch_cave_primary(
                     backends_used=(backend,),
                     models_used=(resolved_model,),
                     error=_truncation_error((backend,) if outcome.truncated else ()),
+                    tier_served="self-hosted",
                 )
             continue
         if outcome.kind == "parse_failed":
@@ -6649,82 +7047,38 @@ def _review_diff_dispatch_cave_primary(
                 kind="all_failed",
                 error="cancelled: review input changed while the review was running",
             )
-        # Both Cave arms produced NO usable response at all (misconfigured,
-        # transport error, or timeout) - the strongest signal the owned
-        # hardware itself is unavailable. The operator's 2026-07-14 call: OpenRouter
-        # and Poolside come back here as a bounded, single-shot LAST RESORT
-        # ("let it be used potentially if/when grug cave... are overloaded",
-        # explicitly not the primary path). Skipped when a Cave arm DID
-        # respond but unparseably (first_parse_fail set) - that is a
-        # model/prompt bug, not overload, and SaaS retrying it would not
-        # help. Each attempt uses _saas_overload_fallback_config's short,
-        # single-shot budget so trying both backends always fits inside the
-        # slack GRUG_REVIEW_JOB_TIMEOUT_S reserves ahead of the Cave arms'
-        # own worst-case 2x_review_llm_timeout_s() budget (see the k8s
-        # manifest comment on GRUG_REVIEW_JOB_TIMEOUT_S).
-        for backend in _usable_saas_fallback_backends():
-            config = _saas_overload_fallback_config(backend)
-            attempt = _run_llm_attempt(
-                backend=backend,
-                config=config,
-                messages=messages,
-                variant=variant,
-                pr_tags=pr_tags,
-                transport_log_event="llm_saas_overload_fallback_transport_failed",
-            )
-            if attempt.error_kind in ("config", "transport"):
-                last_error = attempt.error_text or ""
-                continue
-            # Completed attempt: the seam annotated the span and classified
-            # the outcome. `raw_response` is never None here - config /
-            # transport errors continued above.
-            resp = attempt.raw_response
-            assert resp is not None
-            findings = attempt.findings
-            model = attempt.model
-            err = attempt.error_text or ""
-            span_context = attempt.span_context
-            if not err:
-                resolved_model = model or config.model
-                log.info(
-                    "llm_saas_overload_fallback_used",
-                    extra={"backend": backend.value, "installation_id": installation_id},
-                )
-                origin = _finding_origin(
-                    backend=backend,
-                    model=resolved_model,
-                    review_span_context=span_context,
-                    pr_context=pr_context,
-                    hunks=hunks,
-                )
-                return LlmReviewResponse(
-                    kind="reviewed",
-                    findings=tuple(
-                        replace(finding, origins=(origin,)) for finding in findings
-                    ),
-                    backend_used=backend,
-                    model_name=resolved_model,
-                    review_span_context=span_context,
-                    backends_used=(backend,),
-                    models_used=(resolved_model,),
-                    # grug#1231: a cut-off answer is partial on this last-
-                    # resort path too, never a clean complete review.
-                    error=_attempt_truncation_error(attempt),
-                )
-            if resp.status_code == 200:
-                log.warning(
-                    "llm_response_parse_failed",
-                    extra={"backend": backend.value, "model": model, "error": err},
-                )
-                if first_parse_fail is None:
-                    first_parse_fail = (backend, model, err)
-                last_error = f"{backend.value}: parse_failed: {err}"
-                continue
-            _log_backend_failure(
-                backend_value=backend.value, status=resp.status_code, error=err,
-                error_message=_backend_error_message(resp),
-            )
-            last_error = f"{backend.value}: {err}"
+        # Tier 2: Free provider pool (grug#1269/#1276).
+        # Both Cave arms produced NO usable response at all. Try the free provider
+        # pool in fixed order (gateway free pool, then free SaaS backends).
+        free_resp, free_parse_fail, free_err = _run_free_provider_fallback(
+            messages=messages,
+            variant=variant,
+            pr_tags=pr_tags,
+            hunks=hunks,
+            pr_context=pr_context,
+            installation_id=installation_id,
+        )
+        if free_resp is not None:
+            return free_resp
+        if free_parse_fail is not None and first_parse_fail is None:
+            first_parse_fail = free_parse_fail
+        if free_err:
+            last_error = free_err
+
+        # Tier 3: Operator subscription fallback (grug#1276).
+        # Only after every self-hosted target and every free provider has failed.
+        # Uses headless subscription lanes, never pay-per-token API keys.
+        # Bounded by configured daily cap.
+        sub_resp = _run_subscription_fallback(
+            messages=messages,
+            variant=variant,
+            pr_tags=pr_tags,
+            hunks=hunks,
+            pr_context=pr_context,
+            installation_id=installation_id,
+        )
+        if sub_resp is not None:
+            return sub_resp
 
     if successes:
         first = successes[0]
@@ -6760,6 +7114,7 @@ def _review_diff_dispatch_cave_primary(
                     "head_sha": str(ctx.get("head_sha") or "")[:8],
                 },
             )
+        _emit_tier_served_metric("self-hosted", first.backend.value, first.model)
         return LlmReviewResponse(
             kind="reviewed",
             findings=_merge_review_findings(successes),
@@ -6773,6 +7128,7 @@ def _review_diff_dispatch_cave_primary(
             # above - so `review_backends` is exactly the set of arms that
             # were expected to answer.
             error=_dual_arm_partial_error(review_backends, successes, last_error),
+            tier_served="self-hosted",
         )
 
     # Every backend failed. Prefer the specific parse_failed kind (a backend
@@ -6788,6 +7144,28 @@ def _review_diff_dispatch_cave_primary(
     return LlmReviewResponse(
         kind="all_failed",
         error=last_error or "all backends failed",
+    )
+
+
+def route_elder_model_call(
+    evidence: ElderEvidence,
+    installation_id: int = 1,
+    voice: VoiceSelection = "caveman",
+    cancel_event: threading.Event | None = None,
+    review_map: str = "",
+) -> LlmReviewResponse:
+    """Attempt model providers in fixed order:
+    1. self-hosted (Cave coder/reasoner)
+    2. free provider pool (gateway free pool + free SaaS)
+    3. subscription (operator's headless subscription lanes: Claude Code / Codex)
+    Order is fixed: never reordered by load or latency.
+    """
+    return _review_diff_dispatch_cave_primary(
+        evidence=evidence,
+        installation_id=installation_id,
+        voice=voice,
+        cancel_event=cancel_event,
+        review_map=review_map,
     )
 
 

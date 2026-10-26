@@ -1008,6 +1008,38 @@ def _defensive_drop_note(count: int) -> str:
     return f"\n\n{count} defensive findings dropped: no reachable caller named"
 
 
+def _tier_served_note(tier_served: str | None) -> str:
+    return f"\n\nTier served: `{tier_served}`." if tier_served else ""
+
+
+def _hunt_title(title: str, living_range: str) -> str:
+    return f"Living Hunt {living_range} - {title}" if living_range else title
+
+
+def _hunt_section(living_range: str, living_baseline_rejected: str = "") -> str:
+    hunt = (
+        (
+            "\n\nLiving Hunt: reviewing `"
+            + living_range
+            + "` (files changed since the last completed Elder pass)."
+        )
+        if living_range
+        else ""
+    )
+    if living_baseline_rejected:
+        # #845: the stored baseline was rejected as a non-ancestor - the
+        # range above is empty because no delta was reviewed, but the
+        # fallback must be visible in the check-run, not just the logs.
+        hunt += (
+            "\n\nLiving Hunt: the stored baseline `"
+            + living_baseline_rejected
+            + "` was not an ancestor of the current head, or the range held a "
+            "merge commit (history was rewritten or merged into) - Elder reviewed the full PR diff instead of the "
+            "delta since the last pass."
+        )
+    return hunt
+
+
 def _summary_markdown(
     evaluation: CodeReviewEvaluation,
     *,
@@ -1045,51 +1077,30 @@ def _summary_markdown(
         duplicate_paths,
     )
     defensive_note = _defensive_drop_note(defensive_dropped_count)
-    hunt = (
-        (
-            "\n\nLiving Hunt: reviewing `"
-            + living_range
-            + "` (files changed since the last completed Elder pass)."
-        )
-        if living_range
-        else ""
-    )
-    if living_baseline_rejected:
-        # #845: the stored baseline was rejected as a non-ancestor - the
-        # range above is empty because no delta was reviewed, but the
-        # fallback must be visible in the check-run, not just the logs.
-        hunt += (
-            "\n\nLiving Hunt: the stored baseline `"
-            + living_baseline_rejected
-            + "` was not an ancestor of the current head, or the range held a "
-            "merge commit (history was rewritten or merged into) - Elder reviewed the full PR diff instead of the "
-            "delta since the last pass."
-        )
-
-    def hunt_title(title: str) -> str:
-        return f"Living Hunt {living_range} - {title}" if living_range else title
+    tier_note = _tier_served_note(getattr(evaluation, "tier_served", None))
+    hunt = _hunt_section(living_range, living_baseline_rejected)
 
     if is_partial_coverage(evaluation.degraded_reason):
         # Reached the PR again only after grug#806: this branch existed but
         # rerun.py's fail-open re-posted "Elder skipped - partial_review" over
         # it, so nobody ever saw it. Same event, same words as the board now.
         title = "WARN Elder review coverage partial"
-        return hunt_title(title), (
+        return _hunt_title(title, living_range), (
             "Grug walked part of the diff - some ground did not fit one look, "
             "or a bounded cohort returned nothing usable. Validated markings "
             "from the ground Grug walked are published below. "
             + gate_sentence(blocking)
             + " Coverage detail is in the table above."
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + tier_note
     if is_low_confidence(evaluation.degraded_reason):
         title = "WARN Elder review low confidence"
-        return hunt_title(title), (
+        return _hunt_title(title, living_range), (
             "Part of the diff got only a very short \"no findings\" answer "
             "that no other model confirmed, because every other model failed "
             "this pass. Grug keep the answer but not trust it. Validated "
             "markings from the rest are published below. "
             + gate_sentence(blocking)
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + tier_note
     if review_phase == "deep" and is_blackout(evaluation.degraded_reason):
         # grug#848: a blackout in the deep phase is the REASONER arm's -
         # `_async_deep_decision` never starts the deep append over a
@@ -1099,13 +1110,13 @@ def _summary_markdown(
         # later if escalated") never happened, and this neutral is not the
         # reasoner agreeing.
         title = f"WARN Elder deep arm did not run ({evaluation.degraded_reason})"
-        return hunt_title(title), (
+        return _hunt_title(title, living_range), (
             "Tier-1 coder-arm review completed and its markings stand. The "
             "deep reasoner arm promised on escalation did not run this pass "
             f"- the mist: `{evaluation.degraded_reason}`. Grug not say the "
             "deeper look agreed; it never looked. "
             + gate_sentence(blocking)
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + tier_note
     if evaluation.degraded_reason:
         # grug#985: when some cohorts were never opened (starved of budget),
         # the headline must not read like every cohort ran and broke.
@@ -1125,11 +1136,11 @@ def _summary_markdown(
             if starved
             else ""
         )
-        return hunt_title(title), (
+        return _hunt_title(title, living_range), (
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. "
             + gate_sentence(blocking)
-        ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note
+        ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note + tier_note
     if not evaluation.findings:
         title = (
             "Elder clear - no markings"
@@ -1139,11 +1150,11 @@ def _summary_markdown(
         scope = _clean_review_scope(
             living_range, excluded_paths, oversized_paths, duplicate_paths,
         )
-        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note
+        return _hunt_title(title, living_range), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note + tier_note
 
     blocking = sum(1 for f in evaluation.findings if f.severity in ("high", "critical"))
     title = f"Elder markings - {blocking} blocking, {len(evaluation.findings)} total"
-    title = hunt_title(title)
+    title = _hunt_title(title, living_range)
     table = _findings_table(evaluation)
     phase_line = _review_phase_line(review_phase)
     legend = (
@@ -1151,7 +1162,7 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}"
+    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}{tier_note}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -1641,6 +1652,7 @@ def worth_an_email(evaluation: CodeReviewEvaluation) -> bool:
 def _stack_detail_lines(
     review_phase: str, living_range: str, suppressed_count: int,
     head_sha: str = "", base_sha: str = "",
+    tier_served: str | None = None,
 ) -> str:
     """The two facts a skeptical reader asks for: what was looked at, and what
     was withheld. Everything else that used to live here was cut as noise.
@@ -1662,6 +1674,8 @@ def _stack_detail_lines(
     )
     if scope:
         lines.append(f"- Looked at: {scope}")
+    if tier_served:
+        lines.append(f"- Tier served: `{tier_served}`")
     if suppressed_count:
         lines.append(f"- Grug swallow {suppressed_count} weak thought(s).")
     return "\n".join(lines)
@@ -1860,6 +1874,7 @@ def _review_stack_body(
         table,
         _stack_detail_lines(
             review_phase, living_range, suppressed_count, head_sha, base_sha,
+            tier_served=getattr(evaluation, "tier_served", None),
         ),
     ] if p)
     if detail:
