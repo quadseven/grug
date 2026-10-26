@@ -67,6 +67,7 @@ _PY_SECTION_DEF = re.compile(r"^@@[^@]*@@\s.*?\b(?:async\s+)?def\s+([A-Za-z_]\w*
 # A call on an added line: `name(` not preceded by `.` (method calls on
 # unknown receivers are noise for a 1-hop tracer) or `def `.
 _PY_CALL = re.compile(r"^\+.*?(?<![\w.])([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+_PY_STRING = re.compile(r"(['\"])(.{3,}?)\1")
 
 # Python builtins + stdlib-common noise a 1-hop lookup would waste budget
 # on. Not exhaustive - just the high-frequency call targets.
@@ -153,16 +154,24 @@ def extract_symbols(
        full-file fetch) is available - by walking UP from the first
        added line to the nearest preceding def, covering defs entirely
        outside the diff context window (codex round 4).
-    3. Called names the diff adds that are NOT defined in-diff (their
-       DEFINITION elsewhere tells the reviewer what the call does).
+    3. String literals added or removed in the diff (unchanged tests may
+       still assert a removed value), then called names added that are NOT
+       defined in-diff (their DEFINITION elsewhere tells what they do).
 
     Pure; capped at `_MAX_SYMBOLS`; dedup preserves first-seen order.
     """
     contents = file_contents or {}
     defs: list[str] = []
     calls: list[str] = []
+    literals: list[str] = []
     defined_here: set[str] = set()
     for h in hunks:
+        for line in h.body.splitlines():
+            if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+                for value in _PY_STRING.findall(line[1:]):
+                    literal = value[1]
+                    if literal not in literals:
+                        literals.append(literal)
         for name in _PY_DEF.findall(h.body):
             defined_here.add(name)
             if name not in defs:
@@ -185,6 +194,7 @@ def extract_symbols(
                 calls.append(name)
 
     out: list[str] = list(defs)
+    out.extend(value for value in literals if value not in out)
     for name in calls:
         # A name defined in-diff needs no definition lookup; as a DEF it
         # is already queued above (callers elsewhere still matter).

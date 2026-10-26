@@ -36,6 +36,31 @@ def test_extract_symbols_finds_changed_def_and_external_call():
     assert "validate_tenant" in symbols
 
 
+def test_stale_assertion_regression_pairs_changed_literal_with_untouched_test():
+    """A changed literal must retrieve an unchanged test that asserts its old value."""
+    diff = '''diff --git a/src/labels.py b/src/labels.py
+--- a/src/labels.py
++++ b/src/labels.py
+@@ -1 +1 @@
+-WELCOME = "Welcome back"
++WELCOME = "Welcome again"
+'''
+    symbols = cross_file.extract_symbols(parse_diff(diff))
+    assert "Welcome back" in symbols
+
+    def fake_get(url, **kw):
+        if "/search/code" in url:
+            return _search_response(["tests/test_labels.py"])
+        return _raw_response('def test_welcome_label():\n    assert render() == "Welcome back"\n')
+
+    with patch.object(cross_file.httpx, "get", side_effect=fake_get):
+        context = cross_file.fetch_cross_file_context(
+            "tok", "o", "r", symbols, head_sha="abc123",
+            exclude_paths=frozenset({"src/labels.py"}),
+        )
+    assert "Welcome back" in context["tests/test_labels.py"]
+
+
 def test_extract_symbols_skips_locally_defined_calls():
     """A name both DEFINED and CALLED inside the diff needs no cross-file
     lookup - its definition is already in context."""

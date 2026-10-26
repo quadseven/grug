@@ -295,6 +295,19 @@ RULES: tuple[ReviewRule, ...] = (
         severity="low",
     ),
     ReviewRule(
+        name="stale-test-assertion",
+        bug_class="test fidelity",
+        description="A changed literal invalidates an assertion in an "
+        "UNCHANGED test file shown in cross-file context. Compare removed "
+        "values in the diff with test expectations; report only when the "
+        "unchanged assertion still expects the old behavior.",
+        bad_example='Production text changes to "Welcome again"; unchanged '
+        'test still asserts "Welcome back".',
+        good_example='Update the test expectation to "Welcome again" when '
+        'the intended production text changes.',
+        severity="medium",
+    ),
+    ReviewRule(
         name="fire-and-forget-task",
         bug_class="async blocker",
         description="An asyncio task created without await/gather/tracking — "

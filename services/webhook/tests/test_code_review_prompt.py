@@ -46,6 +46,14 @@ def test_build_system_prompt_includes_every_rule_name():
         assert r.name in prompt, f"rule {r.name} missing from prompt"
 
 
+def test_stale_test_assertion_rule_explains_unchanged_cross_file_assertions():
+    rule = next((r for r in crp.RULES if r.name == "stale-test-assertion"), None)
+    assert rule is not None
+    assert "unchanged" in rule.description.lower()
+    assert "test" in rule.bad_example.lower()
+    assert "test" in rule.good_example.lower()
+
+
 def test_build_system_prompt_carries_finding_json_contract():
     """The prompt must instruct the exact Finding wire shape the parser
     (`_coerce_finding`) consumes: findings[] with path/line/rule/
