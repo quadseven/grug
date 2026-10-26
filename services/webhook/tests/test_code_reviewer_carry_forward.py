@@ -107,6 +107,25 @@ def test_annotated_body_still_reads_its_severity():
     assert c.severity == "high"
 
 
+def test_thread_resolved_by_a_person_is_not_carried_without_the_flag():
+    """#1440: a thread a person resolved carries its resolver in the
+    listing (`resolvedBy`) even when the `isResolved` flag itself is not
+    in the thread dict the listing hands over. Reading the thread state
+    first means that thread is left out, not carried as still open."""
+    thread = _thread()
+    del thread["isResolved"]
+    thread["resolvedBy"] = {"login": "a-reviewer"}
+    assert cf.select_carried([thread], ()) == ()
+
+
+def test_reopened_thread_with_no_resolver_is_carried_again():
+    """#1440: a resolved thread a person reopens counts as open again:
+    the flag is false and no resolver remains on the thread."""
+    thread = _thread(resolved=False)
+    thread["resolvedBy"] = None
+    assert len(cf.select_carried([thread], ())) == 1
+
+
 def test_reraised_finding_is_not_double_counted():
     assert cf.select_carried([_thread()], (_finding(line=14),)) == ()
     # a different rule, a different file, or a far line is a separate finding
@@ -258,6 +277,32 @@ def test_medium_carried_leaves_a_clean_check_green(monkeypatch):
     check, _, _ = _run(monkeypatch, blocking=True,
                        threads=[_thread(severity="🟠 medium")])
     assert check.conclusion == "success"
+
+
+def test_resolved_high_thread_does_not_block_a_clean_delta(monkeypatch):
+    """#1440: a delta review with one resolved high finding and no new
+    markings concludes success. The resolved thread is the incident
+    shape: Elder's root comment plus answers from other authors."""
+    thread = _thread(resolved=True, comments=[
+        _comment(),
+        _comment(author="other-bot"),
+        _comment(author="another-bot"),
+    ])
+    check, _, _ = _run(monkeypatch, blocking=True, threads=[thread])
+    assert check.conclusion == "success"
+    assert "Elder clear" in check.title
+    assert "earlier finding" not in check.title
+
+
+def test_thread_resolved_by_a_person_does_not_block_a_clean_delta(monkeypatch):
+    """#1440, through dispatch: the listing hands over the thread's
+    resolver and no `isResolved` flag; the check still concludes success."""
+    thread = _thread()
+    del thread["isResolved"]
+    thread["resolvedBy"] = {"login": "a-reviewer"}
+    check, _, _ = _run(monkeypatch, blocking=True, threads=[thread])
+    assert check.conclusion == "success"
+    assert "Elder clear" in check.title
 
 
 def test_outdated_thread_does_not_block(monkeypatch):
