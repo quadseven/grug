@@ -86,6 +86,7 @@ class _Store:
         self.recorded: list[dict[str, Any]] = []
         self.enqueued: list[dict[str, Any]] = []
         self.replies: list[str] = []
+        self.marked: list[int] = []
         self.claimed: set[str] = set()
 
     def claim(self, key: str) -> bool:
@@ -121,7 +122,8 @@ def _payload(
 
 def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin",
               head_sha: str = _SHA, store: _Store | None = None,
-              perm_fail: str = "",
+              perm_fail: str = "", diff: str | None = None,
+              commits: list[str] | str | None = None,
               ) -> tuple[dict[str, str], _Store]:
     store = store or _Store()
     monkeypatch.setattr(d, "is_install_allowlisted", lambda _id: True)
@@ -132,6 +134,11 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
     )
     monkeypatch.setattr(pg_install_store, "claim_delivery", store.claim)
     monkeypatch.setattr(rerun, "enqueue_rerun", lambda **k: store.enqueued.append(k))
+    import interactive
+    monkeypatch.setattr(
+        interactive, "_mark_reviewing",
+        lambda **k: store.marked.append(k["pr_number"]) or True,
+    )
 
     class _Resp:
         def __init__(self, body: Any) -> None:
@@ -142,6 +149,10 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
 
         def json(self) -> Any:
             return self._body
+
+        @property
+        def text(self) -> str:
+            return str(self._body)
 
     def _get(url: str, *a: Any, **k: Any) -> _Resp:
         if "/collaborators/" in url:
@@ -154,6 +165,22 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
                     response=httpx.Response(502, request=request),
                 )
             return _Resp({"permission": permission})
+        if "/pulls/42/commits" in url:
+            if commits == "fail":
+                request = httpx.Request("GET", url)
+                raise httpx.HTTPStatusError(
+                    "boom", request=request,
+                    response=httpx.Response(502, request=request),
+                )
+            if commits == "long":
+                # GitHub caps this endpoint at 250: pages of 100, 100 and 50.
+                rows = 50 if "page=3" in url else 100
+                return _Resp([{"author": {"login": "author"}, "committer": {"login": "author"}}] * rows)
+            logins = commits if isinstance(commits, list) else [payload["issue"]["user"]["login"]]
+            return _Resp([{"author": {"login": who} if who else None, "committer": {"login": "web-flow"}}
+                          for who in logins] if "page=1" in url else [])
+        if "/pulls/42" in url and "diff" in str((k.get("headers") or {}).get("Accept")):
+            return _Resp(_DELETION_DIFF if diff is None else diff)
         if "/pulls/42" in url:
             return _Resp({"head": {"sha": head_sha}, "body": "",
                           "user": {"login": payload["issue"]["user"]["login"]}})
@@ -182,6 +209,8 @@ def test_an_admin_records_the_acceptance_on_the_head(monkeypatch):
     assert [j["persona"] for j in store.enqueued] == ["code_reviewer"]
     assert store.enqueued[0]["dedup_key"]
     assert any(_SHA[:8] in r and _WORKFLOW in r for r in store.replies)
+    # The same sign `/grug improve` raises while Elder re-reviews.
+    assert store.marked == [42]
 
 
 @pytest.mark.parametrize(("association", "permission"), [
@@ -484,3 +513,183 @@ def test_the_blocking_finding_prints_the_exact_command_for_this_head(monkeypatch
     final = _run(monkeypatch, _DELETION_DIFF, {})[-1]
     assert final.conclusion == "failure", (final.conclusion, final.title)
     assert f"/grug accept-removal {_WORKFLOW} {_HEAD}" in final.summary
+
+
+# Every refusal is answered once (the live case: a write-only collaborator
+# got no reply and no reaction).
+
+
+@pytest.mark.parametrize(("association", "permission"), [
+    ("COLLABORATOR", "write"), ("MEMBER", "maintain"),
+])
+def test_a_non_admin_is_told_why_and_what_works(monkeypatch, association, permission):
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association=association,
+    ), permission=permission)
+    assert out["status"] == "no_op", out
+    assert len(store.replies) == 1, store.replies
+    assert ("only a repo admin, or a trusted operator on a pr they did not write, can accept a "
+            f"removal; your permission here is {permission}") in store.replies[0].lower()
+    assert "ask a repo admin or a trusted operator" in store.replies[0].lower()
+    assert store.recorded == [] and store.enqueued == []
+
+
+def test_a_refused_comment_is_answered_once_across_redeliveries(monkeypatch):
+    store = _Store()
+    for _ in range(2):
+        _dispatch(monkeypatch, _payload(
+            login="reviewer", pr_author="author", association="COLLABORATOR",
+        ), permission="write", store=store)
+    assert len(store.replies) == 1, store.replies
+
+
+def test_a_failed_permission_lookup_is_answered(monkeypatch):
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association="MEMBER",
+    ), perm_fail="http")
+    assert out["status"] == "skip", out
+    assert len(store.replies) == 1 and "could not check" in store.replies[0]
+
+
+def test_a_non_collaborator_is_told_why(monkeypatch):
+    out, store = _dispatch(monkeypatch, _payload(
+        login="stranger", pr_author="stranger", association="NONE",
+    ))
+    assert out["status"] == "no_op", out
+    assert len(store.replies) == 1 and "repo admin" in store.replies[0]
+
+
+@pytest.mark.parametrize("user_type", ["Bot", "Organization", "Mannequin"])
+def test_a_bot_is_never_answered(monkeypatch, user_type):
+    _, store = _dispatch(monkeypatch, _payload(
+        login="lane[bot]", user_type=user_type, association="MEMBER",
+    ))
+    assert store.replies == []
+
+
+def test_a_path_that_is_not_flagged_is_answered_and_records_nothing(monkeypatch):
+    out, store = _dispatch(monkeypatch, _payload(
+        body=f"/grug accept-removal docs/other.md {_SHA}",
+    ))
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+    assert len(store.replies) == 1 and "not a deleted guard" in store.replies[0]
+    assert _WORKFLOW in store.replies[0]  # names what would work
+
+
+def test_an_unreadable_diff_records_nothing_and_says_so(monkeypatch):
+    import accept_removal
+
+    monkeypatch.setattr(accept_removal, "flagged_removals", lambda *a, **k: None)
+    out, store = _dispatch(monkeypatch, _payload())
+    assert out["status"] == "skip", out
+    assert store.recorded == [] and store.enqueued == []
+    assert len(store.replies) == 1 and "could not read" in store.replies[0]
+
+
+# Trusted operators. A personal account's repos cannot grant a collaborator
+# admin, so the owner names extra logins (owner:login pairs, in SSM) who may
+# accept a removal with write access, on a PR someone else wrote.
+
+
+def _trust(monkeypatch, pairs: set[tuple[str, str]]) -> None:
+    import secrets_loader
+
+    monkeypatch.setattr(secrets_loader, "get_removal_acceptors", lambda: frozenset(pairs))
+
+
+@pytest.mark.parametrize("permission", ["write", "maintain"])
+def test_a_trusted_operator_with_write_may_accept_someone_elses_pr(monkeypatch, permission):
+    _trust(monkeypatch, {("myorg", "reviewer")})
+    out, store = _dispatch(monkeypatch, _payload(
+        login="Reviewer", pr_author="author", association="COLLABORATOR",
+    ), permission=permission)
+    assert out["status"] == "dispatched", out
+    assert store.recorded and store.recorded[0]["accepted_by"] == "Reviewer"
+
+
+@pytest.mark.parametrize(("pairs", "login", "pr_author", "permission"), [
+    ({("otherorg", "reviewer")}, "reviewer", "author", "write"),  # trusted for another owner
+    ({("myorg", "reviewer")}, "reviewer", "reviewer", "write"),  # their own PR
+    ({("myorg", "reviewer")}, "reviewer", "author", "read"),  # no write access
+    ({("myorg", "someone")}, "reviewer", "author", "write"),  # not listed
+])
+def test_a_trusted_operator_is_refused_outside_its_grant(
+    monkeypatch, pairs, login, pr_author, permission,
+):
+    _trust(monkeypatch, pairs)
+    out, store = _dispatch(monkeypatch, _payload(
+        login=login, pr_author=pr_author, association="COLLABORATOR",
+    ), permission=permission)
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+
+
+def test_the_trusted_list_is_read_from_ssm_and_fails_closed(monkeypatch):
+    import secrets_loader
+
+    class _Ssm:
+        def __init__(self, value: str | None) -> None:
+            self.value = value
+
+        def get_parameter(self, Name: str) -> dict[str, Any]:
+            if self.value is None:
+                raise RuntimeError("ParameterNotFound")
+            return {"Parameter": {"Value": self.value}}
+
+    def read(env: str, value: str | None) -> frozenset[tuple[str, str]]:
+        monkeypatch.setenv("GRUG_REMOVAL_ACCEPTORS_SSM", env)
+        monkeypatch.setattr(secrets_loader, "_ssm", _Ssm(value))
+        secrets_loader.get_removal_acceptors.cache_clear()
+        return secrets_loader.get_removal_acceptors()
+
+    assert read("/grug/removal-acceptors", "MyOrg:Reviewer, other:login\nbad bad: :x a:b:c") == {
+        ("myorg", "reviewer"), ("other", "login"),
+    }
+    assert read("/grug/removal-acceptors", None) == frozenset()
+    assert read("", "myorg:reviewer") == frozenset()
+
+
+def test_a_trusted_operator_who_pushed_to_the_pr_is_refused(monkeypatch):
+    """Separation of duties rests on who wrote the change, not only who
+    opened the PR: a commit of theirs on someone else's PR refuses them."""
+    _trust(monkeypatch, {("myorg", "reviewer")})
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association="COLLABORATOR",
+    ), permission="write", commits=["author", "Reviewer"])
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
+
+
+def test_a_trusted_operator_is_refused_when_the_commits_cannot_be_read(monkeypatch):
+    _trust(monkeypatch, {("myorg", "reviewer")})
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association="COLLABORATOR",
+    ), permission="write", commits="fail")
+    assert out["status"] in ("no_op", "skip"), out
+    assert store.recorded == [] and store.enqueued == []
+
+
+def test_a_trusted_operator_needs_a_known_pr_author_and_commit_list():
+    import accept_removal
+
+    trusted = frozenset({("myorg", "reviewer")})
+    ok = {"owner": "myorg", "login": "reviewer", "trusted": trusted}
+    assert accept_removal.may_accept("COLLABORATOR", "write", pr_author="author",
+                                     commit_logins=frozenset({"author"}), **ok)
+    assert not accept_removal.may_accept("COLLABORATOR", "write", pr_author="",
+                                         commit_logins=frozenset({"author"}), **ok)
+    assert not accept_removal.may_accept("COLLABORATOR", "write", pr_author="author",
+                                         commit_logins=None, **ok)
+
+
+@pytest.mark.parametrize("commits", [["author", ""], "long"])
+def test_an_unlinked_commit_author_or_a_truncated_list_refuses_a_trusted_operator(monkeypatch, commits):
+    """A commit whose author maps to no login could be anyone, and a list
+    that does not end within the pages read is not a full list."""
+    _trust(monkeypatch, {("myorg", "reviewer")})
+    out, store = _dispatch(monkeypatch, _payload(
+        login="reviewer", pr_author="author", association="COLLABORATOR",
+    ), permission="write", commits=commits)
+    assert out["status"] == "no_op", out
+    assert store.recorded == [] and store.enqueued == []
