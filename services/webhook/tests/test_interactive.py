@@ -577,7 +577,7 @@ def test_a_headless_command_answer_failure_leaves_it_unclaimed(monkeypatch):
 # --- grug#1433: acknowledge accepted commands with a reaction -------------
 
 
-def test_improve_accepted_posts_reaction_not_comment(monkeypatch):
+def test_improve_accepted_posts_reaction_not_comment(monkeypatch, _mock_review_label_http):
     """An accepted /grug improve adds a reaction to the command comment and
     the grug:reviewing label, and posts no reply comment."""
     fake = _FakeHttp()
@@ -599,6 +599,13 @@ def test_improve_accepted_posts_reaction_not_comment(monkeypatch):
     # No reply comment posted
     reply_comments = [c for c in fake.calls if c[0] == "post" and "/comments" in c[1] and "/reactions" not in c[1]]
     assert reply_comments == []
+    # grug:reviewing label added
+    attaches = [
+        c for c in _mock_review_label_http.calls
+        if c[0] == "post" and c[1].endswith("/issues/2/labels")
+    ]
+    assert len(attaches) == 1
+    assert attaches[0][2] == {"labels": ["grug:reviewing"]}
 
 
 def test_test_gaps_accepted_posts_reaction_not_comment(monkeypatch):

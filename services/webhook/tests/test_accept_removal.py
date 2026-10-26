@@ -217,6 +217,8 @@ def test_an_admin_records_the_acceptance_on_the_head(monkeypatch):
     assert store.enqueued[0]["dedup_key"]
     # The acceptance posts a reaction "eyes" to the command comment instead of a reply comment.
     assert store.reactions == ["eyes"]
+    # The same sign `/grug improve` raises while Elder re-reviews.
+    assert store.marked == [42]
 
 
 @pytest.mark.parametrize(("association", "permission"), [
