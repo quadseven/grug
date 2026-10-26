@@ -408,3 +408,52 @@ def test_run_fix_reads_each_file_once():
         post_reply=lambda b: True,
     )
     assert reads == ["a.py"]
+
+
+# --- the default session getter against the real store contract -------------
+
+
+def test_run_fix_default_getter_uses_full_name_and_parses_the_stored_dict(
+    monkeypatch,
+):
+    """No injected get_session: the default getter must read the row the way
+    hunt_recorder writes it (keyed by owner/repo) and parse the plain dict
+    the store returns, then apply the suggestion as ONE commit and reply.
+    Refs #676: the old getter passed the short name and a raw dict."""
+    import dataclasses
+
+    rec = _make_finding_record(path="a.py", line=1, suggestion="x = 2")
+    stored = rs.to_dict(dataclasses.replace(
+        rs.new_session("o/r", 2, at="t"), findings=(rec,), version=3,
+    ))
+    rows = {(1, "o/r", 2): stored}
+    lookups = []
+
+    def fake_get_review_session(*, install_id, repo, pr_number):
+        lookups.append(repo)
+        row = rows.get((install_id, repo, pr_number))
+        return dict(row) if row else None
+
+    # The facade and the Postgres module both: the stub stands in for the
+    # store whichever import path the getter uses.
+    for target in ("adapters.install_store", "adapters.pg_install_store"):
+        monkeypatch.setattr(
+            f"{target}.get_review_session", fake_get_review_session,
+        )
+
+    commits = []
+
+    def apply(token_fn, owner, repo, head_sha, changes, message, pr_number):
+        commits.append(changes)
+        return "newhead"
+
+    posted = []
+    res = _run_fix(
+        fetch_file=lambda *a: "x = 1\ny = 2\n",
+        apply_commit=apply,
+        post_reply=lambda b: posted.append(b) or True,
+    )
+    assert lookups == ["o/r"]
+    assert res["status"] == "dispatched", (res, posted)
+    assert commits == [{"a.py": "x = 2\ny = 2\n"}]
+    assert len(posted) == 1 and "no review session" not in posted[0]

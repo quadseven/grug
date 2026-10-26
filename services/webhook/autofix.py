@@ -20,6 +20,7 @@ import os
 from typing import Any
 from urllib.parse import quote as _q
 
+import review_session as rs
 from personas.code_reviewer.suggestion import checked_suggestion
 from review_session import FindingRecord
 
@@ -89,12 +90,18 @@ def _default_post_reply(
 
 
 def _default_get_session(
-    install_id: int, repo: str, pr_number: int,
-) -> Any | None:
-    from adapters.pg_install_store import get_review_session  # type: ignore
-    return get_review_session(
-        install_id=install_id, repo=repo, pr_number=int(pr_number),
+    install_id: int, full_name: str, pr_number: int,
+) -> rs.ReviewSession | None:
+    """Load the PR's review session the way hunt_recorder stores it.
+
+    The store keys sessions by the FULL repo name (owner/repo) and returns
+    a plain dict, so the row is parsed with review_session.from_dict.
+    """
+    from adapters.install_store import get_review_session  # type: ignore
+    raw = get_review_session(
+        install_id=install_id, repo=full_name, pr_number=int(pr_number),
     )
+    return rs.from_dict(raw) if raw else None
 
 
 def _default_fetch_file(
@@ -395,7 +402,7 @@ def run_fix(
     )
 
     _, candidates, early_result = _load_candidates(
-        install_id=install_id, repo=repo, pr_number=pr_number,
+        install_id=install_id, repo=f"{owner}/{repo}", pr_number=pr_number,
         get_session=get_session, reply=reply,
     )
     if early_result is not None:
