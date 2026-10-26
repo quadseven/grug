@@ -268,8 +268,8 @@ def _load_candidates(
 
 def _commit_and_report(
     *, applied: list[FindingRecord], skipped: list[tuple[FindingRecord, str]],
-    changes: dict[str, str], candidates: list[FindingRecord], token_fn,
-    owner: str, repo: str, head_sha: str, pr_number: int, apply_commit, reply,
+    changes: dict[str, str], token_fn, owner: str, repo: str,
+    head_sha: str, pr_number: int, apply_commit, reply,
 ) -> dict[str, Any]:
     """Commit prepared changes once and report every applied or skipped finding."""
     if not changes:
@@ -357,7 +357,7 @@ def run_fix(
 
     # Apply all valid changes as ONE commit and report the exact outcome.
     return _commit_and_report(
-        applied=applied, skipped=skipped, changes=changes, candidates=candidates,
+        applied=applied, skipped=skipped, changes=changes,
         token_fn=token_fn, owner=owner, repo=repo, head_sha=head_sha,
         pr_number=pr_number, apply_commit=apply_commit, reply=reply,
     )

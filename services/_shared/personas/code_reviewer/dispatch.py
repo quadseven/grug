@@ -113,9 +113,10 @@ from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
 from personas.code_reviewer.linked_issue import (
-    build_linked_issue_context, rendered_criteria, rendered_criteria_with_state,
-    rendered_health_issues,
+    build_linked_issue_context, linked_issue_numbers, rendered_criteria,
+    rendered_criteria_with_state, rendered_health_issues,
 )
+from personas.code_reviewer.pinned_review import pin_line, pin_review
 from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
 from personas.tpm.issue_fetcher import build_issue_details_fetcher
@@ -1776,11 +1777,16 @@ def _review_stack_body(
     head_sha: str = "",
     base_sha: str = "",
     file_contents: dict[str, str] | None = None,
+    linked_issues: tuple[int, ...] = (),
 ) -> str:
     """PR-timeline review stack comment (Markings v2 / FLINT-style shell).
 
     Deterministic markdown only — no extra LLM. Upserted by marker so
     synchronize edits in place rather than spamming the PR.
+
+    grug#1429: Elder's section is framed by `pin_review` - it opens with the
+    exact head judged and the linked issue, and ends with the numbered fixes
+    (each with its target) and an explicit closure sentence.
     """
     findings = evaluation.findings
     n = len(findings)
@@ -1881,7 +1887,11 @@ def _review_stack_body(
             partial=evaluation.degraded_reason in PUBLISHABLE_DEGRADATIONS,
         ),
     )
-    return board.upsert_section(body, "elder", "\n".join(parts).strip())
+    section = pin_review(
+        "\n".join(parts), evaluation,
+        head_sha=head_sha, linked_issues=linked_issues,
+    )
+    return board.upsert_section(body, "elder", section)
 
 
 def _find_stack_comment_id(
@@ -2133,7 +2143,8 @@ def build_review_result(
         body=(
             f'<img src="{_PERSONA_PORTRAIT}" width="46" align="left" alt="Grug {_PERSONA}" />'
             f"\n\n**Grug {_PERSONA}** gaze upon your PR · {len(comments)} finding(s)"
-            f"\n\n{_REVIEW_PERSONA_TAG.format(persona)}"
+            + (f"\n\n{pin_line(head_sha)}" if head_sha else "")
+            + f"\n\n{_REVIEW_PERSONA_TAG.format(persona)}"
         ),
         comments=comments,
     ), new_findings
@@ -2429,6 +2440,15 @@ def _attach_linked_issue_context(
                 "kind": type(e).__name__,
             },
         )
+
+
+def _pinned_issues(
+    pr_context: "PrContext | dict[str, Any]", owner: str, repo: str,
+) -> tuple[int, ...]:
+    """The issue(s) the PR links, for the review's pin line (grug#1429)."""
+    return tuple(linked_issue_numbers(
+        str(pr_context.get("body") or ""), owner=owner, repo=repo,
+    ))
 
 
 def _linked_issue_summary_note(linked_context: str) -> str:
@@ -3571,6 +3591,12 @@ def dispatch_code_review(
         pull_number=pull_number, head_sha=head_sha, conclusion=conclusion,
         title=title, summary=summary,
     )
+    # grug#1429 pin + closure, then grug#1212's degraded lead: a degraded
+    # pass still says so before anything else, the pin line right after.
+    pinned_issues = _pinned_issues(pr_context, owner, repo_name)
+    summary = pin_review(
+        summary, evaluation, head_sha=head_sha, linked_issues=pinned_issues,
+    )
     summary = _lead_if_degraded(summary, evaluation)
     check_result = CheckRunResult(
         name=_CHECK_NAME,
@@ -3731,6 +3757,7 @@ def dispatch_code_review(
                 head_sha=head_sha,
                 base_sha=str(pr_context.get("base_sha") or ""),
                 file_contents=file_contents,
+                linked_issues=pinned_issues,
             )
             with_install_token_retry(
                 installation_id,
@@ -4538,6 +4565,7 @@ def _publish_deep_review(
     repo_config: RepoConfig | None = None,
     file_contents: dict[str, str] | None = None,
     action: str = "review",
+    linked_issues: tuple[int, ...] = (),
 ) -> None:
     """Publish the async deep review's novel findings as a GitHub review.
 
@@ -4635,6 +4663,7 @@ def _publish_deep_review(
             head_sha=head_sha,
             base_sha=base_sha,
             file_contents=file_contents or {},
+            linked_issues=linked_issues,
         )
         with_install_token_retry(
             installation_id,
@@ -4871,6 +4900,10 @@ def _async_deep_append_if_needed(
         )
     )
     summary = f"{preamble}\n\n{summary}"
+    pinned_issues = _pinned_issues(pr_context, owner, repo_name)
+    summary = pin_review(
+        summary, combined, head_sha=head_sha, linked_issues=pinned_issues,
+    )
     summary = _lead_if_degraded(summary, combined)
     superseded = _newer_elder_verdict_on_head(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
@@ -4917,6 +4950,7 @@ def _async_deep_append_if_needed(
         repo_config=repo_config,
         file_contents=evidence.file_contents,
         action=action,
+        linked_issues=pinned_issues,
     )
     _submit_deep_evals(
         deep_graded,
