@@ -2761,14 +2761,47 @@ def _command_job(**over) -> str:
     return _job(**base)
 
 
-def _command_fixture(monkeypatch, *, running=False, last_run=None, lookup_raises=False):
+def _iso(epoch: float) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _elder_run(age_s: float, *, now: float = 1_100.0, status="in_progress") -> dict:
+    """An Elder check run on the head that started `age_s` seconds before
+    `now`."""
+    return {
+        "id": 55, "name": rerun._ELDER_CHECK_NAME, "status": status,
+        "head_sha": "abc123", "started_at": _iso(now - age_s),
+    }
+
+
+def _command_fixture(
+    monkeypatch, *, running=False, last_run=None, lookup_raises=False,
+    run=None, replies=None, patched=None,
+):
     """Stub the PR fetch, the Elder check state, the command-run store and
-    Elder itself; return (dispatch, requeue, recorded)."""
+    Elder itself; return (dispatch, requeue, recorded).
+
+    `running=True` is a live Elder run (a minute old); `run` is any other
+    in-flight run. Replies Grug posts land in `replies`, check-run PATCHes
+    in `patched`."""
     monkeypatch.setattr(rerun, "_now", lambda: 1_100.0)
     monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
     monkeypatch.setattr(rerun, "_gh_get", lambda tok, url: _pr_data(head_sha="abc123"))
     monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
-    monkeypatch.setattr(rerun, "_elder_running_on", lambda *a: running)
+    in_flight = run if run is not None else (_elder_run(60) if running else None)
+    monkeypatch.setattr(rerun, "_elder_run_in_flight", lambda *a: in_flight)
+    monkeypatch.setattr(
+        rerun, "_answer_command",
+        lambda **k: (replies if replies is not None else []).append(k) or True,
+    )
+    monkeypatch.setattr(
+        rerun, "patch_check_run",
+        lambda tok, owner, repo, run_id, result: (
+            patched if patched is not None else []
+        ).append((run_id, result)),
+    )
     monkeypatch.setattr(rerun, "_mark_reviewing_label", lambda **k: True)
     monkeypatch.setattr(rerun, "_clear_reviewing_label", lambda **k: True)
 
@@ -2859,15 +2892,145 @@ def test_a_held_command_runs_once_the_review_ends(monkeypatch):
     }]
 
 
-def test_a_held_command_runs_when_the_hold_cap_passes(monkeypatch):
-    """A check stuck in progress with no worker must not hold a command
-    forever: past the cap the command runs."""
-    dispatch, requeue, _ = _command_fixture(monkeypatch, running=True)
+def test_a_held_command_is_answered_not_dropped_when_the_hold_cap_passes(monkeypatch):
+    """grug#1447: past the hold cap the command is not run, and Grug says
+    so on the PR with the next step - never a silent end."""
+    replies = []
+    dispatch, requeue, recorded = _command_fixture(
+        monkeypatch, running=True, replies=replies,
+    )
     started = 1_100.0 - rerun._COMMAND_HOLD_MAX_SECONDS
     status = rerun._run_one(_command_job(hold_started_at=started), message_id="m-4")
+    assert status == "rerun_hold_cap_reached"
+    dispatch.assert_not_called()
+    requeue.assert_not_called()
+    assert recorded == []
+    assert len(replies) == 1
+    body = replies[0]["body"]
+    assert "was not run" in body
+    assert "abc123"[:8] in body
+    assert "/grug improve" in body and "push a new commit" in body
+    assert replies[0]["pr_number"] == 7 and replies[0]["owner"] == "myorg"
+    assert body.isascii()
+
+
+def test_a_cap_reply_that_does_not_land_raises_so_the_command_is_redelivered(monkeypatch):
+    """A cap answer GitHub refused must not end the command silently: it
+    raises, SQS redelivers, and the answer is tried again."""
+    dispatch, _, _ = _command_fixture(monkeypatch, running=True)
+    monkeypatch.setattr(rerun, "_answer_command", lambda **k: False)
+    started = 1_100.0 - rerun._COMMAND_HOLD_MAX_SECONDS
+    with pytest.raises(RuntimeError):
+        rerun._run_one(_command_job(hold_started_at=started), message_id="m-4b")
+    dispatch.assert_not_called()
+
+
+def test_the_hold_cap_is_the_stuck_run_cutoff():
+    """grug#1447: the hold lasts as long as a run may live before it counts
+    as abandoned, so one orphaned run always ends by the staleness rule
+    before the cap - the cap comes from the existing sweeper config, not a
+    second number."""
+    import check_run_reconciler
+
+    cutoff = check_run_reconciler._STUCK_IN_PROGRESS_MAX_AGE_MINUTES * 60
+    assert rerun._ELDER_RUN_ABANDONED_SECONDS == cutoff
+    assert rerun._COMMAND_HOLD_MAX_SECONDS == cutoff
+
+
+def test_a_command_behind_an_abandoned_elder_run_runs_a_fresh_review(monkeypatch):
+    """grug#1447: an Elder run in progress past the stuck-run cutoff has no
+    worker. The command does not wait on it: the stale run is closed as
+    abandoned and superseded, Grug says so, and a fresh review runs now."""
+    replies, patched = [], []
+    stale = _elder_run(rerun._ELDER_RUN_ABANDONED_SECONDS + 5)
+    dispatch, requeue, recorded = _command_fixture(
+        monkeypatch, run=stale, replies=replies, patched=patched,
+    )
+    status = rerun._run_one(_command_job(), message_id="m-10")
     assert status == "dispatched"
     dispatch.assert_called_once()
     requeue.assert_not_called()
+    assert len(recorded) == 1
+    assert len(patched) == 1
+    run_id, result = patched[0]
+    assert run_id == 55
+    assert result.status == "completed"
+    assert result.conclusion == "failure"
+    assert result.name == stale["name"] and result.head_sha == "abc123"
+    assert "abandoned" in result.title.lower()
+    assert "superseded" in result.summary and result.summary.isascii()
+    assert len(replies) == 1
+    assert "fresh review" in replies[0]["body"] and replies[0]["body"].isascii()
+
+
+def test_an_abandoned_run_that_cannot_be_closed_still_gets_a_fresh_review(monkeypatch):
+    """Closing the stale check is best-effort: the fresh review's own check
+    replaces it either way, so a failed PATCH must not hold the command."""
+    dispatch, requeue, _ = _command_fixture(
+        monkeypatch, run=_elder_run(rerun._ELDER_RUN_ABANDONED_SECONDS + 5),
+    )
+
+    def _boom(*a, **k):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(rerun, "patch_check_run", _boom)
+    assert rerun._run_one(_command_job(), message_id="m-11") == "dispatched"
+    dispatch.assert_called_once()
+    requeue.assert_not_called()
+
+
+def test_an_abandoned_run_with_no_id_is_not_patched_but_still_superseded(monkeypatch):
+    """A listing row with no id cannot be closed; the command still runs a
+    fresh review and Grug still says why."""
+    replies, patched = [], []
+    run = _elder_run(rerun._ELDER_RUN_ABANDONED_SECONDS + 5)
+    del run["id"]
+    dispatch, _, _ = _command_fixture(
+        monkeypatch, run=run, replies=replies, patched=patched,
+    )
+    assert rerun._run_one(_command_job(), message_id="m-13") == "dispatched"
+    dispatch.assert_called_once()
+    assert patched == []
+    assert len(replies) == 1
+
+
+def test_a_failed_supersede_reply_is_logged_and_the_review_still_runs(monkeypatch, caplog):
+    dispatch, _, _ = _command_fixture(
+        monkeypatch, run=_elder_run(rerun._ELDER_RUN_ABANDONED_SECONDS + 5),
+    )
+    monkeypatch.setattr(rerun, "_answer_command", lambda **k: False)
+    with caplog.at_level(logging.WARNING):
+        assert rerun._run_one(_command_job(), message_id="m-14") == "dispatched"
+    dispatch.assert_called_once()
+    assert "rerun_command_abandoned_reply_failed" in caplog.text
+
+
+@pytest.mark.parametrize("run", [
+    _elder_run(rerun._ELDER_RUN_ABANDONED_SECONDS),  # exactly at the cutoff
+    _elder_run(60),                                  # a live review
+    _elder_run(0, status="queued"),                  # queued, not started
+    {"id": 55, "name": "x", "status": "in_progress"},  # no started_at
+])
+def test_a_command_still_holds_behind_a_run_that_is_not_abandoned(monkeypatch, run):
+    patched = []
+    dispatch, requeue, _ = _command_fixture(monkeypatch, run=run, patched=patched)
+    assert rerun._run_one(_command_job(), message_id="m-12") == "rerun_held_behind_review"
+    dispatch.assert_not_called()
+    requeue.assert_called_once()
+    assert patched == []
+
+
+def test_elder_run_in_flight_returns_the_running_elder_run(monkeypatch):
+    runs = [
+        {"id": 1, "name": "Some other check", "status": "in_progress"},
+        {"id": 2, "name": rerun._ELDER_CHECK_NAME, "status": "completed"},
+        {"id": 3, "name": rerun._ELDER_CHECK_NAME, "status": "in_progress"},
+    ]
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "list_check_runs_for_ref", lambda *a: runs)
+    assert rerun._elder_run_in_flight(11, "o", "r", "abc")["id"] == 3
+    monkeypatch.setattr(rerun, "list_check_runs_for_ref", lambda *a: runs[:2])
+    assert rerun._elder_run_in_flight(11, "o", "r", "abc") is None
 
 
 def test_a_command_served_by_a_later_command_run_is_coalesced(monkeypatch):
@@ -2940,5 +3103,5 @@ def test_elder_running_on_reads_an_unreadable_listing_as_not_running(monkeypatch
         raise RuntimeError("token mint failed")
 
     monkeypatch.setattr(rerun, "with_install_token_retry", _boom)
-    assert rerun._elder_running_on(11, "o", "r", "abc") is False
+    assert rerun._elder_run_in_flight(11, "o", "r", "abc") is None
 
