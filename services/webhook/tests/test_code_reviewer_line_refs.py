@@ -232,3 +232,7 @@ def test_repair_where_refs_is_narrow_and_idempotent() -> None:
     assert repair_where_refs("nowhere near line 7", "src/todos.js", 130) == (
         "nowhere near line 7"
     )
+    # A bare Where with no other prose is repaired too (Elder thread on #1453).
+    assert repair_where_refs("`Where: todos.js:151`", "src/todos.js", 130) == (
+        "`Where: todos.js:130`"
+    )

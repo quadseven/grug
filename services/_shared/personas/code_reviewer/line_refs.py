@@ -102,7 +102,7 @@ def repair_where_refs(message: str, path: str, line: int) -> str:
     any number that might be a real line, a Where label is a claim about
     THIS finding's location, so it is repaired to `path:line` (or `line N`
     for the `line N` form) whatever it said. Pure and idempotent."""
-    if not message or "here" not in message:
+    if not message:
         return message
 
     def fix(m: re.Match[str]) -> str:
