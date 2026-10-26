@@ -368,7 +368,7 @@ def evaluate_diff(
             conclusion="neutral",
             degraded_reason=llm_response.kind,
             coverage=llm_response.coverage,
-            tier_served=getattr(llm_response, "tier_served", None),
+            tier_served=llm_response.tier_served,
         )
 
     line_index = _hunk_line_index(hunks)
@@ -454,5 +454,5 @@ def evaluate_diff(
         dropped_withdrawn=withdrawn,
         degraded_reason=degraded_reason,
         coverage=llm_response.coverage,
-        tier_served=getattr(llm_response, "tier_served", None),
+        tier_served=llm_response.tier_served,
     )

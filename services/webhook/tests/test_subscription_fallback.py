@@ -25,7 +25,6 @@ from llm_client import (
     Backend,
     BackendConfig,
     Hunk,
-    LlmReviewResponse,
     review_diff,
     route_elder_model_call,
 )
@@ -43,7 +42,7 @@ _SUBSCRIPTION_URL = "http://cave.test/subscription/v1/chat/completions"
 @pytest.fixture(autouse=True)
 def _setup_env(monkeypatch):
     """Set up clean fallback environment."""
-    lc._reset_subscription_cap()
+    lc._subscription_daily_calls.clear()
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
@@ -61,7 +60,7 @@ def _setup_env(monkeypatch):
     monkeypatch.setenv("GRUG_SUBSCRIPTION_DAILY_CAP", "50")
     monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
     yield
-    lc._reset_subscription_cap()
+    lc._subscription_daily_calls.clear()
 
 
 def _finding_body(file_path: str = "src/x.py", line: int = 1) -> str:
@@ -258,7 +257,10 @@ def test_subscription_lane_headers_and_no_pay_per_token_keys(monkeypatch) -> Non
 
     assert resp.kind == "reviewed"
     assert resp.backend_used == Backend.SUBSCRIPTION
-    sub_headers = next(h for u, h in zip(recorder.called_urls, recorder.call_headers) if "subscription" in u)
+    sub_headers = next(
+        h for u, h in zip(recorder.called_urls, recorder.call_headers, strict=True)
+        if "subscription" in u
+    )
     assert sub_headers.get("X-Loom-Lane-Type") == "subscription-headless"
     assert sub_headers.get("X-Spark-Priority") == "interactive"
     assert sub_headers.get("X-Spark-Caller") == "grug-elder-subscription"
@@ -285,7 +287,7 @@ def test_subscription_refuses_pay_per_token_api_key(monkeypatch) -> None:
 def test_subscription_daily_call_cap_stops_processing(monkeypatch) -> None:
     """AC: configured daily call cap stops processing and review ends degraded with that reason."""
     monkeypatch.setenv("GRUG_SUBSCRIPTION_DAILY_CAP", "2")
-    lc._reset_subscription_cap()
+    lc._subscription_daily_calls.clear()
 
     recorder = _Recorder({
         _CAVE_URL: httpx.ConnectTimeout("cave down"),

@@ -966,12 +966,6 @@ def _record_subscription_call() -> None:
         _subscription_daily_calls[key] = _subscription_daily_calls.get(key, 0) + 1
 
 
-def _reset_subscription_cap() -> None:
-    """Testing helper to reset in-memory subscription call counts."""
-    with _subscription_cap_lock:
-        _subscription_daily_calls.clear()
-
-
 def _subscription_url() -> str:
     explicit = os.getenv("GRUG_SUBSCRIPTION_URL", "").strip()
     if explicit:
@@ -2122,8 +2116,8 @@ def _emit_tier_served_metric(tier: str, backend: str, model: str) -> None:
             "grug.elder.tier_served", 1,
             {"tier": tier, "backend": backend, "model": model},
         )
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
+        log.debug("tier_served_metric_failed", extra={"kind": type(e).__name__})
 
 
 def _emit_last_resort_metric(tier: str, backend: str, model: str) -> None:
@@ -2133,8 +2127,8 @@ def _emit_last_resort_metric(tier: str, backend: str, model: str) -> None:
             "grug.elder.last_resort_call", 1,
             {"tier": tier, "backend": backend, "model": model},
         )
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
+        log.debug("last_resort_metric_failed", extra={"kind": type(e).__name__})
 
 
 def _emit_subscription_cap_metric() -> None:
@@ -2144,8 +2138,8 @@ def _emit_subscription_cap_metric() -> None:
             "grug.elder.subscription_cap_reached", 1,
             {"tier": "subscription"},
         )
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
+        log.debug("subscription_cap_metric_failed", extra={"kind": type(e).__name__})
 
 
 # A backend that answers with one of these is not busy - it is UNUSABLE, and
@@ -6643,7 +6637,7 @@ def _review_diff_dispatch(
         # Total cloud failure: fall through, unconditionally, to the exact
         # path every "cave" deployment runs - "if that fails, use my local
         # sparks" (the operator, 2026-08-27) is not itself configurable away.
-    response = _review_diff_dispatch_cave_primary(
+    response = route_elder_model_call(
         evidence, installation_id, voice, cancel_event, review_map,
     )
     if low_confidence is not None and response.kind in ("all_failed", "parse_failed"):
