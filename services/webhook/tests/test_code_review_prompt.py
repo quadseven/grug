@@ -327,6 +327,33 @@ def test_unbounded_structured_output_schema_rule_present():
     assert "maxItems" in rule.description and "maxLength" in rule.description
 
 
+def test_diff_gate_scans_hunk_header_rule_present():
+    """Weekly harvest 2026-10-26, routed from the /audit catalogue where it
+    was parked ELDER-ELIGIBLE. quadseven/infra-public#118: the shared leak
+    scanner read a unified diff and skipped `---`/`+++` but not `@@`. Under
+    `git diff -U0` git appends pre-image context to every hunk header, so a
+    change removing two leaked lines in a row had the second hunk header
+    repeat the first removed line -- and the scanner reported the removal as
+    an addition. That kept a repo's leak-scan enablement red through three
+    model rungs before anyone traced it, because the signal was inverted
+    exactly for the PRs trying to fix the thing it was watching for. The rule
+    has to carry the enumeration (every non-content line kind, not just the
+    two obvious ones) and the `-U0` mechanism, since without the latter a
+    reviewer reads a hunk header as line numbers only and sees nothing
+    wrong."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "diff-gate-scans-hunk-header"),
+        None,
+    )
+    assert rule is not None, "diff-gate-scans-hunk-header missing from RULES"
+    assert rule.bug_class == "correctness"
+    assert "diff-gate-scans-hunk-header" in crp.build_system_prompt()
+    # The mechanism, not just the symptom: -U0 is why @@ carries content.
+    assert "-U0" in rule.description
+    # The inversion is the severity argument -- the gate blocks the remedy.
+    assert "removal as an addition" in rule.description
+
+
 def test_voice_has_mandatory_bookend_structure():
     """#343: the voice instruction mandates the structural bookends that
     keep the caveman cadence from slipping to plain English under technical
