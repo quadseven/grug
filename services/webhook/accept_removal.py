@@ -59,6 +59,29 @@ USAGE = (
 )
 _HEX = frozenset("0123456789abcdef")
 
+_ACCEPTANCE_REACTION_CONTENT = "eyes"
+
+
+def _post_acceptance_reaction(token_fn, owner: str, repo: str, comment_id: int) -> None:
+    """Post an acceptance reaction to the acceptance command comment.
+
+    GitHub de-duplicates repeated reactions, so a redelivery is harmless."""
+    import httpx  # type: ignore
+    from urllib.parse import quote as _q
+
+    _API = "https://api.github.com"
+    _TIMEOUT = 15.0
+
+    def _react(token: str) -> None:
+        httpx.post(
+            f"{_API}/repos/{_q(owner, safe='')}/{_q(repo, safe='')}/pulls/comments/{comment_id}/reactions",
+            json={"content": _ACCEPTANCE_REACTION_CONTENT},
+            headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+            timeout=_TIMEOUT,
+        ).raise_for_status()
+
+    token_fn(_react)
+
 
 def removal_path(arg: str) -> str:
     """The path the command names: the backticked text when it starts with
@@ -343,7 +366,6 @@ def run_accept_removal(
         mark_reviewing()
     except Exception as e:  # noqa: BLE001 - the sign is cosmetic; the check is the truth
         log.warning("accept_removal_label_failed", extra={**coords, "kind": type(e).__name__})
-    say(f"Grug recorded `{actor}` accepting the removal of `{path}` on "
-        f"`{head_sha[:8]}`. Elder is re-reviewing this PR. A new push needs "
-        "a new acceptance. So speaks Grug.")
+    # Post a reaction to the acceptance command comment instead of a reply comment
+    _post_acceptance_reaction(token_fn, owner, repo, comment_id)
     return {**out, "status": "dispatched", "persona": "code_reviewer"}

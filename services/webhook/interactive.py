@@ -50,6 +50,16 @@ def _post_reply(token: str, owner: str, repo: str, pr_number: int, body: str) ->
     ).raise_for_status()
 
 
+def _post_reaction(token: str, owner: str, repo: str, comment_id: int, content: str) -> None:
+    """Add a reaction to a comment. GitHub de-duplicates repeated reactions."""
+    httpx.post(
+        f"{_API}/repos/{_q(owner, safe='')}/{_q(repo, safe='')}/pulls/comments/{comment_id}/reactions",
+        json={"content": content},
+        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+        timeout=_TIMEOUT,
+    ).raise_for_status()
+
+
 def _escape_html(s: str) -> str:
     """Escape HTML-significant chars in a displayed learning so a taught
     rule can't break out of the comment markup or inject tags."""
@@ -67,6 +77,20 @@ def _reply(token_fn, owner: str, repo: str, pr_number: int, body: str) -> bool:
         token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.warning("interactive_reply_failed", extra={"kind": type(e).__name__})
+        return False
+    return True
+
+
+def _react(token_fn, owner: str, repo: str, comment_id: int, content: str) -> bool:
+    """Add a reaction to a comment. True when the reaction landed.
+
+    Best-effort: the command's effect (the enqueue) already happened, so a
+    reaction GitHub refuses must not raise out of the command. GitHub
+    de-duplicates repeated reactions, so a redelivery is harmless."""
+    try:
+        token_fn(lambda t: _post_reaction(t, owner, repo, comment_id, content))
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning("interactive_reaction_failed", extra={"kind": type(e).__name__})
         return False
     return True
 
@@ -445,9 +469,10 @@ def _run_persona_rerun(
     else:
         note = ("Elder is re-reviewing this PR." if verb == "improve"
                 else "Smasher is checking for test gaps.")
+    # Post a reaction to the command comment as acknowledgement (no reply comment)
     try:
-        token_fn(lambda t: _post_reply(t, owner, repo, pr_number, f"{note} So speaks Grug."))
-    except Exception as e:  # noqa: BLE001 - the rerun is enqueued; the ack reply is cosmetic
+        token_fn(lambda t: _post_reaction(t, owner, repo, comment_id, "eyes"))
+    except Exception as e:  # noqa: BLE001 - the rerun is enqueued; the ack reaction is cosmetic
         log.warning("interactive_ack_failed", extra={"verb": verb, "kind": type(e).__name__})
     if queued:
         return {"status": "queued", "reason": "queued_behind_review",

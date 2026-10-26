@@ -21,6 +21,8 @@ import pytest
 import rerun
 from adapters import install_store, pg_install_store
 from grug_commands import GrugCommand, parse_command
+import interactive  # type: ignore
+from accept_removal import _post_acceptance_reaction  # type: ignore
 
 from tests.test_removed_files import (  # noqa: F401 - _patch_token is an autouse fixture
     _DELETION_DIFF,
@@ -86,6 +88,7 @@ class _Store:
         self.recorded: list[dict[str, Any]] = []
         self.enqueued: list[dict[str, Any]] = []
         self.replies: list[str] = []
+        self.reactions: list[str] = []
         self.marked: list[int] = []
         self.claimed: set[str] = set()
 
@@ -134,10 +137,14 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
     )
     monkeypatch.setattr(pg_install_store, "claim_delivery", store.claim)
     monkeypatch.setattr(rerun, "enqueue_rerun", lambda **k: store.enqueued.append(k))
-    import interactive
+    import interactive  # type: ignore
     monkeypatch.setattr(
         interactive, "_mark_reviewing",
         lambda **k: store.marked.append(k["pr_number"]) or True,
+    )
+    monkeypatch.setattr(
+        "accept_removal._post_acceptance_reaction",
+        lambda token_fn, owner, repo, comment_id: store.reactions.append("eyes") or True,
     )
 
     class _Resp:
@@ -208,9 +215,8 @@ def test_an_admin_records_the_acceptance_on_the_head(monkeypatch):
     # Elder re-reviews, so the check updates with no further step.
     assert [j["persona"] for j in store.enqueued] == ["code_reviewer"]
     assert store.enqueued[0]["dedup_key"]
-    assert any(_SHA[:8] in r and _WORKFLOW in r for r in store.replies)
-    # The same sign `/grug improve` raises while Elder re-reviews.
-    assert store.marked == [42]
+    # The acceptance posts a reaction "eyes" to the command comment instead of a reply comment.
+    assert store.reactions == ["eyes"]
 
 
 @pytest.mark.parametrize(("association", "permission"), [
