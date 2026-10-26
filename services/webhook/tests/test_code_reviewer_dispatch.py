@@ -3089,6 +3089,20 @@ def test_stack_body_is_a_board_with_a_verdict_first():
     assert "_#1 thing_" in body
 
 
+def test_stack_offers_bulk_fix_for_checked_suggestion():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    finding = Finding(
+        file="a.py", line=1, severity="low", rule_name="r",
+        message="fix value", suggestion="x = 2",
+    )
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+        conclusion="success", file_contents={"a.py": "x = 1\n"},
+    )
+    assert "Finishing touch" in body
+    assert "/grug fix" in body
+
+
 def test_worth_an_email_is_findings_or_degraded_only():
     """The gate on whether grug may CREATE a comment - i.e. whether it may
     mail the author. A clean review is not news; the green check-run already

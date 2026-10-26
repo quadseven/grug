@@ -1787,6 +1787,7 @@ def _review_stack_body(
     pr_title: str = "",
     head_sha: str = "",
     base_sha: str = "",
+    file_contents: dict[str, str] | None = None,
     linked_issues: tuple[int, ...] = (),
 ) -> str:
     """PR-timeline review stack comment (Markings v2 / FLINT-style shell).
@@ -1827,6 +1828,12 @@ def _review_stack_body(
         rows.append(f"| +{n - _STACK_TABLE_ROWS} more | | | |")
     table = "\n".join(rows) if findings else ""
 
+    committable = [
+        f for f in findings
+        if checked_suggestion(f, f.line, (file_contents or {}).get(f.file, ""))
+        is not None
+    ]
+
     # The BOARD (#791). What a human receives by email is exactly this body at
     # CREATION time - GitHub never mails an edit - so the verdict leads and all
     # evidence is folded. Previously the first thing posted was a file table
@@ -1835,6 +1842,11 @@ def _review_stack_body(
     blocking = sum(1 for f in findings if f.severity in ("high", "critical"))
     advisory = len(findings) - blocking
     parts: list[str] = []
+    if committable:
+        parts.append(
+            f"**Finishing touch:** {len(committable)} unresolved suggestion(s) "
+            "can be applied together with `/grug fix`."
+        )
     # Phase, Status and Check-run used to live in the fold. All three were cut:
     # Status restated the summary line verbatim, Phase ("Tier-1 coder arm") is
     # internal vocabulary that means nothing to the author, and the check-run
@@ -3755,6 +3767,7 @@ def dispatch_code_review(
                 pr_title=str(pr_context.get("title") or ""),
                 head_sha=head_sha,
                 base_sha=str(pr_context.get("base_sha") or ""),
+                file_contents=file_contents,
                 linked_issues=pinned_issues,
             )
             with_install_token_retry(
@@ -4661,6 +4674,7 @@ def _publish_deep_review(
             pr_title=pr_title,
             head_sha=head_sha,
             base_sha=base_sha,
+            file_contents=file_contents or {},
             linked_issues=linked_issues,
         )
         with_install_token_retry(
