@@ -40,7 +40,7 @@ class CommitRefused(Exception):
 class _FixCandidate:
     """Minimal Finding-shaped view of a FindingRecord for checked_suggestion."""
 
-    __slots__ = ("file", "line", "suggestion", "message")
+    __slots__ = ("file", "line", "message", "suggestion")
 
     def __init__(self, rec: FindingRecord) -> None:
         self.file = rec.path
@@ -101,7 +101,6 @@ def _default_fetch_file(
     token_fn, owner: str, repo: str, path: str, ref: str,
 ) -> str | None:
     import httpx  # type: ignore
-    from urllib.parse import quote as _q
 
     try:
         def _fetch(token: str) -> str:
