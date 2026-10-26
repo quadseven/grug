@@ -212,7 +212,7 @@ def _write_board_idle_line(
     try:
         from github_app_auth import get_app_id
         app_id = get_app_id()
-    except Exception:
+    except (ImportError, AttributeError):
         app_id = None
     from personas import board_client
     board_client.upsert_board_section(
@@ -231,7 +231,7 @@ def _clear_board_idle_line(
     try:
         from github_app_auth import get_app_id
         app_id = get_app_id()
-    except Exception:
+    except (ImportError, AttributeError):
         app_id = None
     from personas import board_client
     board_client.clear_board_section(

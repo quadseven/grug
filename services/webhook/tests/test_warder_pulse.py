@@ -22,6 +22,7 @@ def _datadog_switch_on(monkeypatch):
     runs with GRUG_DATADOG_ENABLED on (#1208). The off path is pinned in
     test_datadog_switch.py."""
     monkeypatch.setenv("GRUG_DATADOG_ENABLED", "true")
+    monkeypatch.setattr("github_app_auth.get_app_id", lambda: "1")
 
 
 # ── Warder: pure grouping/semver ──────────────────────────────────────
@@ -527,6 +528,20 @@ def test_stale_prs_paginates_past_ineligible_prefix(monkeypatch):
     assert all(p_["number"] != 31 for p_ in out)  # fresh PR excluded, scan ended
 
 
+def _fake_pulse_board_idle_get(url, **kw):
+    if "/labels" in url:
+        return httpx.Response(200, json={"name": "grug:idle"}, request=httpx.Request("GET", url))
+    if "/comments" in url:
+        return httpx.Response(200, json=[{
+            "id": 88,
+            "body": "<!-- grug-board -->\n### Grug look.",
+            "performed_via_github_app": {"id": 1},
+        }], request=httpx.Request("GET", url))
+    if "/issues" in url and "labels" in (kw.get("params") or {}):
+        return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+    return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+
+
 def test_pulse_idle_plan_ready_pr_gets_label_and_board_line_no_comment(monkeypatch):
     """Criterion 1: an idle, plan-ready pull request gets the grug:idle label
     and a board idle line, and no new comment; it fails on main."""
@@ -544,19 +559,6 @@ def test_pulse_idle_plan_ready_pr_gets_label_and_board_line_no_comment(monkeypat
     posts = []
     patches = []
 
-    def fake_get(url, **kw):
-        if "/labels" in url:
-            return httpx.Response(200, json={"name": "grug:idle"}, request=httpx.Request("GET", url))
-        if "/comments" in url:
-            return httpx.Response(200, json=[{
-                "id": 88,
-                "body": "<!-- grug-board -->\n### Grug look.",
-                "performed_via_github_app": {"id": 1},
-            }], request=httpx.Request("GET", url))
-        if "/issues" in url and "labels" in (kw.get("params") or {}):
-            return httpx.Response(200, json=[], request=httpx.Request("GET", url))
-        return httpx.Response(200, json=[], request=httpx.Request("GET", url))
-
     def fake_post(url, **kw):
         posts.append((url, kw.get("json")))
         return httpx.Response(201, json={}, request=httpx.Request("POST", url))
@@ -565,7 +567,7 @@ def test_pulse_idle_plan_ready_pr_gets_label_and_board_line_no_comment(monkeypat
         patches.append((url, kw.get("json")))
         return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    monkeypatch.setattr(pulse.httpx, "get", fake_get)
+    monkeypatch.setattr(pulse.httpx, "get", _fake_pulse_board_idle_get)
     monkeypatch.setattr(pulse.httpx, "post", fake_post)
     monkeypatch.setattr(pulse.httpx, "patch", fake_patch)
 
