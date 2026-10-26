@@ -81,6 +81,7 @@ class RepoConfigPayload(BaseModel):
     sentinel_enabled: bool | None = Field(default=None)
     pulse_enabled: bool | None = Field(default=None)
     pulse_comment_nudge_enabled: bool | None = Field(default=None)
+    pulse_delivery: str | None = Field(default=None, pattern=r"^(label|comment)$")
     smasher_enabled: bool | None = Field(default=None)
     walkthrough_enabled: bool | None = Field(default=None)
     dep_watch_enabled: bool | None = Field(default=None)
@@ -512,6 +513,7 @@ def update_repo_config(
         sentinel_enabled=body.sentinel_enabled,
         pulse_enabled=body.pulse_enabled,
         pulse_comment_nudge_enabled=body.pulse_comment_nudge_enabled,
+        pulse_delivery=body.pulse_delivery,
         smasher_enabled=body.smasher_enabled,
         walkthrough_enabled=body.walkthrough_enabled,
         dep_watch_enabled=body.dep_watch_enabled,

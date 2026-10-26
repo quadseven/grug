@@ -6,6 +6,7 @@ idempotency, per-install cap.
 from __future__ import annotations
 
 from unittest.mock import patch
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -342,8 +343,12 @@ def _pr(number, updated_at, sha="s"):
 
 def test_pulse_nudges_stale_green_pr_once(monkeypatch):
     stale = _pr(1, "2020-01-01T00:00:00Z")
-    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: False)
-    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    monkeypatch.setattr(pulse, "_sweep_idle_labels", lambda *a, **kw: 0)
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p, **kw: False)
+    monkeypatch.setattr(
+        pulse, "get_repo_config",
+        lambda i, r: {"pulse_enabled": True, "pulse_delivery": "comment"},
+    )
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [stale])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
     claims = []
@@ -368,6 +373,8 @@ def test_pulse_nudges_stale_green_pr_once(monkeypatch):
 
 
 def test_pulse_lost_claim_posts_nothing(monkeypatch):
+    monkeypatch.setattr(pulse, "_sweep_idle_labels", lambda *a, **kw: 0)
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda *a, **kw: False)
     monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [_pr(1, "2020-01-01T00:00:00Z")])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
@@ -389,8 +396,12 @@ def test_pulse_disabled_repo_costs_no_github_calls(monkeypatch):
 
 
 def test_pulse_respects_per_install_cap(monkeypatch):
-    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: False)
-    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    monkeypatch.setattr(pulse, "_sweep_idle_labels", lambda *a, **kw: 0)
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda *a, **kw: False)
+    monkeypatch.setattr(
+        pulse, "get_repo_config",
+        lambda i, r: {"pulse_enabled": True, "pulse_delivery": "comment"},
+    )
     many = [_pr(i, "2020-01-01T00:00:00Z") for i in range(10)]
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: many)
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
@@ -409,6 +420,8 @@ def test_pulse_respects_per_install_cap(monkeypatch):
 
 
 def test_pulse_dor_not_green_skips(monkeypatch):
+    monkeypatch.setattr(pulse, "_sweep_idle_labels", lambda *a, **kw: 0)
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda *a, **kw: False)
     monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [_pr(1, "2020-01-01T00:00:00Z")])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: False)
@@ -435,10 +448,14 @@ def test_warder_only_wakes_on_closed_action():
 
 
 def _wire_pulse_happy(monkeypatch, released):
-    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    monkeypatch.setattr(
+        pulse, "get_repo_config",
+        lambda i, r: {"pulse_enabled": True, "pulse_delivery": "comment"},
+    )
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [_pr(1, "2020-01-01T00:00:00Z")])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
-    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: False)
+    monkeypatch.setattr(pulse, "_sweep_idle_labels", lambda *a, **kw: 0)
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda *a, **kw: False)
     monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda i, repo, pr: True)
     monkeypatch.setattr(
         pulse, "release_pulse_nudge",
@@ -483,7 +500,7 @@ def test_pulse_marker_precheck_skips_existing_nudge(monkeypatch):
     means SKIP, never double-post."""
     released: list = []
     _wire_pulse_happy(monkeypatch, released)
-    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: True)
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda *a, **kw: True)
     monkeypatch.setattr(
         pulse.httpx, "post",
         lambda url, **kw: (_ for _ in ()).throw(AssertionError("no POST expected")),
@@ -508,3 +525,166 @@ def test_stale_prs_paginates_past_ineligible_prefix(monkeypatch):
     out = pulse._stale_prs("tok", "o", "r")
     assert len(out) == 31           # 30 from page 1 + 1 stale from page 2
     assert all(p_["number"] != 31 for p_ in out)  # fresh PR excluded, scan ended
+
+
+def test_pulse_idle_plan_ready_pr_gets_label_and_board_line_no_comment(monkeypatch):
+    """Criterion 1: an idle, plan-ready pull request gets the grug:idle label
+    and a board idle line, and no new comment; it fails on main."""
+    stale = _pr(1, "2020-01-01T00:00:00Z")
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p, **kw: False)
+    monkeypatch.setattr(
+        pulse, "get_repo_config",
+        lambda i, r: {"pulse_enabled": True, "pulse_delivery": "label"},
+    )
+    monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [stale])
+    monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
+    monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda i, repo, pr: True)
+    monkeypatch.setattr(pulse, "record_check_verdict", lambda **kw: None)
+
+    posts = []
+    patches = []
+
+    def fake_get(url, **kw):
+        if "/labels" in url:
+            return httpx.Response(200, json={"name": "grug:idle"}, request=httpx.Request("GET", url))
+        if "/comments" in url:
+            return httpx.Response(200, json=[{
+                "id": 88,
+                "body": "<!-- grug-board -->\n### Grug look.",
+                "performed_via_github_app": {"id": 1},
+            }], request=httpx.Request("GET", url))
+        if "/issues" in url and "labels" in (kw.get("params") or {}):
+            return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+        return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+
+    def fake_post(url, **kw):
+        posts.append((url, kw.get("json")))
+        return httpx.Response(201, json={}, request=httpx.Request("POST", url))
+
+    def fake_patch(url, **kw):
+        patches.append((url, kw.get("json")))
+        return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    monkeypatch.setattr(pulse.httpx, "get", fake_get)
+    monkeypatch.setattr(pulse.httpx, "post", fake_post)
+    monkeypatch.setattr(pulse.httpx, "patch", fake_patch)
+
+    n = pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+    assert n == 1
+
+    # PR gets the grug:idle label
+    label_posts = [p for p in posts if p[0].endswith("/issues/1/labels")]
+    assert len(label_posts) == 1
+    assert label_posts[0][1] == {"labels": ["grug:idle"]}
+
+    # PR gets board idle line
+    board_patches = [p for p in patches if "/issues/comments/88" in p[0]]
+    assert len(board_patches) == 1
+    assert "Idle since 2020-01-01" in board_patches[0][1]["body"]
+    assert "days" in board_patches[0][1]["body"]
+
+    # NO new comment posted
+    comment_posts = [p for p in posts if p[0].endswith("/issues/1/comments")]
+    assert len(comment_posts) == 0
+
+
+def test_pulse_updated_pr_loses_idle_label_on_next_pass(monkeypatch):
+    """Criterion 2: a pull request updated after it was labelled loses the
+    label on the next pass."""
+    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [])
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    labeled_issue = {
+        "number": 1,
+        "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/1"},
+        "state": "open",
+        "updated_at": now_iso,
+        "labels": [{"name": "grug:idle"}],
+    }
+
+    deletes = []
+
+    def fake_get(url, **kw):
+        if "/issues" in url and "labels" in (kw.get("params") or {}):
+            return httpx.Response(200, json=[labeled_issue], request=httpx.Request("GET", url))
+        if "/comments" in url:
+            return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+        return httpx.Response(200, json=[], request=httpx.Request("GET", url))
+
+    def fake_delete(url, **kw):
+        deletes.append(url)
+        return httpx.Response(200, json={}, request=httpx.Request("DELETE", url))
+
+    monkeypatch.setattr(pulse.httpx, "get", fake_get)
+    monkeypatch.setattr(pulse.httpx, "delete", fake_delete)
+
+    released = []
+    monkeypatch.setattr(pulse, "release_pulse_nudge", lambda i, repo, pr: released.append((repo, pr)))
+
+    pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+
+    assert any("/issues/1/labels/grug%3Aidle" in d or "/issues/1/labels/grug:idle" in d for d in deletes)
+    assert released == [("o/r", 1)]
+
+
+def test_pulse_delivery_comment_posts_nudge_comment_and_no_label(monkeypatch):
+    """Criterion 3: with pulse_delivery set to comment, the old single
+    weekly nudge comment is posted and no label is added."""
+    stale = _pr(1, "2020-01-01T00:00:00Z")
+    monkeypatch.setattr(pulse, "_sweep_idle_labels", lambda *a, **kw: 0)
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p, **kw: False)
+    monkeypatch.setattr(
+        pulse, "get_repo_config",
+        lambda i, r: {"pulse_enabled": True, "pulse_delivery": "comment"},
+    )
+    monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [stale])
+    monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
+    claims = []
+    monkeypatch.setattr(
+        pulse, "claim_pulse_nudge",
+        lambda i, repo, pr: claims.append((repo, pr)) or True,
+    )
+    posts = []
+    monkeypatch.setattr(
+        pulse.httpx, "post",
+        lambda url, **kw: posts.append((url, kw.get("json"))) or httpx.Response(
+            201, request=httpx.Request("POST", url), json={},
+        ),
+    )
+    monkeypatch.setattr(pulse, "record_check_verdict", lambda **kw: None)
+
+    n = pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+    assert n == 1
+    # Comment is posted with _NUDGE_BODY
+    comment_posts = [p for p in posts if p[0].endswith("/issues/1/comments")]
+    assert len(comment_posts) == 1
+    assert "<!-- grug-pulse-nudge -->" in comment_posts[0][1]["body"]
+
+    # NO label is added
+    label_posts = [p for p in posts if "/labels" in p[0]]
+    assert len(label_posts) == 0
+
+
+def test_pulse_delivery_store_roundtrip():
+    """T1434: pulse_delivery defaults to 'label', accepts 'comment', rejects invalid."""
+    from adapters import pg_install_store as store
+
+    with patch.object(store, "_get_item", return_value={}):
+        assert store.get_repo_config(1, 2)["pulse_delivery"] == "label"
+
+    with patch.object(store, "_get_item", return_value={"pulse_delivery": "comment"}):
+        assert store.get_repo_config(1, 2)["pulse_delivery"] == "comment"
+
+    with patch.object(store, "_merge_attrs"):
+        updated = store.set_repo_config(
+            install_id=1, repo_id=2, repo_full_name="o/r", updated_by_user_id="u",
+            pulse_delivery="comment",
+        )
+        assert updated.get("pulse_delivery") == "comment"
+
+        with pytest.raises(ValueError, match="pulse_delivery"):
+            store.set_repo_config(
+                install_id=1, repo_id=2, repo_full_name="o/r", updated_by_user_id="u",
+                pulse_delivery="invalid",
+            )

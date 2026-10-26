@@ -290,3 +290,31 @@ def upsert_board_section(
         json={"body": merged}, headers=_headers(token), timeout=_TIMEOUT,
     ).raise_for_status()
     return {"board": "updated", "section": key, "comment_id": str(comment_id)}
+
+
+def clear_board_section(
+    token: str, owner: str, repo: str, pr_number: int,
+    *, key: str, app_id: str | None = None,
+) -> bool:
+    """Remove one persona's section from the board, if present. Never creates."""
+    try:
+        found = find_board(token, owner, repo, pr_number, app_id=app_id)
+        if found is None:
+            return False
+        comment_id, existing = found
+        if board.extract_section(existing, key) is None:
+            return False
+        cleaned = board.remove_section(existing, key)
+        base = f"https://api.github.com/repos/{_repo(owner, repo)}"
+        httpx.patch(
+            f"{base}/issues/comments/{comment_id}",
+            json={"body": cleaned}, headers=_headers(token), timeout=_TIMEOUT,
+        ).raise_for_status()
+        return True
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        log.warning(
+            "board_section_clear_failed",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number, "section": key},
+            exc_info=True,
+        )
+        return False

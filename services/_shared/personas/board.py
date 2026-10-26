@@ -50,6 +50,7 @@ SECTION_ORDER: tuple[str, ...] = (
     "elder",      # the review itself
     "guard",      # security / dependency
     "smasher",    # execution-class findings
+    "pulse",      # idle pull request notice
     "sentinel",   # safety-net warnings - last, loudest
 )
 
@@ -111,6 +112,15 @@ def upsert_section(body: str, key: str, markdown: str) -> str:
     anchor = _OPEN.format(key=first_after)
     idx = body.index(anchor)
     return body[:idx] + section + "\n\n" + body[idx:]
+
+
+def remove_section(body: str, key: str) -> str:
+    """Return `body` with `key`'s region removed."""
+    pat = _region(key)
+    if not pat.search(body or ""):
+        return body
+    cleaned = pat.sub("", body)
+    return re.sub(r"\n{3,}", "\n\n", cleaned)
 
 
 def new_board(header: str = "") -> str:
