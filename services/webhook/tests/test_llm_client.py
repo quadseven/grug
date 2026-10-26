@@ -57,6 +57,30 @@ def _hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar") -> Hunk:
     return Hunk(path=path, body=body)
 
 
+def test_reviewability_ordering_survives_noise_cohorts() -> None:
+    from reviewability import assess_reviewability
+
+    hunks = [
+        _hunk("src/account.py", "+class Account:\n+    pass\n"),
+        _hunk("tests/test_account.py", "+def test_account():\n+    pass\n"),
+        _hunk("poetry.lock", "+dependency = '1'\n"),
+    ]
+    assessment = assess_reviewability(hunks)
+    # Noise can cause the actual plan's cohort boundaries and labels to
+    # differ from the semantic-only assessment plan. The semantic unit must
+    # still be matched and prioritized, with noise retained afterward.
+    actual = ReviewPlan(
+        cohorts=(
+            ReviewCohort("noise", (2,), ("poetry.lock",), 20, False, ("implementation",)),
+            ReviewCohort("semantic", (0, 1), ("src/account.py", "tests/test_account.py"), 50, False, ("implementation", "verification")),
+        ),
+        total_diff_chars=70,
+    )
+    ordered = lc._prioritize_review_plan(actual, assessment)
+    assert ordered.cohorts[0].paths == ("src/account.py", "tests/test_account.py")
+    assert ordered.cohorts[1].paths == ("poetry.lock",)
+
+
 def _one_ladder_walk(hunks: list[Hunk], installation_id: int) -> LlmReviewResponse:
     """One walk down the model ladder, without review_diff's chunk retry.
 

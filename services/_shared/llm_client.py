@@ -4504,6 +4504,39 @@ def review_is_staged(hunks: list[Hunk]) -> bool:
     ).staged
 
 
+def _prioritize_review_plan(
+    plan: ReviewPlan, assessment: ReviewabilityAssessment
+) -> ReviewPlan:
+    """Order actual cohorts by the semantic assessment, leaving noise last.
+
+    The assessment excludes generated and mechanical files, so its cohort
+    labels and boundaries can differ from the executable plan. Path overlap
+    carries the semantic ordering across that boundary without dropping any
+    hunks from the review.
+    """
+    if not plan.cohorts or not assessment.suggested_cohorts:
+        return plan
+    priority: dict[str, int] = {}
+    for rank, suggested in enumerate(assessment.suggested_cohorts):
+        for path in suggested.paths:
+            priority.setdefault(path, rank)
+    noise_paths = set(assessment.noise_paths)
+
+    def cohort_priority(indexed: tuple[int, ReviewCohort]) -> tuple[int, int]:
+        index, cohort = indexed
+        ranks = [priority[path] for path in cohort.paths if path in priority]
+        if ranks:
+            return min(ranks), index
+        if all(path in noise_paths for path in cohort.paths):
+            return len(priority) + 1, index
+        return len(priority), index
+
+    ordered = tuple(
+        cohort for _, cohort in sorted(enumerate(plan.cohorts), key=cohort_priority)
+    )
+    return replace(plan, cohorts=ordered)
+
+
 def _cohort_pr_context(
     pr_context: Optional[PrContext],
     *,
@@ -5266,14 +5299,8 @@ def review_diff(
     )
     # Feed review planning: high-risk cohorts receive context and budget
     # first (staged cohorts run serially, so order is budget order).
-    if plan.staged and assessment.suggested_cohorts:
-        wanted = [cohort.label for cohort in assessment.suggested_cohorts]
-        by_label: dict[str, ReviewCohort] = {}
-        for cohort in plan.cohorts:
-            by_label.setdefault(cohort.label, cohort)
-        ordered = [by_label[label] for label in wanted if label in by_label]
-        if len(ordered) == len(plan.cohorts):
-            plan = replace(plan, cohorts=tuple(ordered))
+    if plan.staged:
+        plan = _prioritize_review_plan(plan, assessment)
     review = _Tier1Review(
         evidence=evidence,
         installation_id=installation_id,
