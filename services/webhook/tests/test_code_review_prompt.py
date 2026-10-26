@@ -329,8 +329,11 @@ def test_unbounded_structured_output_schema_rule_present():
 
 def test_diff_gate_scans_hunk_header_rule_present():
     """Weekly harvest 2026-10-26, routed from the /audit catalogue where it
-    was parked ELDER-ELIGIBLE. quadseven/infra-public#118: the shared leak
-    scanner read a unified diff and skipped `---`/`+++` but not `@@`. Under
+    was parked ELDER-ELIGIBLE. The evidence is a merged fix in the fleet's
+    public reusable-CI repository (left unnamed here: the leak guard blocks
+    cross-repo issue refs, since `owner/repo#N` may name a private repo).
+    Its shared leak scanner read a unified diff and skipped `---`/`+++`
+    but not `@@`. Under
     `git diff -U0` git appends pre-image context to every hunk header, so a
     change removing two leaked lines in a row had the second hunk header
     repeat the first removed line -- and the scanner reported the removal as
