@@ -30,6 +30,7 @@ from code_review_prompt import COMPLEXITY_CORRECTNESS_MARKER
 from github_checks_client import CheckConclusion
 from llm_client import FindingOrigin, LlmReviewResponse, is_withdrawn_finding
 from personas.code_reviewer.diff_parser import DiffHunk
+from personas.code_reviewer.line_refs import align_line_refs, repair_where_refs
 from review_types import Effort, Severity  # single source (#250)
 from review_pipeline import ReviewCoverage
 
@@ -398,7 +399,12 @@ def evaluate_diff(
             and _is_static_declarative_scalar(raw.path, raw.line, hunks)
         ):
             continue
-        message = raw.message
+        # grug#1398: a pre-change number for the anchor line becomes the
+        # head-commit number the comment is anchored to; other lines stay.
+        message = repair_where_refs(
+            align_line_refs(raw.message, raw.path, raw.line, hunks),
+            raw.path, raw.line,
+        )
         if outside_diff:
             message = f"OUTSIDE DIFF (advisory): {outside_reason} {message}"
         kept.append(
