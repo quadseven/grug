@@ -1,8 +1,10 @@
 """grug#1398: a finding's prose line numbers agree with its head-commit anchor.
 
 The model sometimes quotes a line by its pre-change number. Only a number the
-hunk's old-to-new map names as a pre-change alias of the anchor line is
-rewritten; every other real line a message names survives unchanged.
+hunk's old-to-new map names as a pre-change alias of the anchor line, and that
+the diff proves is past the head file's end, is rewritten; every number that
+is or may be a real head line survives unchanged (operator ruling: a finding
+citing two lines keeps both).
 """
 from __future__ import annotations
 
@@ -39,16 +41,35 @@ _DIFF = (
 )
 
 
-def _hunks():
-    return parse_diff(_DIFF)
+# A file that shrank from 30 lines to 4, with its end on screen (the
+# no-newline marker after a context line). Head line 3 (an added line) is
+# inserted before pre-change line 30, and 30 cannot be a head line: the
+# head file has 4.
+_DELS = "".join(f"-gone {i}\n" for i in range(27))
+_EOF_DIFF = (
+    "diff --git a/src/todos.js b/src/todos.js\n"
+    "--- a/src/todos.js\n"
+    "+++ b/src/todos.js\n"
+    "@@ -1,30 +1,4 @@\n"
+    " first\n"
+    f"{_DELS}"
+    " ctx\n"
+    "+const grave = load();\n"
+    " last\n"
+    "\\ No newline at end of file\n"
+)
 
 
-def _review(*findings: LlmFinding):
+def _hunks(diff: str = _DIFF):
+    return parse_diff(diff)
+
+
+def _review(*findings: LlmFinding, diff: str = _DIFF):
     llm = LlmReviewResponse(
         kind="reviewed", findings=findings,
         backend_used=Backend.POOLSIDE, model_name="m",
     )
-    return evaluate_diff(_hunks(), llm)
+    return evaluate_diff(_hunks(diff), llm)
 
 
 def _finding(
@@ -76,16 +97,30 @@ def test_pre_change_aliases_walk_the_old_to_new_map() -> None:
 
 
 def test_prechange_line_in_message_is_published_as_the_anchor_line() -> None:
-    evaluation = _review(_finding("Grug see a quiet grave at line 103"))
+    """A pre-change number that cannot be a head line (the head file has 4
+    lines, the model wrote 30) is published as the anchor line."""
+    evaluation = _review(
+        _finding("Grug see a quiet grave at line 30", line=3), diff=_EOF_DIFF,
+    )
     (f,) = evaluation.findings
-    assert f.line == 130
-    assert f.message == "Grug see a quiet grave at line 130"
+    assert f.line == 3
+    assert f.message == "Grug see a quiet grave at line 3"
     result, _ = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
     )
     (comment,) = result.comments
-    assert "at line 130" in comment.body
-    assert "line 103" not in comment.body
+    assert "at line 3" in comment.body
+    assert "line 30" not in comment.body
+
+
+def test_alias_that_is_a_real_head_line_outside_the_hunks_is_kept() -> None:
+    """Pre-change 103 is an alias of head 130, but head line 103 exists
+    (unchanged, above the second hunk): the model may mean it. Both lines a
+    finding names survive."""
+    msg = "The guard at line 103 does not cover the call at line 130"
+    assert align_line_refs(msg, "src/todos.js", 130, _hunks()) == msg
+    (f,) = _review(_finding(msg)).findings
+    assert f.message == msg
 
 
 def test_where_footer_names_the_inline_anchor() -> None:
@@ -116,16 +151,25 @@ def test_two_different_head_lines_both_survive() -> None:
 
 
 def test_a_number_that_is_not_an_alias_of_the_anchor_is_left_alone() -> None:
-    # 104 is a pre-change number, but of line 131, not of the anchor 130.
-    msg = "Grug see grave at line 103 and its twin at line 104"
-    assert align_line_refs(msg, "src/todos.js", 130, _hunks()) == (
-        "Grug see grave at line 130 and its twin at line 104"
+    hunks = _hunks(_EOF_DIFF)
+    # 29 is a pre-change number, but of head line 2, not of the anchor 3.
+    msg = "Grug see grave at line 30 and its twin at line 29"
+    assert align_line_refs(msg, "src/todos.js", 3, hunks) == (
+        "Grug see grave at line 3 and its twin at line 29"
     )
     # A reference to another file, or a number that is no line, is untouched.
-    other = "Compare `other.js:103` and PR 103 before line 103"
-    assert align_line_refs(other, "src/todos.js", 130, _hunks()) == (
-        "Compare `other.js:103` and PR 103 before line 130"
+    other = "Compare `other.js:30` and PR 30 before line 30"
+    assert align_line_refs(other, "src/todos.js", 3, hunks) == (
+        "Compare `other.js:30` and PR 30 before line 3"
     )
+
+
+def test_no_rewrite_when_the_diff_does_not_show_the_head_file_end() -> None:
+    """Without the end on screen, a number past the shown lines may still be
+    a real head line, so nothing is rewritten."""
+    diff = _EOF_DIFF.replace("\\ No newline at end of file\n", "")
+    msg = "Grug see a quiet grave at line 30"
+    assert align_line_refs(msg, "src/todos.js", 3, _hunks(diff)) == msg
 
 
 def test_alias_that_is_also_a_shown_head_line_is_kept() -> None:
@@ -145,27 +189,29 @@ def test_alias_that_is_also_a_shown_head_line_is_kept() -> None:
 
 
 def test_dot_path_reference_is_aligned() -> None:
-    hunks = parse_diff(_DIFF.replace("src/todos.js", ".github/todos.js"))
+    hunks = parse_diff(_EOF_DIFF.replace("src/todos.js", ".github/todos.js"))
     assert align_line_refs(
-        "Where: `.github/todos.js:103`", ".github/todos.js", 130, hunks,
-    ) == "Where: `.github/todos.js:130`"
+        "Where: `.github/todos.js:30`", ".github/todos.js", 3, hunks,
+    ) == "Where: `.github/todos.js:3`"
 
 
 def test_chunked_review_keeps_numbers_consistent() -> None:
     """A diff reviewed in more than one call: each cohort keeps whole hunks
     with their original headers, so findings from either call are aligned
     against the same map once the answers are merged."""
+    gone = "".join(f"-gone {i}\n" for i in range(10))
     second_file = (
         "diff --git a/lib/b.py b/lib/b.py\n"
         "--- a/lib/b.py\n"
         "+++ b/lib/b.py\n"
-        "@@ -40,3 +50,4 @@\n"
-        " b40\n"
+        "@@ -1,12 +1,3 @@\n"
+        " b1\n"
+        f"{gone}"
         "+b_new = risky()\n"
-        " b41\n"
-        " b42\n"
+        " b12\n"
+        "\\ No newline at end of file\n"
     )
-    hunks = parse_diff(_DIFF + second_file)
+    hunks = parse_diff(_EOF_DIFF + second_file)
     llm_hunks = [LlmHunk(path=h.file_path, body=h.body) for h in hunks]
     plan = plan_review(llm_hunks, max_cohort_chars=200, max_cohort_paths=1)
     assert len(plan.cohorts) >= 2
@@ -173,10 +219,10 @@ def test_chunked_review_keeps_numbers_consistent() -> None:
     assert any("src/todos.js" in p for p in cohort_paths)
     assert any("lib/b.py" in p for p in cohort_paths)
     # One finding per call, each quoting its own pre-change number:
-    # head 130 is pre-change 103; head 51 (added) is pre-change 41.
+    # head 3 is pre-change 30; head 2 of lib/b.py (added) is pre-change 12.
     merged = (
-        _finding("Grug see a quiet grave at line 103"),
-        _finding("Grug see risky call at `lib/b.py:41`", line=51, path="lib/b.py"),
+        _finding("Grug see a quiet grave at line 30", line=3),
+        _finding("Grug see risky call at `lib/b.py:12`", line=2, path="lib/b.py"),
     )
     llm = LlmReviewResponse(
         kind="reviewed", findings=merged,
@@ -184,8 +230,8 @@ def test_chunked_review_keeps_numbers_consistent() -> None:
     )
     evaluation = evaluate_diff(hunks, llm)
     by_path = {f.file: f for f in evaluation.findings}
-    assert by_path["src/todos.js"].message.endswith("at line 130")
-    assert by_path["lib/b.py"].message.endswith("`lib/b.py:51`")
+    assert by_path["src/todos.js"].message.endswith("at line 3")
+    assert by_path["lib/b.py"].message.endswith("`lib/b.py:2`")
     result, _ = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
     )
@@ -220,7 +266,31 @@ def test_inline_body_repairs_where_even_without_evaluate_diff() -> None:
     from dataclasses import replace
     f = replace(base, message="Where: line 151 and Where: `other.js:9`; see line 151")
     body = cr_dispatch._inline_comment_body(f)
-    assert "Where: line 130 and Where: `src/todos.js:130`; see line 151" in body
+    # The first Where names one line of the anchor's file: repaired. The
+    # second names another file (and a second line): left as written.
+    assert "Where: line 130 and Where: `other.js:9`; see line 151" in body
+
+
+def test_where_naming_two_locations_keeps_both() -> None:
+    """Operator ruling: a Where citing two lines keeps both."""
+    for msg in (
+        "Where: `todos.js:90` and `todos.js:130`",
+        "Where: line 90; the call at line 130",
+        "**Where:** lines 90 and 130",
+    ):
+        assert repair_where_refs(msg, "src/todos.js", 130) == msg
+        (f,) = _review(_finding(msg)).findings
+        assert f.message == msg
+        body = cr_dispatch._inline_comment_body(f)
+        assert msg in body
+
+
+def test_where_naming_another_file_is_left_alone() -> None:
+    msg = "**Where:** `src/helper.js:12` guard misses this call"
+    assert repair_where_refs(msg, "src/todos.js", 130) == msg
+    (f,) = _review(_finding(msg)).findings
+    assert f.message == msg
+    assert msg in cr_dispatch._inline_comment_body(f)
 
 
 def test_repair_where_refs_is_narrow_and_idempotent() -> None:
