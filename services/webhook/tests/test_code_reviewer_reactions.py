@@ -573,18 +573,32 @@ def test_poll_and_annotate_submit_failure_does_not_abort_batch(monkeypatch, _pat
 
 
 def test_poll_and_annotate_baseline_write_failure_skips_count(monkeypatch):
-    """submit succeeds but the baseline DDB write fails → not counted as
+    """submit succeeds but the baseline store write fails -> not counted as
     submitted-and-recorded; re-submits next cycle (at-least-once)."""
     monkeypatch.setattr(cr_reactions, "submit_reaction_annotation", lambda **kw: None)
     monkeypatch.setattr(
         cr_reactions, "update_comment_record_reaction",
-        MagicMock(side_effect=RuntimeError("DDB throttle")),
+        MagicMock(side_effect=OSError("store transport error")),
     )
     with patch("httpx.get", return_value=_reactions_response(["-1"])):
         n = cr_reactions.poll_and_annotate(
             [_record(comment_id=1)], install_id=1, fetch_token=lambda: "tok",
         )
-    assert n == 0  # baseline never advanced → will retry next cycle
+    assert n == 0  # baseline never advanced -> will retry next cycle
+
+
+def test_poll_and_annotate_propagates_programmer_error(monkeypatch):
+    """Programmer bugs (KeyError, TypeError) must propagate instead of being
+    swallowed by the transport retry guard."""
+    monkeypatch.setattr(cr_reactions, "submit_reaction_annotation", lambda **kw: None)
+    monkeypatch.setattr(
+        cr_reactions, "update_comment_record_reaction",
+        MagicMock(side_effect=KeyError("bogus_key")),
+    )
+    with patch("httpx.get", return_value=_reactions_response(["-1"])), pytest.raises(KeyError):
+        cr_reactions.poll_and_annotate(
+            [_record(comment_id=1)], install_id=1, fetch_token=lambda: "tok",
+        )
 
 
 def test_poll_and_annotate_logs_mixed_signal(monkeypatch, _patch_store, caplog):

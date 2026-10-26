@@ -453,7 +453,7 @@ def _poll_and_annotate_record(
         if verdict == "false_positive":
             _dismiss_in_session(rec, install_id=install_id, owner=owner, name=name)
         return 1, learned
-    except Exception as e:  # noqa: BLE001 — best-effort per-record
+    except (httpx.HTTPStatusError, httpx.RequestError, OSError) as e:
         log.warning(
             "reaction_submit_or_persist_failed",
             extra={"install_id": install_id, "comment_id": comment_id,
