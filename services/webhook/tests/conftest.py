@@ -26,6 +26,35 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+def _has_live_llm_backend() -> bool:
+    """Check if a live LLM backend is available for live-verified tests.
+
+    This function attempts to import the LLM client and call a simple
+    endpoint to determine if the backend is reachable. Used for
+    conditional test skipping in live-verified tests (issue #989).
+
+    Returns:
+        True if a live LLM backend is available, False otherwise.
+    """
+    try:
+        from llm_client import call_llm
+    except ImportError:
+        return False
+
+    try:
+        # Attempt a lightweight call to check backend availability
+        # This uses the default model (elder) and minimal prompt
+        call_llm(
+            system="Test.",
+            messages=[{"role": "user", "content": "OK"}],
+            model="elder",
+        )
+        return True
+    except Exception:
+        # Backend is not configured or reachable
+        return False
+
+
 def _build_handler(
     *,
     status_codes: list[int] | None = None,
