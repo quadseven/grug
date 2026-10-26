@@ -178,8 +178,10 @@ spec:
   podSelector: {}
   policyTypes: [Egress]
 ---
-# The orphan janitor (not a Trial phase) needs the k8s API (DNS + 443) to list +
-# delete leaked resources. It runs NO author code.
+# The orphan janitor (not a Trial phase) needs the k8s API to list + delete
+# leaked resources. It runs NO author code. The API Service is 443 but its
+# endpoint listens on 6443, and an enforcer matches the port after the Service
+# DNAT, so 6443 is the port that has to be open.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -195,6 +197,7 @@ spec:
         - {protocol: TCP, port: 53}
     - ports:
         - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 6443}
 ---
 # Reap app=grug-trial PVCs/Secrets/Jobs left behind by a launcher-pod crash
 # mid-run (the in-process finally cleanup is skipped on a crash; Jobs TTL-clean
