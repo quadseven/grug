@@ -1971,6 +1971,15 @@ def _upsert_review_stack_comment(
     if section is not None:
         try:
             from personas import board_client
+            found = board_client.find_board(
+                token, owner, repo, pr_number, app_id=get_app_id(),
+            )
+            if found is not None:
+                _, existing_board = found
+                existing_elder = board.extract_section(existing_board, "elder") or ""
+                if "**Closed threads**" in existing_elder and "**Closed threads**" not in section:
+                    closed_part = existing_elder[existing_elder.index("**Closed threads**"):]
+                    section = f"{section.rstrip()}\n\n{closed_part.strip()}"
             board_client.upsert_board_section(
                 token, owner, repo, pr_number,
                 key="elder", section=section, header=header,
