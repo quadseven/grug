@@ -134,6 +134,40 @@ def test_changed_files_table_caps_rows_with_visible_count():
 # --- full comment assembly -------------------------------------------------
 
 
+def test_walkthrough_body_email_rendering_pins_no_heading_no_table_row_no_mermaid():
+    """T1386: walkthrough renders at one text size in phone email clients:
+    no ## heading, no markdown table row, and no mermaid diagram fence."""
+    files = [
+        FileStat(path="a.py", additions=3, deletions=1, summary="added a guard"),
+        FileStat(path="b.py", additions=0, deletions=5, summary=None),
+    ]
+    body = walkthrough_body(
+        summary="Adds a guard clause.",
+        files=files,
+        diagram="graph TD\n  subgraph \"x\"\n    N0[\"a.py\"]\n  end",
+        effort="quick",
+        head_sha="a" * 40,
+        degraded=False,
+    )
+    # Walkthrough heading is body size (bold), not an ATX heading
+    assert "**Walkthrough**" in body
+    assert not any(line.strip().startswith("##") for line in body.splitlines())
+    assert "##" not in body
+
+    # Changed files render as a list, one line each: file, change count, summary
+    assert "- `a.py` (+3/-1) - added a guard" in body
+    assert "- `b.py` (+0/-5)" in body
+    # No markdown table rows anywhere in the body
+    for line in body.splitlines():
+        assert not line.strip().startswith("|"), f"table row found: {line}"
+    assert "|---" not in body
+
+    # Mermaid diagram source never reaches the comment
+    assert "```mermaid" not in body
+    assert "```" not in body
+    assert "Shape of the change" not in body
+
+
 def test_walkthrough_body_carries_marker_summary_table_diagram_effort():
     files = [FileStat(path="x.py", additions=2, deletions=0, summary="tweak")]
     body = walkthrough_body(
@@ -145,17 +179,17 @@ def test_walkthrough_body_carries_marker_summary_table_diagram_effort():
         degraded=False,
     )
     assert body.startswith(MARKER)
-    assert "## Walkthrough" in body
+    assert "**Walkthrough**" in body
+    assert "##" not in body
     assert "Adds a guard clause." in body
     assert "x.py" in body
     assert "tweak" in body
-    assert "```mermaid" in body
+    assert "- `x.py` (+2/-0) - tweak" in body
     assert "quick" in body
     assert "aaaaaaaaaaaa" in body  # truncated head sha
     # Detail is collapsed by default (short PR timeline).
     assert "<details>" in body
     assert "<summary>Changed files (1)</summary>" in body
-    assert "<summary>Shape of the change</summary>" in body
     assert "deterministic sketch" not in body  # not degraded
 
 
@@ -197,18 +231,27 @@ def test_walkthrough_body_no_diagram_and_no_files_omits_the_section_silently():
 
 
 def test_walkthrough_body_no_diagram_with_files_states_a_degradation_reason():
-    """LORE #559 (Compliance ID 6): a missing diagram with real changed
-    files present must state a reason, not silently vanish - build_diagram
-    can return None for a bounded, honest set of reasons (no files, too
-    many top-level directories, or its own balance-check failing)."""
+    """T1386: The mermaid 'Shape of the change' diagram never reaches the
+    email comment; it is left out of the comment entirely."""
     files = [FileStat(path="a.py", additions=1, deletions=0)]
     body = walkthrough_body(
         summary="s", files=files, diagram=None, effort="quick",
         head_sha="b" * 40, degraded=False,
     )
     assert "```mermaid" not in body
-    assert "too large or complex" in body
-    assert "<summary>Shape of the change</summary>" in body
+    assert "Shape of the change" not in body
+
+
+def test_walkthrough_body_diagram_never_reaches_comment():
+    """T1386: The mermaid 'Shape of the change' diagram never reaches the
+    email comment; it is left out of the comment entirely."""
+    files = [FileStat(path="a.py", additions=1, deletions=0)]
+    body = walkthrough_body(
+        summary="s", files=files, diagram="graph TD\n  N0[\"a.py\"]", effort="quick",
+        head_sha="b" * 40, degraded=False,
+    )
+    assert "```mermaid" not in body
+    assert "Shape of the change" not in body
 
 
 def test_walkthrough_body_degraded_says_so_honestly():
@@ -257,10 +300,9 @@ def test_changed_files_table_escapes_pipe_in_plain_summary_cell():
     files = [FileStat(path="a.py", additions=1, deletions=0,
                        summary="fixes | breaks the table")]
     table = changed_files_table(files)
-    assert "fixes \\| breaks the table" in table
-    # Exactly 3 data rows (header + separator + 1) - an unescaped pipe
-    # would fake an extra column/row.
-    assert table.count("\n") == 2
+    assert "fixes | breaks the table" in table
+    assert not table.startswith("|")
+    assert table.count("\n") == 0
 
 
 def test_changed_files_table_collapses_newline_in_summary_cell():
@@ -268,7 +310,7 @@ def test_changed_files_table_collapses_newline_in_summary_cell():
                        summary="line one\nFAKE ROW | injected | here")]
     table = changed_files_table(files)
     assert "\nFAKE ROW" not in table
-    assert table.count("\n") == 2
+    assert table.count("\n") == 0
 
 
 def test_changed_files_table_strips_backtick_from_path_cell():
@@ -279,7 +321,7 @@ def test_changed_files_table_strips_backtick_from_path_cell():
     table = changed_files_table(files)
     assert "evil`](x)[owned" not in table  # the raw, unstripped path is gone
     assert "evil'](x)[owned" in table  # backtick swapped for an apostrophe
-    assert table.count("\n") == 2  # still exactly header + separator + 1 row
+    assert table.count("\n") == 0
 
 
 def test_changed_files_table_neutralizes_mention_in_summary_and_path():
