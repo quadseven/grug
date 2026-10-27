@@ -102,10 +102,10 @@ def test_empty_hunks_returns_no_diff_kind_without_llm_call() -> None:
 
 
 @pytest.mark.parametrize(
-    ("policy", "decision"),
-    [("warn", "warn"), ("block", "block"), ("ignore", "pass")],
+    "policy",
+    ["warn", "block", "ignore"],
 )
-def test_review_diff_carries_policy_and_evidence_to_author(monkeypatch, policy, decision):
+def test_review_diff_carries_policy_and_evidence_to_author(monkeypatch, policy):
     hunks = [
         _hunk("src/a.py", "+def a():\n+    return 1"),
         _hunk("infra/main.tf", '+resource "x" {}'),
@@ -117,7 +117,6 @@ def test_review_diff_carries_policy_and_evidence_to_author(monkeypatch, policy, 
 
     response = review_diff(assemble_evidence(hunks), installation_id=1)
 
-    assert response.reviewability_decision == decision
     if policy == "ignore":
         assert response.reviewability_note == ""
     else:

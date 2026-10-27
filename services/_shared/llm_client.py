@@ -876,7 +876,6 @@ class LlmReviewResponse:
     # grug#1276: which tier served this review ("self-hosted", "free-pool", "subscription").
     tier_served: Optional[str] = None
     reviewability_note: str = ""
-    reviewability_decision: str = "pass"
     reviewability_blocking: bool = False
 
 
@@ -5508,7 +5507,6 @@ def review_diff(
     return replace(
         result,
         reviewability_note=note,
-        reviewability_decision=assessment.decision,
         reviewability_blocking=assessment.decision == "block",
     )
 

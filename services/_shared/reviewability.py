@@ -481,23 +481,39 @@ def _semantic_stem(path: str) -> str:
 
 def _cohort_risk_label(cohort: ReviewCohort, concerns: tuple) -> str:
     """One-line explanation of the risk reduced by reviewing this cohort alone."""
+    relevant = {
+        concern.kind
+        for concern in concerns
+        if set(concern.paths).intersection(cohort.paths)
+    }
     layers = set(cohort.layers)
     if {"implementation", "verification"}.issubset(layers):
-        return (
+        label = (
             "Keeping implementation and its verification in one bounded "
             "unit so behavior and its evidence are reviewed together."
         )
-    if "contract" in layers and len(layers) > 1:
-        return (
+    elif "contract" in layers and len(layers) > 1:
+        label = (
             "Isolating the contract change so consumers are reviewed "
             "separately from the implementations that depend on them."
         )
-    if "verification" in layers and "implementation" not in layers:
-        return (
+    elif "verification" in layers and "implementation" not in layers:
+        label = (
             "Reviewing the verification change on its own so a test-only "
             "edit cannot mask a missing implementation change."
         )
-    return "Reviewing this bounded slice in isolation keeps intent and context tight."
+    else:
+        label = "Reviewing this bounded slice in isolation keeps intent and context tight."
+    if "cross-cohort-module" in relevant:
+        label += (
+            " This boundary limits context switching for a module split across cohorts."
+        )
+    if "cross-cohort-proof" in relevant:
+        label += (
+            " Keeping its proof paths visible reduces the chance that split "
+            "implementation and test evidence are reviewed in isolation."
+        )
+    return label
 
 
 def _build_suggested_cohorts(
