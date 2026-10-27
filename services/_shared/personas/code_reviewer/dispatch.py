@@ -146,7 +146,11 @@ from personas.code_reviewer.degraded_gate import (
     degraded_conclusion, gate_sentence, lead_with_degraded_line,
 )
 from personas.code_reviewer.thread_resolver import is_grug, resolve_fixed_threads
-from personas.code_reviewer.verify import downgrade_bound_names, verify_findings
+from personas.code_reviewer.verify import (
+    CheckEvidence,
+    downgrade_bound_names,
+    verify_findings,
+)
 from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
     CommentFindingOrigin,
@@ -3255,13 +3259,21 @@ def dispatch_code_review(
     # today's review, never blocks. The check-runs already ran in isolated
     # CI; nothing new executes here.
     ci_context: str | None = None
+    # The same listing feeds the covered_by_passing_check kill below (#763),
+    # so a caller-not-updated claim that a passing check on this head
+    # already covers is dropped. Empty on any failure: the kill never fires.
+    head_check_runs: list[dict] = []
+
+    def _fetch_head_check_runs(token: str) -> list[dict]:
+        runs = list(list_check_runs_for_ref(token, owner, repo_name, head_sha) or [])
+        head_check_runs[:] = runs
+        return runs
+
     try:
         ci_context = with_install_token_retry(
             installation_id,
             lambda token: build_ci_status_context(
-                fetch_check_runs=lambda: list_check_runs_for_ref(
-                    token, owner, repo_name, head_sha,
-                ),
+                fetch_check_runs=lambda: _fetch_head_check_runs(token),
                 head_sha=head_sha,
                 hunks=hunks,
             ),
@@ -3420,7 +3432,10 @@ def dispatch_code_review(
     # deterministic sources merged below (complexity, claim-check) are
     # precise by construction. One structured log row per kill so the
     # #707 scoreboard can track precision contribution AND false kills.
-    verified, killed = verify_findings(evaluation.findings, file_contents)
+    verified, killed = verify_findings(
+        evaluation.findings, file_contents,
+        checks=_check_evidence(head_check_runs), head_sha=head_sha,
+    )
     if killed:
         evaluation = with_findings(evaluation, verified)
     _record_verification_kills(
@@ -4111,6 +4126,50 @@ def _apply_bound_name_downgrade(
     return with_findings(evaluation, findings)
 
 
+def _check_evidence(runs: Any) -> tuple[CheckEvidence, ...]:
+    """Check-run dicts as verification evidence (#763). Never raises: a
+    malformed row is skipped, so a weird payload only means no evidence."""
+    evidence: list[CheckEvidence] = []
+    for run in runs or ():
+        if not isinstance(run, dict):
+            continue
+        try:
+            evidence.append(CheckEvidence.from_check_run(run))
+        except Exception:  # noqa: BLE001 - evidence is additive; skip the row
+            continue
+    return tuple(evidence)
+
+
+def _fetch_check_evidence(
+    findings: tuple[Finding, ...], *, installation_id: int, owner: str,
+    repo_name: str, pull_number: int, head_sha: str,
+) -> tuple[CheckEvidence, ...]:
+    """The head's check runs for the deep arm's coverage kill (#763).
+
+    One listing, and only when a caller-not-updated finding could use it.
+    Fails open: any error is no evidence, so every finding is kept.
+    """
+    if not head_sha or not any(
+        f.rule_name == "caller-not-updated" for f in findings
+    ):
+        return ()
+    try:
+        runs = with_install_token_retry(
+            installation_id,
+            lambda token: list_check_runs_for_ref(token, owner, repo_name, head_sha),
+        )
+    except Exception as e:  # noqa: BLE001 - evidence is additive; keep findings
+        log.info(
+            "code_review_check_evidence_degraded",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+        return ()
+    return _check_evidence(runs)
+
+
 def _record_verification_kills(
     killed, *, installation_id: int, owner: str, repo_name: str,
     pull_number: int, arm: str,
@@ -4131,6 +4190,7 @@ def _record_verification_kills(
                 "rule": kf.finding.rule_name,
                 "severity": kf.finding.severity,
                 "reason": kf.reason,
+                "detail": getattr(kf, "detail", ""),
                 "arm": arm,
             },
         )
@@ -4225,6 +4285,7 @@ def _grade_deep_response(
     owner: str,
     repo_name: str,
     pull_number: int,
+    head_sha: str = "",
 ) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
     deep_eval = evaluate_diff(
         hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
@@ -4243,6 +4304,11 @@ def _grade_deep_response(
     deep_verified, deep_killed = verify_findings(
         deep_eval.findings,
         evidence.file_contents,
+        checks=_fetch_check_evidence(
+            deep_eval.findings, installation_id=installation_id, owner=owner,
+            repo_name=repo_name, pull_number=pull_number, head_sha=head_sha,
+        ),
+        head_sha=head_sha,
     )
     if deep_killed:
         deep_eval = with_findings(deep_eval, deep_verified)
@@ -4846,6 +4912,7 @@ def _async_deep_append_if_needed(
             owner=owner,
             repo_name=repo_name,
             pull_number=pull_number,
+            head_sha=head_sha,
         )
 
     # Supersession after long reasoner/judge work (#646 FLINT).
