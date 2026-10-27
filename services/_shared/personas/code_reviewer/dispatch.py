@@ -4135,8 +4135,11 @@ def _check_evidence(runs: Any) -> tuple[CheckEvidence, ...]:
             continue
         try:
             evidence.append(CheckEvidence.from_check_run(run))
-        except Exception:  # noqa: BLE001 - evidence is additive; skip the row
-            continue
+        except Exception as e:  # noqa: BLE001 - evidence is additive; skip the row
+            log.info(
+                "code_review_check_evidence_row_skipped",
+                extra={"kind": type(e).__name__},
+            )
     return tuple(evidence)
 
 
