@@ -55,3 +55,33 @@ def test_launcher_role_lives_in_grug_trial():
     text = _text()
     assert "kind: Role\nmetadata:\n  name: grug-smasher-launcher\n  namespace: grug-trial" in text
     assert "kind: RoleBinding\nmetadata:\n  name: grug-smasher-launcher\n  namespace: grug-trial" in text
+
+
+def _policy(text: str, name: str) -> str:
+    """The YAML document holding the NetworkPolicy `name`."""
+    for doc in text.split("\n---\n"):
+        if "kind: NetworkPolicy" in doc and f"\n  name: {name}\n" in doc:
+            return doc
+    raise AssertionError(f"no NetworkPolicy named {name}")
+
+
+def test_janitor_egress_opens_the_api_server_endpoint_port():
+    # An enforcer matches the port after the Service DNAT: the API Service is
+    # 443 but its endpoint listens on 6443, so a 443-only rule cuts the
+    # janitor off from the API the moment enforcement is turned on.
+    assert "port: 6443" in _policy(_text(), "allow-egress-janitor")
+
+
+def test_prep_and_test_phases_get_no_api_server_port():
+    # Only the janitor needs the API. The prep pod fetches over 443 and the
+    # test pod runs author code fully offline.
+    text = _text()
+    assert "6443" not in _policy(text, "allow-egress-prep")
+    assert "egress:" not in _policy(text, "default-deny-egress")
+
+
+def test_grug_namespace_egress_opens_the_api_server_endpoint_port():
+    # The webhook and consumer (Smasher launcher SA) and the preview janitor
+    # call the API from the grug namespace.
+    grug = (_MANIFEST.parent / "networkpolicy.yaml").read_text()
+    assert "port: 6443" in _policy(grug, "allow-egress-scoped")
