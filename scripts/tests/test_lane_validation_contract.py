@@ -46,15 +46,16 @@ def test_contract_affected_runs_the_elder_purity_attester():
 
 
 def test_contract_affected_command_passes_without_secrets():
-    command = _contract_lines()["affected"]
-    env = {"PATH": os.environ.get("PATH", ""), "LOOM_CHANGED_FILES": ""}
-    if shlex.split(command)[0] == "python3":
+    argv = shlex.split(_contract_lines()["affected"])
+    if argv[0] == "python3":
         # Run under this interpreter so the test does not depend on a
         # python3 shim on PATH; the attester is pure stdlib either way.
-        command = command.replace("python3", shlex.quote(sys.executable), 1)
-    result = subprocess.run(
-        command,
-        shell=True,
+        argv[0] = sys.executable
+    env = {"PATH": os.environ.get("PATH", ""), "LOOM_CHANGED_FILES": ""}
+    # The argv comes from this repo's own contract file, the same trusted
+    # source the lane runner executes it from.
+    result = subprocess.run(  # noqa: S603
+        argv,
         cwd=REPO,
         env=env,
         input="",
