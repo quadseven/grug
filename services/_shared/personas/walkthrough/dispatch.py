@@ -279,6 +279,27 @@ def dispatch_walkthrough_review(
     installation_id = int(installation["id"])
     started_at = hunt_recorder.now()
 
+    # grug#1439: a PR the base-ref `.grug.yaml` `skip_prs` matches gets no
+    # walkthrough comment. Lazy import: Elder's dispatch module owns the
+    # base-ref config fetch, so both personas read the same file the same way.
+    from personas.code_reviewer.dispatch import pr_skip_rule
+
+    try:
+        skip_rule = pr_skip_rule(pr, installation_id, owner, repo_name)
+    except RuntimeError:
+        # Token exchange failed; the diff fetch below hits the same wall and
+        # takes the established fetch_failed path.
+        skip_rule = None
+    if skip_rule is not None:
+        log.info(
+            "walkthrough_skipped_by_config",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "rule": skip_rule},
+        )
+        return {
+            "persona": "walkthrough", "result": "skipped_config",
+            "skipped_by": skip_rule,
+        }
+
     try:
         diff_text = with_install_token_retry(
             installation_id,

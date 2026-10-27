@@ -92,6 +92,7 @@ from personas.code_reviewer.analyzers import (
     run_analyzers,
 )
 from personas.code_reviewer.suggestion import checked_suggestion
+from personas.code_reviewer.line_refs import repair_where_refs
 from markdown_safety import neutralize_mentions
 from personas.code_reviewer.repo_ruff_policy import parse_repo_ruff_policy
 from personas.code_reviewer.cross_file import (
@@ -104,6 +105,8 @@ from personas.code_reviewer.repo_config import (
     config_note as _repo_config_note,
     meets_inline_floor,
     parse_repo_config,
+    skip_pr_rule,
+    skip_summary,
     split_ignored_hunks,
     with_instructions,
 )
@@ -145,7 +148,11 @@ from personas.code_reviewer.degraded_gate import (
     degraded_conclusion, gate_sentence, lead_with_degraded_line,
 )
 from personas.code_reviewer.thread_resolver import is_grug, resolve_fixed_threads
-from personas.code_reviewer.verify import downgrade_bound_names, verify_findings
+from personas.code_reviewer.verify import (
+    CheckEvidence,
+    downgrade_bound_names,
+    verify_findings,
+)
 from personas.tribe import CHECK_ELDER
 from adapters.install_store import (  # type: ignore
     CommentFindingOrigin,
@@ -476,20 +483,87 @@ def _load_repo_ruff_policy(installation_id: int, owner: str, repo_name: str, bas
     return parse_repo_ruff_policy(next((fetched[path] for path in _RUFF_POLICY_PATHS if path in fetched), None))
 
 
-def _apply_repo_config(
-    hunks: tuple[DiffHunk, ...], pr: dict[str, Any], installation_id: int,
-    owner: str, repo_name: str,
-) -> tuple[tuple[DiffHunk, ...], RepoConfig, str]:
-    """Load `.grug.yaml` from the PR base and drop `ignore`d hunks.
-
-    Returns (kept hunks, config, summary note). The base is the PR's own
-    base commit (falling back to the base branch name), never the head and
-    never the living-hunt baseline."""
+def _load_pr_repo_config(
+    pr: dict[str, Any], installation_id: int, owner: str, repo_name: str,
+) -> RepoConfig:
+    """`.grug.yaml` at the PR's own base commit (falling back to the base
+    branch name), never the head and never the living-hunt baseline."""
     base = pr.get("base") or {}
-    config = _load_repo_config(
+    return _load_repo_config(
         installation_id, owner, repo_name,
         str(base.get("sha") or base.get("ref") or ""),
     )
+
+
+def pr_skip_rule(
+    pr: dict[str, Any], installation_id: int, owner: str, repo_name: str,
+    config: RepoConfig | None = None,
+) -> str | None:
+    """The base-ref `.grug.yaml` `skip_prs` rule this PR matches, or None
+    (grug#1439). Shared by Elder and Teller; Chief and Guard never call it."""
+    if config is None:
+        config = _load_pr_repo_config(pr, installation_id, owner, repo_name)
+    return skip_pr_rule(
+        config,
+        author=str((pr.get("user") or {}).get("login") or ""),
+        labels=_pr_labels(pr),
+        title=str(pr.get("title") or ""),
+    )
+
+
+def _publish_config_skip(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str, *, rule: str,
+) -> dict[str, str]:
+    """Complete the Elder check `success` for a PR skipped by `skip_prs`.
+
+    No review, no inline comment, no board: the maintainer opted this PR
+    out on the base branch, so the check passes and says why. A publish
+    failure returns `publish_failed` so the durable consumer redrives
+    instead of leaving the enqueue's in_progress check behind."""
+    summary = skip_summary(rule)
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: post_check_run(
+                token, owner, repo_name,
+                CheckRunResult(
+                    name=_CHECK_NAME, head_sha=head_sha, status="completed",
+                    conclusion="success", title="Elder skipped this PR",
+                    summary=summary,
+                ),
+                external_id=(
+                    f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
+                ),
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.error(
+            "code_review_config_skip_publish_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+        return {"persona": "code_reviewer", "result": "publish_failed"}
+    log.info(
+        "code_review_skipped_by_config",
+        extra={"pr": f"{owner}/{repo_name}#{pull_number}", "rule": rule},
+    )
+    return {"persona": "code_reviewer", "result": "pass", "skipped_by": rule}
+
+
+def _apply_repo_config(
+    hunks: tuple[DiffHunk, ...], pr: dict[str, Any], installation_id: int,
+    owner: str, repo_name: str, config: RepoConfig | None = None,
+) -> tuple[tuple[DiffHunk, ...], RepoConfig, str]:
+    """Load `.grug.yaml` from the PR base and drop `ignore`d hunks.
+
+    Returns (kept hunks, config, summary note). `config`, when given, is
+    the one already loaded for this pass, so the file is fetched once."""
+    if config is None:
+        config = _load_pr_repo_config(pr, installation_id, owner, repo_name)
     kept, ignored = split_ignored_hunks(hunks, config)
     return kept, config, _repo_config_note(config, ignored)
 
@@ -880,6 +954,13 @@ def _review_transparency(
         if suppressed_count
         else ""
     )
+    if evaluation.dropped_withdrawn:
+        # grug#1397: say how many candidates were dropped because the
+        # reviewer's own text ruled them out, so the drop is never silent.
+        lines += (
+            f"\n\nGrug dropped {evaluation.dropped_withdrawn} candidate(s) "
+            "the reviewer itself withdrew (its own verdict said no finding)."
+        )
     coverage = evaluation.coverage
     if coverage is not None:
         lines += _coverage_lines(coverage)
@@ -1000,6 +1081,38 @@ def _defensive_drop_note(count: int) -> str:
     return f"\n\n{count} defensive findings dropped: no reachable caller named"
 
 
+def _tier_served_note(tier_served: str | None) -> str:
+    return f"\n\nTier served: `{tier_served}`." if tier_served else ""
+
+
+def _hunt_title(title: str, living_range: str) -> str:
+    return f"Living Hunt {living_range} - {title}" if living_range else title
+
+
+def _hunt_section(living_range: str, living_baseline_rejected: str = "") -> str:
+    hunt = (
+        (
+            "\n\nLiving Hunt: reviewing `"
+            + living_range
+            + "` (files changed since the last completed Elder pass)."
+        )
+        if living_range
+        else ""
+    )
+    if living_baseline_rejected:
+        # #845: the stored baseline was rejected as a non-ancestor - the
+        # range above is empty because no delta was reviewed, but the
+        # fallback must be visible in the check-run, not just the logs.
+        hunt += (
+            "\n\nLiving Hunt: the stored baseline `"
+            + living_baseline_rejected
+            + "` was not an ancestor of the current head, or the range held a "
+            "merge commit (history was rewritten or merged into) - Elder reviewed the full PR diff instead of the "
+            "delta since the last pass."
+        )
+    return hunt
+
+
 def _summary_markdown(
     evaluation: CodeReviewEvaluation,
     *,
@@ -1037,51 +1150,30 @@ def _summary_markdown(
         duplicate_paths,
     )
     defensive_note = _defensive_drop_note(defensive_dropped_count)
-    hunt = (
-        (
-            "\n\nLiving Hunt: reviewing `"
-            + living_range
-            + "` (files changed since the last completed Elder pass)."
-        )
-        if living_range
-        else ""
-    )
-    if living_baseline_rejected:
-        # #845: the stored baseline was rejected as a non-ancestor - the
-        # range above is empty because no delta was reviewed, but the
-        # fallback must be visible in the check-run, not just the logs.
-        hunt += (
-            "\n\nLiving Hunt: the stored baseline `"
-            + living_baseline_rejected
-            + "` was not an ancestor of the current head, or the range held a "
-            "merge commit (history was rewritten or merged into) - Elder reviewed the full PR diff instead of the "
-            "delta since the last pass."
-        )
-
-    def hunt_title(title: str) -> str:
-        return f"Living Hunt {living_range} - {title}" if living_range else title
+    tier_note = _tier_served_note(getattr(evaluation, "tier_served", None))
+    hunt = _hunt_section(living_range, living_baseline_rejected)
 
     if is_partial_coverage(evaluation.degraded_reason):
         # Reached the PR again only after grug#806: this branch existed but
         # rerun.py's fail-open re-posted "Elder skipped - partial_review" over
         # it, so nobody ever saw it. Same event, same words as the board now.
         title = "WARN Elder review coverage partial"
-        return hunt_title(title), (
+        return _hunt_title(title, living_range), (
             "Grug walked part of the diff - some ground did not fit one look, "
             "or a bounded cohort returned nothing usable. Validated markings "
             "from the ground Grug walked are published below. "
             + gate_sentence(blocking)
             + " Coverage detail is in the table above."
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + tier_note
     if is_low_confidence(evaluation.degraded_reason):
         title = "WARN Elder review low confidence"
-        return hunt_title(title), (
+        return _hunt_title(title, living_range), (
             "Part of the diff got only a very short \"no findings\" answer "
             "that no other model confirmed, because every other model failed "
             "this pass. Grug keep the answer but not trust it. Validated "
             "markings from the rest are published below. "
             + gate_sentence(blocking)
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + tier_note
     if review_phase == "deep" and is_blackout(evaluation.degraded_reason):
         # grug#848: a blackout in the deep phase is the REASONER arm's -
         # `_async_deep_decision` never starts the deep append over a
@@ -1091,13 +1183,13 @@ def _summary_markdown(
         # later if escalated") never happened, and this neutral is not the
         # reasoner agreeing.
         title = f"WARN Elder deep arm did not run ({evaluation.degraded_reason})"
-        return hunt_title(title), (
+        return _hunt_title(title, living_range), (
             "Tier-1 coder-arm review completed and its markings stand. The "
             "deep reasoner arm promised on escalation did not run this pass "
             f"- the mist: `{evaluation.degraded_reason}`. Grug not say the "
             "deeper look agreed; it never looked. "
             + gate_sentence(blocking)
-        ) + held + hunt + defensive_note
+        ) + held + hunt + defensive_note + tier_note
     if evaluation.degraded_reason:
         # grug#985: when some cohorts were never opened (starved of budget),
         # the headline must not read like every cohort ran and broke.
@@ -1117,11 +1209,11 @@ def _summary_markdown(
             if starved
             else ""
         )
-        return hunt_title(title), (
+        return _hunt_title(title, living_range), (
             "Grug Elder could not see the diff this pass. The mist: "
             f"`{evaluation.degraded_reason}`. "
             + gate_sentence(blocking)
-        ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note
+        ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note + tier_note
     if not evaluation.findings:
         title = (
             "Elder clear - no markings"
@@ -1131,11 +1223,11 @@ def _summary_markdown(
         scope = _clean_review_scope(
             living_range, excluded_paths, oversized_paths, duplicate_paths,
         )
-        return hunt_title(title), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note
+        return _hunt_title(title, living_range), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note + tier_note
 
     blocking = sum(1 for f in evaluation.findings if f.severity in ("high", "critical"))
     title = f"Elder markings - {blocking} blocking, {len(evaluation.findings)} total"
-    title = hunt_title(title)
+    title = _hunt_title(title, living_range)
     table = _findings_table(evaluation)
     phase_line = _review_phase_line(review_phase)
     legend = (
@@ -1143,7 +1235,7 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}"
+    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}{tier_note}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -1503,7 +1595,10 @@ def _inline_comment_body(
         chip += f" | {_effort_chip(f.effort)}"
     head = (
         f"{chip}\n\n"
-        f"**What Elder sees**\n\n{_defused(f.message)}\n\n"
+        # grug#1398 publish-time check: a Where the model wrote into the
+        # message names the anchor, the same line the footer renders.
+        f"**What Elder sees**\n\n"
+        f"{_defused(repair_where_refs(f.message, f.file, f.line))}\n\n"
         f"**Why it matters**\n\n{_defused(_why_it_matters(f.rule_name))}\n\n"
         f"**Where:** `{_md_code_span(f.file)}:{f.line}`"
     )
@@ -1630,6 +1725,7 @@ def worth_an_email(evaluation: CodeReviewEvaluation) -> bool:
 def _stack_detail_lines(
     review_phase: str, living_range: str, suppressed_count: int,
     head_sha: str = "", base_sha: str = "",
+    tier_served: str | None = None,
 ) -> str:
     """The two facts a skeptical reader asks for: what was looked at, and what
     was withheld. Everything else that used to live here was cut as noise.
@@ -1651,6 +1747,8 @@ def _stack_detail_lines(
     )
     if scope:
         lines.append(f"- Looked at: {scope}")
+    if tier_served:
+        lines.append(f"- Tier served: `{tier_served}`")
     if suppressed_count:
         lines.append(f"- Grug swallow {suppressed_count} weak thought(s).")
     return "\n".join(lines)
@@ -1776,6 +1874,7 @@ def _review_stack_body(
     pr_title: str = "",
     head_sha: str = "",
     base_sha: str = "",
+    file_contents: dict[str, str] | None = None,
     linked_issues: tuple[int, ...] = (),
 ) -> str:
     """PR-timeline review stack comment (Markings v2 / FLINT-style shell).
@@ -1816,6 +1915,12 @@ def _review_stack_body(
         rows.append(f"| +{n - _STACK_TABLE_ROWS} more | | | |")
     table = "\n".join(rows) if findings else ""
 
+    committable = [
+        f for f in findings
+        if checked_suggestion(f, f.line, (file_contents or {}).get(f.file, ""))
+        is not None
+    ]
+
     # The BOARD (#791). What a human receives by email is exactly this body at
     # CREATION time - GitHub never mails an edit - so the verdict leads and all
     # evidence is folded. Previously the first thing posted was a file table
@@ -1824,6 +1929,11 @@ def _review_stack_body(
     blocking = sum(1 for f in findings if f.severity in ("high", "critical"))
     advisory = len(findings) - blocking
     parts: list[str] = []
+    if committable:
+        parts.append(
+            f"**Finishing touch:** {len(committable)} unresolved suggestion(s) "
+            "can be applied together with `/grug fix`."
+        )
     # Phase, Status and Check-run used to live in the fold. All three were cut:
     # Status restated the summary line verbatim, Phase ("Tier-1 coder arm") is
     # internal vocabulary that means nothing to the author, and the check-run
@@ -1837,6 +1947,7 @@ def _review_stack_body(
         table,
         _stack_detail_lines(
             review_phase, living_range, suppressed_count, head_sha, base_sha,
+            tier_served=getattr(evaluation, "tier_served", None),
         ),
     ] if p)
     if detail:
@@ -2956,6 +3067,19 @@ def dispatch_code_review(
         if stale is not None:
             return stale
 
+    # grug#1439: `.grug.yaml` `skip_prs`, read from the BASE ref so a PR
+    # cannot opt itself out. Checked before the diff fetch so a skipped PR
+    # spends nothing; the same config feeds `ignore` and friends below.
+    base_repo_config = _load_pr_repo_config(pr, installation_id, owner, repo_name)
+    skip_rule = pr_skip_rule(
+        pr, installation_id, owner, repo_name, config=base_repo_config,
+    )
+    if skip_rule is not None:
+        return _publish_config_skip(
+            installation_id, owner, repo_name, pull_number, head_sha,
+            rule=skip_rule,
+        )
+
     # DiffParseError → advisory neutral so a fetcher bug or GitHub
     # format drift cannot 500 the webhook.
     try:
@@ -3024,6 +3148,7 @@ def dispatch_code_review(
         # before anything below (full-file fetch, prompt, judge) can see them.
         hunks, repo_config, config_note = _apply_repo_config(
             hunks, pr, installation_id, owner, repo_name,
+            config=base_repo_config,
         )
         # A hunk bigger than a whole cohort can never be reviewed - the
         # planner will not truncate it (line anchors), so it becomes a solo
@@ -3217,13 +3342,21 @@ def dispatch_code_review(
     # today's review, never blocks. The check-runs already ran in isolated
     # CI; nothing new executes here.
     ci_context: str | None = None
+    # The same listing feeds the covered_by_passing_check kill below (#763),
+    # so a caller-not-updated claim that a passing check on this head
+    # already covers is dropped. Empty on any failure: the kill never fires.
+    head_check_runs: list[dict] = []
+
+    def _fetch_head_check_runs(token: str) -> list[dict]:
+        runs = list(list_check_runs_for_ref(token, owner, repo_name, head_sha) or [])
+        head_check_runs[:] = runs
+        return runs
+
     try:
         ci_context = with_install_token_retry(
             installation_id,
             lambda token: build_ci_status_context(
-                fetch_check_runs=lambda: list_check_runs_for_ref(
-                    token, owner, repo_name, head_sha,
-                ),
+                fetch_check_runs=lambda: _fetch_head_check_runs(token),
                 head_sha=head_sha,
                 hunks=hunks,
             ),
@@ -3382,7 +3515,10 @@ def dispatch_code_review(
     # deterministic sources merged below (complexity, claim-check) are
     # precise by construction. One structured log row per kill so the
     # #707 scoreboard can track precision contribution AND false kills.
-    verified, killed = verify_findings(evaluation.findings, file_contents)
+    verified, killed = verify_findings(
+        evaluation.findings, file_contents,
+        checks=_check_evidence(head_check_runs), head_sha=head_sha,
+    )
     if killed:
         evaluation = with_findings(evaluation, verified)
     _record_verification_kills(
@@ -3744,6 +3880,7 @@ def dispatch_code_review(
                 pr_title=str(pr_context.get("title") or ""),
                 head_sha=head_sha,
                 base_sha=str(pr_context.get("base_sha") or ""),
+                file_contents=file_contents,
                 linked_issues=pinned_issues,
             )
             with_install_token_retry(
@@ -3799,6 +3936,7 @@ def dispatch_code_review(
             "models": list(llm_response.models_used),
             "findings_count": len(evaluation.findings),
             "dropped_hallucinations": evaluation.dropped_hallucinations,
+            "dropped_withdrawn": evaluation.dropped_withdrawn,
             "degraded_reason": evaluation.degraded_reason,
             # How much of the diff was actually walked, as a number the
             # eval harness (#645) can track directly instead of parsing
@@ -4071,6 +4209,53 @@ def _apply_bound_name_downgrade(
     return with_findings(evaluation, findings)
 
 
+def _check_evidence(runs: Any) -> tuple[CheckEvidence, ...]:
+    """Check-run dicts as verification evidence (#763). Never raises: a
+    malformed row is skipped, so a weird payload only means no evidence."""
+    evidence: list[CheckEvidence] = []
+    for run in runs or ():
+        if not isinstance(run, dict):
+            continue
+        try:
+            evidence.append(CheckEvidence.from_check_run(run))
+        except Exception as e:  # noqa: BLE001 - evidence is additive; skip the row
+            log.info(
+                "code_review_check_evidence_row_skipped",
+                extra={"kind": type(e).__name__},
+            )
+    return tuple(evidence)
+
+
+def _fetch_check_evidence(
+    findings: tuple[Finding, ...], *, installation_id: int, owner: str,
+    repo_name: str, pull_number: int, head_sha: str,
+) -> tuple[CheckEvidence, ...]:
+    """The head's check runs for the deep arm's coverage kill (#763).
+
+    One listing, and only when a caller-not-updated finding could use it.
+    Fails open: any error is no evidence, so every finding is kept.
+    """
+    if not head_sha or not any(
+        f.rule_name == "caller-not-updated" for f in findings
+    ):
+        return ()
+    try:
+        runs = with_install_token_retry(
+            installation_id,
+            lambda token: list_check_runs_for_ref(token, owner, repo_name, head_sha),
+        )
+    except Exception as e:  # noqa: BLE001 - evidence is additive; keep findings
+        log.info(
+            "code_review_check_evidence_degraded",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+        return ()
+    return _check_evidence(runs)
+
+
 def _record_verification_kills(
     killed, *, installation_id: int, owner: str, repo_name: str,
     pull_number: int, arm: str,
@@ -4091,6 +4276,7 @@ def _record_verification_kills(
                 "rule": kf.finding.rule_name,
                 "severity": kf.finding.severity,
                 "reason": kf.reason,
+                "detail": getattr(kf, "detail", ""),
                 "arm": arm,
             },
         )
@@ -4185,6 +4371,7 @@ def _grade_deep_response(
     owner: str,
     repo_name: str,
     pull_number: int,
+    head_sha: str = "",
 ) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
     deep_eval = evaluate_diff(
         hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
@@ -4203,6 +4390,11 @@ def _grade_deep_response(
     deep_verified, deep_killed = verify_findings(
         deep_eval.findings,
         evidence.file_contents,
+        checks=_fetch_check_evidence(
+            deep_eval.findings, installation_id=installation_id, owner=owner,
+            repo_name=repo_name, pull_number=pull_number, head_sha=head_sha,
+        ),
+        head_sha=head_sha,
     )
     if deep_killed:
         deep_eval = with_findings(deep_eval, deep_verified)
@@ -4649,6 +4841,7 @@ def _publish_deep_review(
             pr_title=pr_title,
             head_sha=head_sha,
             base_sha=base_sha,
+            file_contents=file_contents or {},
             linked_issues=linked_issues,
         )
         with_install_token_retry(
@@ -4805,6 +4998,7 @@ def _async_deep_append_if_needed(
             owner=owner,
             repo_name=repo_name,
             pull_number=pull_number,
+            head_sha=head_sha,
         )
 
     # Supersession after long reasoner/judge work (#646 FLINT).
