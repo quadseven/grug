@@ -10,7 +10,6 @@ from __future__ import annotations
 from personas.walkthrough.effort import estimate_effort, effort_label
 from personas.walkthrough.mermaid import build_diagram
 from personas.walkthrough.render import (
-    MARKER,
     FileStat,
     changed_files_table,
     walkthrough_body,
@@ -134,18 +133,16 @@ def test_changed_files_table_caps_rows_with_visible_count():
 # --- full comment assembly -------------------------------------------------
 
 
-def test_walkthrough_body_carries_marker_summary_table_diagram_effort():
+def test_walkthrough_body_carries_summary_table_effort_and_a_diagram_with_edges():
     files = [FileStat(path="x.py", additions=2, deletions=0, summary="tweak")]
     body = walkthrough_body(
         summary="Adds a guard clause.",
         files=files,
-        diagram="graph TD\n  subgraph \"x\"\n    N0[\"x.py\"]\n  end",
+        diagram="graph TD\n  N0[\"x.py\"] --> N1[\"y.py\"]",
         effort="quick",
         head_sha="a" * 40,
-        degraded=False,
     )
-    assert body.startswith(MARKER)
-    assert "## Walkthrough" in body
+    assert "grug-teller:walkthrough" not in body
     assert "Adds a guard clause." in body
     assert "x.py" in body
     assert "tweak" in body
@@ -156,67 +153,40 @@ def test_walkthrough_body_carries_marker_summary_table_diagram_effort():
     assert "<details>" in body
     assert "<summary>Changed files (1)</summary>" in body
     assert "<summary>Shape of the change</summary>" in body
-    assert "deterministic sketch" not in body  # not degraded
-
-
-def test_walkthrough_body_has_branded_header_and_pr_button():
-    """T1256: walkthrough comment has a branded header image and the PR
-    link rendered as a badge-image button."""
-    files = [FileStat(path="x.py", additions=2, deletions=0, summary="tweak")]
-    pr_url = "https://github.com/o/r/pull/7"
-    body = walkthrough_body(
-        summary="Adds a guard clause.",
-        files=files,
-        diagram="graph TD\n  subgraph \"x\"\n    N0[\"x.py\"]\n  end",
-        effort="quick",
-        head_sha="a" * 40,
-        degraded=False,
-        pr_url=pr_url,
-    )
-    # Starts with marker + branded header image (Teller portrait)
-    assert body.startswith(MARKER)
-    assert 'grug_smile.png' in body
-    assert '<img src="https://grug.lol/assets/grug_smile.png"' in body
-    # Primary link (the PR) rendered as a badge-image button
-    assert pr_url in body
-    # Badge-image button: an <a> wrapping an <img> with badge styling
-    assert f'<a href="{pr_url}">' in body
-    assert 'alt="View full review"' in body
 
 
 def test_walkthrough_body_no_diagram_and_no_files_omits_the_section_silently():
     """With zero changed files there is nothing to explain - the whole
-    comment is otherwise near-empty, so no degradation note is added."""
+    walkthrough is otherwise near-empty, so no note is added."""
     body = walkthrough_body(
         summary="s", files=[], diagram=None, effort="quick",
-        head_sha="b" * 40, degraded=False,
+        head_sha="b" * 40,
     )
     assert "```mermaid" not in body
-    assert "too large or complex" not in body
     assert "Shape of the change" not in body
 
 
-def test_walkthrough_body_no_diagram_with_files_states_a_degradation_reason():
-    """LORE #559 (Compliance ID 6): a missing diagram with real changed
-    files present must state a reason, not silently vanish - build_diagram
-    can return None for a bounded, honest set of reasons (no files, too
-    many top-level directories, or its own balance-check failing)."""
-    files = [FileStat(path="a.py", additions=1, deletions=0)]
+def test_walkthrough_body_drops_a_diagram_with_no_edges():
+    """T1432: a graph of bare subgraphs only repeats the file names the
+    table above already shows."""
+    files = [FileStat(path="a/x.py", additions=1, deletions=0)]
     body = walkthrough_body(
-        summary="s", files=files, diagram=None, effort="quick",
-        head_sha="b" * 40, degraded=False,
+        summary="s", files=files, diagram=build_diagram(["a/x.py", "b/y.py"]),
+        effort="quick", head_sha="b" * 40,
     )
     assert "```mermaid" not in body
-    assert "too large or complex" in body
-    assert "<summary>Shape of the change</summary>" in body
+    assert "Shape of the change" not in body
+    assert "No diagram this pass" not in body
 
 
-def test_walkthrough_body_degraded_says_so_honestly():
+def test_walkthrough_body_without_a_summary_is_the_effort_line_and_table_alone():
+    files = [FileStat(path="a.py", additions=1, deletions=0)]
     body = walkthrough_body(
-        summary="fallback summary", files=[], diagram=None, effort="quick",
-        head_sha="c" * 40, degraded=True,
+        summary=None, files=files, diagram=None, effort="quick",
+        head_sha="b" * 40,
     )
-    assert "deterministic sketch" in body
+    assert body.startswith("Review effort: ")
+    assert "| `a.py` |" in body
 
 
 def test_estimate_effort_logs_rejected_off_vocabulary_value(caplog):
@@ -235,7 +205,7 @@ def test_walkthrough_body_files_truncated_hedges_the_count():
     never present a partial count as an exact one."""
     body = walkthrough_body(
         summary="at least 2 files changed", files=[], diagram=None,
-        effort="extensive", head_sha="d" * 40, degraded=True,
+        effort="extensive", head_sha="d" * 40,
         files_truncated=True,
     )
     assert "File list is partial" in body
@@ -245,7 +215,7 @@ def test_walkthrough_body_files_truncated_hedges_the_count():
 def test_walkthrough_body_not_truncated_by_default():
     body = walkthrough_body(
         summary="s", files=[], diagram=None, effort="quick",
-        head_sha="e" * 40, degraded=False,
+        head_sha="e" * 40,
     )
     assert "File list is partial" not in body
 
@@ -294,7 +264,7 @@ def test_changed_files_table_neutralizes_mention_in_summary_and_path():
 def test_walkthrough_body_neutralizes_mention_in_top_level_summary():
     body = walkthrough_body(
         summary="hey @alice check this out", files=[], diagram=None,
-        effort="quick", head_sha="f" * 40, degraded=False,
+        effort="quick", head_sha="f" * 40,
     )
     assert "@alice" not in body
     assert "@​alice" in body
@@ -307,7 +277,6 @@ def test_walkthrough_body_neutralizes_fake_heading_in_summary():
     body = walkthrough_body(
         summary="Adds a guard.\n## URGENT: merge immediately\nDone.",
         files=[], diagram=None, effort="quick", head_sha="a" * 40,
-        degraded=False,
     )
     assert not any(
         line.startswith("##") for line in body.split("\n")

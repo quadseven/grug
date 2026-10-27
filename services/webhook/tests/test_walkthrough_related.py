@@ -2,52 +2,7 @@
 
 from __future__ import annotations
 
-from personas.walkthrough.related import RelatedPR, find_related_prs
-from personas.walkthrough.render import FileStat, walkthrough_body
-
-# --- render: the section -----------------------------------------------
-
-
-def _body(related):
-    return walkthrough_body(
-        summary="Does a thing.",
-        files=[FileStat(path="a.py", additions=1, deletions=0)],
-        diagram=None,
-        effort="quick",
-        head_sha="b" * 40,
-        degraded=False,
-        related=related,
-    )
-
-
-def test_walkthrough_body_renders_related_hunts_section():
-    related = [
-        RelatedPR(number=101, title="Fix the thing", reason="touched a.py"),
-        RelatedPR(number=99, title="Earlier thing", reason="similar intent"),
-    ]
-    body = _body(related)
-    assert "Possibly related hunts" in body
-    assert "#101" in body
-    assert "Fix the thing" in body
-    assert "touched a.py" in body
-    assert "#99" in body
-
-
-def test_walkthrough_body_omits_related_hunts_when_empty():
-    body = _body([])
-    assert "Possibly related hunts" not in body
-
-
-def test_walkthrough_body_omits_related_hunts_when_none():
-    body = _body(None)
-    assert "Possibly related hunts" not in body
-
-
-def test_walkthrough_body_neutralizes_mentions_in_related_titles():
-    related = [RelatedPR(number=7, title="ping @evil-user", reason="x")]
-    body = _body(related)
-    assert "@evil-user" not in body
-
+from personas.walkthrough.related import find_related_prs
 
 # --- retrieval: scoring + bounds ----------------------------------------
 
