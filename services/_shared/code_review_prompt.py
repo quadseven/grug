@@ -589,6 +589,35 @@ RULES: tuple[ReviewRule, ...] = (
         '                             "maxLength": MAX_MESSAGE_CHARS}}}}',
         severity="medium",
     ),
+    ReviewRule(
+        name="stderr-folded-into-compared-value",
+        bug_class="silent failure",
+        description="A command's stderr merged into its stdout -- `2>&1` "
+        "inside `$(...)`, `stderr=subprocess.STDOUT`, "
+        "`check_output(..., stderr=STDOUT)` -- where the captured text is "
+        "then COMPARED, parsed, or used as a value rather than only logged. "
+        "Any layer on the path can write a banner to stderr: a credential "
+        "exec plugin, a cloud CLI wrapper, a shim, a deprecation notice. "
+        "That text is folded into the value, so an equality test or a parse "
+        "silently goes false -- and the contaminating layer is usually one "
+        "nobody in the diff is thinking about, because it is not the command "
+        "being read. Worst where a false comparison means SKIP rather than "
+        "error: the step does nothing, logs nothing, and looks exactly like "
+        "'not opted in'. The merge is nearly always there for diagnostics "
+        "the author wanted in the log. Fix: read stdout alone, send stderr "
+        "somewhere it stays readable, surface its first lines in the error "
+        "on a failed read, and LOG the skip branch so 'skipped' stops being "
+        "indistinguishable from 'absent'. A `2>&1` whose result is only "
+        "echoed or logged is not this.",
+        bad_example='opt=$(some-cli get "$n" -o value 2>&1)   # banner folded in\n'
+        'if [ "$opt" = "true" ]; then wait_for "$n"; fi\n'
+        '# never equal -> silent skip, and nothing is logged',
+        good_example='opt=$(some-cli get "$n" -o value 2>/tmp/opt.err) || {\n'
+        '  echo "read failed: $(head -3 /tmp/opt.err)" >&2; exit 1; }\n'
+        'if [ "$opt" = "true" ]; then wait_for "$n"\n'
+        'else echo "note: $n not waited on (flag=$opt)"; fi',
+        severity="medium",
+    ),
 )
 
 
