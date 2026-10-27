@@ -22,7 +22,7 @@ _BASIC_CONFIG_RE = re.compile(r"\blogging\.basicConfig\(")
 
 # Files allowed to call basicConfig() directly, with the reason each is safe:
 # - one-off developer CLI tools (sast_benchmark, elder_eval, review_latency
-#   __main__.py entrypoints) are run locally/in CI for ad hoc analysis, never
+#   __main__.py entrypoints, and elder_eval/missed_classes.py) are run locally/in CI for ad hoc analysis, never
 #   deployed as a long-running k8s workload DD scrapes for status-based
 #   alerting.
 # - smasher's trial_worker/trial_deps/trial_fetch run INSIDE the locked-down,
@@ -33,6 +33,7 @@ _BASIC_CONFIG_RE = re.compile(r"\blogging\.basicConfig\(")
 _ALLOWLIST_RELATIVE = (
     "sast_benchmark/__main__.py",
     "elder_eval/__main__.py",
+    "elder_eval/missed_classes.py",
     "review_latency/__main__.py",
     "personas/smasher/trial_worker.py",
     "personas/smasher/trial_deps.py",
