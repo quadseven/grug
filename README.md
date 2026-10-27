@@ -25,7 +25,7 @@ are enabled by default:
 - **Chief** (`Grug - Chief`) - plan readiness before the hunt leaves the cave
 - **Elder** (`Grug - Elder`) - durable Cave review with Markings, Lore, Omen
 - **Guard** (`Grug - Guard`) - cave-mouth security (SAST, secrets, SCA, IaC + Seer)
-- **Teller** (`Grug - Teller`) - tale of the hunt (walkthrough + mermaid map)
+- **Teller** (`Grug - Teller`) - tale of the hunt (walkthrough in the board and check run)
 
 **Smasher**, **Warder**, and **Pulse** are wired as opt-in tracers. Omen runtime
 signal already augments Elder where a repository-to-service mapping exists.
