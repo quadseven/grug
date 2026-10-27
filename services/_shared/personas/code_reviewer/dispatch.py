@@ -747,6 +747,7 @@ def _carry_into_check(
     *, action: str, evaluation: CodeReviewEvaluation, mode: ReviewMode,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, conclusion: CheckConclusion, title: str, summary: str,
+    threads: list[dict] | None = None,
 ) -> tuple[CheckConclusion, str, str, list[dict] | None]:
     """Fold Elder's earlier findings into the check verdict: still-open ones
     via carry-forward, and ones this push addressed as a title note (#1187),
@@ -758,9 +759,10 @@ def _carry_into_check(
     """
     if action not in _RE_REVIEW_ACTIONS or evaluation.degraded_reason:
         return conclusion, title, summary, None
-    threads = carry_forward.list_threads(
-        installation_id, owner, repo_name, pull_number,
-    )
+    if threads is None:
+        threads = carry_forward.list_threads(
+            installation_id, owner, repo_name, pull_number,
+        )
     if threads is None:
         return conclusion, title, summary, None
     carried = carry_forward.select_carried(threads, evaluation.findings)
@@ -3649,6 +3651,25 @@ def dispatch_code_review(
         correctness_only=correctness_only,
     )
 
+    # Fetch review threads once for re-reviews (#1457): shared between the
+    # lane-work filter and the carry-forward verdict so we only list once.
+    review_threads: list[dict] | None = None
+    if action in _RE_REVIEW_ACTIONS and not evaluation.degraded_reason:
+        review_threads = carry_forward.list_threads(
+            installation_id, owner, repo_name, pull_number,
+        )
+
+    # Filter lane-work findings that match resolved or dismissed Elder threads
+    # (#1457): prevents re-raising weakened-test findings on re-reviews when
+    # the thread was already resolved by a human.
+    if review_threads is not None:
+        filtered = carry_forward.filter_findings_against_resolved_threads(
+            evaluation.findings,
+            installation_id, owner, repo_name, pull_number,
+            threads=review_threads,
+        )
+        evaluation = with_findings(evaluation, filtered)
+
     # Durable reviews can spend several minutes in inference. Re-check the
     # complete input after reasoning so changes to code, base, or intent cannot
     # publish a result for an obsolete snapshot. The durable caller enqueues the
@@ -3718,6 +3739,7 @@ def dispatch_code_review(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha, conclusion=conclusion,
         title=title, summary=summary,
+        threads=review_threads,
     )
     # grug#1429 pin + closure, then grug#1212's degraded lead: a degraded
     # pass still says so before anything else, the pin line right after.

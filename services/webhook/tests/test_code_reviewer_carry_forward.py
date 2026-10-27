@@ -134,6 +134,96 @@ def test_reraised_finding_is_not_double_counted():
     assert len(cf.select_carried([_thread()], (_finding(line=90),))) == 1
 
 
+# --- filter_findings_against_resolved_threads (#1457) --------------------
+
+def _thread_for_filter(*, resolved=False, dismissed=False, rule="weakened-test",
+                       path="tests/test_foo.py", line=20, author="grug-tribe"):
+    """Thread helper for filter tests."""
+    from personas.code_reviewer import living_review as lr
+    nodes = [_comment(severity="🔥 high", rule=rule, path=path, line=line, author=author)]
+    t = {
+        "id": "T1", "isResolved": resolved, "isOutdated": False,
+        "comments": {"totalCount": len(nodes), "nodes": nodes},
+    }
+    if dismissed:
+        root = t["comments"]["nodes"][0]
+        root["body"] = lr.render(root["body"], lr.DISMISSED)
+    return t
+
+
+def test_filter_removes_finding_matching_resolved_thread():
+    """A lane-work finding matching a resolved thread is filtered out."""
+    thread = _thread_for_filter(resolved=True)
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == ()
+
+
+def test_filter_removes_finding_matching_dismissed_thread():
+    """A lane-work finding matching a dismissed thread is filtered out."""
+    thread = _thread_for_filter(dismissed=True)
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == ()
+
+
+def test_filter_keeps_finding_with_no_matching_thread():
+    """A lane-work finding with no matching resolved/dismissed thread is kept."""
+    thread = _thread_for_filter(resolved=True, rule="other-rule")
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == (finding,)
+
+
+def test_filter_keeps_finding_far_from_thread_line():
+    """A finding far from the thread's anchor line is kept (different location)."""
+    thread = _thread_for_filter(resolved=True, line=20)
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=90)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == (finding,)
+
+
+def test_filter_keeps_finding_different_file():
+    """A finding in a different file is kept."""
+    thread = _thread_for_filter(resolved=True, path="tests/test_bar.py")
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == (finding,)
+
+
+def test_filter_keeps_open_thread():
+    """A finding matching an OPEN (not resolved/dismissed) thread is kept."""
+    thread = _thread_for_filter(resolved=False)
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == (finding,)
+
+
+def test_filter_with_none_threads_returns_original():
+    """When threads is None (listing failure), original findings are returned."""
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=None)
+    assert filtered == (finding,)
+
+
+def test_filter_multiple_findings_mixed():
+    """Multiple findings: some filtered, some kept."""
+    thread = _thread_for_filter(resolved=True, rule="weakened-test", line=20)
+    finding1 = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    finding2 = _finding(rule="weakened-test", file="tests/test_foo.py", line=90)
+    finding3 = _finding(rule="null-deref", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding1, finding2, finding3), 1, "o", "r", 2, threads=[thread])
+    assert filtered == (finding2, finding3)
+
+
 # --- verdict plumbing -----------------------------------------------------
 
 def _carried(*sevs):

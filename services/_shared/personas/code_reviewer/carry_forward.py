@@ -148,6 +148,56 @@ def list_threads(
         return None
 
 
+def _thread_is_resolved_or_dismissed(thread: dict) -> bool:
+    """True when the thread is resolved (by a person) or dismissed (living review)."""
+    if _thread_is_resolved(thread):
+        return True
+    first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
+    if living_review.parse_state(first.get("body") or "") == living_review.DISMISSED:
+        return True
+    return False
+
+
+def filter_findings_against_resolved_threads(
+    findings: tuple[Finding, ...],
+    installation_id: int, owner: str, repo: str, pull_number: int,
+    *,
+    threads: list[dict] | None = None,
+) -> tuple[Finding, ...]:
+    """Remove findings that match resolved or dismissed Elder threads.
+
+    A finding matches a thread when they share the same rule, file, and
+    the finding's line is within `_NEARBY_LINES` of the thread's anchor line.
+    This prevents re-raising findings that a human has already addressed.
+
+    If `threads` is provided, it is used instead of fetching a new listing.
+    """
+    if threads is None:
+        threads = list_threads(installation_id, owner, repo, pull_number)
+    if threads is None:
+        return findings
+    resolved_threads: list[tuple[str, str, int]] = []
+    for t in threads:
+        if not _thread_is_resolved_or_dismissed(t):
+            continue
+        owned = _owned_rule_and_line(t)
+        if owned is None:
+            continue
+        rule, path, original_line = owned
+        first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
+        line = int(first.get("line") or original_line)
+        resolved_threads.append((rule, path, line))
+    if not resolved_threads:
+        return findings
+    return tuple(
+        f for f in findings
+        if not any(
+            f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
+            for rule, path, line in resolved_threads
+        )
+    )
+
+
 def _summary_block(carried: tuple[CarriedFinding, ...]) -> str:
     high = sum(1 for c in carried if c.blocking)
     lines = [
