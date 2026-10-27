@@ -211,6 +211,27 @@ Other targets: `make pulumi-preview` (read-only infra diff), `make smoke`
 `make sast-benchmark` (score review quality on a committed corpus; these
 call real models).
 
+### Check a PR's claims after a deploy
+
+[`scripts/shepherd_verify.py`](scripts/shepherd_verify.py) reads a PR's
+`## Acceptance criteria` and checks the bullets that name a `Metric`,
+`Log event`, `Endpoint` or `GET` signal:
+
+```bash
+python3 scripts/shepherd_verify.py --pr 123 --repo example-org/example-repo \
+  --since-epoch "$DEPLOY_FINISHED_UNIX" \
+  --query-command /path/to/your-query-adapter \
+  --baseline metric=your.known_live.metric
+```
+
+- The adapter gets `source signal start_epoch end_epoch criterion` and
+  prints one count. For an endpoint it counts only responses that match the
+  expected status or body.
+- Each source needs a baseline known to emit in the window. A target is
+  `missing` only when two checks 30 seconds apart both see the baseline live.
+- Exit codes: 0 observed, 1 missing, 2 unverifiable (no baseline, an empty
+  baseline, a failed lookup, or no explicit signal in the PR).
+
 ## Configure a repo
 
 An optional `.grug.yaml` at the repo root tunes Elder. Grug reads it from
