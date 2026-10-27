@@ -62,6 +62,7 @@ export interface RepoConfig {
   dep_watch_enabled: boolean;
   reopen_watch_enabled: boolean;
   guard_hygiene_watch_enabled: boolean;
+  pulse_comment_nudge_enabled: boolean;
   issue_dor_enabled: boolean;
   check_run_reconcile_enabled: boolean;
 }
@@ -172,6 +173,7 @@ export type RepoConfigPatch = Partial<Pick<RepoConfig,
   | "warder_enabled" | "warder_gate_blocking"
   | "smasher_enabled"
   | "dep_watch_enabled" | "reopen_watch_enabled" | "guard_hygiene_watch_enabled"
+  | "pulse_comment_nudge_enabled"
 >>;
 
 export function useSetRepoConfig(installId: number) {
