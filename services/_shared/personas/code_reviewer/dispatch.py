@@ -147,6 +147,10 @@ from personas.hunt_recorder import PrRef, now as hunt_now
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion, gate_sentence, lead_with_degraded_line,
 )
+from personas.code_reviewer.publish_retry import (
+    DeliveryOutcome, PendingPublication, publication_key, queue_publication,
+    review_carrying_key, with_publish_marker,
+)
 from personas.code_reviewer.thread_resolver import is_grug, resolve_fixed_threads
 from personas.code_reviewer.verify import (
     CheckEvidence,
@@ -4753,6 +4757,11 @@ def _publish_deep_review(
     (#730, via `_capture_review_comments`, best-effort) and refreshes the
     PR-timeline stack comment using `combined_eval` (Tier-1 + deep) so the
     canonical projection carries every finding, not just the deep ones.
+
+    #738: the review body carries its publication key, and a transient
+    publish failure (transport, 5xx, 429) stores the finished review for
+    the poller to retry instead of dropping the model's work. A permanent
+    4xx (#770) is not queued: the same payload gets the same answer.
     """
     if not novel_deep:
         return
@@ -4770,6 +4779,28 @@ def _publish_deep_review(
     )
     if review_result is None:
         return
+    key = publication_key(
+        review_result, installation_id=installation_id, owner=owner,
+        repo_name=repo_name, pull_number=pull_number,
+    )
+    pending = PendingPublication(
+        key=key,
+        installation_id=installation_id,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+        head_sha=head_sha,
+        result=with_publish_marker(review_result, key),
+        findings=posted_findings,
+        review_span_context=deep_llm.review_span_context,
+        author_login=author_login,
+        stack_body=_deep_stack_body(
+            combined_eval, mode=mode, living_range=living_range,
+            deep_suppressed_count=deep_suppressed_count, pr_title=pr_title,
+            head_sha=head_sha, base_sha=base_sha, pr=f"{owner}/{repo_name}#{pull_number}",
+        ),
+        stack_create_if_absent=worth_an_email(combined_eval),
+    )
     review_resp: dict[str, Any] | None = None
     try:
         review_resp = with_install_token_retry(
@@ -4779,38 +4810,26 @@ def _publish_deep_review(
                 owner,
                 repo_name,
                 pull_number=pull_number,
-                result=review_result,
+                result=pending.result,
             ),
         )
     except (httpx.HTTPStatusError, httpx.RequestError) as error:
+        permanent = _is_permanent_rejection(error)
         log.warning(
             "elder_async_deep_review_publish_failed",
             extra={
-                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "pr": pending.pr,
                 "kind": type(error).__name__,
+                "permanent": permanent,
             },
         )
+        if not permanent:
+            _queue_deep_publication(pending)
         return
 
-    # #730: capture the deep review's inline-comment IDs so the hardest-won
-    # findings are visible to the reaction/reply learning loops - the same
-    # durable contract the synchronous path uses (#247). Best-effort: a
-    # capture failure must never change the deep review outcome.
-    review_id = review_resp.get("id") if review_resp else None
-    comment_ids: hunt_link.CommentIds = {}
-    if review_id is not None:
-        comment_ids = _capture_review_comments(
-            installation_id=installation_id,
-            owner=owner,
-            repo_name=repo_name,
-            pull_number=pull_number,
-            review_id=review_id,
-            findings=posted_findings,
-            review_span_context=deep_llm.review_span_context,
-            head_sha=head_sha,
-            author_login=author_login,
-            failure_log="elder_async_deep_comment_capture_failed",
-        )
+    comment_ids = _capture_deep_comments(
+        pending, review_resp.get("id") if review_resp else None,
+    )
 
     # Hunt Board (#1207): the deep pass is a second Elder run on this head.
     # It reads only what Tier-1 already fetched, so it is recorded as a
@@ -4824,15 +4843,28 @@ def _publish_deep_review(
         degraded_reason=combined_eval.degraded_reason,
     )
 
-    # #730: refresh the PR-timeline stack comment so the deep findings appear
-    # in the canonical review projection alongside the Tier-1 findings.
-    # Use combined_eval (Tier-1 + deep) so the stack preserves all findings,
-    # severity, and actionable counts - not just novel_deep.
+    _upsert_deep_stack(pending)
+
+
+def _deep_stack_body(
+    combined_eval: CodeReviewEvaluation,
+    *,
+    mode: ReviewMode,
+    living_range: str,
+    deep_suppressed_count: int,
+    pr_title: str,
+    head_sha: str,
+    base_sha: str,
+    pr: str,
+) -> str | None:
+    """The stack comment body for a deep publish, built before the POST so a
+    queued retry can refresh the stack without the evaluation. None (logged)
+    when it cannot be built: the stack is cosmetic UX."""
     try:
         conclusion = plan_publish(
             combined_eval, mode=mode, degraded_fails_closed=True,
         ).conclusion
-        stack_body = _review_stack_body(
+        return _review_stack_body(
             combined_eval,
             conclusion=conclusion,
             living_range=living_range,
@@ -4844,21 +4876,128 @@ def _publish_deep_review(
             file_contents=file_contents or {},
             linked_issues=linked_issues,
         )
+    except Exception as error:  # noqa: BLE001 - stack is cosmetic UX
+        log.warning(
+            "elder_async_deep_stack_upsert_failed",
+            extra={"pr": pr, "kind": type(error).__name__},
+        )
+        return None
+
+
+def _queue_deep_publication(pending: PendingPublication) -> None:
+    """Store a failed deep publish for the poller's retry (#738). A store
+    failure is logged as an error, not raised: the deep append never raises
+    to its caller, and the review is then lost exactly as before #738."""
+    try:
+        queue_publication(pending)
+    except Exception as error:  # noqa: BLE001 - deep append never raises
+        log.error(
+            "elder_deep_publish_retry_queue_failed",
+            extra={"pr": pending.pr, "key": pending.key, "kind": type(error).__name__},
+        )
+
+
+def _capture_deep_comments(
+    pending: PendingPublication, review_id: Any,
+) -> hunt_link.CommentIds:
+    """#730: capture the deep review's inline-comment IDs so the hardest-won
+    findings are visible to the reaction/reply learning loops - the same
+    durable contract the synchronous path uses (#247). Best-effort: a
+    capture failure must never change the deep review outcome."""
+    if review_id is None:
+        return {}
+    return _capture_review_comments(
+        installation_id=pending.installation_id,
+        owner=pending.owner,
+        repo_name=pending.repo_name,
+        pull_number=pending.pull_number,
+        review_id=review_id,
+        findings=pending.findings,
+        review_span_context=pending.review_span_context,
+        head_sha=pending.head_sha,
+        author_login=pending.author_login,
+        failure_log="elder_async_deep_comment_capture_failed",
+    )
+
+
+def _upsert_deep_stack(pending: PendingPublication) -> None:
+    """#730: refresh the PR-timeline stack comment so the deep findings
+    appear in the canonical review projection alongside the Tier-1 findings.
+    The body was built from combined_eval (Tier-1 + deep), so the stack
+    keeps every finding, not just the novel deep ones."""
+    stack_body = pending.stack_body
+    if stack_body is None:
+        return
+    try:
         with_install_token_retry(
-            installation_id,
+            pending.installation_id,
             lambda token: _upsert_review_stack_comment(
-                token, owner, repo_name, pull_number, stack_body,
-                create_if_absent=worth_an_email(combined_eval),
+                token, pending.owner, pending.repo_name, pending.pull_number,
+                stack_body, create_if_absent=pending.stack_create_if_absent,
             ),
         )
     except Exception as error:  # noqa: BLE001 - stack is cosmetic UX
         log.warning(
             "elder_async_deep_stack_upsert_failed",
-            extra={
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "kind": type(error).__name__,
-            },
+            extra={"pr": pending.pr, "kind": type(error).__name__},
         )
+
+
+def deliver_pending_publication(pending: PendingPublication) -> DeliveryOutcome:
+    """Retry one queued deep publish (#738); the poller's `deliver` seam.
+
+    Drops the retry when the pull request closed or its head moved: a newer
+    review owns that head, and a late stack refresh would replace its
+    projection with this older one. Otherwise a review already carrying the
+    publication key is adopted instead of posted again (the original POST
+    landed but its response was lost). Comment capture and the stack
+    refresh then run as they would have after the original POST. A
+    transient GitHub failure raises, so the row stays queued.
+    """
+    _, live_head, state, _ = with_install_token_retry(
+        pending.installation_id,
+        lambda token: _fetch_current_review_snapshot(
+            token, pending.owner, pending.repo_name, pending.pull_number,
+        ),
+    )
+    if state != "open" or live_head != pending.head_sha:
+        log.info(
+            "elder_deep_publish_retry_superseded",
+            extra={"pr": pending.pr, "key": pending.key, "state": state},
+        )
+        return "superseded"
+    reviews = with_install_token_retry(
+        pending.installation_id,
+        lambda token: list_reviews(
+            token, pending.owner, pending.repo_name, pull_number=pending.pull_number,
+        ),
+    )
+    existing = review_carrying_key(reviews, pending.key)
+    if existing is not None:
+        outcome: DeliveryOutcome = "already_posted"
+        review_id = existing.get("id")
+    else:
+        try:
+            response = with_install_token_retry(
+                pending.installation_id,
+                lambda token: post_review(
+                    token, pending.owner, pending.repo_name,
+                    pull_number=pending.pull_number, result=pending.result,
+                ),
+            )
+        except httpx.HTTPStatusError as error:
+            if not _is_permanent_rejection(error):
+                raise
+            log.warning(
+                "elder_deep_publish_retry_rejected",
+                extra={"pr": pending.pr, "key": pending.key, **_http_error_detail(error)},
+            )
+            return "rejected"
+        outcome = "posted"
+        review_id = response.get("id") if response else None
+    _capture_deep_comments(pending, review_id)
+    _upsert_deep_stack(pending)
+    return outcome
 
 
 def _submit_deep_evals(
