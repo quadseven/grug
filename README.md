@@ -116,7 +116,7 @@ want the Hunt Plan enforced) as required status checks on the branch.
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
     gh["GitHub"]
     browser["Browser"]
 
@@ -149,15 +149,10 @@ flowchart LR
     webhook -- "Elder jobs" --> sqs
     sqs --> consumer
     consumer --> llm
-    webhook -- "check runs" --> gh
-    consumer -- "check runs" --> gh
-    poller -- "reactions" --> gh
     api --> kms
-    webhook --> pg
-    api --> pg
-    consumer --> pg
-    poller --> pg
-    k8s -. "secrets at runtime" .-> ssm
+    k8s -- "state" --> pg
+    k8s -. "secrets" .-> ssm
+    k8s -- "check runs, comments" --> gh
 ```
 
 | Part | What it does | Code |
