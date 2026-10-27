@@ -875,6 +875,9 @@ class LlmReviewResponse:
     attempts: tuple[str, ...] = field(default_factory=tuple)
     # grug#1276: which tier served this review ("self-hosted", "free-pool", "subscription").
     tier_served: Optional[str] = None
+    reviewability_note: str = ""
+    reviewability_decision: str = "pass"
+    reviewability_blocking: bool = False
 
 
 # grug#1196: one failed model call inside a chunk's ladder walk.
@@ -5498,8 +5501,38 @@ def review_diff(
         cancel_event=cancel_event,
     )
     if not plan.staged:
-        return review.run_whole_diff(plan)
-    return review.run_staged(plan)
+        result = review.run_whole_diff(plan)
+    else:
+        result = review.run_staged(plan)
+    note = _render_reviewability_note(assessment)
+    return replace(
+        result,
+        reviewability_note=note,
+        reviewability_decision=assessment.decision,
+        reviewability_blocking=assessment.decision == "block",
+    )
+
+
+def _render_reviewability_note(assessment: ReviewabilityAssessment) -> str:
+    """Render the policy finding and its evidence for the author-visible check."""
+    if assessment.decision == "pass":
+        return ""
+    lines = [
+        f"Reviewability {assessment.decision}: this change is poorly bounded.",
+        "",
+        "Dimensions:",
+    ]
+    lines.extend(
+        f"- {dim.name}: {dim.score:.2f}. Evidence: {dim.evidence}"
+        for dim in assessment.dimensions
+    )
+    if assessment.suggested_cohorts:
+        lines.extend(("", "Suggested cohorts:"))
+        lines.extend(
+            f"- {cohort.label}: {', '.join(cohort.paths)}. {cohort.risk_reduced}"
+            for cohort in assessment.suggested_cohorts
+        )
+    return "\n".join(lines)
 
 
 @dataclass

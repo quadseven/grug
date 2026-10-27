@@ -3699,6 +3699,8 @@ def dispatch_code_review(
         defensive_dropped_count=defensive_dropped_count,
         blocking=blocking,
     )
+    if evaluation.reviewability_note:
+        summary += "\n\n## Reviewability assessment\n\n" + evaluation.reviewability_note
     summary = _intent_paragraph(pr_context) + summary
     if ruff_policy_dropped:
         summary += (

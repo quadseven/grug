@@ -101,6 +101,31 @@ def test_empty_hunks_returns_no_diff_kind_without_llm_call() -> None:
     mock_post.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("policy", "decision"),
+    [("warn", "warn"), ("block", "block"), ("ignore", "pass")],
+)
+def test_review_diff_carries_policy_and_evidence_to_author(monkeypatch, policy, decision):
+    hunks = [
+        _hunk("src/a.py", "+def a():\n+    return 1"),
+        _hunk("infra/main.tf", '+resource "x" {}'),
+        _hunk("docs/readme.md", "+# notes"),
+    ]
+    monkeypatch.setenv("GRUG_REVIEWABILITY_POLICY", policy)
+    monkeypatch.setattr(lc._Tier1Review, "run_whole_diff", lambda self, plan: LlmReviewResponse(kind="reviewed"))
+    monkeypatch.setattr(lc._Tier1Review, "run_staged", lambda self, plan: LlmReviewResponse(kind="reviewed"))
+
+    response = review_diff(assemble_evidence(hunks), installation_id=1)
+
+    assert response.reviewability_decision == decision
+    if policy == "ignore":
+        assert response.reviewability_note == ""
+    else:
+        assert "cohesion" in response.reviewability_note
+        assert "Evidence:" in response.reviewability_note
+        assert response.reviewability_blocking is (policy == "block")
+
+
 def test_review_diff_via_cave_coder_returns_structured_response() -> None:
     findings_json = (
         '{"findings": [{"path": "src/x.py", "line": 1, '
