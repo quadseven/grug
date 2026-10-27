@@ -133,7 +133,39 @@ def test_changed_files_table_caps_rows_with_visible_count():
 # --- full comment assembly -------------------------------------------------
 
 
-def test_walkthrough_body_carries_summary_table_effort_and_a_diagram_with_edges():
+def test_walkthrough_body_email_rendering_pins_no_heading_no_table_row_no_mermaid():
+    """T1386: walkthrough renders at one text size in phone email clients:
+    no ## heading, no markdown table row, and no mermaid diagram fence."""
+    files = [
+        FileStat(path="a.py", additions=3, deletions=1, summary="added a guard"),
+        FileStat(path="b.py", additions=0, deletions=5, summary=None),
+    ]
+    body = walkthrough_body(
+        summary="Adds a guard clause.",
+        files=files,
+        diagram="graph TD\n  subgraph \"x\"\n    N0[\"a.py\"]\n  end",
+        effort="quick",
+        head_sha="a" * 40,
+    )
+    # No ATX heading: the board section and the check run carry the title
+    assert not any(line.strip().startswith("##") for line in body.splitlines())
+    assert "##" not in body
+
+    # Changed files render as a list, one line each: file, change count, summary
+    assert "- `a.py` (+3/-1) - added a guard" in body
+    assert "- `b.py` (+0/-5)" in body
+    # No markdown table rows anywhere in the body
+    for line in body.splitlines():
+        assert not line.strip().startswith("|"), f"table row found: {line}"
+    assert "|---" not in body
+
+    # Mermaid diagram source never reaches the walkthrough
+    assert "```mermaid" not in body
+    assert "```" not in body
+    assert "Shape of the change" not in body
+
+
+def test_walkthrough_body_carries_summary_table_effort_and_no_diagram():
     files = [FileStat(path="x.py", additions=2, deletions=0, summary="tweak")]
     body = walkthrough_body(
         summary="Adds a guard clause.",
@@ -143,16 +175,34 @@ def test_walkthrough_body_carries_summary_table_effort_and_a_diagram_with_edges(
         head_sha="a" * 40,
     )
     assert "grug-teller:walkthrough" not in body
+    assert "##" not in body
     assert "Adds a guard clause." in body
     assert "x.py" in body
     assert "tweak" in body
-    assert "```mermaid" in body
+    assert "- `x.py` (+2/-0) - tweak" in body
     assert "quick" in body
     assert "aaaaaaaaaaaa" in body  # truncated head sha
     # Detail is collapsed by default (short PR timeline).
     assert "<details>" in body
     assert "<summary>Changed files (1)</summary>" in body
-    assert "<summary>Shape of the change</summary>" in body
+    assert "Shape of the change" not in body
+
+
+def test_walkthrough_body_has_no_branded_header_or_button():
+    """T1432: the walkthrough is a board section and a check-run summary,
+    not a comment of Teller's own, so the comment's marker, portrait and
+    "View full review" button go: the body opens on the summary itself."""
+    files = [FileStat(path="x.py", additions=2, deletions=0, summary="tweak")]
+    body = walkthrough_body(
+        summary="Adds a guard clause.",
+        files=files,
+        effort="quick",
+        head_sha="a" * 40,
+    )
+    assert body.startswith("Adds a guard clause.")
+    assert "<!--" not in body
+    assert "<img" not in body
+    assert "<a href" not in body
 
 
 def test_walkthrough_body_no_diagram_and_no_files_omits_the_section_silently():
@@ -166,9 +216,34 @@ def test_walkthrough_body_no_diagram_and_no_files_omits_the_section_silently():
     assert "Shape of the change" not in body
 
 
+def test_walkthrough_body_no_diagram_with_files_states_a_degradation_reason():
+    """T1386: The mermaid 'Shape of the change' diagram never reaches the
+    walkthrough; it is left out entirely, with no note in its place."""
+    files = [FileStat(path="a.py", additions=1, deletions=0)]
+    body = walkthrough_body(
+        summary="s", files=files, diagram=None, effort="quick",
+        head_sha="b" * 40,
+    )
+    assert "```mermaid" not in body
+    assert "Shape of the change" not in body
+    assert "No diagram this pass" not in body
+
+
+def test_walkthrough_body_diagram_never_reaches_comment():
+    """T1386: The mermaid 'Shape of the change' diagram never reaches the
+    walkthrough; it is left out entirely."""
+    files = [FileStat(path="a.py", additions=1, deletions=0)]
+    body = walkthrough_body(
+        summary="s", files=files, diagram="graph TD\n  N0[\"a.py\"]", effort="quick",
+        head_sha="b" * 40,
+    )
+    assert "```mermaid" not in body
+    assert "Shape of the change" not in body
+
+
 def test_walkthrough_body_drops_a_diagram_with_no_edges():
     """T1432: a graph of bare subgraphs only repeats the file names the
-    table above already shows."""
+    list above already shows."""
     files = [FileStat(path="a/x.py", additions=1, deletions=0)]
     body = walkthrough_body(
         summary="s", files=files, diagram=build_diagram(["a/x.py", "b/y.py"]),
@@ -176,17 +251,22 @@ def test_walkthrough_body_drops_a_diagram_with_no_edges():
     )
     assert "```mermaid" not in body
     assert "Shape of the change" not in body
-    assert "No diagram this pass" not in body
 
 
-def test_walkthrough_body_without_a_summary_is_the_effort_line_and_table_alone():
+def test_walkthrough_body_degraded_says_so_honestly_by_omission():
+    """T1432: the deterministic fallback (summary=None) renders no prose
+    paragraph and no sentence saying the summary failed: the body opens on
+    the effort line and the file list carries the walkthrough. The board
+    names the fallback in its model column instead."""
     files = [FileStat(path="a.py", additions=1, deletions=0)]
     body = walkthrough_body(
         summary=None, files=files, diagram=None, effort="quick",
-        head_sha="b" * 40,
+        head_sha="c" * 40,
     )
     assert body.startswith("Review effort: ")
-    assert "| `a.py` |" in body
+    assert "- `a.py` (+1/-0)" in body
+    assert "fell back" not in body
+    assert "teller-voice was quiet" not in body
 
 
 def test_estimate_effort_logs_rejected_off_vocabulary_value(caplog):
@@ -227,10 +307,9 @@ def test_changed_files_table_escapes_pipe_in_plain_summary_cell():
     files = [FileStat(path="a.py", additions=1, deletions=0,
                        summary="fixes | breaks the table")]
     table = changed_files_table(files)
-    assert "fixes \\| breaks the table" in table
-    # Exactly 3 data rows (header + separator + 1) - an unescaped pipe
-    # would fake an extra column/row.
-    assert table.count("\n") == 2
+    assert "fixes | breaks the table" in table
+    assert not table.startswith("|")
+    assert table.count("\n") == 0
 
 
 def test_changed_files_table_collapses_newline_in_summary_cell():
@@ -238,7 +317,7 @@ def test_changed_files_table_collapses_newline_in_summary_cell():
                        summary="line one\nFAKE ROW | injected | here")]
     table = changed_files_table(files)
     assert "\nFAKE ROW" not in table
-    assert table.count("\n") == 2
+    assert table.count("\n") == 0
 
 
 def test_changed_files_table_strips_backtick_from_path_cell():
@@ -249,7 +328,7 @@ def test_changed_files_table_strips_backtick_from_path_cell():
     table = changed_files_table(files)
     assert "evil`](x)[owned" not in table  # the raw, unstripped path is gone
     assert "evil'](x)[owned" in table  # backtick swapped for an apostrophe
-    assert table.count("\n") == 2  # still exactly header + separator + 1 row
+    assert table.count("\n") == 0
 
 
 def test_changed_files_table_neutralizes_mention_in_summary_and_path():

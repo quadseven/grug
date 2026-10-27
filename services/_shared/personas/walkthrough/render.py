@@ -3,10 +3,9 @@
 One body for two surfaces, neither a comment of Teller's own (every new
 comment is an email): the Hunt Board's Walkthrough section and the Teller
 check-run summary. It holds the AI intent summary (absent when the model
-was quiet), a review-effort line, the changed-files table and, when it
-has edges, the deterministic mermaid diagram. Assembly is pure so it can
-be tested without any network/LLM call; `dispatch.py` supplies the
-fetched data and the summary.
+was quiet), a review-effort line and the changed-files list; no mermaid
+diagram. Assembly is pure so it can be tested without any network/LLM
+call; `dispatch.py` supplies the fetched data and the summary.
 """
 
 from __future__ import annotations
@@ -82,37 +81,33 @@ class FileStat:
     summary: str | None = None
 
 
-def changed_files_table(files: list[FileStat]) -> str:
-    """The changed-files table: path, one-line summary, +X/-Y. Bounded to
-    _MAX_TABLE_ROWS with a visible '+N more' line - never a silent cut.
-    `path` and `summary` are escaped for both table-row integrity and
-    mention-spoofing before splicing (round 4, codex) - `path` is repo-
-    controlled (a crafted filename) and `summary` is model-authored."""
+def changed_files_list(files: list[FileStat]) -> str:
+    """The changed-files list (#1386): path, changes (+X/-Y), summary. Bounded
+    to _MAX_TABLE_ROWS with a visible '+N more' line - never a silent cut.
+    `path` and `summary` are sanitized before splicing."""
     if not files:
         return ""
-    rows = ["| File | Summary | Changes |", "|---|---|---|"]
+    lines: list[str] = []
     for f in files[:_MAX_TABLE_ROWS]:
         path = _escape_code_span_cell(_neutralize_mentions(f.path))
-        summary = (
-            _escape_html(
-                _escape_table_cell(
-                    _neutralize_mentions((f.summary or "")[:_MAX_FILE_SUMMARY_CHARS])
-                )
-            )
-            or "-"
-        )
-        rows.append(f"| `{path}` | {summary} | +{f.additions}/-{f.deletions} |")
-    table = "\n".join(rows)
+        raw_summary = _neutralize_mentions(
+            (f.summary or "")[:_MAX_FILE_SUMMARY_CHARS]
+        ).replace("\n", " ").replace("\r", " ").strip()
+        summary = _escape_html(raw_summary)
+        changes = f"+{f.additions}/-{f.deletions}"
+        if summary:
+            lines.append(f"- `{path}` ({changes}) - {summary}")
+        else:
+            lines.append(f"- `{path}` ({changes})")
+    out = "\n".join(lines)
     cut = len(files) - _MAX_TABLE_ROWS
     if cut > 0:
-        table += f"\n\n_(+{cut} more file(s) not shown)_"
-    return table
+        out += f"\n\n_(+{cut} more file(s) not shown)_"
+    return out
 
 
-def _has_edges(diagram: str) -> bool:
-    """Whether the mermaid graph links any two nodes. A graph of bare
-    subgraphs only repeats the file names the table already shows."""
-    return "-->" in diagram
+# Backward-compatible alias
+changed_files_table = changed_files_list
 
 
 def _details(summary: str, body: str) -> str:
@@ -124,10 +119,11 @@ def walkthrough_body(
     *,
     summary: str | None,
     files: list[FileStat],
-    diagram: str | None,
+    diagram: str | None = None,
     effort: ReviewEffort,
     head_sha: str,
     files_truncated: bool = False,
+    related: list | None = None,
 ) -> str:
     """Assemble the walkthrough (default-collapsed detail).
 
@@ -136,16 +132,20 @@ def walkthrough_body(
 
       {short summary, when the model gave one}
       Review effort: ...
+      **Possibly related hunts**   (only when `related` is non-empty)
       <details> Changed files (N) </details>
-      <details> Shape of the change </details>   (only when it has edges)
       _Last walked at ..._
 
     `summary=None` is the deterministic fallback: no prose paragraph at all,
-    the file table below carries the walkthrough. `files_truncated` marks a
+    the file list below carries the walkthrough. `files_truncated` marks a
     PR whose changed-file count exceeded our fetch cap - every number below
     is then a floor, not an exact count. `summary` is model-authored:
     mentions and line-leading `#` headings are neutralized before this
-    prose posts under the app's own installation-token identity.
+    prose posts under the app's own installation-token identity. `diagram`
+    is accepted and never rendered (T1386: a mermaid fence reads as raw
+    source in phone email clients, and the graph has had no edges, T1432).
+    `related` is for the check-run summary; the Hunt Board renders its own
+    Related context list, so its body leaves it out.
     """
     parts: list[str] = []
     if summary:
@@ -160,18 +160,25 @@ def walkthrough_body(
         parts.append("")
     parts.append(f"Review effort: {effort_label(effort)}")
 
-    table = changed_files_table(files)
-    if table:
+    if related:
+        # #675: possibly-related prior hunts. Omitted entirely when nothing
+        # cleared the relevance bar (honest empty - no filler).
+        parts.append("")
+        parts.append("**Possibly related hunts**")
+        parts.append("")
+        for r in related[:3]:
+            title = _neutralize_mentions(r.title)
+            reason = _neutralize_mentions(r.reason)
+            parts.append(f"- #{r.number} {title} — {reason}")
+
+    files_list = changed_files_list(files)
+    if files_list:
         n = len(files)
         label = f"Changed files ({n})"
         if files_truncated:
             label = f"Changed files (first {n})"
         parts.append("")
-        parts.append(_details(label, table))
-
-    if diagram and _has_edges(diagram):
-        parts.append("")
-        parts.append(_details("Shape of the change", f"```mermaid\n{diagram}\n```"))
+        parts.append(_details(label, files_list))
 
     parts.append("")
     parts.append(f"_Last walked at `{head_sha[:12]}`._")

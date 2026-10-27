@@ -55,7 +55,9 @@ def _marker_comment_response(comment_id: int) -> httpx.Response:
     return r
 
 
-def test_dispatch_publishes_the_check_run_when_no_marker_comment_exists(monkeypatch):
+def test_dispatch_posts_no_new_comment_when_no_marker_exists(monkeypatch):
+    """T1432: with no Teller comment on the PR, the one POST is the Teller
+    check run, never a new comment."""
     monkeypatch.setattr(
         wt_dispatch, "with_install_token_retry",
         lambda inst_id, fn: fn("tok"),
@@ -72,6 +74,7 @@ def test_dispatch_publishes_the_check_run_when_no_marker_comment_exists(monkeypa
         return _diff_response()
 
     def fake_post(url, **kwargs):
+        posted["url"] = url
         posted["json"] = kwargs["json"]
         r = MagicMock(spec=httpx.Response)
         r.raise_for_status = MagicMock()
@@ -84,6 +87,7 @@ def test_dispatch_publishes_the_check_run_when_no_marker_comment_exists(monkeypa
         out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
 
     assert out == {"persona": "walkthrough", "result": "degraded"}
+    assert posted["url"].endswith("/check-runs")
     assert posted["json"]["name"] == "Grug - Teller"
     assert "x.py" in posted["json"]["output"]["summary"]
     mock_rcv.assert_called_once()
@@ -659,7 +663,7 @@ def test_teller_check_run_summary_carries_effort_and_files_without_an_edgeless_d
 
     summary = checks[0]["output"]["summary"]
     assert "Review effort" in summary
-    assert "| `x.py` | added guard clause | +3/-1 |" in summary
+    assert "- `x.py` (+3/-1) - added guard clause" in summary
     assert "mermaid" not in summary
     assert "Shape of the change" not in summary
     assert "Review effort" in recorded[0]["text"]
@@ -673,3 +677,22 @@ def test_deterministic_fallback_renders_no_quiet_sentence_on_board_or_check(monk
     for text in (checks[0]["output"]["summary"], recorded[0]["text"]):
         assert "teller-voice was quiet" not in text
         assert "x.py" in text  # the file table alone survives
+
+
+def test_related_hunts_go_to_the_check_run_and_not_twice_on_the_board(monkeypatch):
+    """#675: the check run lists related hunts in the walkthrough; the board
+    renders its own Related context list, so its walkthrough text leaves
+    them out."""
+    from personas.walkthrough.related import RelatedPR
+
+    related = [RelatedPR(number=101, title="Fix the thing", reason="touched x.py")]
+    monkeypatch.setattr(
+        "personas.walkthrough.related.find_related_prs",
+        lambda *a, **kw: related,
+    )
+    _, checks, recorded, _ = _run_capturing(monkeypatch, llm_summary=_llm_summary())
+
+    assert "Possibly related hunts" in checks[0]["output"]["summary"]
+    assert "#101 Fix the thing" in checks[0]["output"]["summary"]
+    assert "Possibly related hunts" not in recorded[0]["text"]
+    assert recorded[0]["related"] == ("#101 Fix the thing (touched x.py)",)

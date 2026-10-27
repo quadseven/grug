@@ -1,13 +1,12 @@
 """Teller persona - PR walkthrough dispatch (#554, epic #522, T1432).
 
 Fetch the diff + changed-file stats, call `summarize_pr` (best-effort,
-degrades to the file table alone), build the deterministic mermaid
-diagram + effort line, and publish the walkthrough to the Hunt Board's
-Walkthrough section and to the `Grug - Teller` check-run summary. Teller
-posts no comment of its own (every new comment is an email); a comment an
-older version left on an open pull request is not touched. Never blocks.
-Runs off the ACK path via the generic async-persona machinery (#77), same
-as Guard/Smasher.
+degrades to the file list alone), estimate the effort line, and publish
+the walkthrough to the Hunt Board's Walkthrough section and to the
+`Grug - Teller` check-run summary. Teller posts no comment of its own
+(every new comment is an email); a comment an older version left on an
+open pull request is not touched. Never blocks. Runs off the ACK path via
+the generic async-persona machinery (#77), same as Guard/Smasher.
 """
 
 from __future__ import annotations
@@ -356,10 +355,6 @@ def dispatch_walkthrough_review(
         model_effort=model_effort,
     )
 
-    from personas.walkthrough.mermaid import build_diagram
-
-    diagram = build_diagram([f.path for f in files])
-
     # #675: possibly-related prior hunts. Best-effort and bounded (one list
     # call + at most 5 file fetches, all inside one 12s budget); a failure
     # just omits the section.
@@ -404,13 +399,21 @@ def dispatch_walkthrough_review(
         )
         return {"persona": "walkthrough", "result": "skipped_closed"}
 
-    body = walkthrough_body(
+    board_body = walkthrough_body(
         summary=summary,
         files=files,
-        diagram=diagram,
         effort=effort,
         head_sha=head_sha,
         files_truncated=files_truncated,
+    )
+    # The check run has no Related context list of its own; the board does.
+    body = walkthrough_body(
+        summary=summary,
+        files=files,
+        effort=effort,
+        head_sha=head_sha,
+        files_truncated=files_truncated,
+        related=related,
     )
     title = (
         f"Teller walked {'at least ' if files_truncated else ''}"
@@ -454,7 +457,7 @@ def dispatch_walkthrough_review(
         started_at=started_at,
         backend="",
         model="deterministic-fallback" if degraded else "",
-        text=body,
+        text=board_body,
         related=tuple(f"#{r.number} {r.title} ({r.reason})" for r in related),
     )
     record_check_verdict(
