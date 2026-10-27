@@ -648,6 +648,38 @@ RULES: tuple[ReviewRule, ...] = (
         'scan(line)',
         severity="medium",
     ),
+    ReviewRule(
+        name="insufficient-assertion",
+        bug_class="test fidelity",
+        description="A new or changed test, attester, or guard whose assertion checks only a proxy (keyword names, presence, a count) instead of the value or behavior it claims to prove. State what the check proves against what it claims; emit a finding ONLY when a concrete passing counterexample can be written, and put that counterexample input in the message (e.g.  or a constant). A check that records only keyword names lets a mismatched or constant value pass.",
+        bad_example="forwarded = _set_repo_config_kwargs(api_tree)",
+        good_example="forwarded = _set_repo_config_forwarding(api_tree)",
+        severity="medium",
+    ),
+    ReviewRule(
+        name="weak-assertion",
+        bug_class="test fidelity",
+        description="A new or changed test, attester, or guard whose assertion checks only a proxy (keyword names, presence, a count) instead of the value or behavior it claims to prove. State what the check proves against what it claims; emit a finding ONLY when a concrete passing counterexample can be written, and put that counterexample input in the message (e.g.  or a constant). A check that records only keyword names lets a mismatched or constant value pass.",
+        bad_example="forwarded = _set_repo_config_kwargs(api_tree)",
+        good_example="forwarded = _set_repo_config_forwarding(api_tree)",
+        severity="medium",
+    ),
+    ReviewRule(
+        name="weak-assertion-keyword-only-forwarding",
+        bug_class="test fidelity",
+        description="A new or changed test, attester, or guard whose assertion checks only a proxy (keyword names, presence, a count) instead of the value or behavior it claims to prove. State what the check proves against what it claims; emit a finding ONLY when a concrete passing counterexample can be written, and put that counterexample input in the message (e.g.  or a constant). A check that records only keyword names lets a mismatched or constant value pass.",
+        bad_example="forwarded = _set_repo_config_kwargs(api_tree)",
+        good_example="forwarded = _set_repo_config_forwarding(api_tree)",
+        severity="medium",
+    ),
+    ReviewRule(
+        name="assertion-mismatch",
+        bug_class="test fidelity",
+        description="A new or changed test, attester, or guard whose assertion checks only a proxy (keyword names, presence, a count) instead of the value or behavior it claims to prove. State what the check proves against what it claims; emit a finding ONLY when a concrete passing counterexample can be written, and put that counterexample input in the message (e.g.  or a constant). A check that records only keyword names lets a mismatched or constant value pass.",
+        bad_example="forwarded = _set_repo_config_kwargs(api_tree)",
+        good_example="forwarded = _set_repo_config_forwarding(api_tree)",
+        severity="medium",
+    ),
 )
 
 
