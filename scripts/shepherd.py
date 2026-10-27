@@ -75,7 +75,7 @@ def evaluate_chain(checks: list[tuple[str, StageCheck]]) -> StageVerdict | None:
     Stages run in order and the first failure wins, so a broken chain names
     exactly one stage with the evidence that says so.
     """
-    for name, check in checks:
+    for _, check in checks:
         verdict = check()
         if not verdict.ok:
             return verdict
@@ -271,7 +271,8 @@ def check_deployment(service: str) -> bool:
     The function compares the digests of the latest deployed
     instance and the most recent tag pushed for the service.
     """
-    return deployment_status(service) == "deployed"
+    verdicts = deployment_stage_verdicts(service)
+    return bool(verdicts) and all(v.ok for v in verdicts)
 
 
 def deployment_status(service: str) -> str:
@@ -314,6 +315,16 @@ def main(service: str = "webhook", *args: str) -> int:
         )
         print(report)
         return 0
+
+    if service == "escalate-deployment":
+        target = args[0] if args else "webhook"
+
+        def _notify(message, stage, evidence):
+            print(f"{message}: {evidence}", file=sys.stderr)
+
+        checks = [("deploy", lambda: deployment_stage_verdicts(target)[0])]
+        result = escalate_once(checks, notify=_notify)
+        return 0 if result != "broken" else 1
 
     status = deployment_status(service)
     if status == "deployed":
@@ -978,7 +989,5 @@ def report_shepherd_pr_queue(
 
 
 if __name__ == "__main__":
-    import sys
-
     svc = sys.argv[1] if len(sys.argv) > 1 else "webhook"
     sys.exit(main(svc))
