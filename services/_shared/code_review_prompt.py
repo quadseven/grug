@@ -618,6 +618,36 @@ RULES: tuple[ReviewRule, ...] = (
         'else echo "note: $n not waited on (flag=$opt)"; fi',
         severity="medium",
     ),
+    ReviewRule(
+        name="diff-gate-scans-hunk-header",
+        bug_class="correctness",
+        description="A scanner, linter or policy gate whose input is a "
+        "unified DIFF rather than a tree, whose skip list enumerates some of "
+        "the diff's non-content line kinds but not `@@`. Under `-U0` git "
+        "appends PRE-IMAGE CONTEXT to every hunk header -- "
+        "`@@ -9 +9 @@ <a line from the OLD file>` -- so when a change removes "
+        "two violations in a row, the second hunk header REPEATS the first "
+        "removed line and the gate reports a removal as an addition. The "
+        "signal then inverts exactly for the change trying to fix what the "
+        "gate watches for, so the offending tree can never go clean and the "
+        "block looks correct from the outside. Require an explicit decision "
+        "for EVERY non-content line kind the format carries -- `diff --git`, "
+        "`index`, `---`, `+++`, `@@`, `\\ No newline at end of file` -- not "
+        "only the two obvious ones; `@@` is the one that gets missed. A skip "
+        "list holding `---`/`+++` and nothing else is the tell. Keep "
+        "`diff --git` path lines scanned where a path is itself information.",
+        bad_example='if line.startswith(("---", "+++")):\n'
+        '    continue              # file headers handled; @@ is not\n'
+        'if line.startswith("-"):\n'
+        '    continue              # removals are a scrub\n'
+        'scan(line)                # "@@ -9 +9 @@ <old text>" scanned as added',
+        good_example='if line.startswith(("---", "+++", "@@")):\n'
+        '    continue              # -U0 appends pre-image context to @@\n'
+        'if line.startswith("-"):\n'
+        '    continue\n'
+        'scan(line)',
+        severity="medium",
+    ),
 )
 
 
