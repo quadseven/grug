@@ -105,6 +105,8 @@ from personas.code_reviewer.repo_config import (
     config_note as _repo_config_note,
     meets_inline_floor,
     parse_repo_config,
+    skip_pr_rule,
+    skip_summary,
     split_ignored_hunks,
     with_instructions,
 )
@@ -477,20 +479,87 @@ def _load_repo_ruff_policy(installation_id: int, owner: str, repo_name: str, bas
     return parse_repo_ruff_policy(next((fetched[path] for path in _RUFF_POLICY_PATHS if path in fetched), None))
 
 
-def _apply_repo_config(
-    hunks: tuple[DiffHunk, ...], pr: dict[str, Any], installation_id: int,
-    owner: str, repo_name: str,
-) -> tuple[tuple[DiffHunk, ...], RepoConfig, str]:
-    """Load `.grug.yaml` from the PR base and drop `ignore`d hunks.
-
-    Returns (kept hunks, config, summary note). The base is the PR's own
-    base commit (falling back to the base branch name), never the head and
-    never the living-hunt baseline."""
+def _load_pr_repo_config(
+    pr: dict[str, Any], installation_id: int, owner: str, repo_name: str,
+) -> RepoConfig:
+    """`.grug.yaml` at the PR's own base commit (falling back to the base
+    branch name), never the head and never the living-hunt baseline."""
     base = pr.get("base") or {}
-    config = _load_repo_config(
+    return _load_repo_config(
         installation_id, owner, repo_name,
         str(base.get("sha") or base.get("ref") or ""),
     )
+
+
+def pr_skip_rule(
+    pr: dict[str, Any], installation_id: int, owner: str, repo_name: str,
+    config: RepoConfig | None = None,
+) -> str | None:
+    """The base-ref `.grug.yaml` `skip_prs` rule this PR matches, or None
+    (grug#1439). Shared by Elder and Teller; Chief and Guard never call it."""
+    if config is None:
+        config = _load_pr_repo_config(pr, installation_id, owner, repo_name)
+    return skip_pr_rule(
+        config,
+        author=str((pr.get("user") or {}).get("login") or ""),
+        labels=_pr_labels(pr),
+        title=str(pr.get("title") or ""),
+    )
+
+
+def _publish_config_skip(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str, *, rule: str,
+) -> dict[str, str]:
+    """Complete the Elder check `success` for a PR skipped by `skip_prs`.
+
+    No review, no inline comment, no board: the maintainer opted this PR
+    out on the base branch, so the check passes and says why. A publish
+    failure returns `publish_failed` so the durable consumer redrives
+    instead of leaving the enqueue's in_progress check behind."""
+    summary = skip_summary(rule)
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: post_check_run(
+                token, owner, repo_name,
+                CheckRunResult(
+                    name=_CHECK_NAME, head_sha=head_sha, status="completed",
+                    conclusion="success", title="Elder skipped this PR",
+                    summary=summary,
+                ),
+                external_id=(
+                    f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
+                ),
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.error(
+            "code_review_config_skip_publish_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+        return {"persona": "code_reviewer", "result": "publish_failed"}
+    log.info(
+        "code_review_skipped_by_config",
+        extra={"pr": f"{owner}/{repo_name}#{pull_number}", "rule": rule},
+    )
+    return {"persona": "code_reviewer", "result": "pass", "skipped_by": rule}
+
+
+def _apply_repo_config(
+    hunks: tuple[DiffHunk, ...], pr: dict[str, Any], installation_id: int,
+    owner: str, repo_name: str, config: RepoConfig | None = None,
+) -> tuple[tuple[DiffHunk, ...], RepoConfig, str]:
+    """Load `.grug.yaml` from the PR base and drop `ignore`d hunks.
+
+    Returns (kept hunks, config, summary note). `config`, when given, is
+    the one already loaded for this pass, so the file is fetched once."""
+    if config is None:
+        config = _load_pr_repo_config(pr, installation_id, owner, repo_name)
     kept, ignored = split_ignored_hunks(hunks, config)
     return kept, config, _repo_config_note(config, ignored)
 
@@ -2994,6 +3063,19 @@ def dispatch_code_review(
         if stale is not None:
             return stale
 
+    # grug#1439: `.grug.yaml` `skip_prs`, read from the BASE ref so a PR
+    # cannot opt itself out. Checked before the diff fetch so a skipped PR
+    # spends nothing; the same config feeds `ignore` and friends below.
+    base_repo_config = _load_pr_repo_config(pr, installation_id, owner, repo_name)
+    skip_rule = pr_skip_rule(
+        pr, installation_id, owner, repo_name, config=base_repo_config,
+    )
+    if skip_rule is not None:
+        return _publish_config_skip(
+            installation_id, owner, repo_name, pull_number, head_sha,
+            rule=skip_rule,
+        )
+
     # DiffParseError → advisory neutral so a fetcher bug or GitHub
     # format drift cannot 500 the webhook.
     try:
@@ -3062,6 +3144,7 @@ def dispatch_code_review(
         # before anything below (full-file fetch, prompt, judge) can see them.
         hunks, repo_config, config_note = _apply_repo_config(
             hunks, pr, installation_id, owner, repo_name,
+            config=base_repo_config,
         )
         # A hunk bigger than a whole cohort can never be reviewed - the
         # planner will not truncate it (line anchors), so it becomes a solo

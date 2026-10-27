@@ -1,12 +1,20 @@
 """Optional in-repo `.grug.yaml` review configuration.
 
-Three keys, all optional:
+Four keys, all optional:
 
   ignore               list of path globs that are never reviewed
   path_instructions    list of {path: glob, instructions: text}; the text is
                        appended to the review prompt for matching files only
   min_inline_severity  low|medium|high|critical; findings below it appear in
                        the check summary but get no inline comment
+  skip_prs             {authors, labels, title_patterns}, each a list of
+                       strings; a matching pull request gets a `success`
+                       Elder check naming the rule and no review, inline
+                       comment, board or Teller walkthrough. Chief and Guard
+                       never read it. Authors and labels match exactly
+                       (case-insensitive); a title pattern is a glob where
+                       only `*` and `?` are special, matched against the
+                       whole title, case-insensitive.
 
 The caller reads the file from the PR BASE ref (never the head), so a PR
 cannot loosen its own review. This module is pure: it takes text and returns
@@ -19,14 +27,17 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from functools import lru_cache
-from dataclasses import dataclass
 
 import yaml
 
 CONFIG_PATH = ".grug.yaml"
 
-_KNOWN_KEYS = frozenset({"ignore", "path_instructions", "min_inline_severity"})
+_KNOWN_KEYS = frozenset(
+    {"ignore", "path_instructions", "min_inline_severity", "skip_prs"},
+)
+_SKIP_PRS_KEYS = ("authors", "labels", "title_patterns")
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 # Bounds so one file cannot blow the prompt budget.
 _MAX_INSTRUCTIONS = 20
@@ -40,11 +51,19 @@ class PathInstruction:
 
 
 @dataclass(frozen=True)
+class SkipPrs:
+    authors: tuple[str, ...] = ()
+    labels: tuple[str, ...] = ()
+    title_patterns: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class RepoConfig:
     ignore: tuple[str, ...] = ()
     path_instructions: tuple[PathInstruction, ...] = ()
     min_inline_severity: str | None = None
     problems: tuple[str, ...] = ()
+    skip_prs: SkipPrs = field(default_factory=SkipPrs)
 
 
 def _string_list(value: object, key: str, problems: list[str]) -> tuple[str, ...]:
@@ -89,6 +108,26 @@ def _path_instructions(
     return tuple(out)
 
 
+def _skip_prs(value: object, problems: list[str]) -> SkipPrs:
+    if not isinstance(value, dict):
+        problems.append(
+            "`skip_prs` must be a mapping of authors, labels, title_patterns"
+        )
+        return SkipPrs()
+    unknown = sorted(str(k) for k in value if k not in _SKIP_PRS_KEYS)
+    if unknown:
+        problems.append(
+            "unknown `skip_prs` key(s) ignored: "
+            + ", ".join(f"`{k}`" for k in unknown)
+        )
+    lists = {
+        key: _string_list(value[key], f"skip_prs.{key}", problems)
+        if key in value else ()
+        for key in _SKIP_PRS_KEYS
+    }
+    return SkipPrs(**lists)
+
+
 def parse_repo_config(text: str | None) -> RepoConfig:
     """Parse `.grug.yaml` text. Never raises."""
     if text is None or not text.strip():
@@ -126,7 +165,46 @@ def parse_repo_config(text: str | None) -> RepoConfig:
             problems.append(
                 "`min_inline_severity` must be one of low, medium, high, critical"
             )
-    return RepoConfig(ignore, instructions, floor, tuple(problems))
+    skip = _skip_prs(data["skip_prs"], problems) if "skip_prs" in data else SkipPrs()
+    return RepoConfig(ignore, instructions, floor, tuple(problems), skip)
+
+
+@lru_cache(maxsize=256)
+def _title_regex(pattern: str) -> re.Pattern[str]:
+    # Only `*` and `?` are special, so a literal `[deps]` prefix matches as
+    # written instead of turning into a character class.
+    out = []
+    for ch in pattern:
+        out.append(".*" if ch == "*" else "." if ch == "?" else re.escape(ch))
+    return re.compile("".join(out), re.DOTALL)
+
+
+def skip_pr_rule(
+    config: RepoConfig, *, author: str, labels: Iterable[str], title: str,
+) -> str | None:
+    """The `skip_prs` rule this pull request matches, or None.
+
+    The returned text names the rule for the check summary, for example
+    "author `dependabot[bot]`". Checked in order: author, label, title."""
+    skip = config.skip_prs
+    who = author.strip().lower()
+    for entry in skip.authors:
+        if who and entry.lower() == who:
+            return f"author `{entry}`"
+    have = {str(label).strip().lower() for label in labels}
+    for entry in skip.labels:
+        if entry.lower() in have:
+            return f"label `{entry}`"
+    name = title.strip().lower()
+    for entry in skip.title_patterns:
+        if _title_regex(entry.lower()).fullmatch(name):
+            return f"title pattern `{entry}`"
+    return None
+
+
+def skip_summary(rule: str) -> str:
+    """The one-line check summary for a pull request skipped by `skip_prs`."""
+    return f"skipped by {CONFIG_PATH} skip_prs ({rule})"
 
 
 @lru_cache(maxsize=256)
