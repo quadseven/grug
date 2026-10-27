@@ -187,7 +187,7 @@ def list_install_repos(
             log.error("gh_install_repos_malformed", extra={"install_id": install_id})
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY, detail="gh_upstream_malformed",
-            )
+            ) from None
         out: list[dict[str, Any]] = []
         for r in repos:
             cfg = get_repo_config(install_id, r["id"])
@@ -489,7 +489,7 @@ def update_repo_config(
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="gh_upstream_malformed",
-            )
+            ) from None
         for r in repos:
             if r["id"] == repo_id:
                 return True, r["full_name"], r.get("default_branch", "main")
