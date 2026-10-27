@@ -4798,6 +4798,7 @@ def _publish_deep_review(
             combined_eval, mode=mode, living_range=living_range,
             deep_suppressed_count=deep_suppressed_count, pr_title=pr_title,
             head_sha=head_sha, base_sha=base_sha, pr=f"{owner}/{repo_name}#{pull_number}",
+            file_contents=file_contents, linked_issues=linked_issues,
         ),
         stack_create_if_absent=worth_an_email(combined_eval),
     )
@@ -4856,6 +4857,8 @@ def _deep_stack_body(
     head_sha: str,
     base_sha: str,
     pr: str,
+    file_contents: dict[str, str] | None,
+    linked_issues: tuple[int, ...],
 ) -> str | None:
     """The stack comment body for a deep publish, built before the POST so a
     queued retry can refresh the stack without the evaluation. None (logged)
