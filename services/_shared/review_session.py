@@ -120,6 +120,11 @@ class ObservedFinding:
     # gave none (a deterministic scanner).
     source: str = "llm"
     inline_comment_id: Optional[int] = None
+    # The model's suggested replacement for the anchored line, or None when
+    # the producer did not supply a fix hint. /grug fix reads this to apply
+    # unresolved findings as a single commit. Kept as None (not "") to
+    # preserve the empty-vs-absent distinction.
+    suggestion: str | None = None
 
     @property
     def finding_id(self) -> str:
@@ -157,6 +162,7 @@ class FindingRecord:
     superseded_by: str = ""
     inline_comment_ids: tuple[int, ...] = ()
     check_run_ids: tuple[int, ...] = ()
+    suggestion: str | None = None
 
 
 @dataclass(frozen=True)
@@ -351,6 +357,7 @@ def _reconcile(
                 category=seen.category,
                 confidence=seen.confidence,
                 evidence=seen.evidence,
+                suggestion=seen.suggestion,
                 last_seen_sha=sha,
                 inline_comment_ids=_add(rec.inline_comment_ids, seen.inline_comment_id),
                 check_run_ids=_add(rec.check_run_ids, check_run_id),
@@ -402,6 +409,7 @@ def _reconcile(
             history=(StateChange("open", sha, at, "first raised"),),
             inline_comment_ids=_add((), f.inline_comment_id),
             check_run_ids=_add((), check_run_id),
+            suggestion=f.suggestion,
         ))
     return tuple(out)
 
@@ -546,6 +554,7 @@ def from_dict(data: Mapping[str, Any]) -> ReviewSession:
             superseded_by=str(d.get("superseded_by", "")),
             inline_comment_ids=tuple(int(x) for x in d.get("inline_comment_ids", [])),
             check_run_ids=tuple(int(x) for x in d.get("check_run_ids", [])),
+            suggestion=d.get("suggestion"),
         )
 
     def _run(d: Mapping[str, Any]) -> ReviewRun:
