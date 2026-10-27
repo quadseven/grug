@@ -133,6 +133,13 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
             - {name: DD_LOGS_INJECTION, value: "true"}
             - {name: GRUG_ENV, value: prod}
+            # grug#1445: the App bot logins the owner allows to run Elder
+            # re-run commands (/grug improve / resume / review) on a PR they
+            # did not author. Read from GRUG_ALLOWED_APP_BOT_LOGINS. Empty =
+            # feature off; the operator lists the owner's App bots here so a
+            # /grug improve from loom-brain[bot] on a PR it did not open runs
+            # Elder like a write collaborator's instead of being dropped.
+            - {name: GRUG_ALLOWED_APP_BOT_LOGINS, value: "loom-brain[bot],loom-station[bot],loom-lanes[bot]"}
             # Off-Lambda async path (#368). Elder's production hot path is
             # durable SQS below; this flag still enables the local worker used
             # by the other async personas and by Elder only if that lane is

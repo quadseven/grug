@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import importlib
 import logging
+import os
 from typing import Any
 
 from adapters.install_store import (
@@ -556,6 +557,20 @@ _AUTHORIZED_ROLES = {"admin", "maintain", "write"}
 # once - the commands after the wall were the ones that got dropped.
 _LOW_BUDGET_FRACTION = 0.10
 
+# grug#1445: the App bot logins the owner allows to run Elder re-run commands
+# (/grug improve / resume / review) on a PR they did not author. Read from the
+# GRUG_ALLOWED_APP_BOT_LOGINS env var (comma/whitespace separated, lower cased).
+# An App login has no collaborator permission record, so the lookup would fail;
+# an App the owner installed and listed here runs Elder re-runs like a write
+# collaborator. Empty = no bots allowed (feature off, safe to deploy).
+_ALLOWED_APP_BOT_LOGINS_ENV = "GRUG_ALLOWED_APP_BOT_LOGINS"
+
+
+def _allowed_app_bot_logins() -> frozenset[str]:
+    """The configured allowed App bot logins, lower cased."""
+    raw = os.getenv(_ALLOWED_APP_BOT_LOGINS_ENV, "")
+    return frozenset(name.lower() for name in raw.replace(",", " ").split())
+
 
 def _budget_reset_epoch(install_id: int) -> float:
     """The epoch second the installation's GitHub budget resets at, when
@@ -579,6 +594,19 @@ def _budget_reset_epoch(install_id: int) -> float:
     if limit <= 0 or remaining >= limit * _LOW_BUDGET_FRACTION:
         return 0.0
     return float(reset)
+
+
+def _sender_is_allowed_app_bot(sender_type: str, sender_login: str) -> bool:
+    """True when the commenter is a Bot from an allowed App on this owner.
+
+    An App login such as loom-brain[bot] is not a collaborator and has no
+    permission record, so the collaborator lookup fails for it. An App the
+    owner installed and listed here runs Elder re-run commands like a write
+    collaborator instead."""
+    return (
+        str(sender_type or "").lower() == "bot"
+        and sender_login.lower() in _allowed_app_bot_logins()
+    )
 
 
 def _actor_has_write(
@@ -1066,6 +1094,27 @@ def _refuse_accept(
     )
 
 
+def _refuse_rerun_command(
+    reason: str, *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, verb: str,
+) -> None:
+    """Tell the commenter once why an Elder re-run command was refused.
+
+    A refused command that vanishes looks like one that worked (grug#1270),
+    so the reader is told why and invited to comment again. Best-effort: a
+    reply GitHub refuses must not turn the refusal into a webhook 500."""
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from interactive import _reply  # type: ignore
+
+    _reply(
+        lambda fn: with_install_token_retry(int(installation_id), fn),
+        owner, repo_name, int(pr_number),
+        f"Grug refused `/grug {verb}`: {reason}. Only the PR author, a "
+        f"write collaborator, or an allowed App bot can re-run Elder here. "
+        f"Comment `/grug {verb}` again.",
+    )
+
+
 def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     action = payload.get("action", "")
     if action != "created":
@@ -1078,7 +1127,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     comment = payload.get("comment") or {}
     body = comment.get("body") or ""
     comment_id = comment.get("id")
-    from grug_commands import parse_command  # type: ignore
+    from grug_commands import ELDER_RERUN_VERBS, parse_command  # type: ignore
     cmd = parse_command(body)
     if cmd is None:
         return {"status": "no_op", "reason": "no /grug command trigger"}
@@ -1092,6 +1141,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     repo_name = repo.get("name")
     pr_number = issue.get("number")
     sender_login = sender.get("login", "")
+    sender_type = sender.get("type", "")
     pr_author_login = (issue.get("user") or {}).get("login", "")
 
     if not all([installation_id, owner, repo_name, pr_number]):
@@ -1181,10 +1231,20 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 commit_logins=commit_logins,
             )
         else:
-            has_write = _actor_has_write(
-                int(installation_id), owner, repo_name, sender_login,
-                allow_author=True, pr_author_login=pr_author_login,
-            )
+            # grug#1445: an allowed App Bot runs Elder re-run commands like a
+            # write collaborator. It has no collaborator permission record, so
+            # the lookup would fail (404) - short circuit it instead. Only
+            # improve / resume / review are opened to bots; recheck and the
+            # other verbs keep the strict author-or-write gate.
+            if cmd.verb in ELDER_RERUN_VERBS and _sender_is_allowed_app_bot(
+                sender_type, sender_login
+            ):
+                has_write = True
+            else:
+                has_write = _actor_has_write(
+                    int(installation_id), owner, repo_name, sender_login,
+                    allow_author=True, pr_author_login=pr_author_login,
+                )
     except httpx.RequestError as e:
         if accepting:
             _refuse_accept(
@@ -1204,6 +1264,12 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 owner=owner, repo_name=repo_name, pr_number=int(pr_number),
                 comment_id=comment_id,
             )
+        elif cmd.verb in ELDER_RERUN_VERBS:
+            _refuse_rerun_command(
+                "the permission lookup failed", installation_id=int(installation_id),
+                owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+                verb=cmd.verb,
+            )
         return {"status": "skip", "reason": "perm_lookup_failed"}
     if not has_write:
         if accepting:
@@ -1212,6 +1278,13 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 repo_name=repo_name, pr_number=int(pr_number),
                 comment_id=comment_id, permission=perm,
                 association=str(comment.get("author_association") or ""),
+            )
+        elif cmd.verb in ELDER_RERUN_VERBS:
+            _refuse_rerun_command(
+                "the sender has no write role on this repo",
+                installation_id=int(installation_id), owner=owner,
+                repo_name=repo_name, pr_number=int(pr_number),
+                verb=cmd.verb,
             )
         log.info(
             "recheck_unauthorized",
