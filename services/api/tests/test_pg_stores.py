@@ -1576,6 +1576,28 @@ def test_an_expired_removal_acceptance_is_replaced_not_merged(pg):
 
 
 # ---------------------------------------------------------------------------
+# Last command-triggered Elder run per PR (grug#1430)
+# ---------------------------------------------------------------------------
+
+
+def test_elder_command_run_keeps_the_latest_start_per_pr(pg):
+    from adapters import pg_install_store as store
+
+    pr = dict(install_id=7, repo="o/r", pr_number=3)
+    assert store.get_elder_command_run(**pr) is None
+    store.record_elder_command_run(**pr, head_sha="sha-a", started_at=100.5)
+    store.record_elder_command_run(**pr, head_sha="sha-b", started_at=200.0)
+    assert store.get_elder_command_run(**pr) == {"head_sha": "sha-b", "started_at": 200.0}
+    # another PR and another install see nothing
+    assert store.get_elder_command_run(install_id=7, repo="o/r", pr_number=4) is None
+    assert store.get_elder_command_run(install_id=8, repo="o/r", pr_number=3) is None
+    # a headless run is not recorded
+    store.record_elder_command_run(
+        install_id=7, repo="o/r", pr_number=5, head_sha="", started_at=1.0)
+    assert store.get_elder_command_run(install_id=7, repo="o/r", pr_number=5) is None
+
+
+# ---------------------------------------------------------------------------
 # Hunt Board review session: compare-and-swap row per PR (grug#1207)
 # ---------------------------------------------------------------------------
 
@@ -1726,3 +1748,95 @@ def test_a_cleared_or_expired_shared_bench_is_gone(pg, monkeypatch):
     monkeypatch.setattr(sb, "_snapshot", {})
     assert sb.refresh() == 0
     assert sb.blocked_until("go", "opencode-go") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# deep publish retry queue (#738)
+# ---------------------------------------------------------------------------
+
+
+def test_publish_retry_enqueue_is_win_once(pg):
+    from adapters import pg_publish_retry_store as store
+
+    assert store.enqueue_publish_retry("k1", {"pr": 1}) is True
+    assert store.enqueue_publish_retry("k1", {"pr": 2}) is False
+    row = store.claim_publish_retry("k1", owner_token="a", lease_seconds=60)
+    assert row is not None
+    assert row["publication"] == {"pr": 1}
+    assert row["attempts"] == 0
+
+
+def test_publish_retry_claim_is_exclusive_while_leased(pg):
+    from adapters import pg_publish_retry_store as store
+
+    store.enqueue_publish_retry("k1", {})
+    assert store.list_due_publish_retries(10) == ["k1"]
+    assert store.claim_publish_retry("k1", owner_token="a", lease_seconds=60) is not None
+    assert store.claim_publish_retry("k1", owner_token="b", lease_seconds=60) is None
+    assert store.list_due_publish_retries(10) == []
+    # Only the lease owner may complete the row.
+    assert store.complete_publish_retry("k1", owner_token="b") is False
+    assert store.complete_publish_retry("k1", owner_token="a") is True
+    assert store.claim_publish_retry("k1", owner_token="a", lease_seconds=60) is None
+
+
+def test_publish_retry_concurrent_claims_have_one_winner(pg):
+    from adapters import pg_publish_retry_store as store
+
+    store.enqueue_publish_retry("k1", {})
+    wins: list[str] = []
+    barrier = threading.Barrier(8)
+
+    def claim(token: str) -> None:
+        barrier.wait()
+        if store.claim_publish_retry("k1", owner_token=token, lease_seconds=60):
+            wins.append(token)
+
+    threads = [threading.Thread(target=claim, args=(f"t{i}",)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(wins) == 1
+
+
+def test_publish_retry_defer_keeps_the_row_queued_until_due(pg):
+    from adapters import pg_publish_retry_store as store
+
+    store.enqueue_publish_retry("k1", {"pr": 1})
+    store.claim_publish_retry("k1", owner_token="a", lease_seconds=60)
+    later = int(time.time()) + 600
+    assert store.defer_publish_retry(
+        "k1", owner_token="a", attempts=1, next_attempt_at=later,
+        last_error="ConnectError", abandon=False,
+    ) is True
+    assert store.list_due_publish_retries(10) == []
+    assert store.claim_publish_retry("k1", owner_token="b", lease_seconds=60) is None
+
+    store.defer_publish_retry(
+        "k1", owner_token="b", attempts=9, next_attempt_at=0,
+        last_error="x", abandon=False,
+    )  # not the owner: ignored
+    with pg.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET data = data || '{\"next_attempt_at\": 0}'::jsonb "
+            "WHERE pk = 'PUBLISH_RETRY'"
+        )
+    row = store.claim_publish_retry("k1", owner_token="b", lease_seconds=60)
+    assert row is not None
+    assert row["attempts"] == 1
+    assert row["last_error"] == "ConnectError"
+    assert row["publication"] == {"pr": 1}
+
+
+def test_publish_retry_abandoned_row_is_never_due(pg):
+    from adapters import pg_publish_retry_store as store
+
+    store.enqueue_publish_retry("k1", {})
+    store.claim_publish_retry("k1", owner_token="a", lease_seconds=60)
+    store.defer_publish_retry(
+        "k1", owner_token="a", attempts=8, next_attempt_at=0,
+        last_error="ConnectError", abandon=True,
+    )
+    assert store.list_due_publish_retries(10) == []
+    assert store.claim_publish_retry("k1", owner_token="b", lease_seconds=60) is None

@@ -15,8 +15,8 @@
 #
 # Egress is intentionally restricted to PORTS, not CIDRs: grug talks to
 # AWS (SSM/SQS/KMS/S3, 443), GitHub + the LLM backends (443), CNPG
-# Postgres (5432), and the node-local Datadog agent (DogStatsD 8125 / APM
-# 8126), plus DNS. Pinning destination CIDRs is the follow-up hardening;
+# Postgres (5432), the Kubernetes API server (6443, see the rule below),
+# and the node-local Datadog agent (DogStatsD 8125 / APM 8126), plus DNS. Pinning destination CIDRs is the follow-up hardening;
 # port-scoping already blocks exfil over non-standard channels without
 # risking an outage from a wrong CIDR.
 ---
@@ -72,6 +72,13 @@ spec:
     # CNPG Postgres.
     - ports:
         - {protocol: TCP, port: 5432}
+    # Kubernetes API server. The webhook and consumer (Smasher launcher SA)
+    # and the preview janitor call `kubernetes.default.svc:443`, but an
+    # enforcer matches the port AFTER the Service DNAT, and the API server
+    # endpoint listens on 6443. Allowing only 443 would cut every API call
+    # the moment the cluster starts enforcing this policy.
+    - ports:
+        - {protocol: TCP, port: 6443}
     # In-cluster spark-gateway (exposed-secret judge, #439 / ADR-0009).
     # Namespace-scoped (unlike the port-only rules above - this dest is
     # a single known namespace, so the CIDR-pinning follow-up is free).

@@ -94,31 +94,33 @@ class FileStat:
     summary: str | None = None
 
 
-def changed_files_table(files: list[FileStat]) -> str:
-    """The changed-files table: path, one-line summary, +X/-Y. Bounded to
-    _MAX_TABLE_ROWS with a visible '+N more' line - never a silent cut.
-    `path` and `summary` are escaped for both table-row integrity and
-    mention-spoofing before splicing (round 4, codex) - `path` is repo-
-    controlled (a crafted filename) and `summary` is model-authored."""
+def changed_files_list(files: list[FileStat]) -> str:
+    """The changed-files list (#1386): path, changes (+X/-Y), summary. Bounded
+    to _MAX_TABLE_ROWS with a visible '+N more' line - never a silent cut.
+    `path` and `summary` are sanitized before splicing."""
     if not files:
         return ""
-    rows = ["| File | Summary | Changes |", "|---|---|---|"]
+    lines: list[str] = []
     for f in files[:_MAX_TABLE_ROWS]:
         path = _escape_code_span_cell(_neutralize_mentions(f.path))
-        summary = (
-            _escape_html(
-                _escape_table_cell(
-                    _neutralize_mentions((f.summary or "")[:_MAX_FILE_SUMMARY_CHARS])
-                )
-            )
-            or "-"
-        )
-        rows.append(f"| `{path}` | {summary} | +{f.additions}/-{f.deletions} |")
-    table = "\n".join(rows)
+        raw_summary = _neutralize_mentions(
+            (f.summary or "")[:_MAX_FILE_SUMMARY_CHARS]
+        ).replace("\n", " ").replace("\r", " ").strip()
+        summary = _escape_html(raw_summary)
+        changes = f"+{f.additions}/-{f.deletions}"
+        if summary:
+            lines.append(f"- `{path}` ({changes}) - {summary}")
+        else:
+            lines.append(f"- `{path}` ({changes})")
+    out = "\n".join(lines)
     cut = len(files) - _MAX_TABLE_ROWS
     if cut > 0:
-        table += f"\n\n_(+{cut} more file(s) not shown)_"
-    return table
+        out += f"\n\n_(+{cut} more file(s) not shown)_"
+    return out
+
+
+# Backward-compatible alias
+changed_files_table = changed_files_list
 
 
 def _details(summary: str, body: str) -> str:
@@ -130,7 +132,7 @@ def walkthrough_body(
     *,
     summary: str,
     files: list[FileStat],
-    diagram: str | None,
+    diagram: str | None = None,
     effort: ReviewEffort,
     head_sha: str,
     degraded: bool,
@@ -143,11 +145,10 @@ def walkthrough_body(
     Layout goal: one screen of useful signal when collapsed, like a review
     summary card - not a wall of tables and mermaid.
 
-      ## Walkthrough
+      **Walkthrough**
       {short summary}
       Review effort: ...
       <details> Changed files (N) </details>
-      <details> Shape of the change </details>
       _Last walked at ..._
 
     `degraded` marks a summary that fell back to the deterministic form
@@ -160,7 +161,7 @@ def walkthrough_body(
     `pr_url` is where the full review is (the PR's Checks tab); when
     provided it's rendered as a badge-image button after the header.
     """
-    parts = [MARKER, TELLER_PORTRAIT_IMG, "", "## Walkthrough", ""]
+    parts = [MARKER, TELLER_PORTRAIT_IMG, "", "**Walkthrough**", ""]
     parts.append(
         _neutralize_headings(_neutralize_mentions(summary[:_MAX_SUMMARY_CHARS]))
     )
@@ -172,8 +173,7 @@ def walkthrough_body(
     notes: list[str] = []
     if degraded:
         notes.append(
-            "Summary fell back to a deterministic sketch; file list and "
-            "diagram (if any) are still live."
+            "Summary fell back to a deterministic sketch; file list is still live."
         )
     if files_truncated:
         notes.append(
@@ -196,29 +196,14 @@ def walkthrough_body(
             reason = _neutralize_mentions(r.reason)
             parts.append(f"- #{r.number} {title} — {reason}")
 
-    table = changed_files_table(files)
-    if table:
+    files_list = changed_files_list(files)
+    if files_list:
         n = len(files)
         label = f"Changed files ({n})"
         if files_truncated:
             label = f"Changed files (first {n})"
         parts.append("")
-        parts.append(_details(label, table))
-
-    if diagram:
-        parts.append("")
-        parts.append(_details("Shape of the change", f"```mermaid\n{diagram}\n```"))
-    elif files:
-        # Stated reason when files exist but diagram could not be drawn
-        # (too many top-level dirs, balance check failed, and so on).
-        parts.append("")
-        parts.append(
-            _details(
-                "Shape of the change",
-                "No diagram this pass - the change was too large or "
-                "complex to visualize cleanly.",
-            )
-        )
+        parts.append(_details(label, files_list))
 
     parts.append("")
     parts.append(f"_Last walked at `{head_sha[:12]}`._")

@@ -1212,11 +1212,16 @@ def test_dispatch_fetches_immutable_base_head_diff(monkeypatch):
     with patch("httpx.get", side_effect=capture_get):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
-    # First GET is the unified diff (diff Accept header).
-    assert captured[0]["headers"]["Accept"] == "application/vnd.github.diff"
-    assert "myorg/myrepo" in captured[0]["url"]
-    assert "/compare/base5678ijkl...abcd1234efgh" in captured[0]["url"]
-    assert captured[0]["timeout"] == review_publish.DIFF_FETCH_TIMEOUT
+    # The unified diff GET (diff Accept header). The base-ref `.grug.yaml`
+    # read comes first since grug#1439 (skip_prs is checked before the diff).
+    diff_gets = [
+        c for c in captured
+        if c["headers"].get("Accept") == "application/vnd.github.diff"
+    ]
+    assert diff_gets, "expected a unified diff fetch"
+    assert "myorg/myrepo" in diff_gets[0]["url"]
+    assert "/compare/base5678ijkl...abcd1234efgh" in diff_gets[0]["url"]
+    assert diff_gets[0]["timeout"] == review_publish.DIFF_FETCH_TIMEOUT
     # #336: subsequent GET(s) fetch full file content with the `.raw` Accept
     # header so the Elder sees mitigations outside the diff hunk.
     raw_gets = [c for c in captured if c["headers"].get("Accept") == "application/vnd.github.raw"]
@@ -3089,6 +3094,20 @@ def test_stack_body_is_a_board_with_a_verdict_first():
     assert "_#1 thing_" in body
 
 
+def test_stack_offers_bulk_fix_for_checked_suggestion():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    finding = Finding(
+        file="a.py", line=1, severity="low", rule_name="r",
+        message="fix value", suggestion="x = 2",
+    )
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+        conclusion="success", file_contents={"a.py": "x = 1\n"},
+    )
+    assert "Finishing touch" in body
+    assert "/grug fix" in body
+
+
 def test_worth_an_email_is_findings_or_degraded_only():
     """The gate on whether grug may CREATE a comment - i.e. whether it may
     mail the author. A clean review is not news; the green check-run already
@@ -3199,7 +3218,9 @@ def test_clean_review_body_is_three_lines_and_has_no_empty_fold():
     # and render as nothing.
     visible = [l for l in body.splitlines()
                if l.strip() and not l.strip().startswith("<!--")]
-    assert len(visible) == 2, visible                    # verdict + PR title
+    # verdict + PR title + the grug#1429 closure sentence, which is last.
+    assert len(visible) == 3, visible
+    assert visible[-1] == "Nothing needs to change on this head."
 
 
 def test_table_and_detail_bullets_are_blank_line_separated():
