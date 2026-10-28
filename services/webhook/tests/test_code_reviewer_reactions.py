@@ -573,18 +573,32 @@ def test_poll_and_annotate_submit_failure_does_not_abort_batch(monkeypatch, _pat
 
 
 def test_poll_and_annotate_baseline_write_failure_skips_count(monkeypatch):
-    """submit succeeds but the baseline DDB write fails → not counted as
+    """submit succeeds but the baseline store write fails -> not counted as
     submitted-and-recorded; re-submits next cycle (at-least-once)."""
     monkeypatch.setattr(cr_reactions, "submit_reaction_annotation", lambda **kw: None)
     monkeypatch.setattr(
         cr_reactions, "update_comment_record_reaction",
-        MagicMock(side_effect=RuntimeError("DDB throttle")),
+        MagicMock(side_effect=OSError("store transport error")),
     )
     with patch("httpx.get", return_value=_reactions_response(["-1"])):
         n = cr_reactions.poll_and_annotate(
             [_record(comment_id=1)], install_id=1, fetch_token=lambda: "tok",
         )
-    assert n == 0  # baseline never advanced → will retry next cycle
+    assert n == 0  # baseline never advanced -> will retry next cycle
+
+
+def test_poll_and_annotate_propagates_programmer_error(monkeypatch):
+    """Programmer bugs (KeyError, TypeError) must propagate instead of being
+    swallowed by the transport retry guard."""
+    monkeypatch.setattr(cr_reactions, "submit_reaction_annotation", lambda **kw: None)
+    monkeypatch.setattr(
+        cr_reactions, "update_comment_record_reaction",
+        MagicMock(side_effect=KeyError("bogus_key")),
+    )
+    with patch("httpx.get", return_value=_reactions_response(["-1"])), pytest.raises(KeyError):
+        cr_reactions.poll_and_annotate(
+            [_record(comment_id=1)], install_id=1, fetch_token=lambda: "tok",
+        )
 
 
 def test_poll_and_annotate_logs_mixed_signal(monkeypatch, _patch_store, caplog):
@@ -680,3 +694,43 @@ def test_classify_finds_thumbs_down_among_many_reactions():
     'first N' slicing can't reintroduce the miss."""
     reactions = [{"content": "heart"}] * 40 + [{"content": "-1"}]
     assert cr_reactions._classify_reactions(reactions) == "false_positive"
+
+
+def test_record_reaction_learning_logs_reaction_learning_written(monkeypatch, caplog):
+    from adapters import install_store
+
+    monkeypatch.setattr(install_store, "put_ledger_row", lambda row: None)
+    monkeypatch.setattr(install_store, "list_ledger_rows", lambda repo: [])
+    monkeypatch.setattr(install_store, "put_repo_practices", lambda repo, data: None)
+    monkeypatch.setattr(install_store, "put_repo_exemplars", lambda repo, data: None)
+
+    with caplog.at_level("INFO"):
+        ok = cr_reactions._record_reaction_learning(
+            _learning_record(comment_id=5), "confirmed",
+        )
+    assert ok is True
+    rec = [r for r in caplog.records if r.message == "reaction_learning_written"]
+    assert len(rec) == 1
+    assert rec[0].comment_id == 5
+    assert rec[0].verdict == "declined"
+    assert getattr(rec[0], "class") == "null-deref"
+
+
+def test_poll_and_annotate_logs_learning_writes_count(monkeypatch, _patch_store, caplog):
+    _patch_annotate(monkeypatch)
+    learned = MagicMock(return_value=True)
+    monkeypatch.setattr(cr_reactions, "_record_reaction_learning", learned)
+    monkeypatch.setattr(
+        cr_reactions, "_has_write_permission", lambda *args: True,
+    )
+    resp = MagicMock(spec=httpx.Response)
+    resp.raise_for_status = MagicMock()
+    resp.json = MagicMock(return_value=[{"content": "+1", "user": {"login": "alice"}}])
+    with caplog.at_level("INFO"), patch("httpx.get", return_value=resp):
+        cr_reactions.poll_and_annotate(
+            [_learning_record(comment_id=5)], install_id=1, fetch_token=lambda: "tok",
+        )
+    cycle = [r for r in caplog.records if r.message == "reaction_poll_cycle"]
+    assert len(cycle) == 1
+    assert cycle[0].learned == 1
+    assert cycle[0].submitted == 1
