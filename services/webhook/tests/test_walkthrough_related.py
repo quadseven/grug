@@ -15,7 +15,6 @@ def _body(related):
         diagram=None,
         effort="quick",
         head_sha="b" * 40,
-        degraded=False,
         related=related,
     )
 

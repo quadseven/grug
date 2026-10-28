@@ -3,6 +3,13 @@
 CONTEXT.md + docs/adr/ surfaced as a DISTINCT review-context block
 (### REPO DOCS), separate from team-practices/Lore and from the #674
 agent-guideline block. Fail-safe: any fetch problem degrades to None.
+
+Test requirements: everything here runs offline with `pytest` and `boto3`
+only (the `make webhook-test` target installs both). The one exception is
+`test_context_md_contradiction_caught` (C5), which calls a real LLM backend
+and is skipped unless `GRUG_LIVE_LLM=1` is set AND a backend answers. The
+offline half of the same claim (the real CONTEXT.md line reaches the
+reviewer prompt) is pinned in `test_repo_docs_regression.py`.
 """
 
 from __future__ import annotations

@@ -174,3 +174,87 @@ def reviewer_precision(rows: list[LedgerRow]) -> dict[str, ReviewerScore]:
         rev: ReviewerScore(reviewer=rev, accepted=a, false_positives=fp)
         for rev, (a, fp) in acc.items()
     }
+
+
+def learning_metrics(rows: list[LedgerRow]) -> dict[str, object]:
+    """Calculate corpus metrics: total, accepted, false-positive, precision,
+    per-reviewer scores, and per-class precision breakdown (#539)."""
+    scores = reviewer_precision(rows)
+    accepted = sum(s.accepted for s in scores.values())
+    fps = sum(s.false_positives for s in scores.values())
+    total = accepted + fps
+    overall_precision = accepted / total if total else 1.0
+
+    class_counts: dict[str, list[int]] = {}
+    for r in rows:
+        cell = class_counts.setdefault(r.finding_class, [0, 0])
+        if r.accepted:
+            cell[0] += 1
+        elif r.false_positive:
+            cell[1] += 1
+    class_precision = {
+        cls: (a / (a + fp) if (a + fp) > 0 else 1.0)
+        for cls, (a, fp) in class_counts.items()
+    }
+
+    return {
+        "total_rows": len(rows),
+        "labeled_rows": total,
+        "accepted": accepted,
+        "false_positives": fps,
+        "precision": overall_precision,
+        "reviewers": {
+            rev: {
+                "accepted": s.accepted,
+                "false_positives": s.false_positives,
+                "total": s.total,
+                "precision": s.precision,
+            }
+            for rev, s in scores.items()
+        },
+        "classes": {
+            cls: {
+                "accepted": a,
+                "false_positives": fp,
+                "total": a + fp,
+                "precision": class_precision[cls],
+            }
+            for cls, (a, fp) in class_counts.items()
+        },
+    }
+
+
+def format_metrics(rows: list[LedgerRow]) -> str:
+    """Human-readable string representation of the ledger metrics (#539)."""
+    m = learning_metrics(rows)
+    lines = [
+        f"ledger: {m['total_rows']} rows, {m['accepted']} accepted, {m['false_positives']} false positives (precision {m['precision']:.2f})",
+        "reviewers:",
+    ]
+    reviewers = m["reviewers"]  # type: ignore[assignment]
+    for rev, s in sorted(reviewers.items()):
+        lines.append(f"  {rev}: {s['accepted']}/{s['total']} accepted (precision {s['precision']:.2f})")
+    lines.append("classes:")
+    classes = m["classes"]  # type: ignore[assignment]
+    for cls, c in sorted(classes.items()):
+        lines.append(f"  {cls}: {c['accepted']}/{c['total']} accepted (precision {c['precision']:.2f})")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import sys
+    args = sys.argv[1:] if argv is None else argv
+    path = args[0] if args else "logs/review-ledger.jsonl"
+    try:
+        with open(path, encoding="utf-8") as f:
+            rows = parse_jsonl(f.read())
+    except FileNotFoundError:
+        print(f"ledger: file not found: {path}")
+        return 1
+    print(format_metrics(rows))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(main(sys.argv[1:]))
