@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from personas.code_reviewer.persona import Finding
-from personas.code_reviewer.verify import verify_findings
+from personas.code_reviewer.verify import CheckEvidence, verify_findings
 
 
 def _finding(**kw) -> Finding:
@@ -674,6 +674,148 @@ def test_lockstep_kill_is_scoped_to_caller_not_updated():
     kept, killed = verify_findings((f,), {_ATTESTER_PATH: _ATTESTER_AT_762_HEAD})
     assert kept == (f,)
     assert killed == ()
+
+
+# --- covered_by_passing_check: a caller-not-updated claim a passing check
+# on the reviewed head already covers (grug #763, the box the
+# collection_lockstep kill left open) ------------------------------------
+#
+# On PR #762 the persona-purity attester printed
+# "OK: evaluate_pull_request is pure" on the reviewed head while Elder
+# claimed its allowlist was stale. This marking is the same claim without
+# the two-list lockstep phrasing, so only the CI evidence can drop it.
+
+_REVIEWED_HEAD = "9f7c499" + "0" * 33
+_OLDER_HEAD = "1a2b3c4" + "0" * 33
+_PURITY_PATH = "infra/scripts/attest_persona_purity.py"
+_PURITY_SOURCE = "\n" * 34 + "ALLOWED_CALL_NAMES = frozenset({'check_why'})\n"
+_PURITY_MESSAGE = (
+    "evaluate_pull_request now dispatches check_linked_issue_completeness, "
+    "but attest_persona_purity.py does not name it, so the attester will "
+    "reject the new call target."
+)
+
+
+def _purity_finding() -> Finding:
+    return _finding(
+        file=_PURITY_PATH, line=35, severity="medium",
+        rule_name="caller-not-updated", message=_PURITY_MESSAGE,
+    )
+
+
+def _check(**kw) -> CheckEvidence:
+    base = dict(
+        name="attest persona purity", head_sha=_REVIEWED_HEAD,
+        status="completed", conclusion="success",
+        text="OK: evaluate_pull_request is pure",
+    )
+    base.update(kw)
+    return CheckEvidence(**base)
+
+
+def _verify_with(*checks: CheckEvidence, finding: Finding | None = None):
+    f = finding or _purity_finding()
+    return f, verify_findings(
+        (f,), {_PURITY_PATH: _PURITY_SOURCE},
+        checks=checks, head_sha=_REVIEWED_HEAD,
+    )
+
+
+def test_passing_attester_on_reviewed_head_drops_the_finding():
+    f, (kept, killed) = _verify_with(_check())
+    assert kept == ()
+    assert [(k.reason, k.detail) for k in killed] == [
+        ("covered_by_passing_check", "attest persona purity"),
+    ]
+    assert killed[0].finding is f
+
+
+def test_without_check_evidence_the_same_finding_is_kept():
+    """The fixture is not dropped by any other kill: only the check does."""
+    f, (kept, killed) = _verify_with()
+    assert kept == (f,)
+    assert killed == ()
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "timed_out", "neutral", "skipped", "cancelled"])
+def test_attester_that_did_not_pass_keeps_the_finding(conclusion):
+    f, (kept, killed) = _verify_with(_check(conclusion=conclusion))
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_attester_still_running_keeps_the_finding():
+    f, (kept, killed) = _verify_with(_check(status="in_progress", conclusion=""))
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_attester_on_an_older_head_keeps_the_finding():
+    f, (kept, killed) = _verify_with(_check(head_sha=_OLDER_HEAD))
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_check_output_naming_the_cited_symbol_covers_it():
+    """An aggregate job whose name says nothing still covers the claim
+    when its own output names the cited symbol."""
+    f, (kept, killed) = _verify_with(_check(name="attest"))
+    assert kept == ()
+    assert [(k.reason, k.detail) for k in killed] == [
+        ("covered_by_passing_check", "attest"),
+    ]
+
+
+def test_unrelated_passing_check_keeps_the_finding():
+    f, (kept, killed) = _verify_with(_check(name="lint", text="All checks passed"))
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_grug_own_check_is_not_ci_evidence():
+    f, (kept, killed) = _verify_with(
+        _check(name="Grug - Elder attest persona purity"),
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_coverage_kill_is_scoped_to_caller_not_updated():
+    f = _finding(
+        file=_PURITY_PATH, line=35, rule_name="logic-error",
+        message=_PURITY_MESSAGE,
+    )
+    _, (kept, killed) = _verify_with(_check(), finding=f)
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_short_file_stem_never_names_a_check():
+    """`main.py` would match half the checks on a PR: too short to count."""
+    f = _finding(
+        file="src/main.py", line=5, rule_name="caller-not-updated",
+        message="run now takes a config, but main.py still calls run().",
+    )
+    kept, killed = verify_findings(
+        (f,), {"src/main.py": "\n" * 10},
+        checks=(_check(name="main", text="ok"),), head_sha=_REVIEWED_HEAD,
+    )
+    assert kept == (f,)
+    assert killed == ()
+
+
+def test_check_run_dict_maps_to_evidence():
+    run = {
+        "name": "attest persona purity", "head_sha": _REVIEWED_HEAD,
+        "status": "completed", "conclusion": "success",
+        "output": {"title": "ok", "summary": None, "text": "evaluate_pull_request is pure"},
+    }
+    ev = CheckEvidence.from_check_run(run)
+    assert ev == CheckEvidence(
+        name="attest persona purity", head_sha=_REVIEWED_HEAD,
+        status="completed", conclusion="success",
+        text="ok\nevaluate_pull_request is pure",
+    )
 
 
 # --- return_value_used: a "return value discarded" claim refuted by the
