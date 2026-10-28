@@ -275,6 +275,17 @@ def check_deployment(service: str) -> bool:
     return bool(verdicts) and all(v.ok for v in verdicts)
 
 
+def deployment_chain_verdict(service: str) -> StageVerdict:
+    """Collapse the stage verdicts into one: the first failure, else the last.
+
+    An empty verdict list is itself broken, so callers never index into it.
+    """
+    verdicts = deployment_stage_verdicts(service)
+    if not verdicts:
+        return StageVerdict("deploy", False, "no stage verdicts produced")
+    return next((v for v in verdicts if not v.ok), verdicts[-1])
+
+
 def deployment_status(service: str) -> str:
     """Distinguish a stale deployment from missing reference evidence."""
     _, deployed_digest = get_latest_digest(service)
@@ -322,7 +333,7 @@ def main(service: str = "webhook", *args: str) -> int:
         def _notify(message, stage, evidence):
             print(f"{message}: {evidence}", file=sys.stderr)
 
-        checks = [("deploy", lambda: deployment_stage_verdicts(target)[0])]
+        checks = [("deploy", lambda: deployment_chain_verdict(target))]
         result = escalate_once(checks, notify=_notify)
         return 0 if result != "broken" else 1
 
