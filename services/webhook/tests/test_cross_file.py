@@ -552,3 +552,60 @@ def test_fetched_context_is_snippets_not_whole_files():
     assert "202: " in snippet
     assert len(snippet.splitlines()) <= cross_file._MAX_SNIPPET_LINES + cross_file._MAX_SNIPPET_WINDOWS
     assert "filler_0 = 0" not in snippet
+
+
+_DIFF_CHANGED_LITERAL = """diff --git a/src/messages.py b/src/messages.py
+--- a/src/messages.py
++++ b/src/messages.py
+@@ -3,3 +3,3 @@
+ def greeting():
+-    return "Welcome back, friend"
++    return "Welcome back"
+"""
+
+
+def test_extract_symbols_includes_removed_string_literal():
+    """#847 (zippie PR 165 shape): a changed user-facing string has no
+    def/call symbol, so without the removed literal no search would ever
+    surface the untouched test that still asserts the old value."""
+    symbols = cross_file.extract_symbols(parse_diff(_DIFF_CHANGED_LITERAL))
+    assert "Welcome back, friend" in symbols
+
+
+def test_extract_symbols_skips_literal_still_present_and_short_ones():
+    diff = """diff --git a/src/m.py b/src/m.py
+--- a/src/m.py
++++ b/src/m.py
+@@ -1,3 +1,3 @@
+-    a = "kept value"
+-    b = "ab"
++    a = "kept value"
++    b = "xy"
+"""
+    assert cross_file.extract_symbols(parse_diff(diff)) == ()
+
+
+def test_stale_assertion_in_untouched_test_reaches_the_model():
+    """End to end through the fetcher: the removed literal finds the
+    unchanged test file and its snippet carries the stale assertion."""
+    test_src = (
+        "from messages import greeting\n\n"
+        "def test_greeting():\n"
+        '    assert greeting() == "Welcome back, friend"\n'
+    )
+
+    def fake_get(url, **kw):
+        if "/search/code" in url:
+            queried.append(kw["params"]["q"])
+            return _search_response(["tests/test_messages.py"])
+        return _raw_response(test_src)
+
+    queried: list[str] = []
+    symbols = cross_file.extract_symbols(parse_diff(_DIFF_CHANGED_LITERAL))
+    with patch.object(cross_file.httpx, "get", side_effect=fake_get):
+        out = cross_file.fetch_cross_file_context(
+            "tok", "o", "r", symbols,
+            head_sha="abc", exclude_paths=frozenset({"src/messages.py"}),
+        )
+    assert any("Welcome back, friend" in q for q in queried)
+    assert 'assert greeting() == "Welcome back, friend"' in out["tests/test_messages.py"]

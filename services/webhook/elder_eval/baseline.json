@@ -1,26 +1,4 @@
 {
-  "backends": {
-    "cave": {
-      "cases_scored": 17,
-      "errored_cases": [],
-      "model": "qwen3-coder-next:q8_0",
-      "noise_rate": 0.0,
-      "overall_catch": 0.1746031746031746,
-      "per_class_catch": {
-        "correctness": 0.18181818181818182,
-        "security-scope": 0.3333333333333333,
-        "silent-failure": 0.07142857142857142,
-        "simplification": 0.0,
-        "test-gap": 0.25,
-        "type-design": 0.0,
-        "upstream-semantics": 0.2857142857142857
-      },
-      "served_models": {},
-      "truncated_cases": [
-        "githumps/grug#366",
-        "githumps/grug#494"
-      ]
-    }
-  },
-  "prompt_sha": "8f85cf9da27d1d57316bb5a8b04ef11a1a8c0afe6e5827d6ee1c99e2932b475b"
+  "backends": {},
+  "prompt_sha": "258d7c1ebf855acb6dbcb2380d3563769b18de29c856e69fcff3a2f3e042433e"
 }
