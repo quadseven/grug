@@ -215,7 +215,13 @@ spec:
             # unparseable, and about 16 posted a finding Tier 1 had not.
             # Under cloud priority the deep pass runs on the cloud chain and
             # reaches the Cave reasoner only when every cloud tier fails.
-            - {name: GRUG_DEEP_ESCALATION, value: auto}
+            # TEMPORARY (2026-10-27): on_demand while both Spark machines are
+            # away for RMA (about a month from 2026-10-27). With the Sparks off
+            # and the free cloud tier exhausted the deep pass ended all_failed
+            # and Elder concluded failure, blocking merges. Revert to auto when
+            # the Spark reasoner returns or paid OpenRouter credits are enabled
+            # (grug#1487).
+            - {name: GRUG_DEEP_ESCALATION, value: "on_demand"}
             # The key has a zero spend limit: a paid model here 403s on every
             # call. Same :free model as the chain's tier 2.
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}

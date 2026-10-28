@@ -31,6 +31,7 @@ function baseConfig(over: Cfg = {}): Cfg {
     dep_watch_enabled: false,
     reopen_watch_enabled: false,
     guard_hygiene_watch_enabled: false,
+    pulse_comment_nudge_enabled: false,
     issue_dor_enabled: false,
     check_run_reconcile_enabled: false,
     ...over,
@@ -192,5 +193,41 @@ describe("Personas panel (grug#1206)", () => {
     const stored = JSON.parse(localStorage.getItem("grug_dash_v2") ?? "{}");
     // The seeded stale value is left alone; no click wrote a persona mode.
     expect(stored.personas).toEqual({ elder: "off", guard: "off" });
+  });
+});
+
+// grug#1482: the pulse comment-nudge persona (F-09) is default off per repo
+// and had no dashboard control; the only write path was a hand-rolled API PUT.
+describe("Repositories panel pulse nudge switch (grug#1482)", () => {
+  async function nudgeSwitch(): Promise<HTMLElement> {
+    return screen.findByTitle("Toggle the pulse comment nudge for acme/app");
+  }
+
+  it("shows the stored value and writes on and off through the config PUT", async () => {
+    mount();
+    const sw = await nudgeSwitch();
+    expect(sw.getAttribute("aria-checked")).toBe("false");
+
+    await act(async () => { fireEvent.click(sw); });
+    await waitFor(() => expect(puts).toHaveLength(1));
+    expect(puts[0].repoId).toBe(REPO_ID);
+    expect(puts[0].body).toMatchObject({ tpm_enabled: true, pulse_comment_nudge_enabled: true });
+    await waitFor(async () => expect((await nudgeSwitch()).getAttribute("aria-checked")).toBe("true"));
+
+    await act(async () => { fireEvent.click(await nudgeSwitch()); });
+    await waitFor(() => expect(puts).toHaveLength(2));
+    expect(puts[1].body).toMatchObject({ pulse_comment_nudge_enabled: false });
+    expect(configs[REPO_ID].pulse_comment_nudge_enabled).toBe(false);
+    // The other repo's stored flag is untouched.
+    expect(configs[OTHER_REPO_ID].pulse_comment_nudge_enabled).toBe(false);
+  });
+
+  it("reads an enabled flag back after a reload", async () => {
+    configs[REPO_ID] = baseConfig({ pulse_comment_nudge_enabled: true });
+    const first = mount();
+    expect((await nudgeSwitch()).getAttribute("aria-checked")).toBe("true");
+    first.unmount();
+    mount();
+    expect((await nudgeSwitch()).getAttribute("aria-checked")).toBe("true");
   });
 });
