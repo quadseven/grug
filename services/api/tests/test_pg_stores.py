@@ -349,12 +349,55 @@ def test_durable_review_claim_expiry_allows_safe_takeover(pg):
     assert store.complete_review_claim(**claim, owner_token="worker-new") is True
 
 
-def test_elder_lease_lifecycle_against_real_store(pg):
-    """ReviewClaimLease end to end over real Postgres: acquire blocks a rival,
-    complete dedupes, and a released snapshot is retakeable."""
+def _settle_elder_terminal(name: str, claim: dict) -> None:
+    """Drive one ticket-named terminal transition over the real store."""
     from personas.code_reviewer.elder_review import (
+        _MAX_INTENT_DRIFT_REDRIVES,
+        RedriveDecision,
         ReviewClaimLease,
         Transition,
+        decide_redrive,
+    )
+
+    status, lease = ReviewClaimLease.acquire(claim)
+    assert status == "acquired" and lease is not None
+    assert ReviewClaimLease.acquire(claim) == ("busy", None)
+    if name == "complete":
+        lease.settle(Transition.COMPLETE, "during review")
+        lease.close()
+        return
+    if name == "re-enqueue-stale":
+        # Stale snapshot: hand the claim back, and the pure policy says
+        # re-enqueue under the same-sha cap, then give up at it.
+        lease.settle(Transition.RELEASE, "for stale snapshot")
+        lease.close()
+        assert decide_redrive(same_sha=True, job_redrive_count=0) == (
+            RedriveDecision("redrive", 1)
+        )
+        assert decide_redrive(
+            same_sha=True, job_redrive_count=_MAX_INTENT_DRIFT_REDRIVES,
+        ).action == "give_up"
+    else:
+        # release+redrive: dispatch failed, so the claim is released for the
+        # SQS redelivery to take.
+        lease.settle(Transition.RELEASE, "during dispatch")
+        lease.close()
+    status, retaken = ReviewClaimLease.acquire(claim)
+    assert status == "acquired" and retaken is not None
+    retaken.settle(Transition.COMPLETE_OR_RELEASE, "after redrive")
+    retaken.close()
+
+
+@pytest.mark.parametrize(
+    "name", ["complete", "re-enqueue-stale", "release+redrive"],
+)
+def test_elder_terminal_transitions_against_real_store(pg, name):
+    """Each terminal transition the ticket enumerates (complete /
+    re-enqueue-stale / release+redrive) over real Postgres: a rival is
+    blocked while the lease is held, and every path ends with the snapshot
+    completed so a duplicate delivery dedupes."""
+    from personas.code_reviewer.elder_review import (
+        ReviewClaimLease,
         release_active_review_claims,
     )
 
@@ -363,53 +406,11 @@ def test_elder_lease_lifecycle_against_real_store(pg):
         repo="quadseven/grug",
         pr_number=12,
         persona="code_reviewer",
-        head_sha="snapshot-elder-lease",
+        head_sha=f"snapshot-elder-{name}",
     )
-    status, lease = ReviewClaimLease.acquire(claim)
-    assert status == "acquired" and lease is not None
-    assert ReviewClaimLease.acquire(claim) == ("busy", None)
-    lease.settle(Transition.RELEASE, "test")
-    lease.close()
-
-    status, lease = ReviewClaimLease.acquire(claim)
-    assert status == "acquired" and lease is not None
-    lease.settle(Transition.COMPLETE, "test")
-    lease.close()
+    _settle_elder_terminal(name, claim)
     assert ReviewClaimLease.acquire(claim) == ("completed", None)
     assert release_active_review_claims() == 0
-
-
-def test_elder_stale_redrive_and_fallback_transitions_against_real_store(pg):
-    """The remaining terminal transitions over real Postgres: a stale snapshot
-    is released and redriven per decide_redrive, and COMPLETE_OR_RELEASE
-    completes an owned claim."""
-    from personas.code_reviewer.elder_review import (
-        ReviewClaimLease,
-        Transition,
-        decide_redrive,
-    )
-
-    claim = dict(
-        install_id=7,
-        repo="quadseven/grug",
-        pr_number=14,
-        persona="code_reviewer",
-        head_sha="snapshot-elder-stale",
-    )
-    status, lease = ReviewClaimLease.acquire(claim)
-    assert status == "acquired" and lease is not None
-    # Stale snapshot: hand the claim back, then the pure policy re-enqueues.
-    lease.settle(Transition.RELEASE, "stale")
-    lease.close()
-    decision = decide_redrive(same_sha=True, job_redrive_count=0)
-    assert decision.action == "redrive" and decision.next_redrive_count == 1
-
-    # The redriven attempt takes the released snapshot and finishes it.
-    status, lease = ReviewClaimLease.acquire(claim)
-    assert status == "acquired" and lease is not None
-    lease.settle(Transition.COMPLETE_OR_RELEASE, "test")
-    lease.close()
-    assert ReviewClaimLease.acquire(claim) == ("completed", None)
 
 
 def test_elder_shutdown_sweep_releases_real_claim(pg):
