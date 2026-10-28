@@ -1,0 +1,21 @@
+{
+  "measurements": {
+    "production": {
+      "caught": {
+        "cross_hop_tpm_default_side_effect": false,
+        "reverse_direction_stale_ui_mapping": false,
+        "weak_assertion_keyword_only_forwarding": false
+      },
+      "findings": [
+        {
+          "line": 140,
+          "message": "Function `main` too tangled -- cyclomatic 16 (cap 15). Grug say: break into smaller pieces so next hunter read it without getting lost.",
+          "path": "infra/scripts/attest_persona_surface_coherence.py",
+          "rule": "high-complexity"
+        }
+      ],
+      "recall": 0.0,
+      "source": "Elder's production review of PR 751 at head 61dce166be on 2026-07-24: one finding, from the deterministic complexity scanner; the LLM arm published nothing"
+    }
+  }
+}

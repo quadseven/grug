@@ -1,0 +1,224 @@
+@@ -0,0 +1,223 @@
++#!/usr/bin/env python3
++"""Coherence attester: the backend persona registry, the API's writable
++repo-config surface, and the dashboard's persona list must not drift.
++
++Motivated by a live audit (2026-07-24, grug#743 follow-up) that found
++THREE independent drifts, all silent, all in the "looks fine" direction:
++
++  1. `sentinel` shipped registered + `enabled_default=True` + actively
++     posting, but was absent from the dashboard's hardcoded 7-persona
++     array - invisible to every operator since it shipped.
++  2. `reopen_watch_enabled` was added to the STORE only. It was missing
++     from `RepoConfigPayload` and from `update_repo_config`'s
++     `set_repo_config(...)` call, so the persona reading it could never
++     be enabled by any means - dead code on arrival. Worse, because the
++     payload model sets `extra="forbid"`, an operator sending the flag
++     got a 422 rather than any hint the field was unwired.
++  3. `dep_watch_enabled` was writable through the API but had no UI.
++
++The shared root cause: three surfaces (registry / API payload / SPA) each
++hardcode their own list, and nothing forces them to agree. Discipline
++cannot catch this - only a machine check that fails loudly can.
++
++What this asserts (NECESSARY conditions, deliberately not sufficient):
++
++  A. Every persona key in `personas/registry.py` whose `enabled_flag` is
++     a real flag has that flag declared on `RepoConfigPayload` AND
++     forwarded in `update_repo_config`'s `set_repo_config(...)` call.
++  B. Every `_EXTRA_REPO_FLAGS` entry in the store (dep_watch_enabled,
++     reopen_watch_enabled, ...) is likewise declared AND forwarded.
++  C. Every registry persona appears in the dashboard's PERSONAS array,
++     via an explicit registry-key -> UI-id map kept here (the UI uses
++     display names: tpm->chief, code_reviewer->elder, walkthrough->teller).
++
++Intentionally NOT asserted: that the dashboard's BLOCK/WARN/OFF controls
++actually persist to the backend. They currently do NOT (they are
++localStorage-only; only tpm_enabled/guard_enabled are wired to the API).
++That is a real, separate gap tracked on its own - pinning it here would
++either fail permanently or bless the current behavior. This attester
++covers PRESENCE, not persistence.
++"""
++from __future__ import annotations
++
++import ast
++import re
++import sys
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++
++REGISTRY = REPO_ROOT / "services/_shared/personas/registry.py"
++STORE = REPO_ROOT / "services/_shared/adapters/pg_install_store.py"
++API = REPO_ROOT / "services/api/installations.py"
++DASHBOARD = REPO_ROOT / "web/src/routes/Dashboard.tsx"
++
++# Registry key -> the id the dashboard's PERSONAS array uses. The UI is
++# named for the CHARACTER, the registry for the CAPABILITY, so these
++# genuinely differ and the map has to be explicit. A registry key absent
++# from this map is itself a failure (forces a conscious decision when a
++# new persona lands, instead of silently shipping it invisible).
++REGISTRY_KEY_TO_UI_ID: dict[str, str] = {
++    "tpm": "chief",
++    "code_reviewer": "elder",
++    "guard": "guard",
++    "warder": "warder",
++    "sentinel": "sentinel",
++    "smasher": "smasher",
++    "walkthrough": "teller",
++    "pulse": "pulse",
++}
++
++
++def _fail(msg: str) -> None:
++    print(f"FAIL: {msg}", file=sys.stderr)
++
++
++def _registry_enabled_flags(tree: ast.Module) -> dict[str, str]:
++    """{registry_key: enabled_flag} for every PersonaSpec(...) call."""
++    out: dict[str, str] = {}
++    for node in ast.walk(tree):
++        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
++                and node.func.id == "PersonaSpec"):
++            continue
++        kw = {k.arg: k.value for k in node.keywords if k.arg}
++        key_node, flag_node = kw.get("key"), kw.get("enabled_flag")
++        if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
++            continue
++        if isinstance(flag_node, ast.Constant) and isinstance(flag_node.value, str):
++            out[key_node.value] = flag_node.value
++    return out
++
++
++def _extra_repo_flags(tree: ast.Module) -> set[str]:
++    """The store's `_EXTRA_REPO_FLAGS = frozenset({...})` literal."""
++    for stmt in tree.body:
++        if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
++                and isinstance(stmt.targets[0], ast.Name)
++                and stmt.targets[0].id == "_EXTRA_REPO_FLAGS"):
++            continue
++        for node in ast.walk(stmt.value):
++            if isinstance(node, ast.Set):
++                return {
++                    e.value for e in node.elts
++                    if isinstance(e, ast.Constant) and isinstance(e.value, str)
++                }
++    return set()
++
++
++def _payload_fields(tree: ast.Module) -> set[str]:
++    """Annotated field names on `class RepoConfigPayload`."""
++    for node in ast.walk(tree):
++        if isinstance(node, ast.ClassDef) and node.name == "RepoConfigPayload":
++            return {
++                s.target.id for s in node.body
++                if isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name)
++            }
++    return set()
++
++
++def _set_repo_config_kwargs(tree: ast.Module) -> set[str]:
++    """Keyword names forwarded to set_repo_config(...) inside
++    update_repo_config - the call that actually persists the flag."""
++    for node in ast.walk(tree):
++        if not (isinstance(node, ast.FunctionDef) and node.name == "update_repo_config"):
++            continue
++        for call in ast.walk(node):
++            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
++                    and call.func.id == "set_repo_config"):
++                return {k.arg for k in call.keywords if k.arg}
++    return set()
++
++
++def _dashboard_persona_ids(text: str) -> set[str]:
++    """Ids in the dashboard's PERSONAS array. The array is a TSX literal,
++    so this is a regex over `{ id: "...", code: "F-NN"` entries - the
++    `code:` neighbour anchors it to the persona array specifically and
++    keeps it from matching the skins/notifications arrays."""
++    return set(re.findall(r'\{\s*id:\s*"([a-z_]+)",\s*code:\s*"F-\d+"', text))
++
++
++def main() -> int:
++    failures: list[str] = []
++
++    registry_tree = ast.parse(REGISTRY.read_text())
++    store_tree = ast.parse(STORE.read_text())
++    api_tree = ast.parse(API.read_text())
++    dashboard_text = DASHBOARD.read_text()
++
++    registry_flags = _registry_enabled_flags(registry_tree)
++    if not registry_flags:
++        failures.append(f"no PersonaSpec(key=..., enabled_flag=...) found in {REGISTRY}")
++
++    extra_flags = _extra_repo_flags(store_tree)
++    if not extra_flags:
++        failures.append(f"no _EXTRA_REPO_FLAGS frozenset found in {STORE}")
++
++    payload = _payload_fields(api_tree)
++    if not payload:
++        failures.append(f"no RepoConfigPayload fields found in {API}")
++
++    forwarded = _set_repo_config_kwargs(api_tree)
++    if not forwarded:
++        failures.append(f"no set_repo_config(...) call found in update_repo_config in {API}")
++
++    ui_ids = _dashboard_persona_ids(dashboard_text)
++    if not ui_ids:
++        failures.append(f"no PERSONAS array entries found in {DASHBOARD}")
++
++    # A + B: every registry enabled_flag and every extra repo flag must be
++    # BOTH declared on the payload and forwarded to the store.
++    for flag in sorted(set(registry_flags.values()) | extra_flags):
++        if flag not in payload:
++            failures.append(
++                f"repo-config flag `{flag}` is not declared on RepoConfigPayload "
++                f"({API.relative_to(REPO_ROOT)}) - it cannot be set through the API "
++                f"(and `extra=forbid` makes sending it a 422)"
++            )
++        if flag not in forwarded:
++            failures.append(
++                f"repo-config flag `{flag}` is not forwarded to set_repo_config(...) "
++                f"in update_repo_config ({API.relative_to(REPO_ROOT)}) - the API would "
++                f"accept it and silently drop it"
++            )
++
++    # C: every registry persona must be mapped and present in the SPA.
++    for key in sorted(registry_flags):
++        ui_id = REGISTRY_KEY_TO_UI_ID.get(key)
++        if ui_id is None:
++            failures.append(
++                f"registry persona `{key}` has no REGISTRY_KEY_TO_UI_ID entry in this "
++                f"attester - add the mapping AND the dashboard entry, or the persona "
++                f"ships invisible to operators"
++            )
++            continue
++        if ui_id not in ui_ids:
++            failures.append(
++                f"registry persona `{key}` (ui id `{ui_id}`) is missing from the "
++                f"PERSONAS array in {DASHBOARD.relative_to(REPO_ROOT)} - it runs but "
++                f"no operator can see it"
++            )
++
++    # Reverse direction: a UI entry with no registry backing is a ghost.
++    for ui_id in sorted(ui_ids):
++        if ui_id not in REGISTRY_KEY_TO_UI_ID.values():
++            failures.append(
++                f"dashboard persona `{ui_id}` has no registry backing - it is shown to "
++                f"operators but nothing dispatches it"
++            )
++
++    if failures:
++        for f in failures:
++            _fail(f)
++        return 1
++
++    print(
++        f"OK: {len(registry_flags)} registry personas, "
++        f"{len(set(registry_flags.values()) | extra_flags)} repo-config flags - "
++        f"registry, API payload, store forwarding, and dashboard all coherent"
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

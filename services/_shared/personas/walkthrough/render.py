@@ -1,17 +1,15 @@
-"""Walkthrough comment assembly (#554) - pure Markdown rendering.
+"""Walkthrough assembly (#554, T1432) - pure Markdown rendering.
 
-One upsert-by-marker comment (same PATCH-else-POST discipline as Chief's
-ticket-compliance): AI intent summary, changed-files table, deterministic
-mermaid diagram, and a review-effort chip. Assembly is pure so it can be
-tested without any network/LLM call; `dispatch.py` supplies the fetched
-data and the (possibly degraded) summary.
+One body for two surfaces, neither a comment of Teller's own (every new
+comment is an email): the Hunt Board's Walkthrough section and the Teller
+check-run summary. It holds the AI intent summary (absent when the model
+was quiet), a review-effort line and the changed-files list; no mermaid
+diagram. Assembly is pure so it can be tested without any network/LLM
+call; `dispatch.py` supplies the fetched data and the summary.
 """
 
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 import re
 from dataclasses import dataclass
 
@@ -19,35 +17,11 @@ from markdown_safety import neutralize_mentions as _neutralize_mentions
 
 from personas.walkthrough.effort import ReviewEffort, effort_label
 
-MARKER = "<!-- grug-teller:walkthrough -->"
-
-# Teller portrait (repo-hosted on grug.lol) - matches Chief's pattern
-TELLER_PORTRAIT = "https://grug.lol/assets/grug_smile.png"
-TELLER_PORTRAIT_IMG = (
-    f'<img src="{TELLER_PORTRAIT}" width="46" align="left" alt="Grug Teller" />'
-)
-
-# Badge for the "View full review" button (shields.io style)
-REVIEW_BADGE = (
-    "https://img.shields.io/badge/View_full_review-181613"
-    "?style=for-the-badge&labelColor=181613"
-)
-
-# Bound the table + summary text so a sweeping PR can't blow the comment
+# Bound the table + summary text so a sweeping PR can't blow the check-run summary
 # body past GitHub's cap; excess files are counted, not silently dropped.
 _MAX_TABLE_ROWS = 60
 _MAX_SUMMARY_CHARS = 2000
 _MAX_FILE_SUMMARY_CHARS = 160
-
-# Lifecycle (#695): one comment is one evolving document. A status line
-# (carrying STATUS_TAG) says what the run is doing right now; the final body
-# carries none. RECORD_PREFIX opens a hidden record of the run, so the next
-# run can show what changed since.
-STATUS_TAG = "<!-- grug-teller:status -->"
-RECORD_PREFIX = "<!-- grug-teller:record:"
-_RECORD_RE = re.compile(r"<!-- grug-teller:record:([A-Za-z0-9_=-]+) -->")
-_MAX_RECORD_FILES = 500
-_MAX_RECORD_SUMMARY = 600
 
 _HEADING_RE = re.compile(r"^(#{1,6})(\s)", re.MULTILINE)
 
@@ -107,111 +81,33 @@ class FileStat:
     summary: str | None = None
 
 
-def changed_files_table(files: list[FileStat]) -> str:
-    """The changed-files table: path, one-line summary, +X/-Y. Bounded to
-    _MAX_TABLE_ROWS with a visible '+N more' line - never a silent cut.
-    `path` and `summary` are escaped for both table-row integrity and
-    mention-spoofing before splicing (round 4, codex) - `path` is repo-
-    controlled (a crafted filename) and `summary` is model-authored."""
+def changed_files_list(files: list[FileStat]) -> str:
+    """The changed-files list (#1386): path, changes (+X/-Y), summary. Bounded
+    to _MAX_TABLE_ROWS with a visible '+N more' line - never a silent cut.
+    `path` and `summary` are sanitized before splicing."""
     if not files:
         return ""
-    rows = ["| File | Summary | Changes |", "|---|---|---|"]
+    lines: list[str] = []
     for f in files[:_MAX_TABLE_ROWS]:
         path = _escape_code_span_cell(_neutralize_mentions(f.path))
-        summary = (
-            _escape_html(
-                _escape_table_cell(
-                    _neutralize_mentions((f.summary or "")[:_MAX_FILE_SUMMARY_CHARS])
-                )
-            )
-            or "-"
-        )
-        rows.append(f"| `{path}` | {summary} | +{f.additions}/-{f.deletions} |")
-    table = "\n".join(rows)
+        raw_summary = _neutralize_mentions(
+            (f.summary or "")[:_MAX_FILE_SUMMARY_CHARS]
+        ).replace("\n", " ").replace("\r", " ").strip()
+        summary = _escape_html(raw_summary)
+        changes = f"+{f.additions}/-{f.deletions}"
+        if summary:
+            lines.append(f"- `{path}` ({changes}) - {summary}")
+        else:
+            lines.append(f"- `{path}` ({changes})")
+    out = "\n".join(lines)
     cut = len(files) - _MAX_TABLE_ROWS
     if cut > 0:
-        table += f"\n\n_(+{cut} more file(s) not shown)_"
-    return table
+        out += f"\n\n_(+{cut} more file(s) not shown)_"
+    return out
 
 
-@dataclass(frozen=True)
-class PreviousRun:
-    """What the last walkthrough said: the head it walked, its summary, and
-    the files it listed. Read back from the hidden record in its comment."""
-
-    head_sha: str
-    summary: str
-    paths: tuple[str, ...]
-
-
-def status_line(text: str) -> str:
-    return f"> {text} {STATUS_TAG}"
-
-
-def with_status(existing: str | None, text: str) -> str:
-    """Return `existing` with its status line replaced by `text`, or a fresh
-    marker + status body when there is no comment yet. Everything else in an
-    existing comment (the last results, the record) stays, so a re-run shows
-    'working' on top of the last walkthrough instead of erasing it."""
-    line = status_line(text)
-    if not existing:
-        return f"{MARKER}\n\n{line}"
-    kept = [ln for ln in existing.split("\n") if STATUS_TAG not in ln]
-    if kept and kept[0].strip() == MARKER:
-        return "\n".join([kept[0], "", line, *kept[1:]])
-    return "\n".join([MARKER, "", line, *kept])
-
-
-def _encode_record(head_sha: str, summary: str, paths: list[str]) -> str:
-    raw = json.dumps(
-        {
-            "sha": head_sha[:40],
-            "summary": summary[:_MAX_RECORD_SUMMARY],
-            "files": paths[:_MAX_RECORD_FILES],
-        },
-        separators=(",", ":"),
-    )
-    token = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
-    return f"{RECORD_PREFIX}{token} -->"
-
-
-def previous_run(body: str | None) -> PreviousRun | None:
-    """Read the hidden record out of a walkthrough comment body. None when
-    the comment has no record (first run, or a placeholder/failure only) or
-    the record does not parse - an unreadable record just means no history."""
-    match = _RECORD_RE.search(body or "")
-    if not match:
-        return None
-    try:
-        data = json.loads(base64.urlsafe_b64decode(match.group(1)))
-        files = [str(f) for f in data["files"]][:_MAX_RECORD_FILES]
-        return PreviousRun(
-            head_sha=str(data["sha"]),
-            summary=str(data["summary"]),
-            paths=tuple(files),
-        )
-    except (binascii.Error, ValueError, KeyError, TypeError):
-        return None
-
-
-def _previous_section(previous: PreviousRun, current: list[FileStat]) -> str:
-    """Collapsed record of the last run. A file it listed that the change no
-    longer touches is marked resolved, never silently dropped."""
-    now = {f.path for f in current}
-    shown = previous.paths[:_MAX_TABLE_ROWS]
-    lines = [
-        _escape_html(_neutralize_headings(_neutralize_mentions(previous.summary))),
-        "",
-        "Files in that walkthrough:",
-        "",
-    ]
-    for path in shown:
-        mark = "still in the change" if path in now else "resolved (no longer in the change)"
-        lines.append(f"- `{_escape_code_span_cell(path)}` - {mark}")
-    cut = len(previous.paths) - len(shown)
-    if cut > 0:
-        lines.append(f"- (+{cut} more not shown)")
-    return _details(f"Previous walkthrough (`{previous.head_sha[:12]}`)", "\n".join(lines))
+# Backward-compatible alias
+changed_files_table = changed_files_list
 
 
 def _details(summary: str, body: str) -> str:
@@ -221,65 +117,47 @@ def _details(summary: str, body: str) -> str:
 
 def walkthrough_body(
     *,
-    summary: str,
+    summary: str | None,
     files: list[FileStat],
-    diagram: str | None,
+    diagram: str | None = None,
     effort: ReviewEffort,
     head_sha: str,
-    degraded: bool,
     files_truncated: bool = False,
     related: list | None = None,
-    pr_url: str | None = None,
-    previous: PreviousRun | None = None,
 ) -> str:
-    """Assemble a short walkthrough comment (default-collapsed detail).
+    """Assemble the walkthrough (default-collapsed detail).
 
     Layout goal: one screen of useful signal when collapsed, like a review
     summary card - not a wall of tables and mermaid.
 
-      ## Walkthrough
-      {short summary}
+      {short summary, when the model gave one}
       Review effort: ...
+      **Possibly related hunts**   (only when `related` is non-empty)
       <details> Changed files (N) </details>
-      <details> Shape of the change </details>
       _Last walked at ..._
 
-    `degraded` marks a summary that fell back to the deterministic form
-    (LLM call failed/timed out) - the comment says so rather than
-    presenting a fallback as the real thing. `files_truncated` marks a PR
-    whose changed-file count exceeded our fetch cap - every number below
+    `summary=None` is the deterministic fallback: no prose paragraph at all,
+    the file list below carries the walkthrough. `files_truncated` marks a
+    PR whose changed-file count exceeded our fetch cap - every number below
     is then a floor, not an exact count. `summary` is model-authored:
     mentions and line-leading `#` headings are neutralized before this
-    prose posts under the app's own installation-token identity.
-    `pr_url` is where the full review is (the PR's Checks tab); when
-    provided it's rendered as a badge-image button after the header.
-    `previous` is the last run read from this same comment (#695): it is
-    kept as a collapsed section with its files marked resolved or still
-    present, and a hidden record of THIS run is appended for the next one.
+    prose posts under the app's own installation-token identity. `diagram`
+    is accepted and never rendered (T1386: a mermaid fence reads as raw
+    source in phone email clients, and the graph has had no edges, T1432).
+    `related` is for the check-run summary; the Hunt Board renders its own
+    Related context list, so its body leaves it out.
     """
-    parts = [MARKER, TELLER_PORTRAIT_IMG, "", "## Walkthrough", ""]
-    parts.append(
-        _neutralize_headings(_neutralize_mentions(summary[:_MAX_SUMMARY_CHARS]))
-    )
-    if pr_url:
-        parts.append("")
+    parts: list[str] = []
+    if summary:
         parts.append(
-            f'<a href="{pr_url}"><img src="{REVIEW_BADGE}" alt="View full review" /></a>'
+            _neutralize_headings(_neutralize_mentions(summary[:_MAX_SUMMARY_CHARS]))
         )
-    notes: list[str] = []
-    if degraded:
-        notes.append(
-            "Summary fell back to a deterministic sketch; file list and "
-            "diagram (if any) are still live."
-        )
-    if files_truncated:
-        notes.append(
-            f"File list is partial: first {len(files)} files only; the PR has more."
-        )
-    if notes:
         parts.append("")
-        parts.extend(f"- {n}" for n in notes)
-    parts.append("")
+    if files_truncated:
+        parts.append(
+            f"- File list is partial: first {len(files)} files only; the PR has more."
+        )
+        parts.append("")
     parts.append(f"Review effort: {effort_label(effort)}")
 
     if related:
@@ -293,35 +171,15 @@ def walkthrough_body(
             reason = _neutralize_mentions(r.reason)
             parts.append(f"- #{r.number} {title} — {reason}")
 
-    table = changed_files_table(files)
-    if table:
+    files_list = changed_files_list(files)
+    if files_list:
         n = len(files)
         label = f"Changed files ({n})"
         if files_truncated:
             label = f"Changed files (first {n})"
         parts.append("")
-        parts.append(_details(label, table))
-
-    if diagram:
-        parts.append("")
-        parts.append(_details("Shape of the change", f"```mermaid\n{diagram}\n```"))
-    elif files:
-        # Stated reason when files exist but diagram could not be drawn
-        # (too many top-level dirs, balance check failed, and so on).
-        parts.append("")
-        parts.append(
-            _details(
-                "Shape of the change",
-                "No diagram this pass - the change was too large or "
-                "complex to visualize cleanly.",
-            )
-        )
-
-    if previous is not None:
-        parts.append("")
-        parts.append(_previous_section(previous, files))
+        parts.append(_details(label, files_list))
 
     parts.append("")
     parts.append(f"_Last walked at `{head_sha[:12]}`._")
-    parts.append(_encode_record(head_sha, summary, [f.path for f in files]))
     return "\n".join(parts)

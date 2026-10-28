@@ -433,6 +433,7 @@ def _finding(
         ),
         suggestion=_fix_suggestion(fix, row, (file_contents or {}).get(path)),
         effort=None,
+        check_output=f"{path}:{row}: {code} {msg}",
     )
 
 

@@ -72,6 +72,7 @@ def observe(
             evidence=evidence_line(file_contents, f.file, f.line),
             source=_SOURCE,
             inline_comment_id=comment_ids.get((f.file, f.rule_name, f.line)),
+            suggestion=f.suggestion,
         )
         for f in findings
     )
