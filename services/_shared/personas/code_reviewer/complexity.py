@@ -169,14 +169,13 @@ def _score_functions(source: str) -> dict[str, tuple[int, int]]:
     out: dict[str, tuple[int, int]] = {}
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            # Same bare name twice in a file (an overload, a method on two
-            # classes): keep the WORST base score. Comparing against the
-            # gentler twin would manufacture a fake regression.
-            prev = out.get(node.name)
+            # Always score the function FROM the current source. Never
+            # carry-forward a score from an earlier version: the whole point
+            # is that this PR moved the function over the cap, and the
+            # complexity finding must use the HEAD's own score, not a stale
+            # copy. For baseline comparison we use separate `base_scores`.
             cur = (cyclomatic_complexity(node), cognitive_complexity(node))
-            out[node.name] = cur if prev is None else (
-                max(prev[0], cur[0]), max(prev[1], cur[1])
-            )
+            out[node.name] = cur
     return out
 
 
