@@ -40,7 +40,9 @@ from adapters.install_store import (  # type: ignore
 import httpx
 from github_app_auth import with_install_token_retry
 from observability import configure_logging
+from personas.code_reviewer.dispatch import deliver_pending_publication
 from personas.code_reviewer.living_review import sync_due_prs
+from personas.code_reviewer.publish_retry import retry_due_publications
 from personas.code_reviewer.reaction_cadence import reaction_poll_due
 from personas.code_reviewer.reactions import poll_and_annotate
 
@@ -167,6 +169,18 @@ _LOW_BUDGET_FRACTION = 0.30
 
 def _now_epoch() -> float:
     return time.time()
+
+
+def _deep_publish_retry_pass() -> tuple[int, int]:
+    """Retry deep reviews whose GitHub publish failed after the model ran
+    (#738). Returns (delivered, failed-or-abandoned). Best-effort like every
+    pass here: a store outage logs and leaves the rows for the next tick."""
+    try:
+        summary = retry_due_publications(deliver_pending_publication)
+    except Exception as e:  # noqa: BLE001 - one pass must not abort the cron
+        log.warning("deep_publish_retry_pass_failed", extra={"kind": type(e).__name__})
+        return 0, 1
+    return summary.delivered, summary.failed + summary.abandoned
 
 
 def _github_core_budget(token: str) -> tuple[int, int] | None:
@@ -539,6 +553,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
 
     chief_healed, chief_heal_failed = self_heal_installs(installs)
 
+    # Deep-review publish retry (#738): finished deep reviews whose GitHub
+    # write failed, stored durably by the deep append.
+    deep_republished, deep_republish_failed = _deep_publish_retry_pass()
+
     install_repaired, install_stale, install_reconciliation_failed = (
         _install_reconciliation_pass()
     )
@@ -576,6 +594,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "check_run_reconcile_failed_installs": check_run_reconcile_failed,
         "chief_self_heal_published": chief_healed,
         "chief_self_heal_failed": chief_heal_failed,
+        "deep_publish_retried": deep_republished,
+        "deep_publish_retry_failed": deep_republish_failed,
         "install_reconciliation_repaired": install_repaired,
         "install_reconciliation_stale": install_stale,
         "install_reconciliation_failed": install_reconciliation_failed,

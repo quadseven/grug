@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import get_args
 from unittest.mock import patch
 
 import httpx
@@ -145,6 +146,29 @@ def test_the_shipped_chain_is_free_cloud_tiers_only_then_the_cave(monkeypatch) -
     assert not lc._backend_enabled(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
     assert not lc._backend_enabled(Backend.OPENROUTER, "anthropic/claude-opus-4.7")
     assert lc._backend_enabled(Backend.OPENROUTER, _FREE)
+
+
+def test_the_shipped_deep_escalation_is_a_mode_the_client_accepts(monkeypatch, caplog) -> None:
+    """grug#1487: GRUG_DEEP_ESCALATION ships as on_demand while the Sparks
+    are away. An unknown value falls back to auto with a warning, which
+    would silently undo the switch, so the shipped value must be a mode
+    `_deep_escalation_mode` takes as-is."""
+    root = Path(__file__).resolve().parents[3] / "k8s"
+    per_manifest = {
+        manifest: re.findall(
+            r'name: GRUG_DEEP_ESCALATION, value: "?([^"}\s]*)"?\}',
+            (root / manifest).read_text(),
+        )
+        for manifest in ("consumer-deployment.yaml", "webhook-deployment.yaml")
+    }
+    assert all(len(v) == 1 for v in per_manifest.values()), per_manifest
+    assert len({v[0] for v in per_manifest.values()}) == 1, per_manifest
+    shipped = _shipped_env("GRUG_DEEP_ESCALATION")
+    assert shipped in get_args(lc.DeepEscalationMode)
+    monkeypatch.setenv("GRUG_DEEP_ESCALATION", shipped)
+    with caplog.at_level("WARNING"):
+        assert lc._deep_escalation_mode() == shipped
+    assert not [r for r in caplog.records if r.getMessage() == "deep_escalation_mode_invalid"]
 
 
 def test_the_free_pool_tier_is_opt_in(monkeypatch) -> None:

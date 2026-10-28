@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-
-from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse
+from llm_client import Backend, LlmReviewResponse
+from llm_client import Finding as LlmFinding
 from personas.code_reviewer import dispatch as cr_dispatch
 
 _DIFF = """diff --git a/src/x.py b/src/x.py
@@ -173,3 +173,56 @@ def test_unknown_key_noted_and_known_keys_apply(monkeypatch):
     assert run.seen_paths == ["src/x.py"]
     assert run.checks[0].summary.count(".grug.yaml problem") == 1
     assert "bogus" in run.checks[0].summary
+
+
+# --- skip_prs (grug#1439) ---------------------------------------------------
+
+_SKIP_AUTHOR = "skip_prs:\n  authors: ['alice']\n"
+
+
+def test_skip_prs_author_gets_success_check_and_no_review(monkeypatch):
+    run = _Run({_BASE: _SKIP_AUTHOR}).go(monkeypatch)
+    assert len(run.checks) == 1
+    check = run.checks[0]
+    assert check.name == "Grug - Elder"
+    assert check.status == "completed"
+    assert check.conclusion == "success"
+    assert check.summary == "skipped by .grug.yaml skip_prs (author `alice`)"
+    assert run.reviews == []
+    assert run.seen_paths == []  # the model never ran
+
+
+def test_skip_prs_added_on_the_head_does_not_skip(monkeypatch):
+    # The PR's own head adds a skip_prs entry naming itself; the config is
+    # read from the base, so the PR is still reviewed.
+    run = _Run({_HEAD: _SKIP_AUTHOR}).go(monkeypatch)
+    assert run.config_refs == [_BASE]
+    assert run.seen_paths == ["src/x.py", "extras/y.py"]
+    assert "skip_prs" not in run.checks[0].summary
+
+
+def test_skip_prs_non_matching_author_is_reviewed(monkeypatch):
+    run = _Run({_BASE: "skip_prs:\n  authors: ['someone-else']\n"}).go(monkeypatch)
+    assert run.seen_paths == ["src/x.py", "extras/y.py"]
+
+
+def test_skip_prs_label_and_title_rules(monkeypatch):
+    payload = _payload()
+    payload["pull_request"]["labels"] = [{"name": "Generated"}]
+    payload["pull_request"]["title"] = "[deps] bump httpx"
+    for cfg, rule in (
+        ("skip_prs:\n  labels: ['generated']\n", "label `generated`"),
+        ("skip_prs:\n  title_patterns: ['[deps] *']\n", "title pattern `[deps] *`"),
+    ):
+        run = _Run({_BASE: cfg})
+        monkeypatch.setattr(cr_dispatch, "review_diff", run.review_diff)
+        monkeypatch.setattr(
+            cr_dispatch, "post_check_run",
+            lambda tok, o, r, result, external_id=None, run=run: run.checks.append(result) or {"id": 1},
+        )
+        with patch("httpx.get", side_effect=run.get):
+            out = cr_dispatch.dispatch_code_review(payload, blocking=True)
+        assert out["result"] == "pass"
+        assert run.checks[0].conclusion == "success"
+        assert run.checks[0].summary.endswith(f"({rule})")
+        assert run.seen_paths == []

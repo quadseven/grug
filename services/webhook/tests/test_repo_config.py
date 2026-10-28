@@ -105,3 +105,37 @@ def test_inline_floor():
     assert rc.meets_inline_floor("high", cfg)
     assert rc.meets_inline_floor("critical", cfg)
     assert rc.meets_inline_floor("low", rc.RepoConfig())
+
+
+# --- skip_prs (grug#1439) ---------------------------------------------------
+
+SkipPrs, skip_pr_rule, parse_repo_config = rc.SkipPrs, rc.skip_pr_rule, rc.parse_repo_config
+
+
+def test_skip_prs_parses_all_three_lists():
+    cfg = parse_repo_config(
+        "skip_prs:\n  authors: [a]\n  labels: [l]\n  title_patterns: ['t*']\n"
+    )
+    assert cfg.skip_prs == SkipPrs(("a",), ("l",), ("t*",))
+    assert cfg.problems == ()
+
+
+def test_skip_prs_bad_shapes_are_problems_not_raises():
+    assert parse_repo_config("skip_prs: [a]\n").problems
+    cfg = parse_repo_config("skip_prs:\n  authors: a\n  bogus: [x]\n")
+    assert cfg.skip_prs == SkipPrs()
+    assert len(cfg.problems) == 2
+
+
+def test_skip_pr_rule_matches_and_misses():
+    cfg = parse_repo_config(
+        "skip_prs:\n  authors: ['Bot[bot]']\n  labels: [generated]\n"
+        "  title_patterns: ['chore(deps)*']\n"
+    )
+    assert skip_pr_rule(cfg, author="bot[bot]", labels=(), title="x") == "author `Bot[bot]`"
+    assert skip_pr_rule(cfg, author="h", labels=("GENERATED",), title="x") == "label `generated`"
+    assert skip_pr_rule(cfg, author="h", labels=(), title="Chore(deps): bump") == (
+        "title pattern `chore(deps)*`"
+    )
+    assert skip_pr_rule(cfg, author="h", labels=("other",), title="feat: x") is None
+    assert skip_pr_rule(parse_repo_config(None), author="bot[bot]", labels=(), title="x") is None

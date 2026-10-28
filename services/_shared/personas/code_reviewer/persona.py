@@ -28,8 +28,9 @@ from typing import get_args
 
 from code_review_prompt import COMPLEXITY_CORRECTNESS_MARKER
 from github_checks_client import CheckConclusion
-from llm_client import FindingOrigin, LlmReviewResponse
+from llm_client import FindingOrigin, LlmReviewResponse, is_withdrawn_finding
 from personas.code_reviewer.diff_parser import DiffHunk
+from personas.code_reviewer.line_refs import align_line_refs, repair_where_refs
 from review_types import DEFAULT_CATEGORY, Category, Effort, Severity  # single source (#250)
 from review_pipeline import ReviewCoverage
 
@@ -98,6 +99,18 @@ def _snippet_has_line(snippet: str, line: int) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class Budget:
+    """A measured limit a finding is over (grug#1429): the current value,
+    the limit it must meet, and the unit both are in. The review renders it
+    as the exact number to hit instead of "make it smaller"."""
+
+    metric: str
+    current: float
+    limit: float
+    unit: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class Finding:
     """Persona-level finding posted as a GitHub inline review comment.
 
@@ -138,6 +151,12 @@ class Finding:
     origins: tuple[FindingOrigin, ...] = field(
         default_factory=tuple, compare=False, repr=False,
     )
+    # grug#1429: measured limits this finding is over, rendered as current ->
+    # limit (budget left). Set by deterministic producers that measured them.
+    budgets: tuple[Budget, ...] = field(default=(), compare=False)
+    # grug#1429: the check's own output line, quoted verbatim in the review
+    # when the finding came from a deterministic check (ruff, opengrep).
+    check_output: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         assert self.line >= 1, (
@@ -184,6 +203,11 @@ class CodeReviewEvaluation:
     dropped_hallucinations: int = 0
     degraded_reason: str | None = None
     coverage: ReviewCoverage | None = None
+    # grug#1397: candidates the reviewer itself withdrew (`is_finding: false`
+    # or a message ending "No finding."). Never published, never counted
+    # toward the verdict, but counted here so recall stays measurable.
+    dropped_withdrawn: int = 0
+    tier_served: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -234,8 +258,10 @@ def with_extra_findings(
         findings=combined,
         conclusion=_derive_conclusion(combined, evaluation.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
+        dropped_withdrawn=evaluation.dropped_withdrawn,
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
+        tier_served=evaluation.tier_served,
     )
 
 
@@ -252,8 +278,10 @@ def with_findings(
         findings=findings,
         conclusion=_derive_conclusion(findings, evaluation.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
+        dropped_withdrawn=evaluation.dropped_withdrawn,
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
+        tier_served=evaluation.tier_served,
     )
 
 
@@ -295,8 +323,10 @@ def with_degradation(
         findings=evaluation.findings,
         conclusion=_derive_conclusion(evaluation.findings, other.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
+        dropped_withdrawn=evaluation.dropped_withdrawn,
         degraded_reason=other.degraded_reason,
         coverage=other.coverage,
+        tier_served=evaluation.tier_served or other.tier_served,
     )
 
 
@@ -341,12 +371,19 @@ def evaluate_diff(
             conclusion="neutral",
             degraded_reason=llm_response.kind,
             coverage=llm_response.coverage,
+            tier_served=llm_response.tier_served,
         )
 
     line_index = _hunk_line_index(hunks)
     kept: list[Finding] = []
     dropped = 0
+    withdrawn = 0
     for raw in llm_response.findings:
+        # grug#1397: the reviewer ruled this candidate out itself. It must
+        # not become a thread or move the verdict; count it and move on.
+        if is_withdrawn_finding(raw):
+            withdrawn += 1
+            continue
         allowed_lines = line_index.get(raw.path)
         outside_diff = allowed_lines is None or raw.line not in allowed_lines
         outside_reason = raw.outside_diff_reason
@@ -370,7 +407,12 @@ def evaluate_diff(
             and _is_static_declarative_scalar(raw.path, raw.line, hunks)
         ):
             continue
-        message = raw.message
+        # grug#1398: a pre-change number for the anchor line becomes the
+        # head-commit number the comment is anchored to; other lines stay.
+        message = repair_where_refs(
+            align_line_refs(raw.message, raw.path, raw.line, hunks),
+            raw.path, raw.line,
+        )
         if outside_diff:
             message = f"OUTSIDE DIFF (advisory): {outside_reason} {message}"
         kept.append(
@@ -413,6 +455,8 @@ def evaluate_diff(
         # degraded_reason="partial_review" is the bug this closes.
         conclusion=_derive_conclusion(kept_findings, degraded_reason),
         dropped_hallucinations=dropped,
+        dropped_withdrawn=withdrawn,
         degraded_reason=degraded_reason,
         coverage=llm_response.coverage,
+        tier_served=llm_response.tier_served,
     )

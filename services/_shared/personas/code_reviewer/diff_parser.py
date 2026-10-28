@@ -396,6 +396,47 @@ def added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
     return out
 
 
+def pre_change_aliases(hunk: DiffHunk, new_line: int) -> frozenset[int]:
+    """Pre-change numbers a model may have written for head line `new_line`.
+
+    grug#1398: the model sees the raw hunk (`@@ -a,b +c,d @@`) and sometimes
+    quotes a line by its OLD-side number instead of the head-commit number
+    the finding is anchored to. This walks the hunk's old-to-new line map
+    and returns, for `new_line`:
+
+      - its old-side number (a context line), or the old line an added
+        line was inserted before (the old cursor at that point);
+      - the header-offset number `new_line - c + a`, the number a model
+        gets when it counts down from the old start over every shown line.
+
+    Empty when `new_line` is not a new-side line of this hunk, or when the
+    header does not parse. Each alias differs from `new_line` (a number
+    equal to the head line needs no rewrite)."""
+    lines = hunk.body.splitlines()
+    m = _OLD_SIDE_RE.match(lines[0]) if lines else None
+    if m is None:
+        return frozenset()
+    old_start = int(m.group(1))
+    old_cursor, new_cursor = old_start, hunk.new_start
+    found: set[int] = set()
+    for raw in lines[1:]:
+        if raw.startswith(chr(92)):
+            continue
+        if raw.startswith("-"):
+            old_cursor += 1
+            continue
+        if new_cursor == new_line:
+            found.add(old_cursor)
+            found.add(new_line - hunk.new_start + old_start)
+            break
+        if not raw.startswith("+"):
+            old_cursor += 1
+        new_cursor += 1
+    found.discard(new_line)
+    found.discard(0)
+    return frozenset(found)
+
+
 def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
     """Parse a unified diff into structured hunks.
 

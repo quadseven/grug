@@ -23,15 +23,19 @@ spec:
   # #701). Per-pod GRUG_RERUN_WORKERS halved 6->3 so TOTAL in-flight Elder
   # concurrency is unchanged - this buys availability, not throughput.
   # RollingUpdate (was Recreate): with 2 replicas Recreate would kill both
-  # on every deploy. Surge-free (maxSurge 0, maxUnavailable 1): a surge pod
-  # would briefly run 3 pods = 9 workers, exceeding the 6-worker budget the
-  # halved GRUG_RERUN_WORKERS exists to hold (CodeRabbit, PR #704); replacing
-  # one pod at a time instead dips to 3 workers for the rollout window while
-  # the queue buffers, and always keeps a live pod.
+  # on every deploy. Surge-first (maxSurge 1, maxUnavailable 0, grug#1275):
+  # a rollout never runs with fewer than the normal 2 ready consumers, so
+  # review capacity holds through a deploy. A surge pod briefly runs 3
+  # pods = 9 workers, above the 6-worker budget the halved
+  # GRUG_RERUN_WORKERS exists to hold (CodeRabbit, PR #704) - accepted for
+  # the rollout window because duplicate work is prevented by the
+  # Postgres owner-token claim leases (a contended acquire returns busy)
+  # and per-PR SQS FIFO serialization, while a capacity dip is exactly
+  # what stranded reviews in the incident #1275 follows up.
   replicas: 2
   strategy:
     type: RollingUpdate
-    rollingUpdate: {maxUnavailable: 1, maxSurge: 0}
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
   selector:
     matchLabels: {app: grug-consumer}
   template:
@@ -49,11 +53,19 @@ spec:
       # (k8s/smasher-trial-namespace.yaml + ADR-0013) with none in `grug`.
       serviceAccountName: grug-smasher-launcher
       automountServiceAccountToken: true
-      # 60s (default 30): shutdown budget = 15s shared thread-join + the
-      # orphaned-claim release sweep (#607). The sweep MUST complete before
-      # SIGKILL or a killed Elder review's claim bounces redeliveries off
-      # "claim busy" while the PR waits on its REQUIRED check (grug#515).
-      terminationGracePeriodSeconds: 60
+      # Sized to the review deadline (grug#1275): GRUG_REVIEW_JOB_TIMEOUT_S
+      # is 800s, so grace = 800 + the 15s shared thread-join + the bounded
+      # orphaned-claim release sweep (#607) + margin = 900s. On SIGTERM the
+      # consumer stops polling at once, gives running work the 15s join,
+      # then hands every in-flight review back - SQS lease reset to visible
+      # and snapshot claim released - so another consumer redoes it. The
+      # long grace is the ceiling, not the expected wait: it keeps SIGKILL
+      # from ever landing inside that hand-back. The sweep MUST complete
+      # before SIGKILL or a killed Elder review's claim bounces
+      # redeliveries off "claim busy" while the PR waits on its REQUIRED
+      # check (grug#515). A run the hand-back still misses is swept and
+      # re-queued once by the poller's check-run reconciler.
+      terminationGracePeriodSeconds: 900
       nodeSelector:
         kubernetes.io/arch: arm64
       # Same soft spread pattern as webhook/api (#700): bias the pair across
@@ -107,6 +119,11 @@ spec:
         - name: consumer
           image: REGISTRY_PLACEHOLDER/grug-webhook:TAG_PLACEHOLDER
           imagePullPolicy: Always
+          # grug#1275: deliberately NO preStop hook. This pod has no Service
+          # or endpoints to drain, so a preStop sleep would only keep it
+          # polling (taking new reviews) after the kubelet decided to stop
+          # it. SIGTERM goes straight to consumer.py, which stops polling at
+          # once and hands in-flight reviews back (see the grace comment).
           command: ["python", "-m", "datadog_switch", "python", "consumer.py"]
           envFrom:
             - secretRef: {name: grug-secrets}
@@ -198,7 +215,13 @@ spec:
             # unparseable, and about 16 posted a finding Tier 1 had not.
             # Under cloud priority the deep pass runs on the cloud chain and
             # reaches the Cave reasoner only when every cloud tier fails.
-            - {name: GRUG_DEEP_ESCALATION, value: auto}
+            # TEMPORARY (2026-10-27): on_demand while both Spark machines are
+            # away for RMA (about a month from 2026-10-27). With the Sparks off
+            # and the free cloud tier exhausted the deep pass ended all_failed
+            # and Elder concluded failure, blocking merges. Revert to auto when
+            # the Spark reasoner returns or paid OpenRouter credits are enabled
+            # (grug#1487).
+            - {name: GRUG_DEEP_ESCALATION, value: "on_demand"}
             # The key has a zero spend limit: a paid model here 403s on every
             # call. Same :free model as the chain's tier 2.
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}

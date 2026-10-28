@@ -589,6 +589,65 @@ RULES: tuple[ReviewRule, ...] = (
         '                             "maxLength": MAX_MESSAGE_CHARS}}}}',
         severity="medium",
     ),
+    ReviewRule(
+        name="stderr-folded-into-compared-value",
+        bug_class="silent failure",
+        description="A command's stderr merged into its stdout -- `2>&1` "
+        "inside `$(...)`, `stderr=subprocess.STDOUT`, "
+        "`check_output(..., stderr=STDOUT)` -- where the captured text is "
+        "then COMPARED, parsed, or used as a value rather than only logged. "
+        "Any layer on the path can write a banner to stderr: a credential "
+        "exec plugin, a cloud CLI wrapper, a shim, a deprecation notice. "
+        "That text is folded into the value, so an equality test or a parse "
+        "silently goes false -- and the contaminating layer is usually one "
+        "nobody in the diff is thinking about, because it is not the command "
+        "being read. Worst where a false comparison means SKIP rather than "
+        "error: the step does nothing, logs nothing, and looks exactly like "
+        "'not opted in'. The merge is nearly always there for diagnostics "
+        "the author wanted in the log. Fix: read stdout alone, send stderr "
+        "somewhere it stays readable, surface its first lines in the error "
+        "on a failed read, and LOG the skip branch so 'skipped' stops being "
+        "indistinguishable from 'absent'. A `2>&1` whose result is only "
+        "echoed or logged is not this.",
+        bad_example='opt=$(some-cli get "$n" -o value 2>&1)   # banner folded in\n'
+        'if [ "$opt" = "true" ]; then wait_for "$n"; fi\n'
+        '# never equal -> silent skip, and nothing is logged',
+        good_example='opt=$(some-cli get "$n" -o value 2>/tmp/opt.err) || {\n'
+        '  echo "read failed: $(head -3 /tmp/opt.err)" >&2; exit 1; }\n'
+        'if [ "$opt" = "true" ]; then wait_for "$n"\n'
+        'else echo "note: $n not waited on (flag=$opt)"; fi',
+        severity="medium",
+    ),
+    ReviewRule(
+        name="diff-gate-scans-hunk-header",
+        bug_class="correctness",
+        description="A scanner, linter or policy gate whose input is a "
+        "unified DIFF rather than a tree, whose skip list enumerates some of "
+        "the diff's non-content line kinds but not `@@`. Under `-U0` git "
+        "appends PRE-IMAGE CONTEXT to every hunk header -- "
+        "`@@ -9 +9 @@ <a line from the OLD file>` -- so when a change removes "
+        "two violations in a row, the second hunk header REPEATS the first "
+        "removed line and the gate reports a removal as an addition. The "
+        "signal then inverts exactly for the change trying to fix what the "
+        "gate watches for, so the offending tree can never go clean and the "
+        "block looks correct from the outside. Require an explicit decision "
+        "for EVERY non-content line kind the format carries -- `diff --git`, "
+        "`index`, `---`, `+++`, `@@`, `\\ No newline at end of file` -- not "
+        "only the two obvious ones; `@@` is the one that gets missed. A skip "
+        "list holding `---`/`+++` and nothing else is the tell. Keep "
+        "`diff --git` path lines scanned where a path is itself information.",
+        bad_example='if line.startswith(("---", "+++")):\n'
+        '    continue              # file headers handled; @@ is not\n'
+        'if line.startswith("-"):\n'
+        '    continue              # removals are a scrub\n'
+        'scan(line)                # "@@ -9 +9 @@ <old text>" scanned as added',
+        good_example='if line.startswith(("---", "+++", "@@")):\n'
+        '    continue              # -U0 appends pre-image context to @@\n'
+        'if line.startswith("-"):\n'
+        '    continue\n'
+        'scan(line)',
+        severity="medium",
+    ),
 )
 
 
@@ -705,7 +764,11 @@ _OUTPUT_CONTRACT = (
     '"suggestion": str (OPTIONAL), "effort": "quick-win"|"heavy-lift" '
     '(OPTIONAL), "category": "correctness"|"security"|"stability"|'
     '"data-integrity"|"maintainability"|"general" (OPTIONAL), '
-    '"outside_diff_reason": str (OPTIONAL)}]}. '
+    '"outside_diff_reason": str (OPTIONAL), '
+    '"is_finding": bool (OPTIONAL)}]}. '
+    "Only list real defects: when you check a candidate and conclude there "
+    "is nothing wrong, leave it out. If you list one anyway, set "
+    "`is_finding` to false so it is never published. "
     "`rule` MUST be one of the rule names above. `line` is the new-side "
     "line number from the diff. A finding on an UNCHANGED cross-file context "
     "line is allowed only when you provide `outside_diff_reason`, naming the "
