@@ -297,8 +297,8 @@ REGISTRY: tuple[PersonaSpec, ...] = (
     PersonaSpec(
         key="walkthrough",
         canonical="teller",
-        # No real check-run posts (comment-only, like Pulse); this name is
-        # the roster/Activity-feed identity record_check_verdict carries.
+        # The walkthrough rides this check run's summary (T1432); Teller
+        # posts no comment of its own.
         check_run_name=CHECK_TELLER,
         enabled_flag="walkthrough_enabled",
         enabled_default=True,  # trial-harvest gap 1: default ON (#554, #522)

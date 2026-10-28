@@ -1,11 +1,12 @@
-"""Teller persona - PR walkthrough dispatch (#554, epic #522).
+"""Teller persona - PR walkthrough dispatch (#554, epic #522, T1432).
 
 Fetch the diff + changed-file stats, call `summarize_pr` (best-effort,
-degrades to a deterministic summary), build the deterministic mermaid
-diagram + effort chip, and upsert ONE advisory comment (find-marker ->
-PATCH, else POST) - the same discipline as Chief's ticket-compliance.
-Comment-only: no check-run, never blocks. Runs off the ACK path via the
-generic async-persona machinery (#77), same as Guard/Smasher.
+degrades to the file list alone), estimate the effort line, and publish
+the walkthrough to the Hunt Board's Walkthrough section and to the
+`Grug - Teller` check-run summary. Teller posts no comment of its own
+(every new comment is an email); a comment an older version left on an
+open pull request is not touched. Never blocks. Runs off the ACK path via
+the generic async-persona machinery (#77), same as Guard/Smasher.
 """
 
 from __future__ import annotations
@@ -17,11 +18,13 @@ from urllib.parse import quote
 
 import httpx
 from activity_log import record_check_verdict
-from github_app_auth import get_app_id, with_install_token_retry
+from github_app_auth import with_install_token_retry
+from github_checks_client import CheckRunResult, post_check_run
 
 from personas import hunt_recorder
+from personas.tribe import CHECK_TELLER
 from personas.walkthrough.effort import estimate_effort
-from personas.walkthrough.render import MARKER, FileStat, walkthrough_body
+from personas.walkthrough.render import FileStat, walkthrough_body
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.walkthrough")
 
@@ -106,74 +109,23 @@ def _fetch_pr_files(
     return out, truncated
 
 
-def _find_marker_comment(
+def _publish_check_run(
     token: str,
     owner: str,
     repo: str,
-    pr_number: int,
-) -> int | None:
-    # `performed_via_github_app` is populated server-side ONLY for comments
-    # created via a GitHub App installation token - a human contributor
-    # cannot set it. But a bare non-null check only proves "some GitHub
-    # App posted this," not "WE did" - a decoy from a DIFFERENT installed
-    # app would still pass. Compare the app's own numeric ID (#554 peer
-    # review round 3, codex). `get_app_id()` is guaranteed to already have
-    # succeeded once by this point - it backs the very token exchange
-    # that produced `token` - so no fallback-on-failure path exists here.
-    own_app_id = get_app_id()
-    page = 1
-    while (
-        page <= 20
-    ):  # bound the scan (>2000 comments = give up, post fresh, warn below)
-        resp = httpx.get(
-            f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
-            params={"per_page": 100, "page": page},
-            headers=_headers(token),
-            timeout=_TIMEOUT,
-        )
-        resp.raise_for_status()
-        batch = resp.json()
-        for c in batch:
-            app = c.get("performed_via_github_app")
-            if not app or str(app.get("id")) != own_app_id:
-                continue
-            if MARKER in (c.get("body") or ""):
-                return int(c["id"])
-        if len(batch) < 100:
-            return None
-        page += 1
-    # Gave up at the cap without finding the marker - distinguish this from
-    # the ordinary "no marker" exit above, or a duplicate-comment-growth
-    # bug on an extreme PR (>2000 comments) would go unnoticed forever.
-    log.warning(
-        "walkthrough_marker_scan_capped",
-        extra={"repo": f"{owner}/{repo}", "pr": pr_number},
-    )
-    return None
-
-
-def _upsert_comment(
-    token: str,
-    owner: str,
-    repo: str,
-    pr_number: int,
+    pull_number: int,
+    head_sha: str,
+    title: str,
     body: str,
 ) -> None:
-    existing = _find_marker_comment(token, owner, repo, pr_number)
-    if existing is not None:
-        httpx.patch(
-            f"{_API}/repos/{_repo_path(owner, repo)}/issues/comments/{existing}",
-            json={"body": body},
-            headers=_headers(token),
-            timeout=_TIMEOUT,
-        ).raise_for_status()
-    else:
-        httpx.post(
-            f"{_API}/repos/{_repo_path(owner, repo)}/issues/{pr_number}/comments",
-            json={"body": body},
-            headers=_headers(token),
-            timeout=_TIMEOUT,
-        ).raise_for_status()
+    post_check_run(
+        token, owner, repo,
+        CheckRunResult(
+            name=CHECK_TELLER, head_sha=head_sha, status="completed",
+            conclusion="success", title=title, summary=body,
+        ),
+        external_id=f"grug-teller:{owner}/{repo}#{pull_number}:{head_sha}",
+    )
 
 
 def _log_fetch_failed(
@@ -246,7 +198,7 @@ def _emit_degraded_metric(degraded: bool) -> None:
         from observability import emit_gauge  # type: ignore
 
         emit_gauge("grug.teller.summary_degraded", 1 if degraded else 0)
-    except Exception as e:  # noqa: BLE001 - telemetry never breaks the comment
+    except Exception as e:  # noqa: BLE001 - telemetry never breaks the walkthrough
         # A silent swallow here would hide a real import/signature bug in
         # observability.emit_gauge indefinitely (FLINT) - debug, not
         # warning, since a missing gauge is never itself an operator page.
@@ -278,6 +230,27 @@ def dispatch_walkthrough_review(
     head_sha = pr["head"]["sha"]
     installation_id = int(installation["id"])
     started_at = hunt_recorder.now()
+
+    # grug#1439: a PR the base-ref `.grug.yaml` `skip_prs` matches gets no
+    # walkthrough comment. Lazy import: Elder's dispatch module owns the
+    # base-ref config fetch, so both personas read the same file the same way.
+    from personas.code_reviewer.dispatch import pr_skip_rule
+
+    try:
+        skip_rule = pr_skip_rule(pr, installation_id, owner, repo_name)
+    except RuntimeError:
+        # Token exchange failed; the diff fetch below hits the same wall and
+        # takes the established fetch_failed path.
+        skip_rule = None
+    if skip_rule is not None:
+        log.info(
+            "walkthrough_skipped_by_config",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "rule": skip_rule},
+        )
+        return {
+            "persona": "walkthrough", "result": "skipped_config",
+            "skipped_by": skip_rule,
+        }
 
     try:
         diff_text = with_install_token_retry(
@@ -349,7 +322,7 @@ def dispatch_walkthrough_review(
                 "head_sha": head_sha,
             },
         )
-    except Exception as e:  # noqa: BLE001 - a summary hiccup must not drop the comment
+    except Exception as e:  # noqa: BLE001 - a summary hiccup must not drop the walkthrough
         log.warning(
             "walkthrough_summarize_failed",
             extra={
@@ -373,13 +346,7 @@ def dispatch_walkthrough_review(
         ]
     else:
         degraded = True
-        count_hedge = "at least " if files_truncated else ""
-        summary = (
-            f"{count_hedge}{len(files)} file(s) changed "
-            f"(+{sum(f.additions for f in files)}/-{sum(f.deletions for f in files)}). "
-            "Grug's teller-voice was quiet this pass; this is the honest "
-            "deterministic summary."
-        )
+        summary = None
         model_effort = None
 
     effort = estimate_effort(
@@ -387,10 +354,6 @@ def dispatch_walkthrough_review(
         lines_changed=lines_changed,
         model_effort=model_effort,
     )
-
-    from personas.walkthrough.mermaid import build_diagram
-
-    diagram = build_diagram([f.path for f in files])
 
     # #675: possibly-related prior hunts. Best-effort and bounded (one list
     # call + at most 5 file fetches, all inside one 12s budget); a failure
@@ -436,26 +399,33 @@ def dispatch_walkthrough_review(
         )
         return {"persona": "walkthrough", "result": "skipped_closed"}
 
-    # The full review is Elder's check run output on the Checks tab: the
-    # walkthrough is a comment on the PR page, so linking that page only
-    # reloaded it.
-    pr_url = f"https://github.com/{owner}/{repo_name}/pull/{pull_number}/checks"
+    board_body = walkthrough_body(
+        summary=summary,
+        files=files,
+        effort=effort,
+        head_sha=head_sha,
+        files_truncated=files_truncated,
+    )
+    # The check run has no Related context list of its own; the board does.
     body = walkthrough_body(
         summary=summary,
         files=files,
-        diagram=diagram,
         effort=effort,
         head_sha=head_sha,
-        degraded=degraded,
         files_truncated=files_truncated,
         related=related,
-        pr_url=pr_url,
+    )
+    title = (
+        f"Teller walked {'at least ' if files_truncated else ''}"
+        f"{len(files)} file(s), effort={effort}"
     )
 
     try:
         with_install_token_retry(
             installation_id,
-            lambda token: _upsert_comment(token, owner, repo_name, pull_number, body),
+            lambda token: _publish_check_run(
+                token, owner, repo_name, pull_number, head_sha, title, body,
+            ),
         )
     except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
         log.warning(
@@ -469,12 +439,12 @@ def dispatch_walkthrough_review(
         _self_recover(installation_id, owner, repo_name, pull_number)
         return {"persona": "walkthrough", "result": "publish_failed"}
 
-    # conclusion stays "success" - the comment WAS published; degraded_reason
+    # conclusion stays "success" - the walkthrough WAS published; degraded_reason
     # is reserved for "Grug could not evaluate at all" (Elder/Guard's LLM
-    # outage), which overstates this case (the deterministic fallback still
-    # delivers real value). The summary text + a best-effort gauge (same
-    # shape as ticket-compliance's _emit_metric) are the honest signal for
-    # "the AI-authored prose fell back" without lying the OTHER way on the
+    # outage), which overstates this case (the file table still delivers real
+    # value). The summary text + a best-effort gauge (same shape as
+    # ticket-compliance's _emit_metric) are the honest signal for "the
+    # AI-authored prose fell back" without lying the OTHER way on the
     # Activity badge.
     _emit_degraded_metric(degraded)
     # Hunt Board (#1207): the walkthrough and related hunts live in the PR's
@@ -487,7 +457,7 @@ def dispatch_walkthrough_review(
         started_at=started_at,
         backend="",
         model="deterministic-fallback" if degraded else "",
-        text=summary,
+        text=board_body,
         related=tuple(f"#{r.number} {r.title} ({r.reason})" for r in related),
     )
     record_check_verdict(

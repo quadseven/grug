@@ -455,6 +455,40 @@ def _run_persona_rerun(
     return {"status": "dispatched", "verb": verb, "persona": persona}
 
 
+def _run_autofix(
+    *, install_id: int, owner: str, repo: str, pr_number: int,
+    comment_id: int, token_fn, claim, head_sha: str,
+) -> dict:
+    """`/grug fix` (#676): apply the open committable suggestions as one
+    bot commit.
+
+    The comment is claimed FIRST, since the command writes to the branch
+    and a redelivery must not commit twice. That claim means GitHub never
+    redelivers it, so any raise from the fix path is answered on the PR and
+    returned as a skip instead of becoming a webhook 500 that drops the
+    command in silence (grug#1430)."""
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": "fix"}
+    try:
+        from autofix import run_fix  # type: ignore
+        return run_fix(
+            install_id=install_id, owner=owner, repo=repo,
+            pr_number=pr_number, head_sha=head_sha, token_fn=token_fn,
+        )
+    except Exception as e:  # noqa: BLE001 - claimed: answer, never 500
+        log.warning(
+            "interactive_fix_failed",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number,
+                   "kind": type(e).__name__},
+        )
+        _reply(
+            token_fn, owner, repo, pr_number,
+            "Grug could not apply the suggestions. Nothing was committed. "
+            "Comment `/grug fix` again. So speaks Grug.",
+        )
+        return {"status": "skip", "reason": "fix_failed", "verb": "fix"}
+
+
 def run_command(
     verb: str, arg: str, *, install_id: int, owner: str, repo: str,
     pr_number: int, comment_id: int, token_fn, enqueue=None, enqueue_ask=None,
@@ -505,6 +539,13 @@ def run_command(
             pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
             enqueue=enqueue, claim=claim, head_sha=head_sha,
             defer_until=defer_until,
+        )
+
+    if verb == "fix":
+        return _run_autofix(
+            install_id=install_id, owner=owner, repo=repo, pr_number=pr_number,
+            comment_id=comment_id, token_fn=token_fn, claim=claim,
+            head_sha=head_sha,
         )
 
     if verb == "ask":

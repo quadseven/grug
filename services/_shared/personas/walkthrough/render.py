@@ -1,10 +1,11 @@
-"""Walkthrough comment assembly (#554) - pure Markdown rendering.
+"""Walkthrough assembly (#554, T1432) - pure Markdown rendering.
 
-One upsert-by-marker comment (same PATCH-else-POST discipline as Chief's
-ticket-compliance): AI intent summary, changed-files table, deterministic
-mermaid diagram, and a review-effort chip. Assembly is pure so it can be
-tested without any network/LLM call; `dispatch.py` supplies the fetched
-data and the (possibly degraded) summary.
+One body for two surfaces, neither a comment of Teller's own (every new
+comment is an email): the Hunt Board's Walkthrough section and the Teller
+check-run summary. It holds the AI intent summary (absent when the model
+was quiet), a review-effort line and the changed-files list; no mermaid
+diagram. Assembly is pure so it can be tested without any network/LLM
+call; `dispatch.py` supplies the fetched data and the summary.
 """
 
 from __future__ import annotations
@@ -16,21 +17,7 @@ from markdown_safety import neutralize_mentions as _neutralize_mentions
 
 from personas.walkthrough.effort import ReviewEffort, effort_label
 
-MARKER = "<!-- grug-teller:walkthrough -->"
-
-# Teller portrait (repo-hosted on grug.lol) - matches Chief's pattern
-TELLER_PORTRAIT = "https://grug.lol/assets/grug_smile.png"
-TELLER_PORTRAIT_IMG = (
-    f'<img src="{TELLER_PORTRAIT}" width="46" align="left" alt="Grug Teller" />'
-)
-
-# Badge for the "View full review" button (shields.io style)
-REVIEW_BADGE = (
-    "https://img.shields.io/badge/View_full_review-181613"
-    "?style=for-the-badge&labelColor=181613"
-)
-
-# Bound the table + summary text so a sweeping PR can't blow the comment
+# Bound the table + summary text so a sweeping PR can't blow the check-run summary
 # body past GitHub's cap; excess files are counted, not silently dropped.
 _MAX_TABLE_ROWS = 60
 _MAX_SUMMARY_CHARS = 2000
@@ -94,31 +81,33 @@ class FileStat:
     summary: str | None = None
 
 
-def changed_files_table(files: list[FileStat]) -> str:
-    """The changed-files table: path, one-line summary, +X/-Y. Bounded to
-    _MAX_TABLE_ROWS with a visible '+N more' line - never a silent cut.
-    `path` and `summary` are escaped for both table-row integrity and
-    mention-spoofing before splicing (round 4, codex) - `path` is repo-
-    controlled (a crafted filename) and `summary` is model-authored."""
+def changed_files_list(files: list[FileStat]) -> str:
+    """The changed-files list (#1386): path, changes (+X/-Y), summary. Bounded
+    to _MAX_TABLE_ROWS with a visible '+N more' line - never a silent cut.
+    `path` and `summary` are sanitized before splicing."""
     if not files:
         return ""
-    rows = ["| File | Summary | Changes |", "|---|---|---|"]
+    lines: list[str] = []
     for f in files[:_MAX_TABLE_ROWS]:
         path = _escape_code_span_cell(_neutralize_mentions(f.path))
-        summary = (
-            _escape_html(
-                _escape_table_cell(
-                    _neutralize_mentions((f.summary or "")[:_MAX_FILE_SUMMARY_CHARS])
-                )
-            )
-            or "-"
-        )
-        rows.append(f"| `{path}` | {summary} | +{f.additions}/-{f.deletions} |")
-    table = "\n".join(rows)
+        raw_summary = _neutralize_mentions(
+            (f.summary or "")[:_MAX_FILE_SUMMARY_CHARS]
+        ).replace("\n", " ").replace("\r", " ").strip()
+        summary = _escape_html(raw_summary)
+        changes = f"+{f.additions}/-{f.deletions}"
+        if summary:
+            lines.append(f"- `{path}` ({changes}) - {summary}")
+        else:
+            lines.append(f"- `{path}` ({changes})")
+    out = "\n".join(lines)
     cut = len(files) - _MAX_TABLE_ROWS
     if cut > 0:
-        table += f"\n\n_(+{cut} more file(s) not shown)_"
-    return table
+        out += f"\n\n_(+{cut} more file(s) not shown)_"
+    return out
+
+
+# Backward-compatible alias
+changed_files_table = changed_files_list
 
 
 def _details(summary: str, body: str) -> str:
@@ -128,61 +117,47 @@ def _details(summary: str, body: str) -> str:
 
 def walkthrough_body(
     *,
-    summary: str,
+    summary: str | None,
     files: list[FileStat],
-    diagram: str | None,
+    diagram: str | None = None,
     effort: ReviewEffort,
     head_sha: str,
-    degraded: bool,
     files_truncated: bool = False,
     related: list | None = None,
-    pr_url: str | None = None,
 ) -> str:
-    """Assemble a short walkthrough comment (default-collapsed detail).
+    """Assemble the walkthrough (default-collapsed detail).
 
     Layout goal: one screen of useful signal when collapsed, like a review
     summary card - not a wall of tables and mermaid.
 
-      ## Walkthrough
-      {short summary}
+      {short summary, when the model gave one}
       Review effort: ...
+      **Possibly related hunts**   (only when `related` is non-empty)
       <details> Changed files (N) </details>
-      <details> Shape of the change </details>
       _Last walked at ..._
 
-    `degraded` marks a summary that fell back to the deterministic form
-    (LLM call failed/timed out) - the comment says so rather than
-    presenting a fallback as the real thing. `files_truncated` marks a PR
-    whose changed-file count exceeded our fetch cap - every number below
+    `summary=None` is the deterministic fallback: no prose paragraph at all,
+    the file list below carries the walkthrough. `files_truncated` marks a
+    PR whose changed-file count exceeded our fetch cap - every number below
     is then a floor, not an exact count. `summary` is model-authored:
     mentions and line-leading `#` headings are neutralized before this
-    prose posts under the app's own installation-token identity.
-    `pr_url` is where the full review is (the PR's Checks tab); when
-    provided it's rendered as a badge-image button after the header.
+    prose posts under the app's own installation-token identity. `diagram`
+    is accepted and never rendered (T1386: a mermaid fence reads as raw
+    source in phone email clients, and the graph has had no edges, T1432).
+    `related` is for the check-run summary; the Hunt Board renders its own
+    Related context list, so its body leaves it out.
     """
-    parts = [MARKER, TELLER_PORTRAIT_IMG, "", "## Walkthrough", ""]
-    parts.append(
-        _neutralize_headings(_neutralize_mentions(summary[:_MAX_SUMMARY_CHARS]))
-    )
-    if pr_url:
-        parts.append("")
+    parts: list[str] = []
+    if summary:
         parts.append(
-            f'<a href="{pr_url}"><img src="{REVIEW_BADGE}" alt="View full review" /></a>'
+            _neutralize_headings(_neutralize_mentions(summary[:_MAX_SUMMARY_CHARS]))
         )
-    notes: list[str] = []
-    if degraded:
-        notes.append(
-            "Summary fell back to a deterministic sketch; file list and "
-            "diagram (if any) are still live."
-        )
-    if files_truncated:
-        notes.append(
-            f"File list is partial: first {len(files)} files only; the PR has more."
-        )
-    if notes:
         parts.append("")
-        parts.extend(f"- {n}" for n in notes)
-    parts.append("")
+    if files_truncated:
+        parts.append(
+            f"- File list is partial: first {len(files)} files only; the PR has more."
+        )
+        parts.append("")
     parts.append(f"Review effort: {effort_label(effort)}")
 
     if related:
@@ -196,29 +171,14 @@ def walkthrough_body(
             reason = _neutralize_mentions(r.reason)
             parts.append(f"- #{r.number} {title} — {reason}")
 
-    table = changed_files_table(files)
-    if table:
+    files_list = changed_files_list(files)
+    if files_list:
         n = len(files)
         label = f"Changed files ({n})"
         if files_truncated:
             label = f"Changed files (first {n})"
         parts.append("")
-        parts.append(_details(label, table))
-
-    if diagram:
-        parts.append("")
-        parts.append(_details("Shape of the change", f"```mermaid\n{diagram}\n```"))
-    elif files:
-        # Stated reason when files exist but diagram could not be drawn
-        # (too many top-level dirs, balance check failed, and so on).
-        parts.append("")
-        parts.append(
-            _details(
-                "Shape of the change",
-                "No diagram this pass - the change was too large or "
-                "complex to visualize cleanly.",
-            )
-        )
+        parts.append(_details(label, files_list))
 
     parts.append("")
     parts.append(f"_Last walked at `{head_sha[:12]}`._")
