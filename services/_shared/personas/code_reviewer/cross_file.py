@@ -83,8 +83,11 @@ _STOP_NAMES = frozenset({
 
 
 # A quoted string literal on a changed line. No quote characters inside, so
-# the value can ride into a code-search phrase query unescaped. Needs a word
-# character and 4+ chars: shorter literals ("a", "--", "ok") match everywhere.
+# the value can ride into a code-search phrase query unescaped. Only
+# natural-language text qualifies (a word character AND whitespace, 4+ chars):
+# short literals ("a", "--", "ok") match everywhere, and a whitespace-free
+# literal is as likely a removed token or key as a message - it must never
+# be sent to code search or logged as a symbol.
 _STRING_LITERAL = re.compile(r"""(?:"([^"\\\n]{4,})"|'([^'"\\\n]{4,})')""")
 _MAX_LITERALS = 2
 
@@ -143,6 +146,10 @@ def _enclosing_def_from_content(content: str, first_added_line: int) -> str | No
     return None
 
 
+def _is_prose(lit: str) -> bool:
+    return bool(re.search(r"\w", lit) and re.search(r"\s", lit))
+
+
 def _removed_literals(hunks: tuple[DiffHunk, ...]) -> list[str]:
     """String literals a hunk REMOVES and does not re-add (#847). A changed
     user-facing value has no def or call symbol, so these are the only handle
@@ -157,7 +164,7 @@ def _removed_literals(hunks: tuple[DiffHunk, ...]) -> list[str]:
                 continue
             for m in _STRING_LITERAL.finditer(ln[1:]):
                 lit = m.group(1) or m.group(2)
-                if re.search(r"\w", lit) and lit not in added and lit not in out:
+                if _is_prose(lit) and lit not in added and lit not in out:
                     out.append(lit)
     return out[:_MAX_LITERALS]
 
