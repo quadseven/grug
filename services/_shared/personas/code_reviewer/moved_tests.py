@@ -121,28 +121,35 @@ class NewSideReader:
         self._sig_depth = 0
         self._cur = None
 
-    def feed(self, text: str, *, added: bool) -> None:
-        stripped = text.strip()
+    def _continuation(self, stripped: str) -> bool:
+        """A line that continues a signature, a decorator or a docstring."""
         if self._sig_depth > 0:
             self._sig_depth += stripped.count("(") - stripped.count(")")
-            return
+            return True
         if self._deco_depth > 0:
             self._pending = self._pending or bool(_SKIP_RE.search(stripped))
             self._deco_depth += stripped.count("(") - stripped.count(")")
-            return
+            return True
         if self._cur is not None and self._body == "doc":
             if self._quote in stripped:
                 self._body = "first"
-            return
-        if not stripped or stripped.startswith("#"):
-            return
-        ind = _indent(text)
-        if ind == 0 and _FILE_SKIP_RE.match(stripped):
-            self.file_skip = True
+            return True
+        return False
+
+    def _close_scopes(self, ind: int) -> None:
         if self._cur is not None and ind <= self._cur_indent:
             self._cur = None
         while self._scopes and self._scopes[-1][0] >= ind:
             self._scopes.pop()
+
+    def feed(self, text: str, *, added: bool) -> None:
+        stripped = text.strip()
+        if self._continuation(stripped) or not stripped or stripped.startswith("#"):
+            return
+        ind = _indent(text)
+        if ind == 0 and _FILE_SKIP_RE.match(stripped):
+            self.file_skip = True
+        self._close_scopes(ind)
         if stripped.startswith("@"):
             self._pending = self._pending or bool(_SKIP_RE.search(stripped))
             self._deco_depth = max(0, stripped.count("(") - stripped.count(")"))
@@ -224,15 +231,9 @@ def _strength(d: Any, a: Added) -> int | None:
     return None
 
 
-def mark_moved(files: list[Any]) -> None:
-    """Fill each file's `moved` with the indexes of its removed tests that
-    have a counterpart (see the module docstring). `files` carry `path`,
-    `incomplete`, `tests_seen` (`Added`) and `removed` (name, total, mock,
-    norm, is_async).
-
-    The pairs are taken in the order (strength, removed path, removed index,
-    counterpart path, counterpart index): one pass per strength over the
-    removed tests in path order, each taking its first free counterpart."""
+def _index_added(files: list[Any]) -> tuple[dict, dict]:
+    """Counterpart candidates by assertion set and by name, each list in
+    (path, index) order."""
     by_set: dict[frozenset[str], list[tuple[str, Added]]] = {}
     by_name: dict[str, list[tuple[str, Added]]] = {}
     for tf in files:
@@ -245,20 +246,42 @@ def mark_moved(files: list[Any]) -> None:
     for index in (by_set, by_name):
         for entries in index.values():
             entries.sort(key=lambda e: (e[0], e[1].index))
-    ordered = sorted(files, key=lambda tf: tf.path)
+    return by_set, by_name
+
+
+def mark_moved(files: list[Any]) -> None:
+    """Fill each file's `moved` with the indexes of its removed tests that
+    have a counterpart (see the module docstring). `files` carry `path`,
+    `incomplete`, `tests_seen` (`Added`) and `removed` (name, total, mock,
+    norm, is_async).
+
+    The pairs are taken in the order (strength, removed path, removed index,
+    counterpart path, counterpart index): one pass per strength over the
+    removed tests in path order, each taking its first free counterpart."""
+    by_set, by_name = _index_added(files)
     taken: set[tuple[str, int]] = set()
     done: set[tuple[str, int]] = set()
     for tier in (0, 1, 2):
-        for tf in ordered:
+        for tf in sorted(files, key=lambda tf: tf.path):
             for j, d in enumerate(tf.removed):
                 if not d.total or (tf.path, j) in done:
                     continue
                 pool = by_set.get(frozenset(d.norm), ()) if tier == 2 else by_name.get(d.name, ())
-                for p, a in pool[:SCAN]:
-                    if (p, a.index) in taken or not _usable(d, tf.path, p, a):
-                        continue
-                    if _strength(d, a) == tier:
-                        taken.add((p, a.index))
-                        done.add((tf.path, j))
-                        tf.moved.add(j)
-                        break
+                found = _first_free(d, tf.path, pool, tier, taken)
+                if found is not None:
+                    taken.add(found)
+                    done.add((tf.path, j))
+                    tf.moved.add(j)
+
+
+def _first_free(
+    d: Any, path: str, pool: list[tuple[str, Added]], tier: int, taken: set[tuple[str, int]],
+) -> tuple[str, int] | None:
+    """The first counterpart of strength `tier` among the first `SCAN` of
+    `pool` that no other removed test has taken."""
+    for p, a in pool[:SCAN]:
+        if (p, a.index) in taken or not _usable(d, path, p, a):
+            continue
+        if _strength(d, a) == tier:
+            return p, a.index
+    return None
