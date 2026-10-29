@@ -443,12 +443,46 @@ def _load_repo_config(
     installation_id: int, owner: str, repo_name: str, base_ref: str,
 ) -> RepoConfig:
     """Parse the repo's optional `.grug.yaml` as it exists at the PR BASE.
+ 
+     `base_ref` must be the base commit, never the head: a PR that edits
+     `.grug.yaml` is reviewed under the OLD file, so it cannot loosen its own
+     review. Absent file, empty ref, or any fetch failure = `RepoConfig()`
+     (today's behavior); parsing never raises.
+     """
 
-    `base_ref` must be the base commit, never the head: a PR that edits
-    `.grug.yaml` is reviewed under the OLD file, so it cannot loosen its own
-    review. Absent file, empty ref, or any fetch failure = `RepoConfig()`
-    (today's behavior); parsing never raises.
+
+def _count_docstring_candidates(findings, file_contents):
+    """Count public functions without docstrings across all findings.
+    
+    Returns the total count across all Python files in the findings.
     """
+    from docstring_generator import _is_public_function, _has_docstring
+    
+    count = 0
+    for f in findings:
+        path = f.path
+        if not path.endswith(".py"):
+            continue
+        
+        file_text = file_contents.get(path, "")
+        if not file_text:
+            continue
+        
+        lines = file_text.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip().startswith(("def ", "async def ")):
+                if line.startswith("async def "):
+                    _, rest = line.split(" ", 1)
+                else:
+                    _, rest = line.split(" ", 1)
+                
+                if "(" in rest:
+                    func_name = rest.split("(")[0].strip()
+                    
+                    if _is_public_function(func_name) and not _has_docstring(lines, i):
+                        count += 1
+    return count
+
     if not base_ref:
         return RepoConfig()
     try:
@@ -1946,6 +1980,12 @@ def _review_stack_body(
         parts.append(
             f"**Finishing touch:** {len(committable)} unresolved suggestion(s) "
             "can be applied together with `/grug fix`."
+        )
+    docstring_candidates = _count_docstring_candidates(findings, file_contents or {})
+    if docstring_candidates:
+        parts.append(
+            f"**Finishing touch:** {docstring_candidates} public function(s) "
+            "can be documented with `/grug docstring`."
         )
     # Phase, Status and Check-run used to live in the fold. All three were cut:
     # Status restated the summary line verbatim, Phase ("Tier-1 coder arm") is

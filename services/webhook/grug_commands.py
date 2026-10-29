@@ -5,7 +5,7 @@ dispatcher gates (allowlist, collaborator, tpm-enabled) and executes; this
 just recognizes the command, so the recognition has a unit-test seam.
 
 Supported verbs (all default-safe - none mutate code, except `learnings
-delete` which forgets a taught preference and `fix` which commits to the
+delete` which forgets a taught preference and `fix`/`docstring` which commits to the
 PR branch):
   /grug recheck        re-run Chief's DoR check (NOT Elder - use improve)
   /grug improve        Elder re-reviews and re-posts its findings
@@ -17,6 +17,7 @@ PR branch):
   /grug learnings delete <digest>  forget one remembered marking by digest
   /grug accept-removal <path> <sha>  accept one deleted guard path on head <sha> (#1405)
   /grug fix            apply all unresolved committable suggestions as one bot commit
+  /grug docstring      generate docstrings for public functions that lack one as one bot commit
 """
 
 from __future__ import annotations
@@ -28,14 +29,14 @@ from dataclasses import dataclass
 # line in a longer comment; the verb is a known token, everything after is
 # the arg (only `ask`, `learnings` and `accept-removal` consume it). Case-insensitive.
 _CMD_RE = re.compile(
-    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings|accept-removal|accept_removal|fix)\b[ \t]*(.*)$",
+    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings|accept-removal|accept_removal|fix|docstring)\b[ \t]*(.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 
 _CANON = {"test_gaps": "test-gaps", "accept_removal": "accept-removal"}
 VERBS = frozenset({
     "recheck", "improve", "ask", "test-gaps", "resume", "review", "learnings",
-    "accept-removal", "fix",
+    "accept-removal", "fix", "docstring",
 })
 
 # The verbs that start an ELDER re-run. They are the ones that must not

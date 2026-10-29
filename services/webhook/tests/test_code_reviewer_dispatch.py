@@ -3109,6 +3109,20 @@ def test_stack_offers_bulk_fix_for_checked_suggestion():
     assert "/grug fix" in body
 
 
+def test_stack_offers_docstring_for_functions_without_docstrings():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    finding = Finding(
+        file="a.py", line=1, severity="low", rule_name="docstring",
+        message="docstring needed", evidence="def func():\n    pass\n",
+    )
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+        conclusion="success", file_contents={"a.py": "def func():\n    pass\n"},
+    )
+    assert "Finishing touch" in body
+    assert "/grug docstring" in body
+
+
 def test_worth_an_email_is_findings_or_degraded_only():
     """The gate on whether grug may CREATE a comment - i.e. whether it may
     mail the author. A clean review is not news; the green check-run already
