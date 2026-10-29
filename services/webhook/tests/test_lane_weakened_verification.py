@@ -14,7 +14,6 @@ import itertools
 import time
 
 import pytest
-
 from personas.code_reviewer import weakened_verification as wv
 from personas.code_reviewer.criteria_coverage import LinkedCriterion
 from personas.code_reviewer.diff_parser import file_changes, parse_diff

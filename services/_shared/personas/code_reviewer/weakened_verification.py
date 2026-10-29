@@ -314,28 +314,35 @@ class _HunkWalk:
             self.current_added = None
             self.class_skip = self.pending_skip
         elif d:
-            self.current_added = None
-            if not text[:1].isspace():
-                self.class_skip = False
-            if added and d.group(1).startswith("test"):
-                self.current_added = _Added(
-                    d.group(1), index=len(self.tf.tests_seen),
-                    skipped=self.pending_skip or self.class_skip,
-                )
-                self.tf.tests_seen.append(self.current_added)
-                self.body_lines = 0
+            self._def_line(text, d.group(1), added=added)
         elif self.current_added is not None and stripped:
-            cur = self.current_added
-            if self.body_lines < _SKIP_LOOKAHEAD:
-                self.body_lines += 1
-                if _SKIP_CALL_RE.search(stripped):
-                    cur.skipped = True
-            if _ASSERT_RE.search(text):
-                cur.total += 1
-                cur.mock += bool(_MOCK_ASSERT_RE.search(text))
-                cur.norm.add(_normal(text))
+            self._body_line(text, stripped)
         if stripped:
             self.pending_skip = False
+
+    def _def_line(self, text: str, name: str, *, added: bool) -> None:
+        self.current_added = None
+        if not text[:1].isspace():
+            self.class_skip = False
+        if added and name.startswith("test"):
+            self.current_added = _Added(
+                name, index=len(self.tf.tests_seen),
+                skipped=self.pending_skip or self.class_skip,
+            )
+            self.tf.tests_seen.append(self.current_added)
+            self.body_lines = 0
+
+    def _body_line(self, text: str, stripped: str) -> None:
+        cur = self.current_added
+        if cur is None:
+            return
+        if self.body_lines < _SKIP_LOOKAHEAD:
+            self.body_lines += 1
+            cur.skipped = cur.skipped or bool(_SKIP_CALL_RE.search(stripped))
+        if _ASSERT_RE.search(text):
+            cur.total += 1
+            cur.mock += bool(_MOCK_ASSERT_RE.search(text))
+            cur.norm.add(_normal(text))
 
     def added_line(self, text: str) -> None:
         self.new_line(text, added=True)
