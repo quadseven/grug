@@ -17,8 +17,7 @@ Two rules, each one finding per file, anchored on a new-side line:
 - `weakened-test`: a test file whose diff deletes test functions (the
   `def` and at least one assertion go, and no test of that name or a close
   rename comes back; a counterpart in another file of the same diff counts
-  only under `_mark_moved`'s rule: an added, not skipped test with at least
-  as many assertions, one counterpart per removed test) or flips an assertion's polarity (`assertTrue` and
+  only under the rule in `moved_tests`) or flips an assertion's polarity (`assertTrue` and
   `assertFalse`, `In` and `NotIn`, `assert x` and `assert not x`, `True`
   and `False` as the expected value). High when `DELETED_HIGH` or more
   deleted tests in a file are not mentioned by the title or the linked
@@ -51,6 +50,17 @@ from dataclasses import dataclass, field
 
 from personas.code_reviewer.criteria_coverage import LinkedCriterion
 from personas.code_reviewer.diff_parser import DiffHunk, FileChange
+from personas.code_reviewer.moved_tests import (
+    ASSERT_RE,
+    CLASS_RE,
+    DEF_RE,
+    MOCK_ASSERT_RE,
+    Added,
+    NewSideReader,
+    is_async,
+    mark_moved,
+    normal,
+)
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.test_paths import is_test_file
 
@@ -89,22 +99,9 @@ _MAX_LINE = 2_000
 # Most deleted tests and flipped assertions one finding lists by name.
 _MAX_NAMED = 6
 
-# Counterparts scanned per lookup key: bounds the cost of a diff full of
-# same-named tests.
-_SCAN = 32
-# A counterpart that skips itself in its first statements pins nothing.
-_SKIP_LOOKAHEAD = 4
-_SKIP_RE = re.compile(
-    r"\b(?:unittest\.(?:skip\w*|expectedFailure)|pytest\.mark\.(?:skip\w*|xfail)"
-    r"|skip(?:If|Unless)?|expectedFailure)\b"
-)
-_SKIP_CALL_RE = re.compile(r"\b(?:pytest\.skip|self\.skipTest|unittest\.SkipTest)\(")
-_MOCK_ASSERT_RE = re.compile(r"\.assert_(?:not_)?called\w*\(")
-_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(")
-_CLASS_RE = re.compile(r"^\s*class\s+\w+")
-_ASSERT_RE = re.compile(
-    r"\bself\.assert\w*\(|^\s*assert\b|\bpytest\.raises\(|\.assert_\w+\(|\bexpect\("
-)
+_DEF_RE = DEF_RE
+_CLASS_RE = CLASS_RE
+_ASSERT_RE = ASSERT_RE
 # (negative, positive) assertion methods; the negative is matched first.
 _POLARITY = (
     ("assertNotIn", "assertIn"),
@@ -186,19 +183,7 @@ class _Deleted:
     # forms: what a copy elsewhere in the diff must match (#1496).
     total: int = 0
     mock: int = 0
-    norm: set[str] = field(default_factory=set)
-
-
-@dataclass
-class _Added:
-    """A test whose `def` the diff adds: name, assertions, and whether it
-    can run at all (a skipped or xfail test pins nothing)."""
-
-    name: str
-    index: int = 0
-    total: int = 0
-    mock: int = 0
-    skipped: bool = False
+    is_async: bool = False
     norm: set[str] = field(default_factory=set)
 
 
@@ -209,7 +194,8 @@ class _TestFile:
     added: set[str] = field(default_factory=set)
     added_defs: set[str] = field(default_factory=set)
     removed: list[_Deleted] = field(default_factory=list)
-    tests_seen: list[_Added] = field(default_factory=list)
+    reader: NewSideReader = field(default_factory=NewSideReader)
+    tests_seen: list[Added] = field(default_factory=list)
     # indexes into `removed` of tests that reappear in another file of the diff
     moved: set[int] = field(default_factory=set)
     # removed test name -> the test added in its place in the same change run
@@ -264,6 +250,8 @@ def _read_test_file(path: str, hunks: list[DiffHunk], budget: list[int]) -> _Tes
                     tf.added_defs.add(d.group(1))
     for hunk, lines in zip(hunks, bodies, strict=True):
         _walk_hunk(tf, lines, _enclosing_removed(tf, hunk))
+        tf.reader.hunk_end()
+    tf.tests_seen = tf.reader.finish()
     return tf
 
 
@@ -284,10 +272,6 @@ class _HunkWalk:
 
     tf: _TestFile
     current: _Deleted | None
-    current_added: _Added | None = None
-    pending_skip: bool = False
-    class_skip: bool = False
-    body_lines: int = 0
     run_removed: list[str] = field(default_factory=list)
     run_added: list[str] = field(default_factory=list)
     added_pol: dict[str, set[int]] = field(default_factory=dict)
@@ -302,50 +286,8 @@ class _HunkWalk:
         self.run_removed.clear()
         self.run_added.clear()
 
-    def new_line(self, text: str, *, added: bool) -> None:
-        """An added or context line: the new side of the file. Only a test
-        whose `def` is an added line becomes a counterpart candidate."""
-        stripped = text.strip()
-        if stripped.startswith("@"):
-            self.pending_skip = self.pending_skip or bool(_SKIP_RE.search(stripped))
-            return
-        d = _DEF_RE.match(text)
-        if _CLASS_RE.match(text):
-            self.current_added = None
-            self.class_skip = self.pending_skip
-        elif d:
-            self._def_line(text, d.group(1), added=added)
-        elif self.current_added is not None and stripped:
-            self._body_line(text, stripped)
-        if stripped:
-            self.pending_skip = False
-
-    def _def_line(self, text: str, name: str, *, added: bool) -> None:
-        self.current_added = None
-        if not text[:1].isspace():
-            self.class_skip = False
-        if added and name.startswith("test"):
-            self.current_added = _Added(
-                name, index=len(self.tf.tests_seen),
-                skipped=self.pending_skip or self.class_skip,
-            )
-            self.tf.tests_seen.append(self.current_added)
-            self.body_lines = 0
-
-    def _body_line(self, text: str, stripped: str) -> None:
-        cur = self.current_added
-        if cur is None:
-            return
-        if self.body_lines < _SKIP_LOOKAHEAD:
-            self.body_lines += 1
-            cur.skipped = cur.skipped or bool(_SKIP_CALL_RE.search(stripped))
-        if _ASSERT_RE.search(text):
-            cur.total += 1
-            cur.mock += bool(_MOCK_ASSERT_RE.search(text))
-            cur.norm.add(_normal(text))
-
     def added_line(self, text: str) -> None:
-        self.new_line(text, added=True)
+        self.tf.reader.feed(text, added=True)
         d = _DEF_RE.match(text)
         if d and d.group(1).startswith("test"):
             self.run_added.append(d.group(1))
@@ -358,27 +300,27 @@ class _HunkWalk:
         """A removed or context line."""
         if kind != "-":
             self.close_run()
-            self.new_line(text, added=False)
+            self.tf.reader.feed(text, added=False)
         d = _DEF_RE.match(text)
         if d or _CLASS_RE.match(text):
-            self._open(kind, d)
+            self._open(kind, d, text)
         elif kind == "-" and _ASSERT_RE.search(text):
             self._removed_assert(text)
 
-    def _open(self, kind: str, d: re.Match[str] | None) -> None:
+    def _open(self, kind: str, d: re.Match[str] | None, text: str) -> None:
         """A def or class line ends the current test; a removed test def
         starts a new one."""
         self.current = None
         if d and kind == "-" and d.group(1).startswith("test"):
-            self.current = _Deleted(d.group(1))
+            self.current = _Deleted(d.group(1), is_async=is_async(text))
             self.tf.removed.append(self.current)
             self.run_removed.append(self.current.name)
 
     def _removed_assert(self, text: str) -> None:
         if self.current is not None:
             self.current.total += 1
-            self.current.mock += bool(_MOCK_ASSERT_RE.search(text))
-            self.current.norm.add(_normal(text))
+            self.current.mock += bool(MOCK_ASSERT_RE.search(text))
+            self.current.norm.add(normal(text))
         if self.current is not None and text.strip() not in self.tf.added:
             self.current.asserts += 1
         p = _polarity(text)
@@ -406,71 +348,6 @@ def _walk_hunk(tf: _TestFile, lines: list[str], current: _Deleted | None) -> Non
         else:
             walk.old_line(kind, text)
     walk.finish()
-
-
-def _normal(line: str) -> str:
-    return "".join(line.split())
-
-
-def _candidates(d: _Deleted, path: str, by_set, by_name) -> dict[tuple[str, int], tuple[int, _Added]]:
-    """Counterparts of a removed test among the added tests of other files,
-    keyed by (path, index) with the strength of the match (0 strongest)."""
-    found: dict[tuple[str, int], tuple[int, _Added]] = {}
-
-    def usable(p: str, a: _Added) -> bool:
-        return (
-            p != path and a.total >= d.total
-            and (a.mock < a.total or d.mock == d.total)
-        )
-
-    for p, a in by_name.get(d.name, ())[:_SCAN]:
-        need = max(1, -(-len(d.norm) // 2))
-        if usable(p, a) and len(d.norm & a.norm) >= need:
-            found[(p, a.index)] = (0 if a.norm == d.norm else 1, a)
-    if d.total > 1:
-        for p, a in by_set.get(frozenset(d.norm), ())[:_SCAN]:
-            if usable(p, a) and (p, a.index) not in found:
-                found[(p, a.index)] = (2, a)
-    return found
-
-
-def _mark_moved(files: list[_TestFile]) -> None:
-    """Mark removed tests that come back in another file of the same diff
-    (#1496). One index per diff, then each removed test looks up its
-    counterparts by name and by assertion set, so the cost stays linear. A
-    counterpart is an ADDED test in another file, not skipped, with at least
-    as many assertions, and either the same name sharing at least half of the
-    removed test's assertion lines, or (with two or more assertions) the
-    same assertion set under any name. Each counterpart excuses one removed
-    test, strongest matches first in path order, so the result does not
-    depend on the order of the files in the diff. A move that drops
-    assertions is still a weakening."""
-    by_set: dict[frozenset[str], list[tuple[str, _Added]]] = {}
-    by_name: dict[str, list[tuple[str, _Added]]] = {}
-    for tf in files:
-        if tf.incomplete:
-            continue
-        for a in tf.tests_seen:
-            if a.total and not a.skipped:
-                by_set.setdefault(frozenset(a.norm), []).append((tf.path, a))
-                by_name.setdefault(a.name, []).append((tf.path, a))
-    pairs = []
-    for tf in files:
-        for j, d in enumerate(tf.removed):
-            if not d.total:
-                continue
-            for (p, idx), (strength, _) in _candidates(d, tf.path, by_set, by_name).items():
-                pairs.append((strength, tf.path, j, p, idx))
-    pairs.sort()
-    taken: set[tuple[str, int]] = set()
-    done: set[tuple[str, int]] = set()
-    by_path = {tf.path: tf for tf in files}
-    for _strength, path, j, p, idx in pairs:
-        if (path, j) in done or (p, idx) in taken:
-            continue
-        done.add((path, j))
-        taken.add((p, idx))
-        by_path[path].moved.add(j)
 
 
 def _renamed(old: str, new: str | None) -> bool:
@@ -798,7 +675,7 @@ def scan_weakened_verification(
             if tf is None:
                 return ()
             tests.append(tf)
-    _mark_moved(tests)
+    mark_moved(tests)
     removed_files = [
         c.path for c in changes if c.status == "removed" and is_test_file(c.path)
     ]
