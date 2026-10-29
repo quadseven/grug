@@ -197,6 +197,11 @@ def test_ledger_sk_handles_null_pr():
     assert none_sk > _ledger_sk("silent-failure", 9999999, "codex", d)
 
 
+def test_parse_row_carries_category_and_defaults_to_general():
+    assert _row(category="security").category == "security"
+    assert _row().category == "general"
+    assert _row(category="not-a-category").category == "general"
+    assert _row(category=["x"]).category == "general"
 def test_learning_metrics_calculates_overall_and_per_class():
     rows = [
         _row(reviewer="codex", finding_class="silent-failure", verdict="fixed"),

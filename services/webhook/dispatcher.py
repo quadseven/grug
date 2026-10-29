@@ -1698,7 +1698,16 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
 
     comment = payload.get("comment") or {}
     in_reply_to = comment.get("in_reply_to_id")
-    if not in_reply_to:
+    body = (comment.get("body") or "").strip()
+
+    # #822: a /grug question inside a review thread - as a reply, or as the
+    # root comment of a new thread - is answered in that thread. Detect it
+    # before the learnings-only flow below, which requires a reply.
+    from grug_commands import parse_command  # type: ignore
+    cmd = parse_command(body) if body else None
+    thread_ask = cmd is not None and cmd.verb == "ask" and bool(cmd.arg)
+
+    if not in_reply_to and not thread_ask:
         # A NEW inline comment (a thread root), not a reply. Grug only learns
         # from replies to its findings; a root comment has nothing to join.
         return {"status": "no_op", "reason": "not a reply"}
@@ -1707,7 +1716,6 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
     if str((comment.get("user") or {}).get("type", "")) == "Bot":
         return {"status": "no_op", "reason": "reply author is a bot"}
 
-    body = (comment.get("body") or "").strip()
     if not body:
         return {"status": "no_op", "reason": "empty reply"}
 
@@ -1740,6 +1748,43 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
     from urllib.parse import quote as _q
     from github_app_auth import with_install_token_retry  # type: ignore
     import httpx  # type: ignore
+
+    if thread_ask:
+        # #822: an in-thread question takes the same gate as a /grug command
+        # on the PR conversation - the PR author or a write collaborator -
+        # NOT the stricter learnings gate below: asking about a finding is
+        # not teaching, and the author asking "why did you flag this?" in
+        # the finding's own thread is the feature's main case.
+        pr_author_login = str((pr.get("user") or {}).get("login") or "")
+        try:
+            may_ask = _actor_has_write(
+                int(installation_id), owner, repo_name, sender_login,
+                allow_author=True, pr_author_login=pr_author_login,
+            )
+        except httpx.RequestError as e:
+            log.warning(
+                "perm_lookup_transport_failed",
+                extra={"sender": sender_login, "kind": type(e).__name__},
+            )
+            return {"status": "skip", "reason": "perm_lookup_transport_failed"}
+        if may_ask is None:
+            return {"status": "skip", "reason": "perm_lookup_failed"}
+        if not may_ask:
+            return {"status": "no_op", "reason": "ask author lacks write perm"}
+        from rerun import enqueue_ask  # type: ignore
+        try:
+            enqueue_ask(
+                install_id=int(installation_id),
+                repo=f"{owner}/{repo_name}",
+                pr_number=int(pr_number),
+                comment_id=int(comment_id),
+                question=cmd.arg,
+                reply_to_comment_id=int(in_reply_to or comment_id),
+            )
+        except Exception as e:  # noqa: BLE001 - same containment as the learn enqueue
+            log.warning("ask_enqueue_failed", extra={"kind": type(e).__name__})
+            return {"status": "skip", "reason": "enqueue_failed"}
+        return {"status": "dispatched", "kind": "ask"}
 
     # Trust gate: ALWAYS require write-or-above, even for the PR author. Unlike
     # /grug recheck (an author re-running their own PR is harmless), a learning

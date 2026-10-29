@@ -6087,3 +6087,56 @@ def test_deep_append_keeps_a_degenerate_answer_when_the_reasoner_fails(
     assert out.findings == ()
     assert out.backend_used == Backend.OPENCODE_GO
     assert out.error.startswith("low confidence:")
+
+
+def test_coerce_finding_validates_category_and_degrades_to_general() -> None:
+    base = {"path": "a.py", "line": 1, "rule": "r", "severity": "low", "message": "m"}
+    for given, want in [
+        ("security", "security"), ("data-integrity", "data-integrity"),
+        (None, "general"), ("bogus", "general"), (["x"], "general"), ({}, "general"),
+    ]:
+        raw = dict(base) if given is None else {**base, "category": given}
+        finding, reason = lc._coerce_finding(raw)
+        assert finding is not None and reason == ""
+        assert finding.category == want
+
+
+def test_cave_schema_and_prompt_declare_category() -> None:
+    from code_review_prompt import _OUTPUT_CONTRACT
+    from review_types import CATEGORIES, DEFAULT_CATEGORY
+    props = lc._CAVE_FINDINGS_RESPONSE_FORMAT["json_schema"]["schema"][
+        "properties"]["findings"]["items"]["properties"]
+    # Criterion 1 fixes the settable taxonomy at five; "general" is the
+    # parse-time default for an unset/invalid value (criterion 4), not a
+    # choice offered to the reviewer.
+    assert set(props["category"]["enum"]) == CATEGORIES - {DEFAULT_CATEGORY}
+    assert '"category"' in _OUTPUT_CONTRACT
+
+
+def test_answer_pr_question_prompt_demands_grug_not_know(monkeypatch) -> None:
+    """#822 criterion: conversational answers follow the no-fabrication
+    rule - when the diff/thread does not hold the answer, the model must
+    say "Grug not know" (and may offer a suggestion block for a fix)."""
+    _capture_llmobs(monkeypatch)
+    monkeypatch.setattr(lc, "_llmobs_llm", lambda **kw: _NullSpan())
+    seen: dict = {}
+
+    def _post(_url, **kw):
+        seen.update(kw)
+        payload = json.dumps({"answer": "Grug not know."})
+        return httpx.Response(200, json=_openai_json_response(payload))
+
+    with patch.object(httpx, "post", side_effect=_post):
+        out = lc.answer_pr_question(
+            "why is the sky blue?", "diff --git a/x.py", installation_id=3,
+        )
+    assert out == "Grug not know."
+    messages = seen["json"]["messages"]
+    system = messages[0]["content"]
+    assert "Grug not know" in system
+    assert "suggestion" in system  # a fix may be offered as a suggestion block
+
+
+class _NullSpan:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False

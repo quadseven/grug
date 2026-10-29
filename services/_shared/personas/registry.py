@@ -92,6 +92,15 @@ class PersonaSpec:
     # that never arrives, so the default is False; flipping it needs the
     # proof written next to the spec and a test.
     may_be_required: bool = False
+    # grug#1431: True only for a persona that posts a real GitHub check-run
+    # on an open PR (via post_check_run). Comment-only personas (Teller,
+    # Sentinel) carry a check_run_name only as a roster / activity-feed
+    # identity and never post one, so the default is False. The check-run
+    # reconciler expects a check-run only from personas with this set (and
+    # `synchronize` in `actions`): expecting one from a comment-only or
+    # closed-only persona reports it missing forever and re-dispatches
+    # every open PR on every poller tick.
+    posts_pr_check_run: bool = False
 
     def __post_init__(self) -> None:
         # The store's is_persona_enabled derives its lookup key as
@@ -167,6 +176,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         missing_repo_policy="enabled",
         events=("pull_request",),
         dispatch_module="personas.tpm.webhook_dispatch",
+        posts_pr_check_run=True,
     ),
     PersonaSpec(
         key="code_reviewer",
@@ -214,6 +224,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         # push, `/grug improve`, or the opt-in check-run sweeper closes it -
         # that is fail-closed, the posture a BLOCK mode asks for.
         may_be_required=True,
+        posts_pr_check_run=True,
     ),
     PersonaSpec(
         key="guard",
@@ -234,6 +245,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         # has no Guard check at all, and a required context would wait on
         # it forever. Prove a terminal-or-redrive guarantee before flipping.
         may_be_required=False,
+        posts_pr_check_run=True,
     ),
     PersonaSpec(
         key="warder",
@@ -293,6 +305,7 @@ REGISTRY: tuple[PersonaSpec, ...] = (
         missing_repo_policy="disabled",  # never run author code blind
         events=("pull_request",),
         dispatch_module="personas.smasher.webhook_dispatch",
+        posts_pr_check_run=True,
     ),
     PersonaSpec(
         key="walkthrough",
