@@ -734,3 +734,29 @@ def test_poll_and_annotate_logs_learning_writes_count(monkeypatch, _patch_store,
     assert len(cycle) == 1
     assert cycle[0].learned == 1
     assert cycle[0].submitted == 1
+
+
+def test_ledger_row_carries_the_finding_category(monkeypatch):
+    """#683: the category tag on the comment record lands on the ledger row;
+    an absent or off-taxonomy tag degrades to "general" and never blocks
+    the row."""
+    from adapters import install_store
+
+    rows: list[dict] = []
+    monkeypatch.setattr(install_store, "put_ledger_row", lambda row: rows.append(row))
+    monkeypatch.setattr(install_store, "list_ledger_rows", lambda repo: list(rows))
+    monkeypatch.setattr(install_store, "put_repo_practices", lambda repo, data: None)
+    monkeypatch.setattr(install_store, "put_repo_exemplars", lambda repo, data: None)
+
+    tagged = _learning_record(comment_id=11)
+    tagged["finding_tags"]["category"] = "security"
+    assert cr_reactions._record_reaction_learning(tagged, "confirmed") is True
+
+    bogus = _learning_record(comment_id=12)
+    bogus["finding_tags"]["category"] = "not-a-category"
+    assert cr_reactions._record_reaction_learning(bogus, "confirmed") is True
+
+    untagged = _learning_record(comment_id=13)
+    assert cr_reactions._record_reaction_learning(untagged, "confirmed") is True
+
+    assert [r["category"] for r in rows] == ["security", "general", "general"]

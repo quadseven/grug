@@ -2,7 +2,10 @@
 
 The operator's pipeline emits one row per review finding into
 `logs/review-ledger.jsonl`: {ts, repo, pr, reviewer, severity, class,
-finding, verdict, commit, evidence, head_sha}. `verdict` is the
+category, finding, verdict, commit, evidence, head_sha}. `category`
+(#683, optional) is the finding's taxonomy category
+(`review_types.CATEGORIES`); rows without it parse as "general".
+`verdict` is the
 ground-truth label - `fixed` / `declined` (a real finding acted on or
 consciously kept) vs `false-positive` (the reviewer was wrong).
 

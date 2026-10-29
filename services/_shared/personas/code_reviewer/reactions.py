@@ -237,12 +237,24 @@ def record_ledger_learning(
     from best_practices import derive_practices, practices_to_dicts
     from few_shot import exemplars_from_rows, exemplars_to_dicts
     from ledger import accepted_findings_by_class, parse_row
+    from review_types import CATEGORIES, DEFAULT_CATEGORY
+
+    # #683: the finding's taxonomy category, tagged at publish time
+    # (judge.eval_tags). Absent or off-taxonomy degrades to the default,
+    # mirroring ledger.parse_row, and never blocks the row.
+    raw_category = tags.get("category")
+    category = (
+        raw_category
+        if isinstance(raw_category, str) and raw_category in CATEGORIES
+        else DEFAULT_CATEGORY
+    )
 
     base_row: dict = {
         "repo": record["repo"],
         "pr": record["pr_number"],
         "severity": severity,
         "class": rule_name,
+        "category": category,
         "finding": finding_text,
         "verdict": ledger_verdict,
         # Stable evidence makes a reaction flip overwrite the same ledger row
