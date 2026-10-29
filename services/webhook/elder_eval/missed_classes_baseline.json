@@ -16,6 +16,18 @@
       ],
       "recall": 0.0,
       "source": "Elder's production review of PR 751 at head 61dce166be on 2026-07-24: one finding, from the deterministic complexity scanner; the LLM arm published nothing"
+    },
+    "production_column_datetime_type_mismatch": {
+      "blocking": true,
+      "caught": {
+        "column_datetime_type_mismatch": false
+      },
+      "findings": [],
+      "missed_blocking_defects": [
+        "column_datetime_type_mismatch"
+      ],
+      "recall": 0.0,
+            "source": "Elder's review of a production repository at head 0badc0d on 2026-10-28: no blocking finding on the new datetime comparison; an independent verifier found it by reading the int() readers of the same column"
     }
   }
 }
