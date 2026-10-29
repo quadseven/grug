@@ -6111,3 +6111,32 @@ def test_cave_schema_and_prompt_declare_category() -> None:
     # choice offered to the reviewer.
     assert set(props["category"]["enum"]) == CATEGORIES - {DEFAULT_CATEGORY}
     assert '"category"' in _OUTPUT_CONTRACT
+
+
+def test_answer_pr_question_prompt_demands_grug_not_know(monkeypatch) -> None:
+    """#822 criterion: conversational answers follow the no-fabrication
+    rule - when the diff/thread does not hold the answer, the model must
+    say "Grug not know" (and may offer a suggestion block for a fix)."""
+    _capture_llmobs(monkeypatch)
+    monkeypatch.setattr(lc, "_llmobs_llm", lambda **kw: _NullSpan())
+    seen: dict = {}
+
+    def _post(_url, **kw):
+        seen.update(kw)
+        payload = json.dumps({"answer": "Grug not know."})
+        return httpx.Response(200, json=_openai_json_response(payload))
+
+    with patch.object(httpx, "post", side_effect=_post):
+        out = lc.answer_pr_question(
+            "why is the sky blue?", "diff --git a/x.py", installation_id=3,
+        )
+    assert out == "Grug not know."
+    messages = seen["json"]["messages"]
+    system = messages[0]["content"]
+    assert "Grug not know" in system
+    assert "suggestion" in system  # a fix may be offered as a suggestion block
+
+
+class _NullSpan:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
