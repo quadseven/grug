@@ -57,7 +57,10 @@ from openrouter_free_limiter import (
     is_free_tier_model,
 )
 from voice_pack import VoiceSelection, apply_voice
-from review_types import EFFORTS, SEVERITIES, Effort, Severity
+from review_types import (
+    CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, Severity,
+    category_or_default,
+)
 from review_pipeline import (
     DEFAULT_MAX_COHORT_CHARS,
     DEFAULT_MAX_COHORT_PATHS,
@@ -716,6 +719,9 @@ class Finding:
     # (mirrors suggestion's None-for-absent).
     suggestion: str | None = None
     effort: Effort | None = None
+    # #683: taxonomy category (review_types.CATEGORIES); invalid or unset
+    # degrades to "general" at parse, never drops the finding.
+    category: Category = DEFAULT_CATEGORY
     # Explicit justification is required to request a cross-file anchor.
     # `evaluate_diff` additionally verifies that the exact line was supplied
     # in bounded cross-file context before accepting it.
@@ -1901,7 +1907,7 @@ _CAVE_REVIEW_REASONER_DEFAULT_MODEL = "qwen3.5:122b"
 # silently TRUNCATES multi-item answers (the known estate trap; same fix as
 # the bench transport, #544) - a large diff reliably came back unparseable
 # (parse_failed). The schema mirrors exactly what `_coerce_finding` requires;
-# the optional `suggestion` and `effort` are declared, and no other key is
+# the optional `suggestion`, `effort` and `category` are declared, and no other key is
 # allowed (grug#989). SaaS-style backends
 # keep plain json_object via the default body (this rides extra_body, which
 # merges AFTER the default response_format and so replaces it per-backend).
@@ -1963,6 +1969,10 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                                 "maxLength": CAVE_MAX_SUGGESTION_CHARS,
                             },
                             "effort": {"type": "string", "enum": sorted(EFFORTS)},
+                            # The five settable values (criterion 1);
+                            # "general" is the parse-time default for an
+                            # unset value (criterion 4), not a choice.
+                            "category": {"type": "string", "enum": sorted(CATEGORIES - {DEFAULT_CATEGORY})},
                             "outside_diff_reason": {
                                 "type": "string", "maxLength": MAX_FINDING_MESSAGE_CHARS,
                             },
@@ -2906,6 +2916,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         if isinstance(raw_effort, str) and raw_effort in EFFORTS
         else None
     )
+    category: Category = category_or_default(raw.get("category"))
     raw_outside_reason = raw.get("outside_diff_reason")
     outside_diff_reason = (
         _redact_secrets(raw_outside_reason[:MAX_FINDING_MESSAGE_CHARS])
@@ -2935,7 +2946,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
             suggestion = None
     return Finding(
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
-        suggestion=suggestion, effort=effort,
+        suggestion=suggestion, effort=effort, category=category,
         outside_diff_reason=outside_diff_reason, withdrawn=withdrawn,
     ), ""
 
@@ -4250,6 +4261,10 @@ def _merge_review_findings(
                 ),
                 suggestion=preferred.suggestion or other.suggestion,
                 effort=preferred.effort or other.effort,
+                category=(
+                    preferred.category if preferred.category != DEFAULT_CATEGORY
+                    else other.category
+                ),
                 origins=tuple(origins),
             )
     return tuple(merged.values())
