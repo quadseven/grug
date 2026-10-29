@@ -84,3 +84,9 @@ def test_freeform_single_nonsense_word_still_none():
     # an LLM call (the pre-#822 unknown-verb behaviour).
     assert parse_command("/grug frobnicate") is None
     assert parse_command("/grug") is None
+
+
+def test_freeform_imperative_is_not_a_question():
+    # Imperatives are statements to the room, not questions to Grug.
+    assert parse_command("/grug do the thing") is None
+    assert parse_command("/grug tell the team this is fine") is None

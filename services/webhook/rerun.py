@@ -750,7 +750,11 @@ def _thread_context(token: str, owner: str, repo_name: str, root_comment_id: int
             f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
             f"/pulls/comments/{root_comment_id}",
         )
-    except Exception:  # noqa: BLE001 - context enrichment must not kill the answer
+    except Exception as e:  # noqa: BLE001 - context enrichment must not kill the answer
+        log.warning(
+            "ask_thread_context_failed",
+            extra={"comment_id": root_comment_id, "kind": type(e).__name__},
+        )
         return ""
     parts = ["REVIEW THREAD the question was asked in:"]
     path = str(c.get("path") or "")
@@ -793,10 +797,18 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str, rep
             f"/issues/{pr_number}/comments"
         )
         footer = "*(Grug answered from the PR diff - may be wrong; verify.)*"
+        thread_note = ""
         if reply_to_comment_id:
             thread = _thread_context(token, owner, repo_name, reply_to_comment_id)
             if thread:
                 context = f"{thread}\n\nFULL PR DIFF:\n{diff}"
+            else:
+                # Say so in the open: an answer that silently lost its
+                # thread context would read as if it had seen the finding.
+                thread_note = (
+                    "\n\n*(Grug could not load the thread itself, so this "
+                    "answer is from the PR diff only.)*"
+                )
             post_url = (
                 f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
                 f"/pulls/{pr_number}/comments/{reply_to_comment_id}/replies"
@@ -817,9 +829,18 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str, rep
         # @mention in it would notify a real GitHub user as if Grug itself
         # pinged them (#561, same class as Teller's #554 round-4 fix).
         safe_answer = neutralize_mentions(answer) if answer else answer
-        body = (f"{safe_answer}\n\n{footer}"
-                if safe_answer else
-                "Grug could not answer that right now (the thinking-rock is tired). Try again.")
+        if safe_answer:
+            body = f"{safe_answer}\n\n{footer}{thread_note}"
+            if not reply_to_comment_id:
+                # A top-level answer names the question it answers (#822
+                # criterion 1: the reply belongs to its thread - the PR
+                # conversation). The quote is neutralized like the answer:
+                # it is echoed user text posted under Grug's authority.
+                quoted = neutralize_mentions(q[:280])
+                body = f"> {quoted}\n\n{body}"
+        else:
+            # Criterion 6's wording, even when the model gave nothing back.
+            body = "Grug not know. The thinking-rock is tired - try again."
         _gh_post(token, post_url, {"body": body})
         return "answered" if answer else "ask_no_answer"
     result = with_install_token_retry(install_id, _do)

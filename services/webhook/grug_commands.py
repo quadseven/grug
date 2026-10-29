@@ -59,8 +59,8 @@ class GrugCommand:
 # stays None; so does declarative prose ("/grug reviewed it").
 _QUESTION_RE = re.compile(r"^\s*/grug\s+(.+)$", re.IGNORECASE | re.MULTILINE)
 _QUESTION_OPENERS = frozenset({
-    "why", "what", "how", "is", "are", "does", "do", "can", "could",
-    "should", "would", "when", "where", "who", "which", "explain", "tell",
+    "why", "what", "how", "is", "are", "does", "can", "could",
+    "should", "would", "when", "where", "who", "which", "explain",
 })
 
 
