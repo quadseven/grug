@@ -16,7 +16,8 @@ Two rules, each one finding per file, anchored on a new-side line:
 
 - `weakened-test`: a test file whose diff deletes test functions (the
   `def` and at least one assertion go, and no test of that name or a close
-  rename comes back) or flips an assertion's polarity (`assertTrue` and
+  rename comes back, in that file or in another file of the same diff with
+  the same name or assertion set and at least as many assertions) or flips an assertion's polarity (`assertTrue` and
   `assertFalse`, `In` and `NotIn`, `assert x` and `assert not x`, `True`
   and `False` as the expected value). High when `DELETED_HIGH` or more
   deleted tests in a file are not mentioned by the title or the linked
@@ -169,6 +170,19 @@ def _incomplete(line: str) -> bool:
 class _Deleted:
     name: str
     asserts: int = 0
+    # Every assertion line the test loses, and their whitespace-normalized
+    # forms: what a copy elsewhere in the diff must match (#1496).
+    total: int = 0
+    norm: set[str] = field(default_factory=set)
+
+
+@dataclass
+class _Added:
+    """A test the diff adds or keeps: name and its assertions."""
+
+    name: str
+    total: int = 0
+    norm: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -178,6 +192,9 @@ class _TestFile:
     added: set[str] = field(default_factory=set)
     added_defs: set[str] = field(default_factory=set)
     removed: list[_Deleted] = field(default_factory=list)
+    tests_seen: list[_Added] = field(default_factory=list)
+    # removed tests that reappear in another file of the same diff
+    moved: set[str] = field(default_factory=set)
     # removed test name -> the test added in its place in the same change run
     replaced_by: dict[str, str] = field(default_factory=dict)
     flips: list[str] = field(default_factory=list)
@@ -250,6 +267,7 @@ class _HunkWalk:
 
     tf: _TestFile
     current: _Deleted | None
+    current_added: _Added | None = None
     run_removed: list[str] = field(default_factory=list)
     run_added: list[str] = field(default_factory=list)
     added_pol: dict[str, set[int]] = field(default_factory=dict)
@@ -264,7 +282,20 @@ class _HunkWalk:
         self.run_removed.clear()
         self.run_added.clear()
 
+    def new_line(self, text: str) -> None:
+        """An added or context line: the new side of the file."""
+        d = _DEF_RE.match(text)
+        if d or _CLASS_RE.match(text):
+            self.current_added = None
+            if d and d.group(1).startswith("test"):
+                self.current_added = _Added(d.group(1))
+                self.tf.tests_seen.append(self.current_added)
+        elif self.current_added is not None and _ASSERT_RE.search(text):
+            self.current_added.total += 1
+            self.current_added.norm.add(_normal(text))
+
     def added_line(self, text: str) -> None:
+        self.new_line(text)
         d = _DEF_RE.match(text)
         if d and d.group(1).startswith("test"):
             self.run_added.append(d.group(1))
@@ -277,6 +308,7 @@ class _HunkWalk:
         """A removed or context line."""
         if kind != "-":
             self.close_run()
+            self.new_line(text)
         d = _DEF_RE.match(text)
         if d or _CLASS_RE.match(text):
             self._open(kind, d)
@@ -293,6 +325,9 @@ class _HunkWalk:
             self.run_removed.append(self.current.name)
 
     def _removed_assert(self, text: str) -> None:
+        if self.current is not None:
+            self.current.total += 1
+            self.current.norm.add(_normal(text))
         if self.current is not None and text.strip() not in self.tf.added:
             self.current.asserts += 1
         p = _polarity(text)
@@ -322,6 +357,28 @@ def _walk_hunk(tf: _TestFile, lines: list[str], current: _Deleted | None) -> Non
     walk.finish()
 
 
+def _normal(line: str) -> str:
+    return "".join(line.split())
+
+
+def _mark_moved(files: list[_TestFile]) -> None:
+    """Mark removed tests that come back in another file of the same diff
+    (#1496). A removed test counts as moved when a test of the same name, or
+    with the same assertion set, is in another file and keeps at least as
+    many assertions: a move that drops assertions is still a weakening."""
+    for tf in files:
+        others = [
+            t for other in files if other is not tf and not other.incomplete
+            for t in other.tests_seen
+        ]
+        for d in tf.removed:
+            if d.total and any(
+                t.total >= d.total and (t.name == d.name or t.norm == d.norm)
+                for t in others
+            ):
+                tf.moved.add(d.name)
+
+
 def _renamed(old: str, new: str | None) -> bool:
     if new is None:
         return False
@@ -337,6 +394,7 @@ def _deleted_tests(tf: _TestFile) -> list[_Deleted]:
     return [
         d for d in tf.removed
         if d.asserts
+        and d.name not in tf.moved
         and d.name not in tf.added_defs
         and not _renamed(d.name, tf.replaced_by.get(d.name))
     ]
@@ -646,6 +704,7 @@ def scan_weakened_verification(
             if tf is None:
                 return ()
             tests.append(tf)
+    _mark_moved(tests)
     removed_files = [
         c.path for c in changes if c.status == "removed" and is_test_file(c.path)
     ]

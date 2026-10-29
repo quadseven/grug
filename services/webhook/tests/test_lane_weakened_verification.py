@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from personas.code_reviewer import weakened_verification as wv
 from personas.code_reviewer.criteria_coverage import LinkedCriterion
 from personas.code_reviewer.diff_parser import file_changes, parse_diff
@@ -255,6 +257,100 @@ def test_a_close_rename_with_a_reworded_assertion_is_not_deleted():
         '+        self.assertEqual(used, routes - {"/api/frame", "/api/watch"})',
     ]))
     assert _scan(diff) == ()
+
+
+# Tests moved between files in one diff (#1496). A split test file removes
+# tests from one file and adds them to others; they are not deleted.
+_UNIT_BODY = {
+    "unittest": lambda n: [
+        f"    def test_{n}(self):",
+        f"        self.assertEqual(widget.{n}(), 1)",
+        f"        self.assertTrue(widget.{n}_ok())",
+    ],
+    "pytest": lambda n: [
+        f"def test_{n}():",
+        f"    assert widget.{n}() == 1",
+        f"    assert widget.{n}_ok()",
+    ],
+}
+_NAMES = ("alpha_is_stable", "beta_is_stable", "gamma_is_stable")
+
+
+def _split(kind, removed, added, *, added_path="tests/test_part.py"):
+    """`removed` tests leave tests/test_big.py; `added` tests join `added_path`."""
+    body = _UNIT_BODY[kind]
+    gone = [f"-{ln}" for n in removed for ln in body(n)]
+    came = [f"+{ln}" for n in added for ln in body(n)]
+    return _diff("tests/test_big.py", ("", gone)) + _diff(added_path, ("", came))
+
+
+def test_a_deleted_test_file_is_medium_even_when_tests_appear_elsewhere():
+    diff = (
+        "diff --git a/tests/test_old.py b/tests/test_old.py\ndeleted file mode 100644\n"
+        "index 1111111..0000000\n--- a/tests/test_old.py\n+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n-def test_x():\n-    assert x()\n"
+        + _diff("tests/test_new.py", ("", ["+def test_x():", "+    assert x()"]))
+    )
+    (f,) = _scan(diff)
+    assert f.severity == "medium"
+    assert "`tests/test_old.py`" in f.message
+
+
+@pytest.mark.parametrize("kind", ["unittest", "pytest"])
+def test_tests_moved_to_another_file_with_the_same_name_are_not_deleted(kind):
+    assert _scan(_split(kind, _NAMES, _NAMES)) == ()
+
+
+@pytest.mark.parametrize("kind", ["unittest", "pytest"])
+def test_tests_moved_under_new_names_with_the_same_body_are_not_deleted(kind):
+    body = _UNIT_BODY[kind]
+    gone = [f"-{ln}" for n in _NAMES[:2] for ln in body(n)]
+    came = [
+        f"+{ln}" for n in _NAMES[:2]
+        for ln in body(n)
+    ]
+    # Rename: keep the body (same normalized assertions), change the name.
+    came = [ln.replace("_is_stable", "_holds_up_under_load_xyz", 1) if "def " in ln else ln
+            for ln in came]
+    diff = _diff("tests/test_big.py", ("", gone)) + _diff("tests/test_part.py", ("", came))
+    assert _scan(diff) == ()
+
+
+@pytest.mark.parametrize("kind", ["unittest", "pytest"])
+def test_a_removed_test_with_no_counterpart_in_the_diff_is_still_marked(kind):
+    diff = _split(kind, _NAMES, _NAMES[:1])
+    (f,) = _scan(diff)
+    assert f.rule_name == "weakened-test"
+    assert "deletes 2 test(s)" in f.message
+    assert "`test_beta_is_stable`" in f.message
+    assert "`test_gamma_is_stable`" in f.message
+    assert "`test_alpha_is_stable`" not in f.message
+
+
+@pytest.mark.parametrize("kind", ["unittest", "pytest"])
+def test_a_move_that_weakens_the_test_is_still_marked(kind):
+    body = _UNIT_BODY[kind]
+    gone = [f"-{ln}" for n in _NAMES[:2] for ln in body(n)]
+    # The same names come back with the second assertion dropped.
+    came = [f"+{ln}" for n in _NAMES[:2] for ln in body(n)[:-1]]
+    diff = _diff("tests/test_big.py", ("", gone)) + _diff("tests/test_part.py", ("", came))
+    (f,) = _scan(diff)
+    assert "deletes 2 test(s)" in f.message
+
+
+def test_the_same_body_under_a_new_name_with_fewer_assertions_is_still_marked():
+    body = _UNIT_BODY["pytest"]
+    gone = [f"-{ln}" for ln in body("alpha_is_stable")]
+    came = ["+def test_something_else_entirely():", "+    assert widget.alpha_is_stable() == 1"]
+    diff = _diff("tests/test_big.py", ("", gone)) + _diff("tests/test_part.py", ("", came))
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_a_move_of_some_tests_marks_only_the_ones_left_behind():
+    (f,) = _scan(_split("pytest", _NAMES, _NAMES[:2]))
+    assert "deletes 1 test(s)" in f.message
+    assert "`test_gamma_is_stable`" in f.message
 
 
 def test_a_cut_short_hunk_is_not_evaluated():
