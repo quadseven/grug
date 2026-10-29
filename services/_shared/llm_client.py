@@ -69,6 +69,12 @@ from review_pipeline import (
     plan_review,
     render_review_map,
 )
+from reviewability import (
+    ReviewabilityAssessment,
+    ReviewabilityPolicy,
+    assess_reviewability,
+    dimension_score,
+)
 from review_evidence import Hunk, ElderEvidence, seal
 from datadog_switch import datadog_enabled
 import call_report
@@ -590,6 +596,22 @@ def _review_llm_timeout_s() -> float:
         log.warning("review_llm_timeout_invalid", extra={"value": raw})
         return _DEFAULT_REVIEW_TIMEOUT_SECONDS
     return min(_MAX_REVIEW_TIMEOUT_SECONDS, max(_MIN_REVIEW_TIMEOUT_SECONDS, value))
+
+
+def _reviewability_policy() -> ReviewabilityPolicy:
+    """Repository policy for reviewability failures: warn, block, or ignore.
+
+    Read from config so the operator chooses the posture without touching any
+    model prompt. `ignore` silences the finding; `warn` makes it advisory;
+    `block` surfaces it as a blocking reviewability concern. None of them
+    refuse to review - the highest-risk cohorts are still reviewed first.
+    """
+    raw = os.getenv("GRUG_REVIEWABILITY_POLICY", "warn")
+    if raw in ("warn", "block", "ignore"):
+        return raw
+    log.warning("reviewability_policy_invalid", extra={"value": raw})
+    return "warn"
+
 _REVIEW_RETRY_ATTEMPTS = 3
 _REVIEW_TRANSPORT_RETRY_ATTEMPTS = 1
 # Exponential backoff applies on every attempt except the final one,
@@ -858,6 +880,8 @@ class LlmReviewResponse:
     attempts: tuple[str, ...] = field(default_factory=tuple)
     # grug#1276: which tier served this review ("self-hosted", "free-pool", "subscription").
     tier_served: Optional[str] = None
+    reviewability_note: str = ""
+    reviewability_blocking: bool = False
 
 
 # grug#1196: one failed model call inside a chunk's ladder walk.
@@ -5439,12 +5463,52 @@ def review_diff(
     if not evidence.hunks:
         return LlmReviewResponse(kind="no_diff")
 
+    # Deterministic reviewability assessment produced BEFORE any model
+    # review. It never refuses to review - it only surfaces a policy-driven
+    # verdict and feeds the planner so high-risk cohorts run first.
+    assessment = assess_reviewability(
+        evidence.hunks,
+        max_cohort_chars=_review_cohort_chars(),
+        max_cohort_paths=_review_cohort_paths(),
+        max_cohorts=_review_max_cohorts(),
+        policy=_reviewability_policy(),
+    )
+    ctx = evidence.pr_context or {}
+    log.info(
+        "llm_reviewability_assessment",
+        extra={
+            "decision": assessment.decision,
+            "reviewable": assessment.reviewable,
+            "partitionable": assessment.partitionable,
+            "overall": assessment.overall,
+            "semantic_paths": assessment.semantic_paths,
+            "noise_paths": assessment.noise_paths,
+            "dimension_scores": {
+                dim.name: dimension_score(assessment, dim.name)
+                for dim in assessment.dimensions
+            },
+            "installation_id": installation_id,
+            "repo": ctx.get("repo"),
+            "pr_number": ctx.get("pr_number"),
+        },
+    )
+
     plan = plan_review(
         evidence.hunks,
         max_cohort_chars=_review_cohort_chars(),
         max_cohort_paths=_review_cohort_paths(),
         max_cohorts=_review_max_cohorts(),
     )
+    # Feed review planning: high-risk cohorts receive context and budget
+    # first (staged cohorts run serially, so order is budget order).
+    if plan.staged and assessment.suggested_cohorts:
+        wanted = [cohort.label for cohort in assessment.suggested_cohorts]
+        by_label: dict[str, ReviewCohort] = {}
+        for cohort in plan.cohorts:
+            by_label.setdefault(cohort.label, cohort)
+        ordered = [by_label[label] for label in wanted if label in by_label]
+        if len(ordered) == len(plan.cohorts):
+            plan = replace(plan, cohorts=tuple(ordered))
     review = _Tier1Review(
         evidence=evidence,
         installation_id=installation_id,
@@ -5452,8 +5516,37 @@ def review_diff(
         cancel_event=cancel_event,
     )
     if not plan.staged:
-        return review.run_whole_diff(plan)
-    return review.run_staged(plan)
+        result = review.run_whole_diff(plan)
+    else:
+        result = review.run_staged(plan)
+    note = _render_reviewability_note(assessment)
+    return replace(
+        result,
+        reviewability_note=note,
+        reviewability_blocking=assessment.decision == "block",
+    )
+
+
+def _render_reviewability_note(assessment: ReviewabilityAssessment) -> str:
+    """Render the policy finding and its evidence for the author-visible check."""
+    if assessment.decision == "pass":
+        return ""
+    lines = [
+        f"Reviewability {assessment.decision}: this change is poorly bounded.",
+        "",
+        "Dimensions:",
+    ]
+    lines.extend(
+        f"- {dim.name}: {dim.score:.2f}. Evidence: {dim.evidence}"
+        for dim in assessment.dimensions
+    )
+    if assessment.suggested_cohorts:
+        lines.extend(("", "Suggested cohorts:"))
+        lines.extend(
+            f"- {cohort.label}: {', '.join(cohort.paths)}. {cohort.risk_reduced}"
+            for cohort in assessment.suggested_cohorts
+        )
+    return "\n".join(lines)
 
 
 @dataclass

@@ -208,6 +208,8 @@ class CodeReviewEvaluation:
     # toward the verdict, but counted here so recall stays measurable.
     dropped_withdrawn: int = 0
     tier_served: str | None = None
+    reviewability_note: str = ""
+    reviewability_blocking: bool = False
 
     @property
     def passed(self) -> bool:
@@ -453,10 +455,15 @@ def evaluate_diff(
         # neutral; else success. `conclusion` and `degraded_reason` must never
         # disagree within one CodeReviewEvaluation - a "success" alongside
         # degraded_reason="partial_review" is the bug this closes.
-        conclusion=_derive_conclusion(kept_findings, degraded_reason),
+        conclusion=(
+            "failure" if llm_response.reviewability_blocking
+            else _derive_conclusion(kept_findings, degraded_reason)
+        ),
         dropped_hallucinations=dropped,
         dropped_withdrawn=withdrawn,
         degraded_reason=degraded_reason,
         coverage=llm_response.coverage,
         tier_served=llm_response.tier_served,
+        reviewability_note=llm_response.reviewability_note,
+        reviewability_blocking=llm_response.reviewability_blocking,
     )
