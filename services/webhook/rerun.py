@@ -99,6 +99,13 @@ _MAX_SETTLE_SECONDS = 300
 # faster than Elder can finish reviewing it. A genuinely new commit always
 # resets this to 0; it only counts same-sha redrives.
 _MAX_INTENT_DRIFT_REDRIVES = 3
+
+# grug#1494: a review where every model failed (`all_failed`) raises, so the
+# queue redelivers it. Deliveries below this number leave a blocking repo's
+# Elder check pending; from this one on the failure is published, so a long
+# provider outage still ends in a red check instead of waiting forever. The
+# queue's own dead-letter limit stays the outer bound.
+_ALL_FAILED_AUTO_RERUN_DELIVERIES = 3
 # A learn job whose classifier backends are all rate limited or down (the
 # OpenRouter key is free-tier only and refuses intermittently - operator
 # decision 2026-09-23) is DEFERRED: re-enqueued as a fresh message with a
@@ -1274,7 +1281,9 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
             first_deferred_at=float(job.get("first_deferred_at", 0) or 0),
         )
     if job.get("kind") == "review":
-        return _run_hot_review(job, install_id, repo_full, pr_number)
+        return _run_hot_review(
+            job, install_id, repo_full, pr_number, receive_count=receive_count,
+        )
     persona = str(job.get("persona", "elder"))
 
     if persona not in _RERUNNABLE:
@@ -2476,6 +2485,7 @@ def _stop_staleness_watch(watch: _StalenessWatch | None) -> None:
 
 def _run_hot_review(
     job: dict[str, Any], install_id: int, repo_full: str, pr_number: int,
+    receive_count: int = 0,
 ) -> str:
     """Settle, cancel stale work, then run Elder on one current snapshot.
 
@@ -2727,6 +2737,7 @@ def _run_hot_review(
                     ),
                     blocking=elder_blocking,
                     cancel_event=watch.cancel,
+                    rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
                 )
             finally:
                 _stop_staleness_watch(watch)

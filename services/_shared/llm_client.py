@@ -891,6 +891,10 @@ class _LadderAttempt:
     backend: str
     model: str
     reason: str
+    # Seconds to wait before asking this model again, for a rate limit (429)
+    # that a wait can clear. 0 means the failure is final for this chunk
+    # (grug#1494).
+    retry_after: float = 0.0
 
     @property
     def label(self) -> str:
@@ -5048,6 +5052,27 @@ def _shadow_deep_vllm(
     )
 
 
+# The longest the chunk retry waits out a 429's Retry-After, and the wait when
+# the 429 names none. The staged deadline still clamps the retried call.
+_RATE_LIMIT_WAIT_CAP_SECONDS = 30.0
+_RATE_LIMIT_WAIT_DEFAULT_SECONDS = 5.0
+
+
+def _rate_limit_wait(outcome: "AttemptOutcome") -> float:
+    """Seconds a 429 asks the caller to wait, or 0.0 when this failure is not
+    a rate limit a wait can clear (any other failure, or a spent allowance)."""
+    resp = outcome.raw_response
+    if outcome.status_code != 429 or resp is None or _is_spent_quota_refusal(resp):
+        return 0.0
+    try:
+        seconds = float((resp.headers.get("retry-after") or "").strip())
+    except ValueError:
+        return _RATE_LIMIT_WAIT_DEFAULT_SECONDS
+    if not math.isfinite(seconds) or seconds <= 0:
+        return _RATE_LIMIT_WAIT_DEFAULT_SECONDS
+    return min(seconds, _RATE_LIMIT_WAIT_CAP_SECONDS)
+
+
 class _ChunkLadder:
     """Per-chunk memory of failed model calls across attempts (grug#1196).
 
@@ -5061,6 +5086,8 @@ class _ChunkLadder:
 
     def __init__(self) -> None:
         self._tried: dict[int, list[_LadderAttempt]] = {}
+        # grug#1494: the wait a chunk's last walk was told to make by a 429.
+        self._wait: dict[int, float] = {}
         self._parse_failed: dict[int, LlmReviewResponse] = {}
 
     def run(
@@ -5081,7 +5108,15 @@ class _ChunkLadder:
         self, key: int, call: Callable[[], LlmReviewResponse],
     ) -> LlmReviewResponse:
         tried = self._tried.setdefault(key, [])
-        skip = frozenset((attempt.backend, attempt.model) for attempt in tried)
+        # A rate-limited model is asked again after its wait; only models that
+        # really failed are skipped (grug#1494).
+        skip = frozenset(
+            (attempt.backend, attempt.model)
+            for attempt in tried if not attempt.retry_after
+        )
+        wait = self._wait.pop(key, 0.0)
+        if wait:
+            _RETRY_SLEEP(wait)
         trail: list[_LadderAttempt] = []
         trail_token = _LADDER_TRAIL.set(trail)
         skip_token = _LADDER_SKIP.set(skip)
@@ -5101,6 +5136,9 @@ class _ChunkLadder:
                 },
             )
         tried.extend(trail)
+        waits = [attempt.retry_after for attempt in trail if attempt.retry_after]
+        if waits and response.kind != "reviewed":
+            self._wait[key] = max(waits)
         if response.kind in ("all_failed", "parse_failed") and tried:
             labels = tuple(dict.fromkeys(attempt.label for attempt in tried))
             return replace(response, attempts=labels)
@@ -5930,7 +5968,10 @@ def _run_llm_attempt(
     trail = _LADDER_TRAIL.get()
     reason = _ladder_failure_reason(outcome)
     if trail is not None and reason is not None:
-        trail.append(_LadderAttempt(backend=key[0], model=key[1], reason=reason))
+        trail.append(_LadderAttempt(
+            backend=key[0], model=key[1], reason=reason,
+            retry_after=_rate_limit_wait(outcome),
+        ))
     return outcome
 
 
