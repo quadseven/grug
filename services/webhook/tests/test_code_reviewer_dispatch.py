@@ -2138,8 +2138,9 @@ def test_inline_comment_body_effort_chip_and_agent_prompt():
     assert "Grug see unused path" in body
     assert "Why it matters" in body
     assert "Verify each finding against the current code" in body
-    # dead-code rule maps to maintainability in RULES
-    assert "maintainability" in body
+    # #683: the chip carries the finding's taxonomy category ("general"
+    # when unset); the rule-derived class still keys why-it-matters.
+    assert "_general_" in body.split("\n", 1)[0]
     assert cr_dispatch._category_for_rule("dead-code") == "maintainability"
 
 
@@ -4334,7 +4335,10 @@ def test_model_set_category_renders_as_chip_and_beats_rule_category():
     assert "maintainability" not in head
 
 
-def test_unset_category_falls_back_to_rule_category():
+def test_unset_category_renders_as_general():
+    """#683 criterion 4: an unset category degrades to "general" on the
+    Marking too - the chip, the ledger row and the run store all carry the
+    finding's one category, never the rule-derived class."""
     from personas.code_reviewer.persona import Finding
     f = Finding(
         file="x.py", line=3, severity="high", rule_name="dead-code",
@@ -4342,5 +4346,6 @@ def test_unset_category_falls_back_to_rule_category():
     )
     assert f.category == "general"
     head = cr_dispatch._inline_comment_body(f).split("\n", 1)[0]
-    assert "_maintainability_" in head
+    assert "_general_" in head
+    assert "maintainability" not in head
 

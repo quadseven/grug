@@ -24,7 +24,7 @@ degradation means the pass did not look, and is recorded as a failed run.
 """
 from __future__ import annotations
 
-from typing import Callable, Iterable, Mapping, Optional
+from typing import Iterable, Mapping, Optional
 
 import review_session as rs
 from personas import hunt_recorder
@@ -57,7 +57,6 @@ def observe(
     findings: Iterable[Finding],
     file_contents: Mapping[str, str],
     comment_ids: CommentIds,
-    category_of: Callable[[str], str],
 ) -> tuple[rs.ObservedFinding, ...]:
     return tuple(
         rs.ObservedFinding(
@@ -65,7 +64,9 @@ def observe(
             path=f.file,
             line=f.line,
             rule=f.rule_name,
-            category=category_of(f.rule_name),
+            # #683: the finding's taxonomy category, the same value the
+            # Marking chip and the ledger row carry.
+            category=f.category,
             severity=f.severity,
             confidence=None,
             message=f.message,
@@ -121,7 +122,6 @@ def record_elder_run(
     delta: bool,
     comment_ids: CommentIds,
     check_run_id: Optional[int],
-    category_of: Callable[[str], str],
     degraded_reason: str = "",
 ) -> Optional[rs.ReviewSession]:
     """Record one Elder pass in the PR's canonical session. Never raises."""
@@ -137,7 +137,7 @@ def record_elder_run(
     return hunt_recorder.record_run(
         ref, meta,
         findings=() if did_not_look else observe(
-            findings, file_contents, comment_ids, category_of),
+            findings, file_contents, comment_ids),
         anchors=anchors,
         check_run_id=check_run_id,
         error=degraded_reason if did_not_look else "",

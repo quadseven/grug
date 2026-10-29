@@ -63,7 +63,7 @@ from llm_client import (
 )
 from voice_pack import VoiceSelection, entitled_voice
 from review_evidence import ElderEvidence, assemble_evidence
-from review_types import DEFAULT_CATEGORY, EFFORTS, SEVERITIES
+from review_types import EFFORTS, SEVERITIES
 from personas.review_publish import (
     DIFF_FETCH_TIMEOUT, PUBLISHABLE_DEGRADATIONS, ReviewMode, fetch_file_contents,
     fetch_pr_diff, fetch_pr_diff_with_scope, is_blackout, is_low_confidence,
@@ -1446,11 +1446,10 @@ def _category_for_rule(rule_name: str) -> str:
 
 
 def _category_for_finding(f: Finding) -> str:
-    """The reviewer-set taxonomy category (#683); an unset ("general") one
-    falls back to the rule's own category."""
-    if f.category != DEFAULT_CATEGORY:
-        return f.category
-    return _category_for_rule(f.rule_name)
+    """The finding's taxonomy category (#683) - the same value the ledger
+    row and the run store carry. An unset one is "general" (criterion 4),
+    never the rule-derived class, so every surface agrees."""
+    return f.category
 
 
 def _why_it_matters(rule_name: str) -> str:
@@ -4656,7 +4655,6 @@ def _record_hunt_run(
         delta=delta,
         comment_ids=comment_ids,
         check_run_id=check_run_id,
-        category_of=_category_for_rule,
         degraded_reason=real,
     )
 

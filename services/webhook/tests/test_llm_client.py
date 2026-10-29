@@ -6103,8 +6103,11 @@ def test_coerce_finding_validates_category_and_degrades_to_general() -> None:
 
 def test_cave_schema_and_prompt_declare_category() -> None:
     from code_review_prompt import _OUTPUT_CONTRACT
-    from review_types import CATEGORIES
+    from review_types import CATEGORIES, DEFAULT_CATEGORY
     props = lc._CAVE_FINDINGS_RESPONSE_FORMAT["json_schema"]["schema"][
         "properties"]["findings"]["items"]["properties"]
-    assert set(props["category"]["enum"]) == CATEGORIES
+    # Criterion 1 fixes the settable taxonomy at five; "general" is the
+    # parse-time default for an unset/invalid value (criterion 4), not a
+    # choice offered to the reviewer.
+    assert set(props["category"]["enum"]) == CATEGORIES - {DEFAULT_CATEGORY}
     assert '"category"' in _OUTPUT_CONTRACT

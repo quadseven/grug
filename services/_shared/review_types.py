@@ -9,7 +9,7 @@ another module dropped).
 """
 from __future__ import annotations
 
-from typing import Literal, get_args
+from typing import Literal, cast, get_args
 
 Severity = Literal["low", "medium", "high", "critical"]
 
@@ -31,6 +31,17 @@ Category = Literal[
 ]
 CATEGORIES: frozenset[str] = frozenset(get_args(Category))
 DEFAULT_CATEGORY: Category = "general"
+
+
+def category_or_default(raw: object) -> Category:
+    """The one degradation rule (#683 criterion 4), shared by every parse
+    and write site so they cannot drift: an unset or off-taxonomy value
+    becomes the default instead of dropping the finding."""
+    return (
+        cast(Category, raw)
+        if isinstance(raw, str) and raw in CATEGORIES
+        else DEFAULT_CATEGORY
+    )
 
 
 # ── Activity-feed verdict + persona mapping (PRD #301; ADR-0002, ADR-0003) ────

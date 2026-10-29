@@ -59,6 +59,7 @@ from openrouter_free_limiter import (
 from voice_pack import VoiceSelection, apply_voice
 from review_types import (
     CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, Severity,
+    category_or_default,
 )
 from review_pipeline import (
     DEFAULT_MAX_COHORT_CHARS,
@@ -1968,7 +1969,10 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                                 "maxLength": CAVE_MAX_SUGGESTION_CHARS,
                             },
                             "effort": {"type": "string", "enum": sorted(EFFORTS)},
-                            "category": {"type": "string", "enum": sorted(CATEGORIES)},
+                            # The five settable values (criterion 1);
+                            # "general" is the parse-time default for an
+                            # unset value (criterion 4), not a choice.
+                            "category": {"type": "string", "enum": sorted(CATEGORIES - {DEFAULT_CATEGORY})},
                             "outside_diff_reason": {
                                 "type": "string", "maxLength": MAX_FINDING_MESSAGE_CHARS,
                             },
@@ -2912,12 +2916,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         if isinstance(raw_effort, str) and raw_effort in EFFORTS
         else None
     )
-    raw_category = raw.get("category")
-    category: Category = (
-        cast(Category, raw_category)
-        if isinstance(raw_category, str) and raw_category in CATEGORIES
-        else DEFAULT_CATEGORY
-    )
+    category: Category = category_or_default(raw.get("category"))
     raw_outside_reason = raw.get("outside_diff_reason")
     outside_diff_reason = (
         _redact_secrets(raw_outside_reason[:MAX_FINDING_MESSAGE_CHARS])

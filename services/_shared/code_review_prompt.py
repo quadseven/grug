@@ -763,7 +763,7 @@ _OUTPUT_CONTRACT = (
     '"severity": "low"|"medium"|"high"|"critical", "message": str, '
     '"suggestion": str (OPTIONAL), "effort": "quick-win"|"heavy-lift" '
     '(OPTIONAL), "category": "correctness"|"security"|"stability"|'
-    '"data-integrity"|"maintainability"|"general" (OPTIONAL), '
+    '"data-integrity"|"maintainability" (OPTIONAL), '
     '"outside_diff_reason": str (OPTIONAL), '
     '"is_finding": bool (OPTIONAL)}]}. '
     "Only list real defects: when you check a candidate and conclude there "
@@ -783,8 +783,9 @@ _OUTPUT_CONTRACT = (
     "(structural); omit when unsure. `category` is the axis a reviewer "
     "triages on: correctness (wrong behavior), security, stability (crashes, "
     "availability, concurrency), data-integrity (data loss, integration "
-    "contracts), maintainability (clarity, tests, types); use general when "
-    "none fits. No prose, no markdown, no text "
+    "contracts), maintainability (clarity, tests, types); omit it when "
+    "none fits - it is then recorded as general. No prose, no markdown, "
+    "no text "
     "outside the JSON object."
 )
 

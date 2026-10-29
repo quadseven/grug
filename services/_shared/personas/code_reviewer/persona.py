@@ -137,8 +137,8 @@ class Finding:
     # (review_types.Effort) so an off-vocabulary value is a type error at
     # the constructor, not a silently dropped chip. None = no estimate.
     effort: Effort | None = None
-    # #683: reviewer-set taxonomy category; "general" = unset, in which case
-    # the chip falls back to the rule's own bug_class.
+    # #683: reviewer-set taxonomy category; "general" is the criterion-4
+    # default for an unset or invalid value, on every surface.
     category: Category = DEFAULT_CATEGORY
     # Stable identity for deterministic complexity findings across pushes.
     complexity_function: str | None = None
