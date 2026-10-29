@@ -2967,6 +2967,7 @@ def _repo_private(payload: dict[str, Any]) -> bool | None:
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
+    rerun_pending: bool = False,
 ) -> dict[str, str]:
     """Entry point — orchestrate one Elder review pass.
 
@@ -2986,6 +2987,12 @@ def dispatch_code_review(
     fires. The caller (rerun.py's `_run_hot_review`) owns setting it, via a
     background watcher that re-fetches the PR every few seconds for as long
     as this call is running.
+
+    `rerun_pending` (grug#1494): the caller will run this review again if it
+    degrades to `all_failed` (every model rung failed). On a blocking repo the
+    check then stays `in_progress` - pending, so the required check still
+    blocks the merge - instead of completing `failure` for a retry that is
+    already queued. Never set for the last scheduled attempt.
     """
     # #1350: when this run began, so a clean verdict can tell Elder's own
     # earlier blocks on this head from one another run posts mid-flight.
@@ -3713,6 +3720,16 @@ def dispatch_code_review(
             repo=f"{owner}/{repo_name}",
             pr_number=pull_number,
             head_sha=head_sha,
+        )
+
+    if (
+        rerun_pending
+        and blocking
+        and evaluation.degraded_reason == "all_failed"
+    ):
+        return _publish_rerun_pending(
+            installation_id, owner, repo_name, pull_number, head_sha,
+            evaluation.degraded_reason,
         )
 
     # Both clients are independent — a 5xx on review post must not
@@ -5332,6 +5349,51 @@ def _async_deep_append_if_needed(
             "conclusion": conclusion,
         },
     )
+
+
+def _publish_rerun_pending(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str, reason: str,
+) -> dict[str, str]:
+    """Leave the Elder check pending while a queued re-run retries (grug#1494).
+
+    `in_progress` is not a pass: a required check that has not concluded keeps
+    the merge blocked, exactly as the check the enqueue posted. Best-effort -
+    a failed post leaves that earlier pending check in place."""
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: post_check_run(
+                token, owner, repo_name,
+                CheckRunResult(
+                    name=_CHECK_NAME, head_sha=head_sha, status="in_progress",
+                    conclusion=None,
+                    title="Elder waiting on a model - re-run scheduled",
+                    summary=(
+                        f"Every model failed this pass (`{reason}`). Elder "
+                        "re-runs the review automatically. Merge stays "
+                        "blocked until a full review lands; if the re-runs "
+                        "also fail this check fails. Comment `/grug improve` "
+                        "to re-run sooner."
+                    ),
+                ),
+                external_id=(
+                    f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
+                ),
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning(
+            "code_review_rerun_pending_publish_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+    return {
+        "persona": "code_reviewer", "result": "skipped", "degraded_reason": reason,
+    }
 
 
 def _publish_degraded(
