@@ -10,6 +10,7 @@ reviewed each as a test edit.
 
 from __future__ import annotations
 
+import itertools
 import time
 
 import pytest
@@ -351,6 +352,168 @@ def test_a_move_of_some_tests_marks_only_the_ones_left_behind():
     (f,) = _scan(_split("pytest", _NAMES, _NAMES[:2]))
     assert "deletes 1 test(s)" in f.message
     assert "`test_gamma_is_stable`" in f.message
+
+
+def _pytest_test(name, *asserts, decorators=(), pre=()):
+    return [*decorators, f"def test_{name}():", *pre, *(f"    {a}" for a in asserts)]
+
+
+def _gone(*tests):
+    return [f"-{ln}" for t in tests for ln in t]
+
+
+def _came(*tests):
+    return [f"+{ln}" for t in tests for ln in t]
+
+
+_TWO = ("assert shared.check() == 1", "assert shared.ok()")
+
+
+def test_a_same_name_test_with_an_unrelated_body_elsewhere_does_not_excuse():
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("basic", *_TWO)))) + _diff(
+        "tests/test_part.py",
+        ("", _came(_pytest_test("basic", "assert other.thing() == 2", "assert other.more()"))),
+    )
+    (f,) = _scan(diff)
+    assert "`test_basic`" in f.message
+
+
+def test_a_same_name_test_sharing_half_the_assertions_excuses():
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("basic", *_TWO)))) + _diff(
+        "tests/test_part.py",
+        ("", _came(_pytest_test("basic", _TWO[0], "assert other.more()"))),
+    )
+    assert _scan(diff) == ()
+
+
+def test_a_reformatted_copy_in_the_same_file_does_not_excuse():
+    # Only another file's test counts as a counterpart; the in-file rules are
+    # unchanged. The copy differs in spacing, so the file still loses a line.
+    compact = ("assert shared.check()==1", "assert shared.ok()")
+    diff = _diff(
+        "tests/test_big.py",
+        ("", _gone(_pytest_test("alpha_is_stable", *_TWO))),
+        ("", _came(_pytest_test("unrelated_thing_entirely", *compact))),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_a_renamed_test_with_the_same_assertions_in_another_file_excuses():
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *_TWO)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("unrelated_thing_entirely", *_TWO))),
+    )
+    assert _scan(diff) == ()
+
+
+def test_one_counterpart_excuses_only_one_removed_test():
+    diff = _diff(
+        "tests/test_big.py",
+        ("", _gone(_pytest_test("alpha_is_stable", *_TWO), _pytest_test("beta_is_stable", *_TWO))),
+    ) + _diff("tests/test_part.py", ("", _came(_pytest_test("alpha_is_stable", *_TWO))))
+    (f,) = _scan(diff)
+    assert "deletes 1 test(s)" in f.message
+    assert "`test_beta_is_stable`" in f.message
+
+
+@pytest.mark.parametrize("variant", ["unittest", "mark_skip", "xfail", "call", "skipif"])
+def test_a_skipped_counterpart_does_not_excuse(variant):
+    decorators, pre = {
+        "unittest": (['@unittest.skip("later")'], []),
+        "mark_skip": (["@pytest.mark.skip"], []),
+        "xfail": (["@pytest.mark.xfail"], []),
+        "skipif": (['@pytest.mark.skipif(True, reason="x")'], []),
+        "call": ([], ['    pytest.skip("later")']),
+    }[variant]
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *_TWO)))) + _diff(
+        "tests/test_part.py",
+        ("", _came(_pytest_test("alpha_is_stable", *_TWO, decorators=decorators, pre=pre))),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_a_same_name_test_seen_only_as_context_does_not_excuse():
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *_TWO)))) + _diff(
+        "tests/test_part.py",
+        ("", [f" {ln}" for ln in _pytest_test("alpha_is_stable", *_TWO)] + ["+X = 1"]),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_a_single_assertion_needs_the_same_name_to_be_excused():
+    one = "assert widget.ready()"
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", one)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("unrelated_thing_entirely", one))),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+    same_name = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", one)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("alpha_is_stable", one))),
+    )
+    assert _scan(same_name) == ()
+
+
+def test_a_counterpart_that_only_verifies_mock_calls_does_not_excuse():
+    mock = ("fake.assert_called_once()", "fake.assert_not_called()")
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *_TWO)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("alpha_is_stable", *mock))),
+    )
+    assert _scan(diff)
+    both = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *mock)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("alpha_is_stable", *mock))),
+    )
+    assert _scan(both) == ()
+
+
+def test_a_mock_only_counterpart_does_not_excuse_a_test_with_real_assertions():
+    removed = _pytest_test("alpha_is_stable", "fake.assert_called_once()", "assert widget.ready()")
+    came = _pytest_test("alpha_is_stable", "fake.assert_called_once()", "fake.assert_not_called()")
+    diff = _diff("tests/test_big.py", ("", _gone(removed))) + _diff(
+        "tests/test_part.py", ("", _came(came)),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_a_same_name_test_sharing_under_half_the_assertions_does_not_excuse():
+    four = tuple(f"assert widget.f{i}() == {i}" for i in range(4))
+    other = (four[0], "assert q.a()", "assert q.b()", "assert q.c()")
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *four)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("alpha_is_stable", *other))),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_the_marking_does_not_depend_on_the_order_of_the_files():
+    parts = [
+        _diff("tests/test_a.py", ("", _gone(
+            _pytest_test("one_is_stable", *_TWO), _pytest_test("two_is_stable", *_TWO),
+            _pytest_test("three_is_stable", "assert z.a() == 1", "assert z.b()")))),
+        _diff("tests/test_b.py", ("", _came(_pytest_test("one_is_stable", *_TWO)))),
+        _diff("tests/test_c.py", ("", _came(_pytest_test("renamed_other_thing", *_TWO)))),
+    ]
+    seen = set()
+    for order in itertools.permutations(parts):
+        found = _scan("".join(order))
+        seen.add(tuple(sorted(f.message for f in found)))
+    assert len(seen) == 1
+    (messages,) = seen
+    assert len(messages) == 1
+    assert "`test_three_is_stable`" in messages[0]
+
+
+def test_the_move_check_stays_fast_on_a_large_diff():
+    n = 4000
+    gone = _gone(*(_pytest_test(f"case_{i}", f"assert w.f{i}() == 1", f"assert w.g{i}()") for i in range(n)))
+    unmatched = _came(*(_pytest_test(f"other_{i}", f"assert v.f{i}() == 2", f"assert v.h{i}()") for i in range(n)))
+    matched = _came(*(_pytest_test(f"case_{i}", f"assert w.f{i}() == 1", f"assert w.g{i}()") for i in range(n)))
+    start = time.monotonic()
+    assert _scan(_diff("tests/test_big.py", ("", gone)) + _diff("tests/test_part.py", ("", unmatched)))
+    assert _scan(_diff("tests/test_big.py", ("", gone)) + _diff("tests/test_part.py", ("", matched))) == ()
+    assert time.monotonic() - start < 5
 
 
 def test_a_cut_short_hunk_is_not_evaluated():
