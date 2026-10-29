@@ -642,6 +642,9 @@ def test_a_helper_def_inside_a_test_does_not_end_the_test_body():
     assert not _marked(body)
     signature = ["def test_alpha_is_stable(", "    fixture,", "):", *[f"    {a}" for a in _TWO]]
     assert not _marked(signature)
+    skipping = ["def test_alpha_is_stable(", "    fixture,", "):", '    pytest.skip("x")',
+                *[f"    {a}" for a in _TWO]]
+    assert _marked(skipping)
 
 
 def test_a_removed_async_test_is_not_excused_by_a_sync_one_or_the_reverse():
@@ -765,6 +768,118 @@ def test_a_skip_decorator_or_class_does_not_carry_across_hunks():
         ("", _came(_ALPHA)),
     )
     assert _scan(deco) == ()
+
+
+_APP = _diff("app.py", ("", ["-x = 1", "+x = 2"]))
+
+
+def _marked_raw(raw_lines, *, removed=_REMOVED_ALPHA):
+    """Like `_marked` for a counterpart file given as diff lines."""
+    found = _scan(removed + _diff("tests/test_part.py", ("", raw_lines)))
+    return bool(found)
+
+
+@pytest.mark.parametrize(
+    ("decorator", "marked"),
+    [
+        (["@pytest.mark.skipif(", "    cond, reason='not :)',", ")"], True),
+        (["@pytest.mark.skipif(", '    cond, reason="not :) at all",', ")"], True),
+        (["@pytest.mark.skipif(", '    cond, reason="""not', "    :)", '    """,', ")"], True),
+        (["@pytest.mark.skipif(", "    cond,  # why :)", "    reason='x',", ")"], True),
+        (["@pytest.mark.skipif(", "    cond, reason='a (b',", ")"], True),
+        (["@pytest.mark.skip(reason='a (b')"], True),
+        (["@pytest.mark.skipif(", "    cond, reason='plain',", ")"], True),
+        (["@pytest.mark.parametrize(", "    'x', ['(', ')'],", ")"], False),
+        (["@pytest.mark.parametrize('x', ['not :)'])"], False),
+        (["@pytest.mark.parametrize('x', ['(', 'a (b'])"], False),
+        (["@pytest.mark.parametrize(", "    'x', ['it\\'s ('],", ")"], False),
+        (["@pytest.mark.parametrize(", '    "x", ["say \\"hi\\" ("],', ")"], False),
+    ],
+)
+def test_parentheses_inside_strings_do_not_end_or_extend_a_decorator(decorator, marked):
+    assert _marked([*decorator, *_ALPHA]) is marked
+
+
+def test_a_stray_closing_line_does_not_clear_a_skip_decorator():
+    assert _marked(["@pytest.mark.skip(reason=x))", ")", *_ALPHA])
+
+
+def test_a_counterpart_named_otherwise_is_not_a_counterpart():
+    helper = _pytest_test("alpha_is_stable", *_TWO)
+    helper[0] = "def check_alpha_is_stable():"
+    assert _marked(helper)
+    renamed = list(helper)
+    renamed[0] = "def test_other_name_entirely():"
+    assert not _marked(renamed)
+
+
+def test_a_skip_decorator_followed_by_another_decorator_still_skips():
+    assert _marked(["@pytest.mark.skip", "@pytest.mark.slow", *_ALPHA])
+    assert _marked(["@pytest.mark.skip", "@pytest.mark.slow", "@pytest.mark.network", *_ALPHA])
+    assert _marked(["@pytest.mark.slow", "@pytest.mark.skip", *_ALPHA])
+
+
+def test_a_skip_word_on_a_decorator_continuation_line_counts():
+    deco = ["@some.decorator(", "    pytest.mark.skip,", ")"]
+    assert _marked([*deco, *_ALPHA])
+
+
+@pytest.mark.parametrize(
+    "decorator",
+    ["@expectedFailure", '@skip("x")', '@skipIf(True, "x")', '@skipUnless(False, "x")'],
+)
+def test_a_bare_imported_skip_decorator_skips(decorator):
+    assert _marked([decorator, *_ALPHA])
+
+
+@pytest.mark.parametrize("quotes", ['"""', "'''"])
+def test_a_one_line_docstring_then_a_skip_call_skips(quotes):
+    body = ["def test_alpha_is_stable():", f"    {quotes}One line.{quotes}",
+            '    pytest.skip("later")', *[f"    {a}" for a in _TWO]]
+    assert _marked(body)
+    after = ["def test_alpha_is_stable():", f"    {quotes}One line.{quotes}",
+             *[f"    {a}" for a in _TWO]]
+    assert not _marked(after)
+
+
+def test_context_lines_are_read_so_a_decorator_or_class_above_an_added_def_counts():
+    added = [f"+{ln}" for ln in _ALPHA]
+    assert _marked_raw([" @pytest.mark.skip", *added])
+    assert _marked_raw([' @unittest.skip("x")', " class TestOne:",
+                        "+    def test_alpha_is_stable(self):", *[f"+        {a}" for a in _TWO]])
+    assert not _marked_raw([" @pytest.mark.slow", *added])
+
+
+def test_a_tab_indented_method_in_a_skipped_class_is_inside_the_class():
+    tabbed = ['@unittest.skip("x")', "class TestOne:", "\tdef test_alpha_is_stable(self):",
+              *[f"\t\t{a}" for a in _TWO]]
+    assert _marked(tabbed)
+    nested = ['@unittest.skip("x")', "class TestOuter:", "\tclass TestInner:",
+              "\t\tdef test_alpha_is_stable(self):", *[f"\t\t\t{a}" for a in _TWO]]
+    assert _marked(nested)
+    sibling = ['@unittest.skip("x")', "class TestOne:", "\tpass", "class TestTwo:",
+               "\tdef test_alpha_is_stable(self):", *[f"\t\t{a}" for a in _TWO]]
+    assert not _marked(sibling)
+
+
+def test_a_tab_indented_module_skip_inside_a_block_is_not_a_module_skip():
+    assert not _marked(["if sys.platform:", "\tpytestmark = pytest.mark.skip", "", *_ALPHA])
+    assert _marked(["pytestmark = pytest.mark.skip", "", *_ALPHA])
+
+
+def test_pytest_raises_counts_as_an_assertion_of_the_detector():
+    raises = ["with pytest.raises(ValueError):", "    widget.go()"]
+    gone = _file("tests/test_big.py", _pytest_test("alpha_is_stable", *raises), "-") + _APP
+    assert _scan(gone)
+    came = _file("tests/test_part.py", _pytest_test("alpha_is_stable", *raises))
+    assert _scan(gone + came) == ()
+
+
+def test_a_counterpart_in_a_conftest_does_not_count_but_a_removed_conftest_test_is_marked():
+    conf = _file("tests/conftest.py", _ALPHA)
+    assert _scan(_REMOVED_ALPHA + conf)
+    assert _scan(_file("tests/conftest.py", _ALPHA, "-") + _file("tests/test_part.py", _ALPHA)) == ()
+    assert _scan(_file("tests/conftest.py", _ALPHA, "-") + _APP)
 
 
 def test_a_cut_short_hunk_is_not_evaluated():

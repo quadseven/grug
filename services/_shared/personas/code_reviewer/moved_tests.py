@@ -92,6 +92,34 @@ class Added:
     norm: set[str] = field(default_factory=set)
 
 
+def paren_change(line: str, quote: str = "") -> tuple[int, str]:
+    """Net `(` minus `)` of a line outside string literals, and the triple
+    quote still open at its end (only a triple-quoted string spans lines;
+    a comment ends the scan). `quote` is the triple quote open at its start."""
+    depth = 0
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\" and len(quote) == 1:
+                i += 2
+                continue
+            if line.startswith(quote, i):
+                i += len(quote)
+                quote = ""
+                continue
+        elif c == "#":
+            break
+        elif c in "'\"":
+            quote = c * 3 if line.startswith(c * 3, i) else c
+            i += len(quote)
+            continue
+        else:
+            depth += (c == "(") - (c == ")")
+        i += 1
+    return depth, quote if len(quote) == 3 else ""
+
+
 def _indent(text: str) -> int:
     return len(text) - len(text.lstrip())
 
@@ -109,6 +137,7 @@ class NewSideReader:
     _pending: bool = False
     _deco_depth: int = 0
     _sig_depth: int = 0
+    _open_quote: str = ""
     _cur: Added | None = None
     _cur_indent: int = 0
     _body: str = "first"  # first | doc | done
@@ -119,16 +148,19 @@ class NewSideReader:
         self._pending = False
         self._deco_depth = 0
         self._sig_depth = 0
+        self._open_quote = ""
         self._cur = None
 
     def _continuation(self, stripped: str) -> bool:
         """A line that continues a signature, a decorator or a docstring."""
         if self._sig_depth > 0:
-            self._sig_depth += stripped.count("(") - stripped.count(")")
+            change, self._open_quote = paren_change(stripped, self._open_quote)
+            self._sig_depth += change
             return True
         if self._deco_depth > 0:
             self._pending = self._pending or bool(_SKIP_RE.search(stripped))
-            self._deco_depth += stripped.count("(") - stripped.count(")")
+            change, self._open_quote = paren_change(stripped, self._open_quote)
+            self._deco_depth += change
             return True
         if self._cur is not None and self._body == "doc":
             if self._quote in stripped:
@@ -146,13 +178,16 @@ class NewSideReader:
         stripped = text.strip()
         if self._continuation(stripped) or not stripped or stripped.startswith("#"):
             return
+        if not stripped.strip("),]:"):
+            return  # a line that only closes a bracket is not a statement
         ind = _indent(text)
         if ind == 0 and _FILE_SKIP_RE.match(stripped):
             self.file_skip = True
         self._close_scopes(ind)
         if stripped.startswith("@"):
             self._pending = self._pending or bool(_SKIP_RE.search(stripped))
-            self._deco_depth = max(0, stripped.count("(") - stripped.count(")"))
+            change, self._open_quote = paren_change(stripped)
+            self._deco_depth = max(0, change)
             return
         self._statement(text, stripped, ind, added=added)
         self._pending = False
@@ -176,7 +211,8 @@ class NewSideReader:
             )
             self.tests.append(test)
             self._cur, self._cur_indent, self._body = test, ind, "first"
-            self._sig_depth = max(0, text.count("(") - text.count(")"))
+            change, self._open_quote = paren_change(stripped)
+            self._sig_depth = max(0, change)
         elif self._cur is not None:
             self._body_line(text, stripped)
 
@@ -231,6 +267,11 @@ def _strength(d: Any, a: Added) -> int | None:
     return None
 
 
+def _collected_never(path: str) -> bool:
+    """A conftest.py is never collected as tests (its removed tests still count)."""
+    return path.rsplit("/", 1)[-1] == "conftest.py"
+
+
 def _index_added(files: list[Any]) -> tuple[dict, dict]:
     """Counterpart candidates by assertion set and by name, each list in
     (path, index) order."""
@@ -240,7 +281,7 @@ def _index_added(files: list[Any]) -> tuple[dict, dict]:
         if tf.incomplete:
             continue
         for a in tf.tests_seen:
-            if a.candidate and a.total and not a.skipped:
+            if a.candidate and a.total and not a.skipped and not _collected_never(tf.path):
                 by_set.setdefault(frozenset(a.norm), []).append((tf.path, a))
                 by_name.setdefault(a.name, []).append((tf.path, a))
     for index in (by_set, by_name):
