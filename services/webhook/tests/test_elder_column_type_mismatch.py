@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 import httpx
 import pytest
+
 from elder_eval import column_type_mismatch as ctm
 from sast_benchmark.backends import BenchBackend
 
@@ -177,3 +178,39 @@ def test_replay_transport_failure_is_errored_not_a_zero():
         raise httpx.ConnectError("down")
 
     assert ctm.replay(_BACKEND, post=post).errored
+
+
+def test_module_is_wired_to_an_on_demand_entry_point():
+    """The fixture is not dead code: it exposes a `main` and the Makefile
+    target runs the module, like `make elder-eval` does for the corpus."""
+    assert callable(ctm.main)
+    makefile = (ctm.FIXTURE_DIR.parents[4] / "Makefile").read_text()
+    assert "python -m elder_eval.column_type_mismatch" in makefile
+
+
+def test_main_reports_a_catch(monkeypatch):
+    monkeypatch.setattr(ctm, "configured_backends", lambda: [_BACKEND])
+    monkeypatch.setattr(
+        ctm,
+        "replay",
+        lambda _backend: ctm.Replay(
+            findings=(
+                _F(ctm.PATH, 20, "created_at is an integer; comparing with a datetime"),
+            ),
+            errored=False,
+        ),
+    )
+    assert ctm.main([]) == 0
+
+
+def test_main_refuses_to_read_an_errored_replay_as_a_zero(monkeypatch):
+    monkeypatch.setattr(ctm, "configured_backends", lambda: [_BACKEND])
+    monkeypatch.setattr(
+        ctm, "replay", lambda _backend: ctm.Replay(findings=(), errored=True)
+    )
+    assert ctm.main([]) == 2
+
+
+def test_main_without_backends_is_not_a_result(monkeypatch):
+    monkeypatch.setattr(ctm, "configured_backends", list)
+    assert ctm.main([]) == 2

@@ -14,12 +14,19 @@ a touched column regardless of file size, so the mismatch is visible even
 when the file is too large for the full-file block.
 
 The pure core (fixture, evidence, scoring) runs in CI. `replay` makes a
-backend call and is only used by the on-demand eval.
+backend call and is only used by the on-demand eval:
+
+    python -m elder_eval.column_type_mismatch     # print the replay result
+
+`make elder-eval-column` runs the same thing with the webhook dependencies
+installed, the sibling of `make elder-eval`.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
+import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +35,8 @@ from typing import Protocol
 import httpx
 from llm_client import Hunk, _build_messages, _parse_review
 from review_evidence import ElderEvidence, assemble_evidence
-from sast_benchmark.backends import BenchBackend
+
+from sast_benchmark.backends import BenchBackend, configured_backends
 from sast_benchmark.runner import _post
 
 from .missed_classes import (
@@ -151,3 +159,37 @@ def replay(
         )
         return Replay(findings=(), errored=True)
     return Replay(findings=tuple(parsed.findings), errored=False)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Replay the fixture once per configured backend and print the verdict."""
+    parser = argparse.ArgumentParser(prog="elder_eval.column_type_mismatch")
+    parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    backends = configured_backends()
+    if not backends:
+        print("No backends configured (see sast_benchmark.backends).", file=sys.stderr)
+        return 2
+    status = 0
+    for backend in backends:
+        run = replay(backend)
+        if run.errored:
+            print(
+                f"\n!! backend {backend.name}: replay errored - not a result",
+                file=sys.stderr,
+            )
+            status = 2
+            continue
+        hit = caught_finding(run.findings)
+        print(
+            f"\n=== backend: {backend.name} === "
+            f"{FIXTURE.name}: {'CAUGHT' if hit else 'missed'}"
+        )
+        for finding in run.findings:
+            print(f"    finding {finding.path}:{finding.line} {finding.message[:120]}")
+    return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
