@@ -459,8 +459,26 @@ def _s608_is_constant(source: str, row: int) -> bool:
                     if isinstance(target, ast.Name):
                         constants[target.id] = value
 
+    for name in _locally_bound_names(tree):
+        constants.pop(name, None)
+
     candidates = _s608_candidates(tree, row)
     return any(_literal_sql(candidate, constants) for candidate in candidates)
+
+
+def _locally_bound_names(tree: ast.Module) -> set[str]:
+    """Names bound by a parameter or a store inside any function or lambda.
+    A module constant of the same name may be shadowed at the flagged row, so
+    those names are never resolved as constants (conservative: high severity)."""
+    bound: set[str] = set()
+    for scope in ast.walk(tree):
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            bound.update(a.arg for a in ast.walk(scope.args) if isinstance(a, ast.arg))
+            bound.update(
+                n.id for n in ast.walk(scope)
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+            )
+    return bound
 
 
 def _s608_candidates(tree: ast.Module, row: int) -> list[ast.expr]:
