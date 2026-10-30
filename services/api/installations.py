@@ -362,7 +362,7 @@ def list_ledger(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not found")
     limit = max(1, min(limit, 200))
     rows = [
-        r for r in list_ledger_rows(repo)
+        r for r in list_ledger_rows(repo, limit=limit)
         if verdict is None or r.get("verdict") == verdict
     ]
     return {"ledger": rows[:limit]}

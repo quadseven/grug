@@ -1243,6 +1243,8 @@ def put_ledger_row(row: dict[str, Any]) -> None:
 def list_ledger_rows(repo: str, limit: int | None = None) -> list[dict[str, Any]]:
     """Every ledger finding for a repo (the corpus #527 / few-shot read),
     class-ordered. Same prefix-scan shape as list_check_verdicts."""
+    limit_sql = "" if limit is None else "LIMIT %s"
+    params: tuple[Any, ...] = (_ledger_pk(repo),) if limit is None else (_ledger_pk(repo), limit)
     with get_pool().connection() as conn:
         rows = conn.execute(
             f"""
@@ -1252,11 +1254,11 @@ def list_ledger_rows(repo: str, limit: int | None = None) -> list[dict[str, Any]
             -- (PRACTICES #527, EXEMPLARS #538): a cached derivation leaking
             -- into the corpus scan feeds Elder its own output as ground truth
             ORDER BY sk COLLATE "C" ASC
+            {limit_sql}
             """,
-            (_ledger_pk(repo),),
+            params,
         ).fetchall()
-    out = [decode_item(pk, sk, data) for pk, sk, data in rows]
-    return out if limit is None else out[:limit]
+    return [decode_item(pk, sk, data) for pk, sk, data in rows]
 
 
 def put_repo_practices(repo: str, practices: list[dict[str, Any]]) -> None:
