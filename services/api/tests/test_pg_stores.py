@@ -1185,6 +1185,24 @@ def test_ledger_exemplars_cache_and_corpus_scan_exclusion(pg):
     assert store.get_repo_exemplars("o/none") == []
 
 
+def test_ledger_verdict_filter_applies_before_limit(pg):
+    """The verdict predicate sits in the query, so LIMIT counts matches: the
+    match sorted past `limit` non-matching rows is still returned, and rows
+    written through put_ledger_row are bounded by `limit` once filtered."""
+    from adapters import pg_install_store as store
+
+    repo = "o/sparse"
+    for pr, verdict in ((1, "declined"), (2, "declined"), (3, "fixed"), (4, "fixed")):
+        store.put_ledger_row({
+            "repo": repo, "pr": pr, "reviewer": "codex", "severity": "HIGH",
+            "class": "correctness", "finding": f"row {pr}", "verdict": verdict,
+        })
+    rows = store.list_ledger_rows(repo, limit=1, verdict="fixed")
+    assert [r["pr"] for r in rows] == [3]
+    assert len(store.list_ledger_rows(repo, limit=None, verdict="fixed")) == 2
+    assert len(store.list_ledger_rows(repo, limit=None)) == 4
+
+
 def test_learning_timestamps_normalized_to_utc(pg):
     """Caller-supplied stamps in other offsets normalize to UTC ISO, so the
     text ORDER BY stays chronological across mixed inputs."""

@@ -99,3 +99,55 @@ def test_activity_filter_does_not_underreturn_when_matches_are_sparse():
             out = inst.list_activity(install_id=1, verdict="block", limit=50, user=_user(user_id="100"))
     assert len(out["activity"]) == 3
     assert all(a["verdict"] == "block" for a in out["activity"])
+
+
+# Ledger rows below mirror what pg_install_store.put_ledger_row writes (the
+# raw JSONL dict) and list_ledger_rows returns; fixtures taken from that code.
+def _ledger(**kw):
+    base = dict(
+        repo="alice/r", pr=7, reviewer="codex", severity="HIGH",
+        **{"class": "silent-failure"}, finding="f", verdict="fixed",
+        evidence="e", ts="2026-06-05T00:00:00+00:00",
+    )
+    base.update(kw)
+    return base
+
+
+_LEDGER_INSTALL = {"installed_by_user_id": "100", "account_login": "alice"}
+
+
+def test_ledger_foreign_repo_404():
+    with patch("installations.get_installation", return_value=_LEDGER_INSTALL):
+        with pytest.raises(HTTPException) as exc:
+            inst.list_ledger(install_id=1, repo="bob/r", user=_user())
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.parametrize("repo", ["alice", "alice/", "alice/a/b"])
+def test_ledger_malformed_repo_404(repo):
+    with patch("installations.get_installation", return_value=_LEDGER_INSTALL):
+        with pytest.raises(HTTPException) as exc:
+            inst.list_ledger(install_id=1, repo=repo, user=_user())
+    assert exc.value.status_code == 404
+
+
+def test_ledger_stranger_403():
+    with patch("installations.get_installation", return_value=_LEDGER_INSTALL):
+        with pytest.raises(HTTPException) as exc:
+            inst.list_ledger(install_id=1, repo="alice/r", user=_user(user_id="7"))
+    assert exc.value.status_code == 403
+
+
+def test_ledger_pushes_verdict_and_limit_into_the_store():
+    """The filter must run in the store's query, under its LIMIT: filtering the
+    capped rows here would strand matches past the cap (the real-Postgres half
+    is test_pg_stores.test_ledger_verdict_filter_applies_before_limit)."""
+    rows = [_ledger(verdict="fixed")]
+    with patch("installations.get_installation", return_value=_LEDGER_INSTALL):
+        with patch("installations.list_ledger_rows", return_value=rows) as list_rows:
+            out = inst.list_ledger(
+                install_id=1, repo="Alice/r", verdict="fixed", limit=999, user=_user(),
+            )
+    list_rows.assert_called_once_with("Alice/r", limit=200, verdict="fixed")
+    assert [r["pr"] for r in out["ledger"]] == [7]
+    assert out["ledger"][0]["class"] == "silent-failure"
