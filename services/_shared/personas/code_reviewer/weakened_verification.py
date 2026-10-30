@@ -16,7 +16,8 @@ Two rules, each one finding per file, anchored on a new-side line:
 
 - `weakened-test`: a test file whose diff deletes test functions (the
   `def` and at least one assertion go, and no test of that name or a close
-  rename comes back) or flips an assertion's polarity (`assertTrue` and
+  rename comes back; a counterpart in another file of the same diff counts
+  only under the rule in `moved_tests`) or flips an assertion's polarity (`assertTrue` and
   `assertFalse`, `In` and `NotIn`, `assert x` and `assert not x`, `True`
   and `False` as the expected value). High when `DELETED_HIGH` or more
   deleted tests in a file are not mentioned by the title or the linked
@@ -49,6 +50,17 @@ from dataclasses import dataclass, field
 
 from personas.code_reviewer.criteria_coverage import LinkedCriterion
 from personas.code_reviewer.diff_parser import DiffHunk, FileChange
+from personas.code_reviewer.moved_tests import (
+    ASSERT_RE,
+    CLASS_RE,
+    DEF_RE,
+    MOCK_ASSERT_RE,
+    Added,
+    NewSideReader,
+    is_async,
+    mark_moved,
+    normal,
+)
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.test_paths import is_test_file
 
@@ -87,11 +99,9 @@ _MAX_LINE = 2_000
 # Most deleted tests and flipped assertions one finding lists by name.
 _MAX_NAMED = 6
 
-_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(\w+)\s*\(")
-_CLASS_RE = re.compile(r"^\s*class\s+\w+")
-_ASSERT_RE = re.compile(
-    r"\bself\.assert\w*\(|^\s*assert\b|\bpytest\.raises\(|\.assert_\w+\(|\bexpect\("
-)
+_DEF_RE = DEF_RE
+_CLASS_RE = CLASS_RE
+_ASSERT_RE = ASSERT_RE
 # (negative, positive) assertion methods; the negative is matched first.
 _POLARITY = (
     ("assertNotIn", "assertIn"),
@@ -169,6 +179,12 @@ def _incomplete(line: str) -> bool:
 class _Deleted:
     name: str
     asserts: int = 0
+    # Every assertion line the test loses, and their whitespace-normalized
+    # forms: what a copy elsewhere in the diff must match (#1496).
+    total: int = 0
+    mock: int = 0
+    is_async: bool = False
+    norm: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -178,6 +194,10 @@ class _TestFile:
     added: set[str] = field(default_factory=set)
     added_defs: set[str] = field(default_factory=set)
     removed: list[_Deleted] = field(default_factory=list)
+    reader: NewSideReader = field(default_factory=NewSideReader)
+    tests_seen: list[Added] = field(default_factory=list)
+    # indexes into `removed` of tests that reappear in another file of the diff
+    moved: set[int] = field(default_factory=set)
     # removed test name -> the test added in its place in the same change run
     replaced_by: dict[str, str] = field(default_factory=dict)
     flips: list[str] = field(default_factory=list)
@@ -230,6 +250,8 @@ def _read_test_file(path: str, hunks: list[DiffHunk], budget: list[int]) -> _Tes
                     tf.added_defs.add(d.group(1))
     for hunk, lines in zip(hunks, bodies, strict=True):
         _walk_hunk(tf, lines, _enclosing_removed(tf, hunk))
+        tf.reader.hunk_end()
+    tf.tests_seen = tf.reader.finish()
     return tf
 
 
@@ -265,6 +287,7 @@ class _HunkWalk:
         self.run_added.clear()
 
     def added_line(self, text: str) -> None:
+        self.tf.reader.feed(text, added=True)
         d = _DEF_RE.match(text)
         if d and d.group(1).startswith("test"):
             self.run_added.append(d.group(1))
@@ -277,22 +300,27 @@ class _HunkWalk:
         """A removed or context line."""
         if kind != "-":
             self.close_run()
+            self.tf.reader.feed(text, added=False)
         d = _DEF_RE.match(text)
         if d or _CLASS_RE.match(text):
-            self._open(kind, d)
+            self._open(kind, d, text)
         elif kind == "-" and _ASSERT_RE.search(text):
             self._removed_assert(text)
 
-    def _open(self, kind: str, d: re.Match[str] | None) -> None:
+    def _open(self, kind: str, d: re.Match[str] | None, text: str) -> None:
         """A def or class line ends the current test; a removed test def
         starts a new one."""
         self.current = None
         if d and kind == "-" and d.group(1).startswith("test"):
-            self.current = _Deleted(d.group(1))
+            self.current = _Deleted(d.group(1), is_async=is_async(text))
             self.tf.removed.append(self.current)
             self.run_removed.append(self.current.name)
 
     def _removed_assert(self, text: str) -> None:
+        if self.current is not None:
+            self.current.total += 1
+            self.current.mock += bool(MOCK_ASSERT_RE.search(text))
+            self.current.norm.add(normal(text))
         if self.current is not None and text.strip() not in self.tf.added:
             self.current.asserts += 1
         p = _polarity(text)
@@ -335,8 +363,9 @@ def _renamed(old: str, new: str | None) -> bool:
 
 def _deleted_tests(tf: _TestFile) -> list[_Deleted]:
     return [
-        d for d in tf.removed
+        d for j, d in enumerate(tf.removed)
         if d.asserts
+        and j not in tf.moved
         and d.name not in tf.added_defs
         and not _renamed(d.name, tf.replaced_by.get(d.name))
     ]
@@ -646,6 +675,7 @@ def scan_weakened_verification(
             if tf is None:
                 return ()
             tests.append(tf)
+    mark_moved(tests)
     removed_files = [
         c.path for c in changes if c.status == "removed" and is_test_file(c.path)
     ]

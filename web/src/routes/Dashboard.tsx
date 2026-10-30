@@ -336,6 +336,7 @@ function ReposPanel({ show, installId, reposLoading, fireToast }: { show: boolea
               onDepWatchToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: r.config.tpm_enabled, dep_watch_enabled: enabled }); }}
               onReopenWatchToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: r.config.tpm_enabled, reopen_watch_enabled: enabled }); }}
               onGuardHygieneWatchToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: r.config.tpm_enabled, guard_hygiene_watch_enabled: enabled }); }}
+              onPulseCommentNudgeToggle={(enabled) => { setConfig.mutate({ repo_id: r.repo_id, tpm_enabled: r.config.tpm_enabled, pulse_comment_nudge_enabled: enabled }); }}
               onFix={() => fixEnforcement.mutate(r.repo_id)}
               fixPending={fixEnforcement.isPending && fixEnforcement.variables === r.repo_id}
               fixError={fixEnforcement.isError && fixEnforcement.variables === r.repo_id ? ((fixEnforcement.error as Error)?.message ?? "fix failed") : undefined}
@@ -350,8 +351,8 @@ function ReposPanel({ show, installId, reposLoading, fireToast }: { show: boolea
   );
 }
 
-function RepoRow({ repo, installId, onToggle, onGuardToggle, onDepWatchToggle, onReopenWatchToggle, onGuardHygieneWatchToggle, onFix, fixPending, fixError }: {
-  repo: Repo; installId: number; onToggle: (e: boolean) => void; onGuardToggle: (e: boolean) => void; onDepWatchToggle: (e: boolean) => void; onReopenWatchToggle: (e: boolean) => void; onGuardHygieneWatchToggle: (e: boolean) => void; onFix: () => void; fixPending: boolean; fixError?: string;
+function RepoRow({ repo, installId, onToggle, onGuardToggle, onDepWatchToggle, onReopenWatchToggle, onGuardHygieneWatchToggle, onPulseCommentNudgeToggle, onFix, fixPending, fixError }: {
+  repo: Repo; installId: number; onToggle: (e: boolean) => void; onGuardToggle: (e: boolean) => void; onDepWatchToggle: (e: boolean) => void; onReopenWatchToggle: (e: boolean) => void; onGuardHygieneWatchToggle: (e: boolean) => void; onPulseCommentNudgeToggle: (e: boolean) => void; onFix: () => void; fixPending: boolean; fixError?: string;
 }) {
   const [owner, name] = repo.full_name.split("/");
   const on = repo.config.tpm_enabled;
@@ -362,6 +363,8 @@ function RepoRow({ repo, installId, onToggle, onGuardToggle, onDepWatchToggle, o
   const depWatchOn = repo.config.dep_watch_enabled === true;
   const reopenWatchOn = repo.config.reopen_watch_enabled === true;
   const guardHygieneWatchOn = repo.config.guard_hygiene_watch_enabled === true;
+  // Pulse comment nudge (grug#1482) - default off per repo, like the watches.
+  const pulseNudgeOn = repo.config.pulse_comment_nudge_enabled === true;
   const enforcement = useEnforcement(on ? installId : undefined, on ? repo.repo_id : undefined);
   const state = enforcement.data?.enforcement_state;
   const degraded = enforcement.data?.degraded === true;
@@ -394,6 +397,8 @@ function RepoRow({ repo, installId, onToggle, onGuardToggle, onDepWatchToggle, o
       <div className={`sw${reopenWatchOn ? " on" : ""}`} onClick={() => onReopenWatchToggle(!reopenWatchOn)} role="switch" aria-checked={reopenWatchOn} title="Toggle reopen watch for this repo"></div>
       <span className={`state ${guardHygieneWatchOn ? "live" : "paused"}`} title={guardHygieneWatchOn ? "GUARD HYGIENE WATCH ON." : "GUARD HYGIENE WATCH OFF."}>{guardHygieneWatchOn ? "HYGIENE WATCH" : "HYGIENE WATCH OFF"}</span>
       <div className={`sw${guardHygieneWatchOn ? " on" : ""}`} onClick={() => onGuardHygieneWatchToggle(!guardHygieneWatchOn)} role="switch" aria-checked={guardHygieneWatchOn} title="Toggle guard hygiene watch for this repo"></div>
+      <span className={`state ${pulseNudgeOn ? "live" : "paused"}`} title={pulseNudgeOn ? "PULSE NUDGE ON: Grug replies with a suggested fix on stale unanswered review threads." : "PULSE NUDGE OFF."}>{pulseNudgeOn ? "PULSE NUDGE" : "PULSE NUDGE OFF"}</span>
+      <div className={`sw${pulseNudgeOn ? " on" : ""}`} onClick={() => onPulseCommentNudgeToggle(!pulseNudgeOn)} role="switch" aria-checked={pulseNudgeOn} title={`Toggle the pulse comment nudge for ${repo.full_name}`}></div>
     </div>
   );
 }

@@ -437,3 +437,14 @@ def test_intent_mismatch_rule_contract():
         prompt = crp.build_system_prompt(variant)
         assert "intent-mismatch" in prompt
         assert rule.description in prompt, f"variant {variant} lost the rule text"
+
+
+def test_insufficient_assertion_rule_requires_a_counterexample():
+    """#1420: the rule may only fire with a concrete counterexample input
+    in the message; the rule text must say so."""
+    matches = [r for r in crp.RULES if r.name == "insufficient-assertion"]
+    assert len(matches) == 1
+    text = matches[0].description.lower()
+    assert "counterexample" in text
+    assert "only when" in text
+    assert "message" in text

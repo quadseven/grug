@@ -24,12 +24,9 @@ INST#installed_by_user_id). Admins bypass the ownership check.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
-
 from adapters.install_store import (
     get_installation,
     get_repo_config,
@@ -39,8 +36,10 @@ from adapters.install_store import (
 )
 from adapters.user_store import UserIdentity
 from auth.dependencies import require_authenticated
+from fastapi import APIRouter, Depends, HTTPException, status
 from github_app_auth import with_install_token_retry
-from github_rest import GitHubMalformedPayload, _GH_API, paginate_all
+from github_rest import _GH_API, GitHubMalformedPayload, paginate_all
+from pydantic import BaseModel, ConfigDict, Field
 from rerun_personas import requestable_pattern
 from review_types import verdict as derive_verdict
 
@@ -124,7 +123,9 @@ def _ensure_can_access(install: dict[str, Any], user: UserIdentity) -> None:
 
 
 @router.get("/installations")
-def list_installations(user: UserIdentity = Depends(require_authenticated)) -> dict[str, Any]:
+def list_installations(
+    user: Annotated[UserIdentity, Depends(require_authenticated)],
+) -> dict[str, Any]:
     """Installs owned by the current user (admin sees only own here too;
     cross-user listing is admin-only and lives at /api/v1/admin/users)."""
     items = list_user_installations(user.github_user_id)
@@ -155,7 +156,7 @@ def list_installations(user: UserIdentity = Depends(require_authenticated)) -> d
 @router.get("/installations/{install_id}/repos")
 def list_install_repos(
     install_id: int,
-    user: UserIdentity = Depends(require_authenticated),
+    user: Annotated[UserIdentity, Depends(require_authenticated)],
 ) -> dict[str, Any]:
     """List repos visible to this install (live from GitHub) merged with
     DDB per-repo config so the SPA can render toggle state.
@@ -186,7 +187,7 @@ def list_install_repos(
             log.error("gh_install_repos_malformed", extra={"install_id": install_id})
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY, detail="gh_upstream_malformed",
-            )
+            ) from None
         out: list[dict[str, Any]] = []
         for r in repos:
             cfg = get_repo_config(install_id, r["id"])
@@ -283,9 +284,9 @@ def _required_checks_changed(
 @router.get("/installations/{install_id}/activity")
 def list_activity(
     install_id: int,
+    user: Annotated[UserIdentity, Depends(require_authenticated)],
     verdict: str | None = None,
     limit: int = 50,
-    user: UserIdentity = Depends(require_authenticated),
 ) -> dict[str, Any]:
     """Activity feed (PRD #301): the install's recent Check verdicts,
     newest-first. The `verdict` badge is DERIVED server-side from each row's
@@ -338,7 +339,7 @@ def list_activity(
 def rerun_check(
     install_id: int,
     body: RerunRequest,
-    user: UserIdentity = Depends(require_authenticated),
+    user: Annotated[UserIdentity, Depends(require_authenticated)],
 ) -> dict[str, str]:
     """Re-run one persona's check on a PR (#305, ADR-0004). Enqueues to
     `grug-rerun-jobs` and returns 202; the webhook re-runs on the PR's CURRENT
@@ -374,7 +375,7 @@ def rerun_check(
 )
 def rerun_all_errored(
     install_id: int,
-    user: UserIdentity = Depends(require_authenticated),
+    user: Annotated[UserIdentity, Depends(require_authenticated)],
 ) -> dict[str, int]:
     """Re-run EVERY currently-`errored` row for an install (#306) — the
     outage-recovery move ("Elder failed on 12 PRs → one click"). Fans each
@@ -453,7 +454,7 @@ def update_repo_config(
     install_id: int,
     repo_id: int,
     body: RepoConfigPayload,
-    user: UserIdentity = Depends(require_authenticated),
+    user: Annotated[UserIdentity, Depends(require_authenticated)],
 ) -> dict[str, Any]:
     """Upsert per-repo persona toggle. Caller must own the install."""
     install = get_installation(install_id)
@@ -488,7 +489,7 @@ def update_repo_config(
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="gh_upstream_malformed",
-            )
+            ) from None
         for r in repos:
             if r["id"] == repo_id:
                 return True, r["full_name"], r.get("default_branch", "main")
@@ -542,7 +543,7 @@ def update_repo_config(
 def get_enforcement(
     install_id: int,
     repo_id: int,
-    user: UserIdentity = Depends(require_authenticated),
+    user: Annotated[UserIdentity, Depends(require_authenticated)],
 ) -> dict[str, Any]:
     """Live enforcement detection — queries GitHub Rulesets + legacy BP."""
     install = get_installation(install_id)
@@ -550,8 +551,8 @@ def get_enforcement(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
     _ensure_can_access(install, user)
 
-    from github_rulesets_client import detect_enforcement  # type: ignore
     from enforcement import GRUG_DOR_CHECK_NAME  # type: ignore
+    from github_rulesets_client import detect_enforcement  # type: ignore
 
     def _detect(token: str) -> dict[str, Any]:
         repos = _resolve_repo(token, install_id, repo_id)
@@ -597,7 +598,7 @@ def get_enforcement(
 def fix_enforcement(
     install_id: int,
     repo_id: int,
-    user: UserIdentity = Depends(require_authenticated),
+    user: Annotated[UserIdentity, Depends(require_authenticated)],
 ) -> dict[str, Any]:
     """Create Grug-managed enforcement ruleset (the "Fix" button)."""
     install = get_installation(install_id)

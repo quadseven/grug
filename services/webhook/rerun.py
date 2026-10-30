@@ -99,6 +99,13 @@ _MAX_SETTLE_SECONDS = 300
 # faster than Elder can finish reviewing it. A genuinely new commit always
 # resets this to 0; it only counts same-sha redrives.
 _MAX_INTENT_DRIFT_REDRIVES = 3
+
+# grug#1494: a review where every model failed (`all_failed`) raises, so the
+# queue redelivers it. Deliveries below this number leave a blocking repo's
+# Elder check pending; from this one on the failure is published, so a long
+# provider outage still ends in a red check instead of waiting forever. The
+# queue's own dead-letter limit stays the outer bound.
+_ALL_FAILED_AUTO_RERUN_DELIVERIES = 3
 # A learn job whose classifier backends are all rate limited or down (the
 # OpenRouter key is free-tier only and refuses intermittently - operator
 # decision 2026-09-23) is DEFERRED: re-enqueued as a fresh message with a
@@ -630,11 +637,15 @@ def enqueue_review(
 # The static TPM check is requestable but logged + skipped below (deliberate).
 
 
-def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, question: str) -> None:
+def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, question: str, reply_to_comment_id: int = 0) -> None:
     """Enqueue a `/grug ask` job (#528) so the heavy LLM Q&A runs in the
     consumer, NOT inline in the webhook ACK path. Dedup keys on comment_id
     (each question is distinct - unlike a persona rerun), so a re-delivered
-    comment collapses but two different questions do not."""
+    comment collapses but two different questions do not.
+
+    `reply_to_comment_id` (#822) is the review-thread root when the question
+    was asked inside a review thread; the consumer then answers IN that
+    thread with its hunk as context. 0 = a plain PR comment (top-level)."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
     _sqs.send_message(
@@ -643,6 +654,7 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
             "schema_version": SCHEMA_VERSION, "kind": "ask",
             "install_id": install_id, "repo": repo, "pr_number": pr_number,
             "comment_id": comment_id, "question": question,
+            "reply_to_comment_id": reply_to_comment_id,
         }),
         MessageGroupId=_ask_group_id(install_id, repo, pr_number),
         MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:ask:{comment_id}",
@@ -733,11 +745,46 @@ def _gh_post(token: str, url: str, json_body: dict[str, Any]) -> None:
     resp.raise_for_status()
 
 
-def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> str:
+def _thread_context(token: str, owner: str, repo_name: str, root_comment_id: int) -> str:
+    """The review-thread block for an in-thread ask (#822): the comment the
+    thread is about (usually one of Grug's findings) plus its diff hunk, so
+    the answer can cite the specific finding and lines. Best-effort - an
+    unreadable thread degrades to the plain diff context, never to silence."""
+    from urllib.parse import quote as _q
+    try:
+        c = _gh_get(
+            token,
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+            f"/pulls/comments/{root_comment_id}",
+        )
+    except Exception as e:  # noqa: BLE001 - context enrichment must not kill the answer
+        log.warning(
+            "ask_thread_context_failed",
+            extra={"comment_id": root_comment_id, "kind": type(e).__name__},
+        )
+        return ""
+    parts = ["REVIEW THREAD the question was asked in:"]
+    path = str(c.get("path") or "")
+    line = c.get("line") or c.get("original_line")
+    if path:
+        parts.append(f"File: {path}" + (f", line {line}" if line else ""))
+    if c.get("body"):
+        parts.append(f"Comment under discussion:\n{c['body']}")
+    if c.get("diff_hunk"):
+        parts.append(f"Diff hunk:\n{c['diff_hunk']}")
+    return "\n".join(parts) if len(parts) > 1 else ""
+
+
+def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str, reply_to_comment_id: int = 0) -> str:
     """Answer a /grug ask question in the consumer (async, #528). Fetches the
     diff, runs the JSON-constrained Q&A over the REDACTED question + diff, and
     posts the answer as a reply. Records an activity row. Never raises past
-    the job (a bad answer degrades to a fallback reply)."""
+    the job (a bad answer degrades to a fallback reply).
+
+    With `reply_to_comment_id` (#822) the question came from a review thread:
+    the answer posts as a reply IN that thread (the one notification GitHub
+    already sends for a thread reply - no extra email), with the thread's
+    finding + hunk ahead of the diff as context."""
     from urllib.parse import quote as _q
     from llm_client import _redact_secrets, answer_pr_question  # type: ignore
     from markdown_safety import neutralize_mentions  # type: ignore
@@ -751,9 +798,32 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
             f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/pulls/{pr_number}",
             accept="application/vnd.github.v3.diff",
         )
+        context = diff
+        post_url = (
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+            f"/issues/{pr_number}/comments"
+        )
+        footer = "*(Grug answered from the PR diff - may be wrong; verify.)*"
+        thread_note = ""
+        if reply_to_comment_id:
+            thread = _thread_context(token, owner, repo_name, reply_to_comment_id)
+            if thread:
+                context = f"{thread}\n\nFULL PR DIFF:\n{diff}"
+            else:
+                # Say so in the open: an answer that silently lost its
+                # thread context would read as if it had seen the finding.
+                thread_note = (
+                    "\n\n*(Grug could not load the thread itself, so this "
+                    "answer is from the PR diff only.)*"
+                )
+            post_url = (
+                f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+                f"/pulls/{pr_number}/comments/{reply_to_comment_id}/replies"
+            )
+            footer = "*(Grug answered from the thread and the PR diff - may be wrong; verify.)*"
         answer = answer_pr_question(
             q,
-            diff,
+            context,
             install_id,
             pr_context={
                 "installation_id": install_id,
@@ -766,14 +836,19 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
         # @mention in it would notify a real GitHub user as if Grug itself
         # pinged them (#561, same class as Teller's #554 round-4 fix).
         safe_answer = neutralize_mentions(answer) if answer else answer
-        body = (f"{safe_answer}\n\n*(Grug answered from the PR diff - may be wrong; verify.)*"
-                if safe_answer else
-                "Grug could not answer that right now (the thinking-rock is tired). Try again.")
-        _gh_post(
-            token,
-            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/issues/{pr_number}/comments",
-            {"body": body},
-        )
+        if safe_answer:
+            body = f"{safe_answer}\n\n{footer}{thread_note}"
+            if not reply_to_comment_id:
+                # A top-level answer names the question it answers (#822
+                # criterion 1: the reply belongs to its thread - the PR
+                # conversation). The quote is neutralized like the answer:
+                # it is echoed user text posted under Grug's authority.
+                quoted = neutralize_mentions(q[:280])
+                body = f"> {quoted}\n\n{body}"
+        else:
+            # Criterion 6's wording, even when the model gave nothing back.
+            body = "Grug not know. The thinking-rock is tired - try again."
+        _gh_post(token, post_url, {"body": body})
         return "answered" if answer else "ask_no_answer"
     result = with_install_token_retry(install_id, _do)
     try:
@@ -1186,7 +1261,10 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     repo_full = str(job["repo"])  # "owner/name"
     pr_number = int(job["pr_number"])
     if job.get("kind") == "ask":
-        return _run_ask(install_id, repo_full, pr_number, str(job.get("question", "")))
+        return _run_ask(
+            install_id, repo_full, pr_number, str(job.get("question", "")),
+            reply_to_comment_id=int(job.get("reply_to_comment_id", 0) or 0),
+        )
     if job.get("kind") == "learn":
         # A deferred job (every classifier backend was rate limited) arrives
         # at once; FIFO queues have no per-message delay. Hold it until due.
@@ -1203,7 +1281,9 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
             first_deferred_at=float(job.get("first_deferred_at", 0) or 0),
         )
     if job.get("kind") == "review":
-        return _run_hot_review(job, install_id, repo_full, pr_number)
+        return _run_hot_review(
+            job, install_id, repo_full, pr_number, receive_count=receive_count,
+        )
     persona = str(job.get("persona", "elder"))
 
     if persona not in _RERUNNABLE:
@@ -2405,6 +2485,7 @@ def _stop_staleness_watch(watch: _StalenessWatch | None) -> None:
 
 def _run_hot_review(
     job: dict[str, Any], install_id: int, repo_full: str, pr_number: int,
+    receive_count: int = 0,
 ) -> str:
     """Settle, cancel stale work, then run Elder on one current snapshot.
 
@@ -2656,6 +2737,7 @@ def _run_hot_review(
                     ),
                     blocking=elder_blocking,
                     cancel_event=watch.cancel,
+                    rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
                 )
             finally:
                 _stop_staleness_watch(watch)

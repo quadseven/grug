@@ -42,7 +42,11 @@ import httpx
 from adapters.install_store import CommentRecord, update_comment_record_reaction
 from llm_client import ReactionVerdict, submit_reaction_annotation
 from personas import hunt_recorder
-from personas.code_reviewer.model_metrics import emit_verdict, origin_dims
+from personas.code_reviewer.model_metrics import (
+    emit_learning_write,
+    emit_verdict,
+    origin_dims,
+)
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.reactions")
 
@@ -233,12 +237,16 @@ def record_ledger_learning(
     from best_practices import derive_practices, practices_to_dicts
     from few_shot import exemplars_from_rows, exemplars_to_dicts
     from ledger import accepted_findings_by_class, parse_row
+    from review_types import category_or_default
 
     base_row: dict = {
         "repo": record["repo"],
         "pr": record["pr_number"],
         "severity": severity,
         "class": rule_name,
+        # #683: the finding's taxonomy category, tagged at publish time
+        # (judge.eval_tags); absent/off-taxonomy degrades, never blocks.
+        "category": category_or_default(tags.get("category")),
         "finding": finding_text,
         "verdict": ledger_verdict,
         # Stable evidence makes a reaction flip overwrite the same ledger row
@@ -274,6 +282,21 @@ def record_ledger_learning(
     emit_verdict(
         record.get("finding_origins"), ledger_verdict != "false-positive",
         parsed_rows,
+    )
+    emit_learning_write(
+        record.get("finding_origins"),
+        ledger_verdict,
+        rule_name,
+    )
+    log.info(
+        "reaction_learning_written",
+        extra={
+            "repo": record["repo"],
+            "pr": record["pr_number"],
+            "comment_id": record["comment_id"],
+            "verdict": ledger_verdict,
+            "class": rule_name,
+        },
     )
     put_repo_practices(
         record["repo"], practices_to_dicts(derive_practices(parsed_rows)),
@@ -340,6 +363,109 @@ def _dismiss_in_session(
     )
 
 
+def _submit_producer_annotations(
+    annotation_targets: list[tuple[dict, dict[str, str]]],
+    verdict: ReactionVerdict,
+    *,
+    install_id: int,
+    comment_id: int,
+) -> bool:
+    """Submit annotations to each producer span. Returns True if all succeeded."""
+    failed = False
+    for span_context, tags in annotation_targets:
+        try:
+            submit_reaction_annotation(
+                verdict=verdict,
+                review_span_context=span_context,
+                tags=tags,
+            )
+        except Exception as e:  # noqa: BLE001 - best-effort per producer span
+            failed = True
+            log.warning(
+                "reaction_submit_or_persist_failed",
+                extra={
+                    "install_id": install_id,
+                    "comment_id": comment_id,
+                    "kind": type(e).__name__,
+                    "source_backend": tags.get("source_backend"),
+                },
+            )
+    return not failed
+
+
+def _poll_and_annotate_record(
+    rec: CommentRecord,
+    *,
+    install_id: int,
+    fetch_token: Callable[[], str],
+    permission_cache: dict[tuple[str, str], bool],
+) -> tuple[int, int]:
+    """Poll reactions for a single record. Returns (submitted, learned)."""
+    comment_id = rec["comment_id"]
+    annotation_targets = _annotation_targets(rec)
+    if not annotation_targets and not _can_learn(rec):
+        return 0, 0
+    owner, sep, name = rec["repo"].partition("/")
+    if not sep:
+        log.warning(
+            "reaction_record_malformed_repo",
+            extra={"install_id": install_id, "comment_id": comment_id,
+                   "repo": rec["repo"]},
+        )
+        return 0, 0
+    try:
+        install_token = fetch_token()
+        reactions = poll_comment_reactions(
+            install_token, owner, name, comment_id,
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning(
+            "reaction_poll_failed",
+            extra={
+                "install_id": install_id, "comment_id": comment_id,
+                "kind": type(e).__name__,
+            },
+        )
+        return 0, 0
+    reactions = _trusted_reactions(
+        rec,
+        reactions,
+        install_token=install_token,
+        owner=owner,
+        repo=name,
+        permission_cache=permission_cache,
+    )
+    verdict = _classify_reactions(reactions)
+    if verdict is None or verdict == rec.get("last_verdict"):
+        return 0, 0
+    contents = {r.get("content") for r in reactions}
+    if "+1" in contents and "-1" in contents:
+        log.info(
+            "reaction_mixed_signal",
+            extra={"install_id": install_id, "comment_id": comment_id,
+                   "verdict": verdict},
+        )
+    if not _submit_producer_annotations(
+        annotation_targets, verdict, install_id=install_id, comment_id=comment_id,
+    ):
+        return 0, 0
+    try:
+        learned = 1 if _record_reaction_learning(rec, verdict) else 0
+        update_comment_record_reaction(
+            install_id=install_id, comment_id=comment_id, verdict=verdict,
+        )
+        if verdict == "false_positive":
+            _dismiss_in_session(rec, install_id=install_id, owner=owner, name=name)
+        return 1, learned
+    except (httpx.HTTPStatusError, httpx.RequestError, OSError) as e:
+        log.warning(
+            "reaction_submit_or_persist_failed",
+            extra={"install_id": install_id, "comment_id": comment_id,
+                   "kind": type(e).__name__},
+        )
+        return 0, 0
+
+
 def poll_and_annotate(
     records: list[CommentRecord],
     *,
@@ -356,114 +482,24 @@ def poll_and_annotate(
     what the thunk caches).
     """
     submitted = 0
+    learned = 0
     permission_cache: dict[tuple[str, str], bool] = {}
     for rec in records:
-        comment_id = rec["comment_id"]
-        annotation_targets = _annotation_targets(rec)
-        if not annotation_targets and not _can_learn(rec):
-            # Old record with neither a producer span nor trusted-learning
-            # fields has no usable feedback destination.
-            continue
-        # `partition` (not `split` + splat): a malformed persisted repo
-        # without a "/" would make `*split("/",1)` a 1-element splat →
-        # uncaught TypeError → aborts the whole batch, breaking the
-        # per-record best-effort contract. Guard + skip instead.
-        owner, sep, name = rec["repo"].partition("/")
-        if not sep:
-            log.warning(
-                "reaction_record_malformed_repo",
-                extra={"install_id": install_id, "comment_id": comment_id,
-                       "repo": rec["repo"]},
-            )
-            continue
-        try:
-            install_token = fetch_token()
-            reactions = poll_comment_reactions(
-                install_token, owner, name, comment_id,
-            )
-        except (httpx.HTTPStatusError, httpx.RequestError) as e:
-            log.warning(
-                "reaction_poll_failed",
-                extra={
-                    "install_id": install_id, "comment_id": comment_id,
-                    "kind": type(e).__name__,
-                },
-            )
-            continue
-        reactions = _trusted_reactions(
+        s, l = _poll_and_annotate_record(
             rec,
-            reactions,
-            install_token=install_token,
-            owner=owner,
-            repo=name,
+            install_id=install_id,
+            fetch_token=fetch_token,
             permission_cache=permission_cache,
         )
-        verdict = _classify_reactions(reactions)
-        if verdict is None:
-            continue
-        if verdict == rec.get("last_verdict"):
-            # Dedup: already submitted this verdict for this comment.
-            continue
-        # Mixed-signal observability: a comment with BOTH 👍 and 👎 is a
-        # developer disagreement — the highest-information calibration
-        # case, force-classified to false_positive. Log it (with the
-        # verdict) so the calibration set can DOWN-WEIGHT contested rows
-        # rather than have them silently flatten into the verdict.
-        contents = {r.get("content") for r in reactions}
-        if "+1" in contents and "-1" in contents:
-            log.info(
-                "reaction_mixed_signal",
-                extra={"install_id": install_id, "comment_id": comment_id,
-                       "verdict": verdict},
-            )
-        # Attempt every producer even if one DD submit fails. Advance the
-        # per-comment baseline only when every annotation and the store update
-        # succeed; otherwise the next poll retries the whole fan-out. A retry
-        # can append a duplicate eval for a producer that succeeded before a
-        # sibling failed, which the calibration consumer already deduplicates
-        # by (span, label).
-        annotation_failed = False
-        for span_context, tags in annotation_targets:
-            try:
-                submit_reaction_annotation(
-                    verdict=verdict,
-                    review_span_context=span_context,
-                    tags=tags,
-                )
-            except Exception as e:  # noqa: BLE001 - best-effort per producer span
-                annotation_failed = True
-                log.warning(
-                    "reaction_submit_or_persist_failed",
-                    extra={
-                        "install_id": install_id,
-                        "comment_id": comment_id,
-                        "kind": type(e).__name__,
-                        "source_backend": tags.get("source_backend"),
-                    },
-                )
-        if annotation_failed:
-            continue
-        try:
-            _record_reaction_learning(rec, verdict)
-            update_comment_record_reaction(
-                install_id=install_id, comment_id=comment_id, verdict=verdict,
-            )
-            submitted += 1
-            if verdict == "false_positive":
-                _dismiss_in_session(rec, install_id=install_id, owner=owner, name=name)
-        except Exception as e:  # noqa: BLE001 — best-effort per-record
-            log.warning(
-                "reaction_submit_or_persist_failed",
-                extra={"install_id": install_id, "comment_id": comment_id,
-                       "kind": type(e).__name__},
-            )
-            continue
+        submitted += s
+        learned += l
     log.info(
         "reaction_poll_cycle",
         extra={
             "install_id": install_id,
             "records": len(records),
             "submitted": submitted,
+            "learned": learned,
         },
     )
     return submitted
