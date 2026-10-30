@@ -168,8 +168,9 @@ def parse_comment_table(text: str, repo: str, pr: int | None) -> list[dict]:
             continue
         if len(cells) < 5:
             continue
-        cells += [""] * (len(_TABLE_COLUMNS) - len(cells))
-        rows.append({"repo": repo, "pr": pr, **dict(zip(_TABLE_COLUMNS, cells))})
+        cells = (cells + [""] * len(_TABLE_COLUMNS))[: len(_TABLE_COLUMNS)]
+        fields = dict(zip(_TABLE_COLUMNS, cells, strict=True))
+        rows.append({"repo": repo, "pr": pr, **fields})
     return rows
 
 

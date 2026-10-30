@@ -8,6 +8,8 @@ adds any new ones. The `seq` disambiguates findings that share
 (class, pr, reviewer) within a repo.
 
     python ingest_ledger.py [path-to-jsonl]   # default: logs/review-ledger.jsonl
+    python ingest_ledger.py --comment FILE --repo OWNER/NAME [--pr N]
+        # FILE holds one PR comment body carrying a Findings Ledger table
 """
 
 from __future__ import annotations
@@ -134,10 +136,33 @@ def _refresh_practices(parsed_by_repo: dict, put_practices=None) -> int:
     return n
 
 
+def _usage_error(msg: str) -> int:
+    print(f"ledger ingest: {msg}", file=sys.stderr)
+    return 2
+
+
+def _flag(argv: list[str], name: str) -> str | None:
+    """Value following `name` in argv, or None when the flag is absent."""
+    if name not in argv:
+        return None
+    i = argv.index(name)
+    return argv[i + 1] if i + 1 < len(argv) else ""
+
+
 def main(argv: list[str]) -> int:
-    path = argv[1] if len(argv) > 1 else _DEFAULT_PATH
-    with open(path, encoding="utf-8") as f:
-        result = ingest_text(f.read())
+    comment = _flag(argv, "--comment")
+    if comment is not None:
+        repo, pr = _flag(argv, "--repo"), _flag(argv, "--pr")
+        if not comment or not repo:
+            return _usage_error("--comment FILE needs --repo OWNER/NAME")
+        if pr is not None and not pr.isdigit():
+            return _usage_error("--pr must be a number")
+        with open(comment, encoding="utf-8") as f:
+            result = ingest_comment_table(f.read(), repo, int(pr) if pr else None)
+    else:
+        path = argv[1] if len(argv) > 1 else _DEFAULT_PATH
+        with open(path, encoding="utf-8") as f:
+            result = ingest_text(f.read())
     print(
         f"ledger ingest: {result['ingested']} ingested, "
         f"{result['skipped']} skipped, "
