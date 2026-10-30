@@ -78,7 +78,8 @@ from personas.code_reviewer.diff_parser import (
     split_reviewable_hunks, split_tree_copy_hunks,
 )
 from personas.code_reviewer.precedent import (
-    class_precision, match_precedent, render_precedent_note,
+    ClassPrecision, class_precision, match_precedent, mute_note,
+    muted_classes, render_precedent_note,
 )
 from personas.code_reviewer.claim_check import (
     filter_novel_claim_findings,
@@ -1131,6 +1132,7 @@ def _summary_markdown(
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
     defensive_dropped_count: int = 0,
     blocking: bool = False,
+    muted: dict[str, ClassPrecision] | None = None,
 ) -> tuple[str, str]:
     """Render a (title, summary) pair for the check-run output.
 
@@ -1241,7 +1243,10 @@ def _summary_markdown(
         f"{phase_line} "
         "Inline comments carry Fix + agent prompt on each marking.\n\n"
     )
-    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{held}{hunt}{defensive_note}{tier_note}"
+    muted_note = _muted_lines(evaluation.findings, muted)
+    if muted_note:
+        muted_note = f"\n\n{muted_note}"
+    summary = f"{legend}{table}{_maintainability_notes(evaluation)}{muted_note}{held}{hunt}{defensive_note}{tier_note}"
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         summary = f"{summary}\n\n{agent}"
@@ -1889,6 +1894,7 @@ def _review_stack_body(
     base_sha: str = "",
     file_contents: dict[str, str] | None = None,
     linked_issues: tuple[int, ...] = (),
+    muted: dict[str, ClassPrecision] | None = None,
 ) -> str:
     """PR-timeline review stack comment (Markings v2 / FLINT-style shell).
 
@@ -1958,6 +1964,7 @@ def _review_stack_body(
     # line after a table row is swallowed into the table.
     detail = "\n\n".join(p for p in [
         table,
+        _muted_lines(findings, muted),
         _stack_detail_lines(
             review_phase, living_range, suppressed_count, head_sha, base_sha,
             tier_served=getattr(evaluation, "tier_served", None),
@@ -2185,6 +2192,48 @@ def _precedent_notes_for(
         return {}
 
 
+def _muted_classes_for(
+    repo_full: str, repo_config: RepoConfig | None,
+) -> dict[str, ClassPrecision]:
+    """Finding classes muted by their measured precision (#1436).
+
+    Best-effort like the precedent notes: a ledger failure mutes nothing, so
+    the review posts every finding inline rather than hiding any."""
+    cfg = repo_config or RepoConfig()
+    try:
+        from adapters.install_store import list_ledger_rows  # type: ignore
+        from ledger import parse_row
+
+        raw = list_ledger_rows(repo_full) or []
+        rows = [r for r in (parse_row(d) for d in raw) if r is not None]
+        return muted_classes(
+            class_precision(rows),
+            min_labeled=cfg.elder_mute_min_labeled,
+            below_precision=cfg.elder_mute_below_precision,
+            locked=frozenset(cfg.elder_mute_locked_classes),
+        )
+    except Exception as e:  # noqa: BLE001 - muting is tuning, never load-bearing
+        log.info("muted_classes_unavailable", extra={"repo": repo_full, "kind": type(e).__name__})
+        return {}
+
+
+def _muted_lines(
+    findings: "tuple[Finding, ...] | list[Finding]",
+    muted: dict[str, ClassPrecision] | None,
+) -> str:
+    """Board/summary list of the muted classes this review hit, or ''."""
+    classes = sorted({f.rule_name for f in findings if muted and f.rule_name in muted})
+    if not classes:
+        return ""
+    bullets = "\n".join(
+        f"- `{_md_code_span(c)}`: {mute_note(muted[c])}" for c in classes
+    )
+    return (
+        "**Muted classes on this review** (no inline comment unless high or critical):"
+        f"\n\n{bullets}"
+    )
+
+
 def _checked_comment_body(f: Finding, file_text: str, precedent_note: str) -> str:
     """Inline body whose committable block, if any, passed `checked_suggestion`.
     A fix that fails the check still renders, as prose under "Fix"."""
@@ -2201,6 +2250,7 @@ def build_review_result(
     repo_config: RepoConfig | None = None,
     file_contents: dict[str, str] | None = None,
     persona: str = "elder",
+    muted: dict[str, ClassPrecision] | None = None,
 ) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
     """Build the ReviewResult, or (None, ()) if nothing NEW to post.
 
@@ -2243,6 +2293,14 @@ def build_review_result(
         # summary (built from the full evaluation) but get no inline comment.
         new_findings = tuple(
             f for f in new_findings if meets_inline_floor(f.severity, repo_config)
+        )
+    if muted:
+        # #1436: a muted class stays on the board and in the check summary.
+        # A blocking finding (high, critical) keeps its inline thread: the
+        # thread is what carries the block across later pushes.
+        new_findings = tuple(
+            f for f in new_findings
+            if f.severity in ("high", "critical") or f.rule_name not in muted
         )
     if not new_findings:
         return None, ()
@@ -2967,6 +3025,7 @@ def _repo_private(payload: dict[str, Any]) -> bool | None:
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
+    rerun_pending: bool = False,
 ) -> dict[str, str]:
     """Entry point — orchestrate one Elder review pass.
 
@@ -2986,6 +3045,12 @@ def dispatch_code_review(
     fires. The caller (rerun.py's `_run_hot_review`) owns setting it, via a
     background watcher that re-fetches the PR every few seconds for as long
     as this call is running.
+
+    `rerun_pending` (grug#1494): the caller will run this review again if it
+    degrades to `all_failed` (every model rung failed). On a blocking repo the
+    check then stays `in_progress` - pending, so the required check still
+    blocks the merge - instead of completing `failure` for a retry that is
+    already queued. Never set for the last scheduled attempt.
     """
     # #1350: when this run began, so a clean verdict can tell Elder's own
     # earlier blocks on this head from one another run posts mid-flight.
@@ -3715,6 +3780,20 @@ def dispatch_code_review(
             head_sha=head_sha,
         )
 
+    if (
+        rerun_pending
+        and blocking
+        and evaluation.degraded_reason == "all_failed"
+    ):
+        return _publish_rerun_pending(
+            installation_id, owner, repo_name, pull_number, head_sha,
+            evaluation.degraded_reason,
+        )
+
+    muted = (
+        _muted_classes_for(f"{owner}/{repo_name}", repo_config)
+        if evaluation.findings else {}
+    )
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
     outcome = plan_publish(
@@ -3735,6 +3814,7 @@ def dispatch_code_review(
         review_phase=tier1_phase,
         defensive_dropped_count=defensive_dropped_count,
         blocking=blocking,
+        muted=muted,
     )
     if evaluation.reviewability_note:
         summary += "\n\n## Reviewability assessment\n\n" + evaluation.reviewability_note
@@ -3821,7 +3901,7 @@ def dispatch_code_review(
     review_result, posted_findings = build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
         precedent_notes=precedent_notes, repo_config=repo_config,
-        file_contents=file_contents,
+        file_contents=file_contents, muted=muted,
     )
     review_resp: dict[str, Any] | None = None
     if review_result is not None:
@@ -3926,6 +4006,7 @@ def dispatch_code_review(
                 base_sha=str(pr_context.get("base_sha") or ""),
                 file_contents=file_contents,
                 linked_issues=pinned_issues,
+                muted=muted,
             )
             with_install_token_retry(
                 installation_id,
@@ -4807,6 +4888,7 @@ def _publish_deep_review(
     precedent_notes = _precedent_notes_for(
         f"{owner}/{repo_name}", deep_eval.findings,
     )
+    muted = _muted_classes_for(f"{owner}/{repo_name}", repo_config)
     review_result, posted_findings = build_review_result(
         deep_eval,
         head_sha=head_sha,
@@ -4815,6 +4897,7 @@ def _publish_deep_review(
         precedent_notes=precedent_notes,
         repo_config=repo_config,
         file_contents=file_contents,
+        muted=muted,
     )
     if review_result is None:
         return
@@ -4838,6 +4921,7 @@ def _publish_deep_review(
             deep_suppressed_count=deep_suppressed_count, pr_title=pr_title,
             head_sha=head_sha, base_sha=base_sha, pr=f"{owner}/{repo_name}#{pull_number}",
             file_contents=file_contents, linked_issues=linked_issues,
+            muted=muted,
         ),
         stack_create_if_absent=worth_an_email(combined_eval),
     )
@@ -4898,6 +4982,7 @@ def _deep_stack_body(
     pr: str,
     file_contents: dict[str, str] | None,
     linked_issues: tuple[int, ...],
+    muted: dict[str, ClassPrecision] | None = None,
 ) -> str | None:
     """The stack comment body for a deep publish, built before the POST so a
     queued retry can refresh the stack without the evaluation. None (logged)
@@ -4917,6 +5002,7 @@ def _deep_stack_body(
             base_sha=base_sha,
             file_contents=file_contents or {},
             linked_issues=linked_issues,
+            muted=muted,
         )
     except Exception as error:  # noqa: BLE001 - stack is cosmetic UX
         log.warning(
@@ -5241,6 +5327,7 @@ def _async_deep_append_if_needed(
         living_baseline_rejected=living_baseline_rejected,
         review_phase="deep",
         blocking=blocking,
+        muted=_muted_classes_for(f"{owner}/{repo_name}", repo_config),
     )
     summary = _intent_paragraph(pr_context) + summary
     summary += config_note
@@ -5332,6 +5419,51 @@ def _async_deep_append_if_needed(
             "conclusion": conclusion,
         },
     )
+
+
+def _publish_rerun_pending(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str, reason: str,
+) -> dict[str, str]:
+    """Leave the Elder check pending while a queued re-run retries (grug#1494).
+
+    `in_progress` is not a pass: a required check that has not concluded keeps
+    the merge blocked, exactly as the check the enqueue posted. Best-effort -
+    a failed post leaves that earlier pending check in place."""
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: post_check_run(
+                token, owner, repo_name,
+                CheckRunResult(
+                    name=_CHECK_NAME, head_sha=head_sha, status="in_progress",
+                    conclusion=None,
+                    title="Elder waiting on a model - re-run scheduled",
+                    summary=(
+                        f"Every model failed this pass (`{reason}`). Elder "
+                        "re-runs the review automatically. Merge stays "
+                        "blocked until a full review lands; if the re-runs "
+                        "also fail this check fails. Comment `/grug improve` "
+                        "to re-run sooner."
+                    ),
+                ),
+                external_id=(
+                    f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
+                ),
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning(
+            "code_review_rerun_pending_publish_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+    return {
+        "persona": "code_reviewer", "result": "skipped", "degraded_reason": reason,
+    }
 
 
 def _publish_degraded(

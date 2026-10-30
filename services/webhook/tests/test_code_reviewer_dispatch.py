@@ -4349,3 +4349,99 @@ def test_unset_category_renders_as_general():
     assert "_general_" in head
     assert "maintainability" not in head
 
+
+
+# --- muting a rarely-fixed finding class (#1436) ----------------------------
+# Fixture rows are dicts in the shape ledger.parse_row reads (the writer is
+# services/_shared/ledger.py); no live read.
+
+def _mute_rows(cls, accepted, rejected):
+    def row(i, verdict):
+        return {"repo": "o/r", "pr": i, "reviewer": "claude/x",
+                "severity": "HIGH", "class": cls, "finding": "f",
+                "verdict": verdict, "ts": "2026-06-10T00:00:00Z"}
+    return ([row(i, "fixed") for i in range(accepted)]
+            + [row(100 + i, "false-positive") for i in range(rejected)])
+
+
+def _mute_eval(cls, severity="medium"):
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    f = Finding(file="src/x.py", line=2, severity=severity, rule_name=cls,
+                message="m", suggestion=None)
+    conclusion = "failure" if severity in ("high", "critical") else "success"
+    return CodeReviewEvaluation(findings=(f,), conclusion=conclusion)
+
+
+def _muted(monkeypatch, rows, config=None):
+    monkeypatch.setattr("adapters.install_store.list_ledger_rows",
+                        lambda repo, *a, **k: rows, raising=False)
+    return cr_dispatch._muted_classes_for("o/r", config)
+
+
+def test_rarely_fixed_class_posts_no_inline_and_one_board_line(monkeypatch):
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))  # 25 labeled, 0.08
+    evaluation = _mute_eval("noisy")
+
+    result, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT", muted=muted,
+    )
+
+    assert result is None and posted == ()
+    _, summary = cr_dispatch._summary_markdown(evaluation, muted=muted)
+    assert summary.count("muted: fixed in 2 of 25 past findings") == 1
+    board = cr_dispatch._review_stack_body(
+        evaluation, conclusion="success", muted=muted,
+    )
+    assert board.count("muted: fixed in 2 of 25 past findings") == 1
+
+
+def test_class_below_min_labeled_is_not_muted(monkeypatch):
+    assert _muted(monkeypatch, _mute_rows("noisy", 0, 19)) == {}
+
+
+def test_critical_finding_of_muted_class_still_posts_inline_and_blocks(monkeypatch):
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))
+    evaluation = _mute_eval("noisy", severity="critical")
+
+    result, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="REQUEST_CHANGES", muted=muted,
+    )
+
+    assert result is not None and len(result.comments) == 1
+    assert posted == evaluation.findings
+    outcome = plan_publish(evaluation, mode="blocking")
+    assert (outcome.conclusion, outcome.event) == ("failure", "REQUEST_CHANGES")
+
+
+def test_locked_class_posts_inline_at_zero_precision(monkeypatch):
+    from personas.code_reviewer.repo_config import parse_repo_config
+
+    config = parse_repo_config("elder_mute_locked_classes: [noisy]\n")
+    muted = _muted(monkeypatch, _mute_rows("noisy", 0, 25), config)
+    assert muted == {}
+
+    result, posted = cr_dispatch.build_review_result(
+        _mute_eval("noisy"), head_sha="a" * 40, event="COMMENT", muted=muted,
+    )
+
+    assert result is not None and len(result.comments) == 1
+
+
+def test_mute_thresholds_come_from_repo_config(monkeypatch):
+    from personas.code_reviewer.repo_config import parse_repo_config
+
+    config = parse_repo_config(
+        "elder_mute_min_labeled: 5\nelder_mute_below_precision: 0.5\n"
+    )
+    assert "noisy" in _muted(monkeypatch, _mute_rows("noisy", 2, 4), config)
+    assert _muted(monkeypatch, _mute_rows("noisy", 3, 3), config) == {}
+
+
+def test_high_finding_of_muted_class_keeps_its_inline_thread(monkeypatch):
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))
+    result, _ = cr_dispatch.build_review_result(
+        _mute_eval("noisy", severity="high"), head_sha="a" * 40,
+        event="REQUEST_CHANGES", muted=muted,
+    )
+    assert result is not None and len(result.comments) == 1
