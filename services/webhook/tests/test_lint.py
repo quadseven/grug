@@ -425,11 +425,10 @@ def test_s608_fstring_of_shadowed_constant_stays_high():
 
 
 def test_s608_fstring_of_rebound_constant_stays_high():
-    src = ("TTL_LIVE = 'expires_at > now()'\n"
-           "TTL_LIVE += input()\n"
-           "def resume(cur):\n"
-           "    query = f'SELECT * FROM t WHERE {TTL_LIVE}'\n"
-           "    cur.execute(query)\n")
+    # The flagged row must sit inside the helper's 3-line diff hunk.
+    src = ("query = f'SELECT * FROM t WHERE {TTL_LIVE}'\n"
+           "TTL_LIVE = 'expires_at > now()'\n"
+           "TTL_LIVE += input()\n")
     assert _scan_s608(src)[0].severity == "high"
 
 
