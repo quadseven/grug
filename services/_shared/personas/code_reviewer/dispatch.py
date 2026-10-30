@@ -2229,7 +2229,7 @@ def _muted_lines(
         f"- `{_md_code_span(c)}`: {mute_note(muted[c])}" for c in classes
     )
     return (
-        "**Muted classes on this review** (no inline comment unless critical):"
+        "**Muted classes on this review** (no inline comment unless high or critical):"
         f"\n\n{bullets}"
     )
 
@@ -2295,11 +2295,12 @@ def build_review_result(
             f for f in new_findings if meets_inline_floor(f.severity, repo_config)
         )
     if muted:
-        # #1436: a muted class stays on the board and in the check summary;
-        # only a critical finding of it still opens an inline thread.
+        # #1436: a muted class stays on the board and in the check summary.
+        # A blocking finding (high, critical) keeps its inline thread: the
+        # thread is what carries the block across later pushes.
         new_findings = tuple(
             f for f in new_findings
-            if f.severity == "critical" or f.rule_name not in muted
+            if f.severity in ("high", "critical") or f.rule_name not in muted
         )
     if not new_findings:
         return None, ()

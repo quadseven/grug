@@ -4436,3 +4436,12 @@ def test_mute_thresholds_come_from_repo_config(monkeypatch):
     )
     assert "noisy" in _muted(monkeypatch, _mute_rows("noisy", 2, 4), config)
     assert _muted(monkeypatch, _mute_rows("noisy", 3, 3), config) == {}
+
+
+def test_high_finding_of_muted_class_keeps_its_inline_thread(monkeypatch):
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))
+    result, _ = cr_dispatch.build_review_result(
+        _mute_eval("noisy", severity="high"), head_sha="a" * 40,
+        event="REQUEST_CHANGES", muted=muted,
+    )
+    assert result is not None and len(result.comments) == 1

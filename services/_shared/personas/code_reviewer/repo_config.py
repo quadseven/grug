@@ -19,8 +19,8 @@ Seven keys, all optional:
                        class needs before it can be muted
   elder_mute_below_precision number 0..1, default 0.2; a class with at least
                        that many labeled rows and a lower fixed-rate is muted:
-                       no inline comment, board and summary only (a critical
-                       finding still posts inline)
+                       no inline comment, board and summary only (a high or
+                       critical finding still posts inline)
   elder_mute_locked_classes  list of finding classes that stay inline whatever
                        their precision
 
