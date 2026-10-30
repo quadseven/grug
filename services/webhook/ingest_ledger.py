@@ -1,4 +1,5 @@
-"""Ingest logs/review-ledger.jsonl into the store (#361 slice 1).
+"""Ingest the review-findings ledger into the store (#361 slice 1): the
+committed logs/review-ledger.jsonl, or a PR comment's Findings Ledger table.
 
 Runs as a one-shot (CLI or a k8s Job): read the committed corpus, skip
 malformed lines, and upsert each finding as a first-class grug_kv row via
@@ -15,7 +16,7 @@ import json
 import logging
 import sys
 
-from ledger import parse_row
+from ledger import parse_comment_table, parse_row
 
 log = logging.getLogger("grug.ingest_ledger")
 
@@ -29,20 +30,41 @@ def ingest_text(
     `put_exemplars` default to the store adapter but are injectable for
     tests. Returns {ingested, skipped, repos_refreshed,
     exemplars_refreshed}."""
-    if put is None:
-        from adapters.pg_install_store import put_ledger_row  # type: ignore
-        put = put_ledger_row
-    ingested = skipped = 0
-    parsed_by_repo: dict[str, list] = {}
+    rows: list[dict] = []
+    skipped = 0
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            row = json.loads(line)
+            rows.append(json.loads(line))
         except json.JSONDecodeError:
             skipped += 1
-            continue
+    return _ingest_rows(rows, skipped, put, put_practices, put_exemplars)
+
+
+def ingest_comment_table(
+    body: str, repo: str, pr: int | None,
+    put=None, put_practices=None, put_exemplars=None,
+) -> dict[str, object]:
+    """Persist the Findings Ledger table of one PR comment body (#361's
+    second source, beside the JSONL file). Same store, same result shape as
+    `ingest_text`; a body with no ledger table ingests nothing."""
+    rows = parse_comment_table(body, repo, pr)
+    return _ingest_rows(rows, 0, put, put_practices, put_exemplars)
+
+
+def _ingest_rows(
+    rows: list[dict], skipped: int, put, put_practices, put_exemplars
+) -> dict[str, object]:
+    """Validate, persist and refresh the per-repo derived caches for raw
+    row dicts. `skipped` carries the caller's pre-parse drops."""
+    if put is None:
+        from adapters.pg_install_store import put_ledger_row  # type: ignore
+        put = put_ledger_row
+    ingested = 0
+    parsed_by_repo: dict[str, list] = {}
+    for row in rows:
         lr = parse_row(row)
         if lr is None:  # reuse the same validity gate
             skipped += 1
