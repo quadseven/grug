@@ -17,6 +17,8 @@ import re
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from typing import NamedTuple
+
 _CONTEXT_PATH = "CONTEXT.md"
 _ADR_DIR = "docs/adr/"
 
@@ -50,6 +52,236 @@ _STOP_TOKENS = frozenset(
         "spec",
         "docs",
         "doc",
+    }
+)
+
+
+class GlossaryEntry(NamedTuple):
+    """A single glossary entry from CONTEXT.md."""
+
+    term: str
+    definition: str
+
+
+_GLOSSARY_TABLE_PATTERN = re.compile(r"^##\s+\S+")
+_TERM_PATTERN = re.compile(r"\|\s*([^|]+?)\s*\|")
+_DEFINITION_PATTERN = re.compile(r"\|\s*([^|]*?(?:\|(?!\|)[^|]*)?)\s*\|$")
+
+
+def _parse_glossary_section(section_text: str) -> list[GlossaryEntry]:
+    """Parse a glossary section (e.g., ## Product surface) into glossary entries.
+
+    Returns a list of (term, definition) pairs for all table entries in the section.
+    """
+    entries: list[GlossaryEntry] = []
+    in_table = False
+    lines = section_text.split("\n")
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        if _GLOSSARY_TABLE_PATTERN.match(line):
+            in_table = True
+            i += 1
+            continue
+
+        if in_table:
+            if line.strip() == "":
+                i += 1
+                continue
+            term_match = _TERM_PATTERN.match(line)
+            definition_match = _DEFINITION_PATTERN.match(line)
+            if term_match and definition_match:
+                term = term_match.group(1).strip().replace("**", "").strip()
+                definition = definition_match.group(1).strip()
+                if term and definition:
+                    entries.append(GlossaryEntry(term=term, definition=definition))
+        i += 1
+
+    return entries
+
+
+def _select_relevant_entries(
+    context_text: str, changed_tokens: set[str], max_entries: int = 10
+) -> list[GlossaryEntry]:
+    """Select glossary entries that are relevant to the changed paths.
+
+    An entry is relevant when its term shares a token with the changed paths.
+    Returns a bounded list to stay within the overall context budget.
+    """
+    relevant: list[GlossaryEntry] = []
+
+    sections = context_text.split("\n## ")
+    for section in sections:
+        if not section.strip():
+            continue
+        entries = _parse_glossary_section(section)
+        for entry in entries:
+            entry_tokens = _tokens(entry.term + " " + entry.definition)
+            if entry_tokens & changed_tokens:
+                relevant.append(entry)
+
+    return relevant[:max_entries]
+
+
+def _select_relevant_entries(
+    context_text: str, changed_tokens: set[str], max_entries: int = 10
+) -> list[GlossaryEntry]:
+    """Select glossary entries that are relevant to the changed paths.
+
+    An entry is relevant when its term shares a token with the changed paths.
+    Returns a bounded list to stay within the overall context budget.
+    """
+    relevant: list[GlossaryEntry] = []
+
+    sections = context_text.split("\n## ")
+    for section in sections:
+        if not section.strip():
+            continue
+        entries = _parse_glossary_section(section)
+        for entry in entries:
+            entry_tokens = _tokens(entry.term + " " + entry.definition)
+            if entry_tokens & changed_tokens:
+                relevant.append(entry)
+
+    return relevant[:max_entries]
+
+
+def _select_relevant_entries(
+    context_text: str, changed_tokens: set[str], max_entries: int = 10
+) -> list[GlossaryEntry]:
+    """Select glossary entries that are relevant to the changed paths.
+
+    An entry is relevant when its term shares a token with the changed paths.
+    Returns a bounded list to stay within the overall context budget.
+    """
+    relevant: list[GlossaryEntry] = []
+
+    sections = context_text.split("\n## ")
+    for section in sections:
+        if not section.strip():
+            continue
+        entries = _parse_glossary_section(section)
+        for entry in entries:
+            entry_tokens = _tokens(entry.term + " " + entry.definition)
+            if entry_tokens & changed_tokens:
+                relevant.append(entry)
+
+    return relevant[:max_entries]
+
+
+def _select_relevant_entries(
+    context_text: str, changed_tokens: set[str], max_entries: int = 10
+) -> list[GlossaryEntry]:
+    """Select glossary entries that are relevant to the changed paths.
+
+    An entry is relevant when its term shares a token with the changed paths.
+    Returns a bounded list to stay within the overall context budget.
+    """
+    relevant: list[GlossaryEntry] = []
+
+    sections = context_text.split("\n## ")
+    for section in sections:
+        if not section.strip():
+            continue
+        entries = _parse_glossary_section(section)
+        for entry in entries:
+            entry_tokens = _tokens(entry.term + " " + entry.definition)
+            if entry_tokens & changed_tokens:
+                relevant.append(entry)
+
+    return relevant[:max_entries]
+
+
+def _cap_with_selection(
+    text: str, limit: int, label: str, selected: list[str]
+) -> str:
+    """Cap text while preserving only selected sections with an omission notice.
+
+    Builds a custom format that shows which entries were included and which were omitted.
+    """
+    if not selected:
+        if len(text) <= limit:
+            return text
+        return (
+            text[:limit].rstrip()
+            + f"\n... (truncated to {limit} chars; {label} continues)"
+        )
+
+    selected_text = "\n\n".join(selected)
+    if len(selected_text) <= limit:
+        return selected_text
+
+    remaining = limit - len(selected_text)
+    cutoff = selected_text[:remaining].rsplit("\n\n", 1)[0]
+
+    omission = (
+        "\n\n"
+        + f"**{label} continues (omitted {len(selected) - 1} more entries to stay "
+        + f"within {limit} chars of review context budget)**"
+    )
+
+    return cutoff.rstrip() + omission
+
+
+# Precompute a list of generic tokens that are unlikely to be in glossary terms
+_GLOSSARY_GENERIC_TOKENS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "to",
+        "of",
+        "in",
+        "on",
+        "at",
+        "by",
+        "for",
+        "with",
+        "as",
+        "from",
+        "into",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "between",
+        "under",
+        "again",
+        "further",
+        "then",
+        "once",
+        "here",
+        "there",
+        "when",
+        "where",
+        "why",
+        "how",
+        "all",
+        "each",
+        "few",
+        "more",
+        "most",
+        "other",
+        "some",
+        "such",
+        "no",
+        "nor",
+        "not",
+        "only",
+        "own",
+        "same",
+        "so",
+        "than",
+        "too",
+        "very",
+        "s",
+        "t",
     }
 )
 
@@ -115,10 +347,29 @@ def build_repo_docs_context(
 
         context_md = fetch_file(_CONTEXT_PATH)
         if context_md:
-            sections.append(
-                f"--- {_CONTEXT_PATH} ---\n"
-                + _cap(context_md, _MAX_CONTEXT_CHARS, _CONTEXT_PATH)
+            changed = _changed_tokens(hunks)
+            relevant_entries = _select_relevant_entries(
+                context_md, changed, max_entries=_MAX_CONTEXT_CHARS // 500
             )
+
+            if relevant_entries:
+                selected_text = "\n\n".join(
+                    [f"**{e.term}**: {e.definition}" for e in relevant_entries]
+                )
+                sections.append(
+                    f"--- {_CONTEXT_PATH} (relevant entries for changed paths) ---\n"
+                    + _cap_with_selection(
+                        selected_text,
+                        _MAX_CONTEXT_CHARS,
+                        _CONTEXT_PATH,
+                        [f"{e.term}: {e.definition}" for e in relevant_entries],
+                    )
+                )
+            else:
+                sections.append(
+                    f"--- {_CONTEXT_PATH} ---\n"
+                    + _cap(context_md, _MAX_CONTEXT_CHARS, _CONTEXT_PATH)
+                )
 
         try:
             entries = list_dir(_ADR_DIR) or []
