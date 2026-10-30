@@ -59,6 +59,13 @@ def test_learnings_list_and_delete_parse():
     assert c.verb == "learnings" and c.arg == "DeLeTe deadbeef"
 
 
+def test_walkthrough_verb_parses():
+    assert parse_command("/grug walkthrough").verb == "walkthrough"
+    assert parse_command("/grug walkthrough").arg == ""
+    assert parse_command("/GRUG WALKTHROUGH").verb == "walkthrough"
+    assert parse_command("please\n/grug walkthrough\nthanks").verb == "walkthrough"
+
+
 # --- #822: a free-form /grug <question> is an ask -------------------------
 
 def test_freeform_question_parses_as_ask():

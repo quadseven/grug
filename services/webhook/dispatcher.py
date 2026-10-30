@@ -1055,6 +1055,116 @@ def _defer_if_budget_spent(
     )
 
 
+def _enqueue_walkthrough_for_pr(
+    pr: dict[str, Any], *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, comment_id: int,
+) -> str:
+    """Enqueue one Teller walkthrough for the PR a `/grug walkthrough`
+    named. No `labeled` pull_request action is dispatched, so without this
+    the opt-in would wait for the next push. Returns `queued` or
+    `enqueue_failed`; a failed enqueue gets the same durable self-recover
+    the pull_request path uses."""
+    from async_dispatch import enqueue_walkthrough_review, self_recover_review  # lazy: webhook-only
+
+    base_repo = (pr.get("base") or {}).get("repo") or {}
+    payload = {
+        "action": "walkthrough_command",
+        "pull_request": {**pr, "number": int(pr_number)},
+        "repository": {
+            "owner": {"login": owner},
+            "name": repo_name,
+            "private": base_repo.get("private"),
+        },
+        "installation": {"id": int(installation_id)},
+    }
+    delivery_id = f"grug-walkthrough-{int(pr_number)}-{int(comment_id)}"
+    if enqueue_walkthrough_review(payload=payload, delivery_id=delivery_id, blocking=False):
+        return "queued"
+    self_recover_review(payload, delivery_id, persona="walkthrough")
+    log.error(
+        "walkthrough_command_enqueue_failed",
+        extra={
+            "installation_id": installation_id,
+            "owner": owner,
+            "repo": repo_name,
+            "pr_number": pr_number,
+            "delivery_id": delivery_id,
+        },
+    )
+    return "enqueue_failed"
+
+
+def _handle_grug_walkthrough(
+    pr: dict[str, Any], *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, comment_id: int, token_fn,
+) -> dict[str, str]:
+    """Handle `/grug walkthrough` - add the opt-in label, then enqueue the
+    walkthrough for the PR's current head.
+
+    The label `grug:walkthrough` keeps the walkthrough running on later
+    pushes. Idempotent - adding an existing label is a no-op. A label
+    failure enqueues nothing: the opt-in did not land.
+    """
+    import httpx  # type: ignore
+    from urllib.parse import quote as _q
+
+    def _add_label(token: str) -> dict[str, Any]:
+        r = httpx.post(
+            f"https://api.github.com/repos/{_q(owner, safe='')}/"
+            f"{_q(repo_name, safe='')}/issues/{int(pr_number)}/labels",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"labels": ["grug:walkthrough"]},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    try:
+        token_fn(_add_label)
+    except httpx.HTTPStatusError as e:
+        log.warning(
+            "grug_walkthrough_label_failed",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": pr_number,
+                "status": e.response.status_code,
+            },
+        )
+        return {"status": "skip", "reason": "label_add_failed"}
+    except httpx.RequestError as e:
+        log.warning(
+            "grug_walkthrough_label_transport_failed",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": pr_number,
+                "kind": type(e).__name__,
+            },
+        )
+        return {"status": "skip", "reason": "label_add_transport_failed"}
+
+    log.info(
+        "grug_walkthrough_opt_in",
+        extra={
+            "installation_id": installation_id,
+            "owner": owner,
+            "repo": repo_name,
+            "pr_number": pr_number,
+        },
+    )
+    result = _enqueue_walkthrough_for_pr(
+        pr, installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pr_number=pr_number, comment_id=comment_id,
+    )
+    return {"status": "ok", "trigger": "walkthrough", "result": result}
+
+
 def _answer_pr_fetch_failed(
     cmd, *, installation_id: int, owner: str, repo_name: str, pr_number: int,
 ) -> None:
@@ -1372,6 +1482,13 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # Interactive commands (#528) reuse the SAME gating above (allowlist +
     # tpm + author-or-write-collaborator), then branch to their own actions.
     # recheck keeps the original DoR-re-evaluate path below.
+    if cmd.verb == "walkthrough":
+        return _handle_grug_walkthrough(
+            pr, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
+            comment_id=int(comment_id) if comment_id is not None else 0,
+            token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+        )
     if cmd.verb != "recheck":
         from interactive import run_command  # type: ignore
         return run_command(

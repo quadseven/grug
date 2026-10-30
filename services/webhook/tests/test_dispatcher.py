@@ -205,14 +205,17 @@ def test_ensure_enforcement_on_pr_store_outage_skips_silently():
     mock_retry.assert_not_called()
 
 
-def _full_pr_payload():
+def _full_pr_payload(with_walkthrough_label: bool = False):
+    pr = {
+        "number": 42,
+        "body": "## Why\nbecause we need it badly\n## Acceptance criteria\n- a\n- b\n- c\n## Out of scope\nx\nSize: S\ncloses #1",
+        "head": {"sha": "abc123def456"},
+    }
+    if with_walkthrough_label:
+        pr["labels"] = [{"name": "grug:walkthrough"}]
     return {
         "action": "opened",
-        "pull_request": {
-            "number": 42,
-            "body": "## Why\nbecause we need it badly\n## Acceptance criteria\n- a\n- b\n- c\n## Out of scope\nx\nSize: S\ncloses #1",
-            "head": {"sha": "abc123def456"},
-        },
+        "pull_request": pr,
         "repository": {"id": 7777, "name": "infra", "owner": {"login": "quadseven"}, "full_name": "quadseven/infra"},
         "installation": {"id": 999},
     }
@@ -342,12 +345,12 @@ def test_pull_request_dispatches_all_personas_independently():
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
                return_value={"persona": "tpm", "result": "pass"}), \
-         patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq, \
-         patch("async_dispatch.enqueue_guard_review", return_value=True) as mock_guard_enq, \
-         patch("async_dispatch.enqueue_smasher_review", return_value=True) as mock_smasher_enq, \
-         patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
+patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq, \
+          patch("async_dispatch.enqueue_guard_review", return_value=True) as mock_guard_enq, \
+          patch("async_dispatch.enqueue_smasher_review", return_value=True) as mock_smasher_enq, \
+          patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
-        out = dispatch("pull_request", _full_pr_payload())
+        out = dispatch("pull_request", _full_pr_payload(with_walkthrough_label=True))
 
     assert out["status"] == "dispatched"
     assert len(out["personas"]) == 5
@@ -361,6 +364,34 @@ def test_pull_request_dispatches_all_personas_independently():
     mock_guard_enq.assert_called_once()
     mock_teller_enq.assert_called_once()
     mock_smasher_enq.assert_called_once()
+
+
+def test_pull_request_walkthrough_opt_in_required_without_label():
+    """Walkthrough requires the grug:walkthrough label on the PR.
+    Without it, the persona returns opt_in_required instead of queued."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
+         patch("async_dispatch.enqueue_elder_review", return_value=True), \
+         patch("async_dispatch.enqueue_guard_review", return_value=True), \
+         patch("async_dispatch.enqueue_smasher_review", return_value=True), \
+         patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        # No label = opt_in_required
+        out = dispatch("pull_request", _full_pr_payload(with_walkthrough_label=False))
+
+    assert out["status"] == "dispatched"
+    # TPM runs, Elder/Guard/Smasher run, but walkthrough requires opt-in
+    assert out["personas"][0]["persona"] == "tpm"
+    assert out["personas"][1] == {"persona": "code_reviewer", "result": "queued"}
+    assert out["personas"][2] == {"persona": "guard", "result": "queued"}
+    assert out["personas"][3] == {"persona": "smasher", "result": "queued"}
+    assert out["personas"][4] == {"persona": "walkthrough", "result": "opt_in_required"}
+    # enqueue_walkthrough_review should NOT have been called
+    mock_teller_enq.assert_not_called()
 
 
 def test_pull_request_tpm_failure_does_not_skip_elder_enqueue():
