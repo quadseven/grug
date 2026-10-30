@@ -396,6 +396,33 @@ def test_s608_interpolated_parameter_stays_high():
     assert found[0].severity == "high"
 
 
+def test_s608_fstring_of_module_constant_is_medium():
+    src = ("TTL_LIVE = 'expires_at > now()'\n"
+           "def resume(cur):\n"
+           "    query = f'SELECT * FROM t WHERE {TTL_LIVE}'\n"
+           "    cur.execute(query)\n")
+    found = _scan_s608(src)
+    assert len(found) == 1
+    assert found[0].severity == "medium"
+
+
+def test_s608_fstring_of_parameter_stays_high():
+    src = ("TTL_LIVE = 'expires_at > now()'\n"
+           "def resume(cur, table):\n"
+           "    query = f'SELECT * FROM {table} WHERE {TTL_LIVE}'\n"
+           "    cur.execute(query)\n")
+    found = _scan_s608(src)
+    assert len(found) == 1
+    assert found[0].severity == "high"
+
+
+def test_s608_fstring_of_call_stays_high():
+    src = ("def resume(cur):\n"
+           "    query = f'SELECT * FROM {pick()}'\n"
+           "    cur.execute(query)\n")
+    assert _scan_s608(src)[0].severity == "high"
+
+
 def test_s608_literal_joined_to_parameter_stays_high():
     """The literal "SELECT " inside the join is not the flagged SQL."""
     found = _scan_s608("def f(table):\n    query = 'SELECT * FROM ' + table\n    cursor.execute(query)\n")

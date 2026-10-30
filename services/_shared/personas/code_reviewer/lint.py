@@ -477,7 +477,7 @@ def _s608_candidates(tree: ast.Module, row: int) -> list[ast.expr]:
         on_row = isinstance(node, ast.expr) and node.lineno == row
         assigned = isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
         if on_row and not inside and not assigned and isinstance(
-            node, (ast.BinOp, ast.Constant, ast.Name)
+            node, (ast.BinOp, ast.Constant, ast.Name, ast.JoinedStr)
         ):
             candidates.append(node)
         for child in ast.iter_child_nodes(node):
@@ -491,7 +491,8 @@ def _literal_sql(
     node: ast.AST, constants: dict[str, ast.expr], seen: frozenset[str] = frozenset()
 ) -> bool:
     """True for literals, names in `constants` (module-level assignments)
-    whose value is itself constant, `+` of constants, and tuple, list, set or
+    whose value is itself constant, `+` of constants, f-strings whose
+    interpolated values are constant, and tuple, list, set or
     dict displays of constants. Calls never count, even with literal
     arguments: their return value is unknown."""
     if isinstance(node, ast.Constant):
@@ -502,6 +503,10 @@ def _literal_sql(
         )
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         return _literal_sql(node.left, constants, seen) and _literal_sql(node.right, constants, seen)
+    if isinstance(node, ast.JoinedStr):
+        return all(_literal_sql(part, constants, seen) for part in node.values)
+    if isinstance(node, ast.FormattedValue):
+        return node.format_spec is None and _literal_sql(node.value, constants, seen)
     if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
         return all(_literal_sql(item, constants, seen) for item in node.elts)
     if isinstance(node, ast.Dict):
