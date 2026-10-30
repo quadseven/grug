@@ -780,7 +780,9 @@ _OUTPUT_CONTRACT = (
     '{"findings": [{"path": str, "line": int, "rule": str, '
     '"severity": "low"|"medium"|"high"|"critical", "message": str, '
     '"suggestion": str (OPTIONAL), "effort": "quick-win"|"heavy-lift" '
-    '(OPTIONAL), "outside_diff_reason": str (OPTIONAL), '
+    '(OPTIONAL), "category": "correctness"|"security"|"stability"|'
+    '"data-integrity"|"maintainability" (OPTIONAL), '
+    '"outside_diff_reason": str (OPTIONAL), '
     '"is_finding": bool (OPTIONAL)}]}. '
     "Only list real defects: when you check a candidate and conclude there "
     "is nothing wrong, leave it out. If you list one anyway, set "
@@ -796,7 +798,12 @@ _OUTPUT_CONTRACT = (
     "diff syntax, no backticks; include it ONLY when you are confident "
     "the replacement is complete and line-exact, else omit it. `effort` "
     "estimates the fix: quick-win (small, local) or heavy-lift "
-    "(structural); omit when unsure. No prose, no markdown, no text "
+    "(structural); omit when unsure. `category` is the axis a reviewer "
+    "triages on: correctness (wrong behavior), security, stability (crashes, "
+    "availability, concurrency), data-integrity (data loss, integration "
+    "contracts), maintainability (clarity, tests, types); omit it when "
+    "none fits - it is then recorded as general. No prose, no markdown, "
+    "no text "
     "outside the JSON object."
 )
 

@@ -85,10 +85,11 @@ def env(monkeypatch):
     return SimpleNamespace(store=store, board=board)
 
 
-def _finding(rule="unchecked-none", line=10, file=PATH, sev="high"):
+def _finding(rule="unchecked-none", line=10, file=PATH, sev="high",
+             category="correctness"):
     return Finding(
         file=file, line=line, severity=sev, rule_name=rule,
-        message=f"{rule} problem", suggestion=None,
+        message=f"{rule} problem", suggestion=None, category=category,
     )
 
 
@@ -106,7 +107,7 @@ def _elder(env, head, findings, *, contents, at, trigger="review",
         findings=findings, file_contents=contents,
         diff_paths=frozenset(diff_paths), delta=delta,
         comment_ids=comment_ids or {}, check_run_id=check_run_id,
-        category_of=lambda rule: "correctness", degraded_reason=degraded_reason,
+        degraded_reason=degraded_reason,
     )
     return rs.from_dict(env.store.row)
 
@@ -282,7 +283,6 @@ def test_a_store_outage_never_raises_into_the_review(env, monkeypatch, caplog):
             backend="", model="", findings=[_finding()],
             file_contents=_contents(LINE_A), diff_paths=frozenset({PATH}),
             delta=False, comment_ids={}, check_run_id=None,
-            category_of=lambda rule: "correctness",
         )
     assert out is None
     assert any(r.message == "hunt_session_update_failed" for r in caplog.records)

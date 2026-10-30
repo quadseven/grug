@@ -31,7 +31,7 @@ from github_checks_client import CheckConclusion
 from llm_client import FindingOrigin, LlmReviewResponse, is_withdrawn_finding
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.line_refs import align_line_refs, repair_where_refs
-from review_types import Effort, Severity  # single source (#250)
+from review_types import DEFAULT_CATEGORY, Category, Effort, Severity  # single source (#250)
 from review_pipeline import ReviewCoverage
 
 # A finding at one of these severities flips the aggregate verdict.
@@ -137,6 +137,9 @@ class Finding:
     # (review_types.Effort) so an off-vocabulary value is a type error at
     # the constructor, not a silently dropped chip. None = no estimate.
     effort: Effort | None = None
+    # #683: reviewer-set taxonomy category; "general" is the criterion-4
+    # default for an unset or invalid value, on every surface.
+    category: Category = DEFAULT_CATEGORY
     # Stable identity for deterministic complexity findings across pushes.
     complexity_function: str | None = None
     # Set only for a validated cross-file snippet anchor. These findings are
@@ -205,6 +208,8 @@ class CodeReviewEvaluation:
     # toward the verdict, but counted here so recall stays measurable.
     dropped_withdrawn: int = 0
     tier_served: str | None = None
+    reviewability_note: str = ""
+    reviewability_blocking: bool = False
 
     @property
     def passed(self) -> bool:
@@ -424,6 +429,7 @@ def evaluate_diff(
                 # anchors on a line the LLM actually saw.
                 suggestion=raw.suggestion,
                 effort=raw.effort,
+                category=raw.category,
                 origins=raw.origins,
                 outside_diff_reason=outside_reason if outside_diff else None,
             )
@@ -449,10 +455,15 @@ def evaluate_diff(
         # neutral; else success. `conclusion` and `degraded_reason` must never
         # disagree within one CodeReviewEvaluation - a "success" alongside
         # degraded_reason="partial_review" is the bug this closes.
-        conclusion=_derive_conclusion(kept_findings, degraded_reason),
+        conclusion=(
+            "failure" if llm_response.reviewability_blocking
+            else _derive_conclusion(kept_findings, degraded_reason)
+        ),
         dropped_hallucinations=dropped,
         dropped_withdrawn=withdrawn,
         degraded_reason=degraded_reason,
         coverage=llm_response.coverage,
         tier_served=llm_response.tier_served,
+        reviewability_note=llm_response.reviewability_note,
+        reviewability_blocking=llm_response.reviewability_blocking,
     )
