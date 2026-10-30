@@ -92,7 +92,8 @@ CNI-independent and does not rely on any admission controller. Trial pods run as
 the `grug-trial` `default` SA with `automountServiceAccountToken:false`.
 
 The launcher talks to the in-cluster API over HTTPS (`kubernetes.default.svc`,
-port 443, already permitted by the `grug` egress NetworkPolicy) using the
+Service port 443; the `grug` egress NetworkPolicy opens the endpoint port 6443,
+which is what an enforcer matches after the Service DNAT) using the
 mounted SA token + CA bundle via `httpx` — no new heavyweight `kubernetes`
 client dependency, consistent with the repo's hand-rolled-over-deps ethos
 (`diff_parser`, OSV-over-httpx).

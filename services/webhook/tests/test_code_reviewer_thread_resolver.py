@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
-
+from personas import board_client as bc
 from personas.code_reviewer import thread_resolver as tr
 from personas.code_reviewer.dedup import rule_marker
 from personas.code_reviewer.persona import Finding
@@ -46,11 +46,14 @@ def _thread(tid="T1", *, outdated=True, resolved=False, comments=None,
 class _Gh:
     """Fake GraphQL endpoint recording replies/resolves."""
 
-    def __init__(self, threads, *, resolve_error=None):
+    def __init__(self, threads, *, resolve_error=None, board=None):
         self.threads = threads
         self.replies: list[tuple[str, str]] = []
         self.resolved: list[str] = []
         self.resolve_error = resolve_error
+        self.board = board
+        self.edited: list[tuple[str, str]] = []
+        self.minimized: list[str] = []
 
     def post(self, url, json=None, headers=None, timeout=None):
         q, v = json["query"], json["variables"]
@@ -65,10 +68,35 @@ class _Gh:
             if self.resolve_error:
                 return _Resp({"errors": [{"message": self.resolve_error}]})
             self.resolved.append(v["thread"])
+            for t in self.threads:
+                if t.get("id") == v["thread"]:
+                    t["isResolved"] = True
             data = {"resolveReviewThread": {"thread": {"isResolved": True}}}
+        elif "updatePullRequestReviewComment" in q:
+            self.edited.append((v["comment"], v["body"]))
+            data = {"updatePullRequestReviewComment": {
+                "pullRequestReviewComment": {"id": v["comment"]}}}
+        elif "minimizeComment" in q:
+            self.minimized.append(v["subject"])
+            for t in self.threads:
+                for c in (t.get("comments") or {}).get("nodes") or []:
+                    if c.get("id") == v["subject"]:
+                        c["isMinimized"] = True
+            data = {"minimizeComment": {"minimizedComment": {
+                "isMinimized": True, "minimizedReason": "outdated"}}}
         else:  # pragma: no cover
             raise AssertionError(q)
         return _Resp({"data": data})
+
+    def get(self, url, headers=None, timeout=None, params=None):
+        if self.board is not None and "/comments" in url:
+            return _Resp([{"id": 42, "body": self.board}])
+        return _Resp([])
+
+    def patch(self, url, json=None, headers=None, timeout=None):
+        if self.board is not None and "/comments" in url and json and "body" in json:
+            self.board = json["body"]
+        return _Resp({})
 
 
 class _Resp:
@@ -94,6 +122,8 @@ def _reply(author="alice", body=f"Fixed in {HEAD[:7]}", db_id=2):
 def run(monkeypatch):
     def _run(gh, findings=(), pr_author=None):
         monkeypatch.setattr(tr.httpx, "post", gh.post)
+        monkeypatch.setattr(bc.httpx, "get", gh.get)
+        monkeypatch.setattr(bc.httpx, "patch", gh.patch)
         monkeypatch.setattr(
             tr, "with_install_token_retry", lambda iid, fn: fn("tok"),
         )
@@ -104,27 +134,53 @@ def run(monkeypatch):
     return _run
 
 
-def test_fixed_and_not_reraised_replies_then_resolves(run):
+def test_fixed_thread_resolves_without_reply_comment(run):
+    """A pass whose findings no longer include a thread's finding resolves
+    that thread and posts no reply comment."""
     gh = _Gh([_thread()])
     assert run(gh) == 1
     assert gh.resolved == ["T1"]
-    assert len(gh.replies) == 1
-    assert gh.replies[0][0] == "T1" and HEAD[:7] in gh.replies[0][1]
+    assert gh.replies == []
 
 
-def test_reply_is_posted_before_resolve(run, monkeypatch):
-    gh = _Gh([_thread()])
-    order = []
-    orig = gh.post
+def test_refused_resolve_edits_root_comment_and_collapses_without_reply(run):
+    """When the resolve call is refused, the root comment is edited to start
+    with 'Fixed in <sha>' and collapsed, and no reply is posted."""
+    gh = _GhForbiddenResolve([_with_node_id(_thread())])
+    assert run(gh) == 1
+    assert gh.resolved == []
+    assert gh.replies == []
+    assert gh.minimized == ["C1"]
+    assert len(gh.edited) == 1
+    assert gh.edited[0][0] == "C1"
+    assert gh.edited[0][1].startswith(f"Fixed in {HEAD[:7]}")
 
-    def spy(url, json=None, **kw):
-        order.append("reply" if "addPullRequestReviewThreadReply" in json["query"]
-                     else "resolve" if "resolveReviewThread" in json["query"]
-                     else "list")
-        return orig(url, json=json, **kw)
-    gh.post = spy
-    run(gh)
-    assert order == ["list", "reply", "resolve"]
+
+def test_board_lists_closed_thread_with_fixing_sha_and_is_idempotent(run):
+    """The board lists the closed thread with the fixing sha, and running
+    the same pass twice changes nothing and adds no line twice."""
+    initial_board = (
+        "<!-- grug-board -->\n"
+        "### Grug review.\n"
+        "<!-- /grug-header -->\n\n"
+        "<!-- grug-sec:elder -->\n"
+        "**Required fixes**\n"
+        "<!-- /grug-sec:elder -->"
+    )
+    gh = _Gh([_thread()], board=initial_board)
+    assert run(gh) == 1
+    assert gh.resolved == ["T1"]
+    assert gh.board is not None
+    assert f"Fixed in {HEAD[:7]}" in gh.board
+    assert "T1" in gh.board
+    first_pass_board = gh.board
+
+    # Second pass: touches nothing twice and adds no line twice.
+    assert run(gh) == 0
+    assert gh.board == first_pass_board
+    assert gh.board.count(f"Fixed in {HEAD[:7]}") == 1
+    assert gh.board.count("T1") == 1
+
 
 
 def test_changed_but_reraised_nearby_stays_open(run):
@@ -218,12 +274,11 @@ def test_author_fixed_in_reply_is_not_answered_twice(run):
     assert gh.resolved == ["T1"] and gh.replies == []
 
 
-def test_author_fixed_in_reply_for_old_head_is_answered_again(run):
+def test_author_fixed_in_reply_for_old_head_is_resolved_without_reply(run):
     gh = _Gh([_thread(comments=[_comment(), _reply(author="alice", body="Fixed in 1234567: done")])])
     assert run(gh, pr_author="alice") == 1
     assert gh.resolved == ["T1"]
-    assert len(gh.replies) == 1
-    assert HEAD[:7] in gh.replies[0][1]
+    assert gh.replies == []
 
 
 def test_author_reply_with_null_body_blocks_resolution_without_raising(run):
@@ -313,7 +368,7 @@ def test_forbidden_resolve_falls_back_to_collapsing_the_comment(run):
     collapse its own comment as outdated. That is the fallback."""
     gh = _GhForbiddenResolve([_with_node_id(_thread())])
     assert run(gh) == 1
-    assert len(gh.replies) == 1
+    assert gh.replies == []
     assert gh.resolved == []
     assert gh.minimized == ["C1"]
 

@@ -1,130 +1,244 @@
-<p align="center">
-  <img src="assets/grug-portrait.png" width="200" alt="Grug. Grumpy caveman. Holding club.">
-</p>
+# grug
 
-<h1 align="center">Grug</h1>
+A GitHub App that reviews every pull request: plan, code and security.
 
-<p align="center">
-  <strong>Grug see bug. Grug crush bug. Grug guard code.</strong><br>
-  One grumpy caveman. Whole software lifecycle.
-</p>
+Grug checks that a PR says why it exists, what done looks like and how big
+it is, reviews the code with an LLM, and scans it for security problems. It
+answers with check runs and inline review comments, not a pile of chat
+comments. It is for teams and agent fleets that want every PR held to the
+same bar before merge. You ship. Grug guard.
 
-<p align="center">
-  <a href="https://github.com/apps/grug-tribe/installations/new"><img src="https://img.shields.io/badge/Install_Grug-fbbf24?style=for-the-badge&labelColor=181613" alt="Install Grug"></a>
-  <a href="https://grug.lol"><img src="https://img.shields.io/badge/grug.lol-181613?style=for-the-badge" alt="grug.lol"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/AGPL--3.0-181613?style=for-the-badge" alt="AGPL-3.0"></a>
-</p>
+## What it does
 
----
+Each part of the review is a persona with its own check run, named
+`Grug - <Persona>`. On a PR you see:
 
-## What Grug do
+| Check | What it looks at | When it fails |
+|---|---|---|
+| `Grug - Chief` | The PR body, read as a Hunt Plan (see Contributing). Runs at once, no LLM. | A required section is missing or empty, the PR is `Size: XL`, or a linked ticket has no epic. |
+| `Grug - Elder` | The code. An LLM review with whole-file and cross-file context, posted as inline findings plus a findings table in the check summary. | It finds a real problem. A degraded review (model outage, unreadable answer) ends `neutral`, never a block. |
+| `Grug - Guard` | Security: SAST, secrets on added lines, dependency CVEs, and Terraform, Kubernetes and Dockerfile misconfigs. An LLM judge drops the noise first. | Advisory by default: findings post as `neutral` until the repo turns on Guard blocking. |
 
-Grug is a modular GitHub bot with focused **personas** across the SDLC. Four
-are enabled by default:
+Also on by default:
 
-- **Chief** (`Grug - Chief`) - plan readiness before the hunt leaves the cave
-- **Elder** (`Grug - Elder`) - durable Cave review with Markings, Lore, Omen
-- **Guard** (`Grug - Guard`) - cave-mouth security (SAST, secrets, SCA, IaC + Seer)
-- **Teller** (`Grug - Teller`) - tale of the hunt (walkthrough + mermaid map)
+- **Teller** (`Grug - Teller`) writes a walkthrough of the change into its
+  check run and the PR's board comment.
+- **Haunt** comments once when a PR closes over an unresolved critical
+  finding.
 
-**Smasher**, **Warder**, and **Pulse** are wired as opt-in tracers. Omen runtime
-signal already augments Elder where a repository-to-service mapping exists.
-Check titles use caveman names (`Grug - <Persona>`); legacy aliases dual-post
-during cutover so old required-status rulesets keep working.
+Opt-in per repo: **Smasher** (mutation testing), **Totem** (release notes
+and semver after merge) and **Drum** (scheduled project-health nudges).
 
-Grug live in GitHub. Grug post Check Runs. Grug never spam comments. **You ship. Grug guard.**
+Talk to Grug by commenting on the PR with a slash command. Use no at-sign:
+the bot is `grug-tribe[bot]`, and the at-sign handle belongs to someone else.
 
-## Install
+| Command | What it does |
+|---|---|
+| `/grug improve` | Elder reviews the PR again and re-posts its findings. |
+| `/grug recheck` | Chief re-runs the Hunt Plan checks. |
+| `/grug ask <question>` | Answers a question about the diff as a reply. |
+| `/grug fix` | Applies every unresolved suggested fix as one commit. |
+| `/grug review` | One Elder review now, even while Elder is paused. |
+| `/grug resume` | Lifts the auto-pause (five pushes in ten minutes) and reviews what changed. |
 
-### Hosted SaaS — recommended
+The full list, including `test-gaps`, `learnings` and `accept-removal`, is
+at the top of
+[`services/webhook/grug_commands.py`](services/webhook/grug_commands.py).
 
-1. Sign in at [grug.lol](https://grug.lol) with GitHub
-2. Install the **Grug Boss** GitHub App on the repos you want gated
-3. Toggle personas per-repo in the dashboard
+## Quick start
 
-That's it. Webhook is wired, check-runs post on every PR.
+Hosted, at [grug.lol](https://grug.lol):
 
-> **Note:** the hosted instance is **allowlist-gated**. Request access by
-> opening a GitHub issue on this repo (no bracket prefix needed, `gh issue
-> create` works fine) - a maintainer will pick it up.
-> Self-host (below) is the open path and needs nobody's
-> approval.
+1. Sign in with GitHub.
+2. Install the `grug-tribe` GitHub App on the repos you want reviewed.
+3. Turn personas on or off per repo in the dashboard.
+4. Open a PR. Chief, Elder and Guard post their checks on it.
 
-### Self-host (run Grug in your own cave)
+The hosted instance is allowlist-gated: open an issue on this repo to ask
+for access.
 
-Grug is AGPL-3.0. Deploy your own instance against your own AWS account + Cloudflare account. Step-by-step in [`docs/SELF_HOST.md`](docs/SELF_HOST.md).
+To make Grug gate merges, add `Grug - Elder` (and `Grug - Chief` if you
+want the Hunt Plan enforced) as required status checks on the branch.
 
+To run your own Grug instead (it is AGPL-3.0), follow
+[`docs/SELF_HOST.md`](docs/SELF_HOST.md); Configuration below lists what you
+must bring.
+
+## How it works
+
+```mermaid
+flowchart TB
+    gh["GitHub"]
+    browser["Browser"]
+
+    subgraph cf["Cloudflare"]
+        pages["web SPA<br/>Cloudflare Pages"]
+        tunnel["Worker + tunnel"]
+    end
+
+    subgraph k8s["Kubernetes"]
+        webhook["grug-webhook<br/>HMAC verify, then persona dispatch:<br/>Chief, Elder, Guard"]
+        api["grug-api<br/>OAuth, /me, /installations"]
+        consumer["grug-consumer<br/>Elder reviews from SQS"]
+        poller["grug-poller<br/>CronJob, every 15 min"]
+    end
+
+    subgraph aws["AWS"]
+        sqs[("SQS")]
+        keys["KMS + SSM"]
+    end
+
+    pg[("Postgres<br/>CNPG")]
+    llm["LLM backends"]
+
+    gh -- "webhook" --> tunnel
+    browser --> pages
+    pages -- "API calls" --> tunnel
+    tunnel --> webhook
+    tunnel --> api
+    webhook -- "Elder jobs" --> sqs
+    sqs --> consumer
+    consumer --> llm
+    k8s -- "state" --> pg
+    k8s -. "tokens, secrets" .-> keys
+    k8s -- "check runs, comments" --> gh
 ```
-# roughly
-aws ssm put-parameter ...   # pre-load App secrets
-pulumi up                   # provision AWS infra (SSM refs, SQS, KMS, DD monitors)
-# provision Postgres (grug_kv on CNPG) + stand up a Cloudflare tunnel
-# push to main → deploy.k8s.yml builds the images + applies k8s/ to your cluster
-# point GitHub App webhook → webhook.<your-domain>/webhook/github
-# done. Grug guard now.
-```
 
-## What Chief checks (Hunt Plan)
+| Part | What it does | Code |
+|---|---|---|
+| web | Landing page and dashboard (React + Vite) on Cloudflare Pages | [`web/`](web/) |
+| grug-webhook | Checks GitHub's signature, runs Chief, starts Guard and Teller, and queues Elder | [`services/webhook/`](services/webhook/) |
+| grug-consumer | Waits for a PR to settle, then runs Elder reviews, reruns and `/grug ask` | [`services/webhook/consumer.py`](services/webhook/consumer.py) |
+| grug-poller | Reads reactions on Grug's comments to learn which findings were right | [`services/webhook/poller_handler.py`](services/webhook/poller_handler.py) |
+| grug-api | GitHub sign-in, the dashboard's reads and writes, admin | [`services/api/`](services/api/) |
+| Personas | Chief, Elder, Guard and the rest, shared by both services | [`services/_shared/personas/`](services/_shared/personas/) |
+| Deploy | Kubernetes manifests, and Pulumi for the AWS side | [`k8s/`](k8s/), [`infra/pulumi/`](infra/pulumi/) |
 
-Before the tribe leave the cave, Chief reads the **Hunt Plan** on the PR body —
-**6 blocking plan checks, 3 advisory:**
+Postgres holds installs, repo settings, review history and learnings. KMS
+encrypts users' OAuth tokens, and pods read the App key and LLM keys from
+SSM at runtime. [`docs/NETWORK-TOPOLOGY.md`](docs/NETWORK-TOPOLOGY.md) has
+the request flows and trust boundaries.
 
-| | Plan check | Pass when | Blocks? |
-|---|---|---|---|
-| yes | `why` (why hunt) | Has `## Why` (or `## Summary`) with at least 5 words | **yes** |
-| yes | `acceptance` (what good look like) | Has `## Acceptance criteria` (or `## Test plan`) with at least 3 non-empty bullets | **yes** |
-| yes | `estimate` (how big) | Body includes `Size: XS/S/M/L` (XL must be split) | **yes** |
-| yes | `scope-fence` (where stop) | Has a non-empty `## Out of scope` section | **yes** |
-| yes | `linked-issue-completeness` (ticket done) | Every ticket closed by a closing keyword has its checkboxes ticked | **yes** |
-| yes | `linked-issue-epic` (which epic) | Every ticket the body names is an epic or belongs to one (grug#1034) | **yes** |
-| soft | `issue-link` (which ticket) | Body links a ticket, e.g. `Refs #N` or `Part of #N` | advisory |
-| soft | `loom-footer` (loom mark) | A PR naming a loom ticket carries the Loom audit footer | advisory |
-| soft | `in-scope` (in scope) | All changed files trace to the linked issue's scope (grug#1195) | advisory |
+## Run and test locally
 
-Text inside HTML comments counts for nothing, and neither does a bare `-`
-or empty checkbox: a PR body left as the template ships fails the plan.
-Write `Refs #N` and `Part of #N`, not a closing keyword: a ticket closes
-once its boxes are ticked, not when the PR merges.
-
-The `in-scope` check names any rider files the linked issue never asked for
-and is advisory by default; org/repo config can promote it to blocking.
-
-The Hunt Plan is for PRs written by people and by operator sessions. A PR
-body carrying an agent-authored marker (a `claude.ai/code/session_` link or
-Claude Code's attribution footer) is still checked when its author is a
-trusted operator (a human owner, member or collaborator on the repo). It gets
-a **neutral** `Grug - Chief`, which still satisfies a required check, when it
-is a fleet lane PR (agent marker plus the Loom audit footer), carries the
-explicit `<!-- grug:agent-authored -->` opt-out, or comes from any other
-author. The check-run title names the rule that applied. Elder and Guard
-review every PR as usual.
-
-### Check a Hunt Plan before you open the PR
-
-`gh pr create --body` skips the repo's PR template, so a missing section or a
-ticket with no epic usually shows up as a red `Grug - Chief` after the PR is
-open. `scripts/chief_check.py` runs the same evaluator Chief runs, against
-your `gh` login, and prints the same title and table:
+You need Python 3.13 and [uv](https://docs.astral.sh/uv/); the web app also
+needs Node 20. CI (`check.python.yml`) runs these four targets against a
+Postgres service container:
 
 ```bash
-make chief-check REPO=owner/name BODY=pr.md      # a body you are about to post
-make chief-check REPO=owner/name PR=123          # an open PR's current body
-gh pr create --body-file pr.md                   # once it exits 0
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=test \
+  -e POSTGRES_DB=grug_test postgres:18-alpine
+export GRUG_TEST_DATABASE_URL="postgresql://postgres:test@localhost/grug_test"
+
+make webhook-test
+make scripts-test
+make api-test
+make pg-test
 ```
 
-It exits 0 when Chief would pass (or skip), 1 when Chief would hold the PR,
-and 2 on a usage error. When `which epic` fails it lists the repo's open
-`Epic: ...` issues and the two fixes: add the ticket as a sub-issue of an
-epic, or write `Part of #<epic>` in the ticket's body.
+Without `GRUG_TEST_DATABASE_URL` the store tests skip, and without
+`opengrep` or `semgrep` on your PATH the SAST rule tests skip; CI has both.
+`make test` runs the first three targets in one go.
 
-### Verify stated claims after a deploy
+The web app, as `check.web.yml` runs it:
 
-`scripts/shepherd_verify.py` reads the PR's `## Acceptance criteria` bullets
-and checks explicitly named `Metric`, `Log event`, `Endpoint`, or `GET`
-signals. Names may be in backticks, and metric names or URLs may be plain
-text. It does not infer a signal from prose elsewhere in the PR. The caller
-runs it after deploy completion and supplies source-specific query commands
-and known-live baselines:
+```bash
+cd web
+npm ci
+npm test
+npm run build
+npm run dev        # local server on port 5173
+```
+
+## Configuration
+
+**Per repo**, an optional `.grug.yaml` at the repo root tunes Elder. Grug
+reads it from the PR's base commit, so a PR cannot loosen its own review.
+
+| Key | Effect |
+|---|---|
+| `ignore` | Path globs Elder never reviews |
+| `path_instructions` | Extra review instructions for files matching a path |
+| `min_inline_severity` | Findings below this level stay in the summary, with no inline comment |
+| `skip_prs` | Skip Elder and Teller for PRs matching `authors`, `labels` or `title_patterns` |
+
+```yaml
+ignore:
+  - vendor/**
+  - "*.lock"
+path_instructions:
+  - path: "k8s/**"
+    instructions: Check every container sets resource requests and limits.
+min_inline_severity: medium
+```
+
+[`docs/REPO_CONFIG.md`](docs/REPO_CONFIG.md) has the details. Which
+personas run, and whether Elder and Guard block, is set per repo in the
+dashboard.
+
+**Self-hosting**, you supply:
+
+| Setting | Where | What it does |
+|---|---|---|
+| GitHub App ID, private key, webhook secret, OAuth client ID and secret | SSM under `/grug/` | Your own App; [`docs/HITL_PREREQUISITES.md`](docs/HITL_PREREQUISITES.md) registers it |
+| Database URL | SSM `/grug/database-url` | Your Postgres for the `grug_kv` table |
+| Domain, AWS region, Cloudflare zone and token | Pulumi stack config, from [`Pulumi.dev.yaml.example`](infra/pulumi/Pulumi.dev.yaml.example) | Provisions SQS, KMS, S3 and DNS |
+| LLM API keys | SSM, named by the `*_SSM` env vars in [`k8s/`](k8s/) | Elder's model backends |
+| `GRUG_DATADOG_ENABLED` | Env of each Deployment and CronJob (services), and a repository Actions variable read by `web.deploy.yml` (web RUM) | Off unless truthy; see [`docs/SELF_HOST.md`](docs/SELF_HOST.md). Datadog has been off on the hosted instance since 2026-10-05. |
+
+Not in this repo: an AWS account, a Cloudflare account with a tunnel, a
+Kubernetes cluster with arm64 nodes and an image registry, and a Postgres
+server. [`docs/SELF_HOST.md`](docs/SELF_HOST.md) walks through each step.
+
+## Status
+
+Open work is tracked in the goal
+[#1143, "the review bot makes lane PRs better and never slower"](https://github.com/quadseven/grug/issues/1143).
+
+## Contributing
+
+Changes land through a pull request; direct pushes to `main` are refused.
+The branch rules require `grug python tests` and `Grug - Chief`, and a PR
+merges only once `Grug - Elder` also passes on its head commit.
+Read [`AGENTS.md`](AGENTS.md) first: this repository is public.
+
+Grug reviews its own repo, so fill in the Hunt Plan from the
+[PR template](.github/pull_request_template.md). Chief checks it:
+
+| Check | Passes when | Blocks? |
+|---|---|---|
+| `why` | `## Why` (or `## Summary`) has at least 5 words | yes |
+| `acceptance` | `## Acceptance criteria` (or `## Test plan`) has 3+ non-empty bullets | yes |
+| `estimate` | The body says `Size: XS`, `S`, `M` or `L` (XL must be split) | yes |
+| `scope-fence` | `## Out of scope` is not empty | yes |
+| `linked-issue-completeness` | Every ticket closed by a closing keyword has its boxes ticked | yes |
+| `linked-issue-epic` | Every ticket the body names is an epic or belongs to one | yes |
+| `issue-link` | The body links a ticket, e.g. `Refs #N` or `Part of #N` | advisory |
+| `loom-footer` | A PR naming a Loom ticket carries the Loom audit footer | advisory |
+| `in-scope` | Every changed file traces to the linked ticket's scope | advisory |
+
+Text inside HTML comments does not count, so an unfilled template fails.
+Write `Refs #N` rather than a closing keyword: a ticket closes once its
+boxes are ticked, not when the PR merges. A PR body with an agent's marker
+gets a `neutral` Chief unless a trusted maintainer opened it.
+
+Run the same checks before you open the PR. It exits 0 when Chief would
+pass and 1 when it would hold the PR:
+
+```bash
+make chief-check REPO=owner/name BODY=pr.md   # a body you are about to post
+make chief-check REPO=owner/name PR=123       # an open PR
+```
+
+## Tools
+
+- `make pulumi-preview`: read-only diff of the AWS infra.
+- `make smoke`: checks the public endpoints answer.
+- `make elder-eval` and `make sast-benchmark`: score review quality on a
+  committed corpus. These call real models.
+- [`scripts/shepherd_verify.py`](scripts/shepherd_verify.py): after a
+  deploy, checks a PR's acceptance bullets that name a `Metric`,
+  `Log event`, `Endpoint` or `GET` signal.
 
 ```bash
 python3 scripts/shepherd_verify.py --pr 123 --repo example-org/example-repo \
@@ -133,136 +247,25 @@ python3 scripts/shepherd_verify.py --pr 123 --repo example-org/example-repo \
   --baseline metric=your.known_live.metric
 ```
 
-The adapter receives `source signal start_epoch end_epoch criterion` as
-arguments and prints one nonnegative integer count. It must query the named
-source over that window, including both the target and its baseline from the
-same source. For an endpoint, it must count only responses matching the
-criterion's expected status or body. A nonzero exit or invalid count makes
-the result unverifiable.
-Supply a baseline for each source used by the PR. The baseline must be known
-to emit during the post-deploy window; a historical signal is not enough.
-The default is two checks 30 seconds apart. An absent target is `missing`
-only after both checks find its baseline live. An empty baseline, missing
-baseline configuration, failed lookup, or PR with no explicit observable is
-`unverifiable`. The output includes each criterion and the counts from each
-attempt. Exit codes are 0 observed, 1 missing, and 2 unverifiable.
+The adapter gets `source signal start_epoch end_epoch criterion` and prints
+one count. Each source needs a baseline known to emit in the window; a
+target is `missing` only when two checks 30 seconds apart both see the
+baseline live. Exit codes: 0 observed, 1 missing, 2 unverifiable.
 
-## What Elder and Guard check
+## Docs
 
-### Elder: deep code review (Apex)
-
-Every PR snapshot, after its base, head, and real author intent stay stable for
-the adaptive quiet window:
-
-- **Swift Hunt settle** - tiny PRs skip the quiet wait; medium PRs settle a few
-  seconds; large multi-file storms keep the full window. Elder posts an
-  `in_progress` `Grug - Elder` check the moment the durable job is
-  queued, so required-status rulesets show pending instead of "check missing".
-- **Tiered Cave review** (ADR-0019 / #645) - default is a single **coder** arm
-  for ordinary PRs; the **reasoner** arm escalates only on large diffs,
-  high-risk paths, explicit `deep-review`, or a calibration sample. Dual-arm
-  `GRUG_REVIEW_DEPTH=deep` remains the max-recall rollback. Covers 25+ named
-  correctness, error-handling, concurrency, and security-shape rules.
-  Whole-file + 1-hop cross-file context + PR intent ride every pass. SaaS
-  overload fallback stays last-resort (ADR-0005).
-- **Markings Board** - structured inline findings: severity, effort, What Elder
-  sees, Fix (one-click when safe), Lore citations from prior tribe history, and
-  a copy-paste agent repair prompt. Check-run summary is a full findings table.
-- **Lore + Omen** - accepted/rejected ledger history becomes measured confidence
-  and few-shot practices; Datadog runtime signal (Omen) fuses when a service map
-  exists - a moat that comes from owning the stack end-to-end.
-- **Stable snapshot identity** - bot HTML footers no longer thrash mid-flight
-  reviews; only base/head or real human intent changes re-queue Elder.
-- **Living Hunt + auto-pause** - a push after Elder's first review gets a delta
-  review of only what changed since the last reviewed head, with the commit
-  range in the check title. Five pushes inside ten minutes pause Elder with one
-  note on the PR; `/grug resume` lifts the pause and reviews the delta, and
-  `/grug review` takes one look while the pause stays (grug#1188).
-- **Deletion-only review** - a PR that only deletes files gets a verdict. A
-  deleted guard (a CI workflow, CODEOWNERS, ruleset config, a security, policy
-  or leak-scan file, or a test whose code stays) blocks, and only a person can
-  clear it. The finding prints the exact command,
-  `/grug accept-removal <path> <full-head-sha>`. From a User account that is
-  an admin (OWNER, or admin permission), it clears that path's finding while
-  the SHA is still the head, then Elder re-reviews. The check summary names
-  who accepted it and on which head; a new push needs a new acceptance
-  (grug#1401, grug#1405).
-- **Feedback learning** - judge labels and write-authorized maintainer reactions
-  retain per-model provenance. Confirmed findings refresh positive practices and
-  few-shot examples; false positives become bounded AVOID guidance for later
-  reviews.
-
-### Guard: deterministic security review
-
-- **SAST** — Semgrep OSS over vendored offline rules + a zero-dep builtin
-  detector (sql/command/template injection, path traversal, SSRF, unsafe
-  deserialization, weak crypto, cleartext secret logging).
-- **SCA** — dependency-CVE scan of manifest/lockfile changes via the OSV API.
-- **Secret scanning** — provider-token patterns + entropy-gated generic rule
-  on added lines of ANY file type; values are masked, never echoed.
-- **IaC scanning** — Terraform / Kubernetes YAML / Dockerfile misconfigs
-  (open 0.0.0.0/0, privileged pods, public ACLs, root containers).
-- **Exploitability judge** — an LLM precision layer that grades every
-  security candidate real-vs-noise before it reaches your PR; recall +
-  precision are tracked against a committed benchmark corpus.
-
-Advisory-first: Elder and Guard findings post as `neutral` until their separate
-per-repo blocking flags are enabled.
-
-## Roadmap (epic #464)
-
-- expand Smasher beyond its mutation-testing tracer
-- add deploy gating to Warder's changelog and semver analysis
-- deepen Pulse's scheduled project-health sweep
-- add title/body scope review to Chief
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                    grug.lol                            │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐      │
-│  │  web/    │  │ webhook/ │  │     api/         │      │
-│  │ React+   │  │ FastAPI  │  │  FastAPI         │      │
-│  │ Vite SPA │  │ pod      │  │  (OAuth, /me,    │      │
-│  │ CF Pages │  │ (HMAC →  │  │  /installations) │      │
-│  │          │  │ persona  │  │   pod            │      │
-│  │          │  │ dispatch)│  │                  │      │
-│  └──────────┘  └──────────┘  └──────────────────┘      │
-│       webhook + api on Kubernetes (OKE),               │
-│       behind a Cloudflare tunnel; + grug-consumer       │
-│       (SQS) and grug-poller job    │
-│                                                        │
-│  ┌──────────────────────────────────────────────┐     │
-│  │ infra/pulumi/  +  k8s/                        │     │
-│  │ Postgres (CNPG) + SQS + KMS + SSM + CF + DD   │     │
-│  └──────────────────────────────────────────────┘     │
-└──────────────────────────────────────────────────────┘
-```
-
-PRD #21 + slice issues #22-#34 track v1.
-
-## Contributing
-
-Issues + PRs welcome. Use the Hunt Plan template — Grug will gate your own PR. Fair is fair.
-
-PR body must have `## Why`, `## Acceptance criteria`, `## Out of scope`, `Size:`, and `Refs #N` (plus `Part of #N` naming the epic).
-
-## Related docs
-
-| Doc | What inside |
+| Doc | What is in it |
 |---|---|
-| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Operations (first deploy, secret rotation, tear-down + rebuild) |
-| [`docs/SELF_HOST.md`](docs/SELF_HOST.md) | Step-by-step self-host setup |
-| [`docs/HITL_PREREQUISITES.md`](docs/HITL_PREREQUISITES.md) | One-time GitHub App registration walkthrough |
-| [`docs/NETWORK-TOPOLOGY.md`](docs/NETWORK-TOPOLOGY.md) | k8s/tunnel/CNPG/SQS topology, request flows, trust boundaries |
-| [`CONTEXT.md`](CONTEXT.md) | Domain glossary (every term you'll see in the code) |
+| [`CONTEXT.md`](CONTEXT.md) | Glossary: every term in the code |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Operations: first deploy, secret rotation, tear-down and rebuild |
+| [`docs/SELF_HOST.md`](docs/SELF_HOST.md) | Running your own Grug |
+| [`docs/HITL_PREREQUISITES.md`](docs/HITL_PREREQUISITES.md) | Registering the GitHub App |
+| [`docs/NETWORK-TOPOLOGY.md`](docs/NETWORK-TOPOLOGY.md) | Request flows, placement, trust boundaries |
+| [`docs/REPO_CONFIG.md`](docs/REPO_CONFIG.md) | `.grug.yaml` reference |
 | [`docs/adr/`](docs/adr/) | Architecture decision records |
 
 ## License
 
-[AGPL-3.0](LICENSE) — see [`docs/SELF_HOST.md`](docs/SELF_HOST.md) for network-service compliance notes if you self-host.
-
-<p align="center">
-  <sub>Grug not lawyer. Grug just guard.</sub>
-</p>
+[AGPL-3.0](LICENSE). If you run a modified Grug as a network service,
+[`docs/SELF_HOST.md`](docs/SELF_HOST.md) explains what you owe its users.
+Grug not lawyer. Grug just guard.

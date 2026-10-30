@@ -29,6 +29,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -37,9 +38,11 @@ import httpx
 
 from adapters.install_store import get_repo_config, is_elder_paused  # type: ignore
 from github_app_auth import get_app_id, with_install_token_retry
+from check_run_reconciler import _STUCK_IN_PROGRESS_MAX_AGE_MINUTES
 from github_checks_client import (
     CheckRunResult,
     list_check_runs_for_ref,
+    patch_check_run,
     post_check_run,
 )
 from personas import board_client
@@ -96,6 +99,13 @@ _MAX_SETTLE_SECONDS = 300
 # faster than Elder can finish reviewing it. A genuinely new commit always
 # resets this to 0; it only counts same-sha redrives.
 _MAX_INTENT_DRIFT_REDRIVES = 3
+
+# grug#1494: a review where every model failed (`all_failed`) raises, so the
+# queue redelivers it. Deliveries below this number leave a blocking repo's
+# Elder check pending; from this one on the failure is published, so a long
+# provider outage still ends in a red check instead of waiting forever. The
+# queue's own dead-letter limit stays the outer bound.
+_ALL_FAILED_AUTO_RERUN_DELIVERIES = 3
 # A learn job whose classifier backends are all rate limited or down (the
 # OpenRouter key is free-tier only and refuses intermittently - operator
 # decision 2026-09-23) is DEFERRED: re-enqueued as a fresh message with a
@@ -627,11 +637,15 @@ def enqueue_review(
 # The static TPM check is requestable but logged + skipped below (deliberate).
 
 
-def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, question: str) -> None:
+def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, question: str, reply_to_comment_id: int = 0) -> None:
     """Enqueue a `/grug ask` job (#528) so the heavy LLM Q&A runs in the
     consumer, NOT inline in the webhook ACK path. Dedup keys on comment_id
     (each question is distinct - unlike a persona rerun), so a re-delivered
-    comment collapses but two different questions do not."""
+    comment collapses but two different questions do not.
+
+    `reply_to_comment_id` (#822) is the review-thread root when the question
+    was asked inside a review thread; the consumer then answers IN that
+    thread with its hunk as context. 0 = a plain PR comment (top-level)."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
     _sqs.send_message(
@@ -640,6 +654,7 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
             "schema_version": SCHEMA_VERSION, "kind": "ask",
             "install_id": install_id, "repo": repo, "pr_number": pr_number,
             "comment_id": comment_id, "question": question,
+            "reply_to_comment_id": reply_to_comment_id,
         }),
         MessageGroupId=_ask_group_id(install_id, repo, pr_number),
         MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:ask:{comment_id}",
@@ -730,11 +745,46 @@ def _gh_post(token: str, url: str, json_body: dict[str, Any]) -> None:
     resp.raise_for_status()
 
 
-def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> str:
+def _thread_context(token: str, owner: str, repo_name: str, root_comment_id: int) -> str:
+    """The review-thread block for an in-thread ask (#822): the comment the
+    thread is about (usually one of Grug's findings) plus its diff hunk, so
+    the answer can cite the specific finding and lines. Best-effort - an
+    unreadable thread degrades to the plain diff context, never to silence."""
+    from urllib.parse import quote as _q
+    try:
+        c = _gh_get(
+            token,
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+            f"/pulls/comments/{root_comment_id}",
+        )
+    except Exception as e:  # noqa: BLE001 - context enrichment must not kill the answer
+        log.warning(
+            "ask_thread_context_failed",
+            extra={"comment_id": root_comment_id, "kind": type(e).__name__},
+        )
+        return ""
+    parts = ["REVIEW THREAD the question was asked in:"]
+    path = str(c.get("path") or "")
+    line = c.get("line") or c.get("original_line")
+    if path:
+        parts.append(f"File: {path}" + (f", line {line}" if line else ""))
+    if c.get("body"):
+        parts.append(f"Comment under discussion:\n{c['body']}")
+    if c.get("diff_hunk"):
+        parts.append(f"Diff hunk:\n{c['diff_hunk']}")
+    return "\n".join(parts) if len(parts) > 1 else ""
+
+
+def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str, reply_to_comment_id: int = 0) -> str:
     """Answer a /grug ask question in the consumer (async, #528). Fetches the
     diff, runs the JSON-constrained Q&A over the REDACTED question + diff, and
     posts the answer as a reply. Records an activity row. Never raises past
-    the job (a bad answer degrades to a fallback reply)."""
+    the job (a bad answer degrades to a fallback reply).
+
+    With `reply_to_comment_id` (#822) the question came from a review thread:
+    the answer posts as a reply IN that thread (the one notification GitHub
+    already sends for a thread reply - no extra email), with the thread's
+    finding + hunk ahead of the diff as context."""
     from urllib.parse import quote as _q
     from llm_client import _redact_secrets, answer_pr_question  # type: ignore
     from markdown_safety import neutralize_mentions  # type: ignore
@@ -748,9 +798,32 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
             f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/pulls/{pr_number}",
             accept="application/vnd.github.v3.diff",
         )
+        context = diff
+        post_url = (
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+            f"/issues/{pr_number}/comments"
+        )
+        footer = "*(Grug answered from the PR diff - may be wrong; verify.)*"
+        thread_note = ""
+        if reply_to_comment_id:
+            thread = _thread_context(token, owner, repo_name, reply_to_comment_id)
+            if thread:
+                context = f"{thread}\n\nFULL PR DIFF:\n{diff}"
+            else:
+                # Say so in the open: an answer that silently lost its
+                # thread context would read as if it had seen the finding.
+                thread_note = (
+                    "\n\n*(Grug could not load the thread itself, so this "
+                    "answer is from the PR diff only.)*"
+                )
+            post_url = (
+                f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+                f"/pulls/{pr_number}/comments/{reply_to_comment_id}/replies"
+            )
+            footer = "*(Grug answered from the thread and the PR diff - may be wrong; verify.)*"
         answer = answer_pr_question(
             q,
-            diff,
+            context,
             install_id,
             pr_context={
                 "installation_id": install_id,
@@ -763,14 +836,19 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
         # @mention in it would notify a real GitHub user as if Grug itself
         # pinged them (#561, same class as Teller's #554 round-4 fix).
         safe_answer = neutralize_mentions(answer) if answer else answer
-        body = (f"{safe_answer}\n\n*(Grug answered from the PR diff - may be wrong; verify.)*"
-                if safe_answer else
-                "Grug could not answer that right now (the thinking-rock is tired). Try again.")
-        _gh_post(
-            token,
-            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/issues/{pr_number}/comments",
-            {"body": body},
-        )
+        if safe_answer:
+            body = f"{safe_answer}\n\n{footer}{thread_note}"
+            if not reply_to_comment_id:
+                # A top-level answer names the question it answers (#822
+                # criterion 1: the reply belongs to its thread - the PR
+                # conversation). The quote is neutralized like the answer:
+                # it is echoed user text posted under Grug's authority.
+                quoted = neutralize_mentions(q[:280])
+                body = f"> {quoted}\n\n{body}"
+        else:
+            # Criterion 6's wording, even when the model gave nothing back.
+            body = "Grug not know. The thinking-rock is tired - try again."
+        _gh_post(token, post_url, {"body": body})
         return "answered" if answer else "ask_no_answer"
     result = with_install_token_retry(install_id, _do)
     try:
@@ -1183,7 +1261,10 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     repo_full = str(job["repo"])  # "owner/name"
     pr_number = int(job["pr_number"])
     if job.get("kind") == "ask":
-        return _run_ask(install_id, repo_full, pr_number, str(job.get("question", "")))
+        return _run_ask(
+            install_id, repo_full, pr_number, str(job.get("question", "")),
+            reply_to_comment_id=int(job.get("reply_to_comment_id", 0) or 0),
+        )
     if job.get("kind") == "learn":
         # A deferred job (every classifier backend was rate limited) arrives
         # at once; FIFO queues have no per-message delay. Hold it until due.
@@ -1200,7 +1281,9 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
             first_deferred_at=float(job.get("first_deferred_at", 0) or 0),
         )
     if job.get("kind") == "review":
-        return _run_hot_review(job, install_id, repo_full, pr_number)
+        return _run_hot_review(
+            job, install_id, repo_full, pr_number, receive_count=receive_count,
+        )
     persona = str(job.get("persona", "elder"))
 
     if persona not in _RERUNNABLE:
@@ -1430,32 +1513,124 @@ def _command_fields(job: dict[str, Any]) -> dict[str, Any]:
 
 
 # grug#1430: a command job waits behind an Elder review in flight on the
-# same head, polled this often, for at most this long from the first hold -
-# a check stuck in progress with no worker must not hold a command forever.
+# same head, polled this often.
 _COMMAND_HOLD_POLL_SECONDS = 60
-_COMMAND_HOLD_MAX_SECONDS = 1800
+# grug#1447: an Elder run in progress longer than the check-run sweeper's
+# stuck-run cutoff (grug#947, GRUG_CHECK_RUN_STUCK_MAX_AGE_MINUTES) has no
+# worker left; a command does not wait on it. The hold is bounded by the
+# same cutoff, so one orphaned run always ends by that rule before the cap.
+_ELDER_RUN_ABANDONED_SECONDS = _STUCK_IN_PROGRESS_MAX_AGE_MINUTES * 60
+_COMMAND_HOLD_MAX_SECONDS = _ELDER_RUN_ABANDONED_SECONDS
 
 
-def _elder_running_on(install_id: int, owner: str, repo_name: str, head_sha: str) -> bool:
-    """True while an Elder check on `head_sha` is queued or in progress.
+def _elder_run_in_flight(
+    install_id: int, owner: str, repo_name: str, head_sha: str,
+) -> dict[str, Any] | None:
+    """The Elder check run queued or in progress on `head_sha`, or None.
     An unreadable listing is NOT a review in flight: holding on a guess
     could hold the command until the cap for nothing."""
-    from review_label import elder_check_state  # type: ignore
+    def _do(token: str) -> dict[str, Any] | None:
+        for run in list_check_runs_for_ref(token, owner, repo_name, head_sha):
+            if str(run.get("name") or "") not in _ELDER_CHECK_NAMES:
+                continue
+            if str(run.get("status") or "") in {"queued", "in_progress"}:
+                return run
+        return None
 
     try:
-        state = with_install_token_retry(
-            install_id,
-            lambda tok: elder_check_state(
-                token=tok, owner=owner, repo=repo_name, head_sha=head_sha,
-            ),
-        )
+        return with_install_token_retry(install_id, _do)
     except Exception as error:  # noqa: BLE001 - unreadable reads as not running
         log.warning(
             "rerun_command_check_state_failed",
             extra={"repo": f"{owner}/{repo_name}", "kind": type(error).__name__},
         )
-        return False
-    return state == "running"
+        return None
+
+
+def _run_age_seconds(run: dict[str, Any], now: float) -> float | None:
+    """Seconds since `run` started, or None when it carries no usable
+    `started_at` (an unknown age is never read as abandoned)."""
+    started_at = str(run.get("started_at") or "")
+    if not started_at:
+        return None
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return now - started.timestamp()
+
+
+def _answer_command(
+    *, install_id: int, owner: str, repo_name: str, pr_number: int, body: str,
+) -> bool:
+    """Reply on the PR for a held command. True when the reply landed."""
+    from interactive import _reply  # type: ignore
+
+    return _reply(
+        lambda fn: with_install_token_retry(install_id, fn),
+        owner, repo_name, pr_number, body,
+    )
+
+
+def _supersede_abandoned_run(
+    run: dict[str, Any], *, install_id: int, owner: str, repo_name: str,
+    pr_number: int, head_sha: str, age_s: float,
+) -> None:
+    """Close an Elder run that lost its worker and say so on the PR
+    (grug#1447). Both are best-effort: the fresh review that follows posts
+    its own check, which replaces this one either way."""
+    minutes = int(age_s // 60)
+    result = CheckRunResult(
+        name=str(run.get("name") or _ELDER_CHECK_NAME),
+        head_sha=str(run.get("head_sha") or head_sha),
+        status="completed",
+        conclusion="failure",
+        title="Elder review abandoned",
+        summary=(
+            f"This Elder run was in progress for {minutes} minutes with no "
+            f"conclusion, past the {_STUCK_IN_PROGRESS_MAX_AGE_MINUTES}-minute "
+            "cutoff, so its worker is gone. It is not a real finding. A "
+            "queued `/grug` command superseded it with a fresh review of "
+            "this commit, whose check replaces this one."
+        ),
+    )
+    run_id = run.get("id")
+    if not isinstance(run_id, int):
+        # A listing row with no usable id cannot be PATCHed; the fresh
+        # review's own check still replaces it.
+        log.warning(
+            "rerun_command_abandoned_close_skipped",
+            extra={"repo": f"{owner}/{repo_name}", "pr": pr_number},
+        )
+    else:
+        try:
+            with_install_token_retry(
+                install_id,
+                lambda tok: patch_check_run(tok, owner, repo_name, run_id, result),
+            )
+        except Exception as error:  # noqa: BLE001 - the fresh review replaces it anyway
+            log.warning(
+                "rerun_command_abandoned_close_failed",
+                extra={"repo": f"{owner}/{repo_name}", "pr": pr_number,
+                       "kind": type(error).__name__},
+            )
+    # Not raised on a miss: a redelivery would find the run already closed
+    # and could start a second review. The fresh review's own check and
+    # board comment are the fallback sign; the miss is logged.
+    if not _answer_command(
+        install_id=install_id, owner=owner, repo_name=repo_name,
+        pr_number=pr_number,
+        body=(
+            f"Elder's review of {head_sha[:8]} stopped: its check was in "
+            f"progress for {minutes} minutes with no worker. Grug marked it "
+            "abandoned and started a fresh review for the queued command."
+        ),
+    ):
+        log.warning(
+            "rerun_command_abandoned_reply_failed",
+            extra={"repo": f"{owner}/{repo_name}", "pr": pr_number,
+                   "head_sha": head_sha[:8]},
+        )
 
 
 def _command_already_served(
@@ -1497,9 +1672,14 @@ def _command_queue_status(
       second review.
     - held: an Elder review is in flight on this head. The job goes back on
       the queue (its own group, so it stays behind the in-flight work) with
-      a short `not_before`, keeping its identity, until that review ends or
-      the hold cap passes. It is never dropped: a failed requeue raises, and
-      SQS redelivers the original."""
+      a short `not_before`, keeping its identity, until that review ends.
+      It is never dropped: a failed requeue raises, and SQS redelivers the
+      original.
+    - superseded (returns None): the in-flight run is older than the
+      stuck-run cutoff, so its worker is gone; it is closed as abandoned
+      and the command runs now (grug#1447).
+    - hold_cap_reached: held for the full cap; the command is not run and
+      Grug says so on the PR with the next step (grug#1447)."""
     if not job.get("comment_id"):
         return None
     repo_full = f"{owner}/{repo_name}"
@@ -1511,16 +1691,48 @@ def _command_queue_status(
     ):
         log.info("rerun_command_coalesced", extra=coords)
         return "rerun_coalesced"
-    if not head_sha or not _elder_running_on(install_id, owner, repo_name, head_sha):
+    run = _elder_run_in_flight(install_id, owner, repo_name, head_sha) if head_sha else None
+    if run is None:
         return None
     now = _now()
+    age = _run_age_seconds(run, now)
+    # Strictly past the cutoff, as the sweeper reads it. A held command was
+    # queued after its run started, so the run's age always passes the
+    # cutoff before the hold reaches the same cap.
+    if age is not None and age > _ELDER_RUN_ABANDONED_SECONDS:
+        # grug#1447: the run lost its worker; waiting on it is waiting on
+        # nothing. Close it and run the command now.
+        log.warning(
+            "rerun_command_superseded_abandoned_run",
+            extra={**coords, "run_age_s": int(age)},
+        )
+        _supersede_abandoned_run(
+            run, install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number, head_sha=head_sha, age_s=age,
+        )
+        return None
     hold_started = float(job.get("hold_started_at", 0) or 0) or now
     if now - hold_started >= _COMMAND_HOLD_MAX_SECONDS:
+        held_min = int((now - hold_started) // 60)
         log.warning(
             "rerun_command_hold_cap_reached",
             extra={**coords, "held_s": int(now - hold_started)},
         )
-        return None
+        # grug#1447: the end of a hold is answered, never silent. A reply
+        # that did not land raises, so SQS redelivers and it is tried again.
+        if not _answer_command(
+            install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number,
+            body=(
+                f"Grug held a queued `/grug` command for {held_min} minutes "
+                f"behind an Elder review of {head_sha[:8]} that has not "
+                "ended, so the command was not run. Next step: comment "
+                "`/grug improve` again once the Elder check on this commit "
+                "concludes, or push a new commit to start a fresh review."
+            ),
+        ):
+            raise RuntimeError("hold-cap reply did not land")
+        return "rerun_hold_cap_reached"
     fields = _command_fields(job)
     fields["hold_started_at"] = hold_started
     enqueue_rerun(
@@ -2273,6 +2485,7 @@ def _stop_staleness_watch(watch: _StalenessWatch | None) -> None:
 
 def _run_hot_review(
     job: dict[str, Any], install_id: int, repo_full: str, pr_number: int,
+    receive_count: int = 0,
 ) -> str:
     """Settle, cancel stale work, then run Elder on one current snapshot.
 
@@ -2524,6 +2737,7 @@ def _run_hot_review(
                     ),
                     blocking=elder_blocking,
                     cancel_event=watch.cancel,
+                    rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
                 )
             finally:
                 _stop_staleness_watch(watch)

@@ -107,12 +107,121 @@ def test_annotated_body_still_reads_its_severity():
     assert c.severity == "high"
 
 
+def test_thread_resolved_by_a_person_is_not_carried_without_the_flag():
+    """#1440: a thread a person resolved carries its resolver in the
+    listing (`resolvedBy`) even when the `isResolved` flag itself is not
+    in the thread dict the listing hands over. Reading the thread state
+    first means that thread is left out, not carried as still open."""
+    thread = _thread()
+    del thread["isResolved"]
+    thread["resolvedBy"] = {"login": "a-reviewer"}
+    assert cf.select_carried([thread], ()) == ()
+
+
+def test_reopened_thread_with_no_resolver_is_carried_again():
+    """#1440: a resolved thread a person reopens counts as open again:
+    the flag is false and no resolver remains on the thread."""
+    thread = _thread(resolved=False)
+    thread["resolvedBy"] = None
+    assert len(cf.select_carried([thread], ())) == 1
+
+
 def test_reraised_finding_is_not_double_counted():
     assert cf.select_carried([_thread()], (_finding(line=14),)) == ()
     # a different rule, a different file, or a far line is a separate finding
     assert len(cf.select_carried([_thread()], (_finding(rule="other"),))) == 1
     assert len(cf.select_carried([_thread()], (_finding(file="b.py"),))) == 1
     assert len(cf.select_carried([_thread()], (_finding(line=90),))) == 1
+
+
+# --- filter_findings_against_resolved_threads (#1457) --------------------
+
+def _thread_for_filter(*, resolved=False, dismissed=False, rule="weakened-test",
+                       path="tests/test_foo.py", line=20, author="grug-tribe"):
+    """Thread helper for filter tests."""
+    from personas.code_reviewer import living_review as lr
+    nodes = [_comment(severity="🔥 high", rule=rule, path=path, line=line, author=author)]
+    t = {
+        "id": "T1", "isResolved": resolved, "isOutdated": False,
+        "comments": {"totalCount": len(nodes), "nodes": nodes},
+    }
+    if dismissed:
+        root = t["comments"]["nodes"][0]
+        root["body"] = lr.render(root["body"], lr.DISMISSED)
+    return t
+
+
+def test_filter_removes_finding_matching_resolved_thread():
+    """A lane-work finding matching a resolved thread is filtered out."""
+    thread = _thread_for_filter(resolved=True)
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == ()
+
+
+def test_filter_removes_finding_matching_dismissed_thread():
+    """A lane-work finding matching a dismissed thread is filtered out."""
+    thread = _thread_for_filter(dismissed=True)
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == ()
+
+
+def test_filter_keeps_finding_with_no_matching_thread():
+    """A lane-work finding with no matching resolved/dismissed thread is kept."""
+    thread = _thread_for_filter(resolved=True, rule="other-rule")
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == (finding,)
+
+
+def test_filter_keeps_finding_far_from_thread_line():
+    """A finding far from the thread's anchor line is kept (different location)."""
+    thread = _thread_for_filter(resolved=True, line=20)
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=90)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == (finding,)
+
+
+def test_filter_keeps_finding_different_file():
+    """A finding in a different file is kept."""
+    thread = _thread_for_filter(resolved=True, path="tests/test_bar.py")
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == (finding,)
+
+
+def test_filter_keeps_open_thread():
+    """A finding matching an OPEN (not resolved/dismissed) thread is kept."""
+    thread = _thread_for_filter(resolved=False)
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread])
+    assert filtered == (finding,)
+
+
+def test_filter_with_none_threads_returns_original():
+    """When threads is None (listing failure), original findings are returned."""
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=None)
+    assert filtered == (finding,)
+
+
+def test_filter_multiple_findings_mixed():
+    """Multiple findings: some filtered, some kept."""
+    thread = _thread_for_filter(resolved=True, rule="weakened-test", line=20)
+    finding1 = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    finding2 = _finding(rule="weakened-test", file="tests/test_foo.py", line=90)
+    finding3 = _finding(rule="null-deref", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding1, finding2, finding3), 1, "o", "r", 2, threads=[thread])
+    assert filtered == (finding2, finding3)
 
 
 # --- verdict plumbing -----------------------------------------------------
@@ -258,6 +367,32 @@ def test_medium_carried_leaves_a_clean_check_green(monkeypatch):
     check, _, _ = _run(monkeypatch, blocking=True,
                        threads=[_thread(severity="🟠 medium")])
     assert check.conclusion == "success"
+
+
+def test_resolved_high_thread_does_not_block_a_clean_delta(monkeypatch):
+    """#1440: a delta review with one resolved high finding and no new
+    markings concludes success. The resolved thread is the incident
+    shape: Elder's root comment plus answers from other authors."""
+    thread = _thread(resolved=True, comments=[
+        _comment(),
+        _comment(author="other-bot"),
+        _comment(author="another-bot"),
+    ])
+    check, _, _ = _run(monkeypatch, blocking=True, threads=[thread])
+    assert check.conclusion == "success"
+    assert "Elder clear" in check.title
+    assert "earlier finding" not in check.title
+
+
+def test_thread_resolved_by_a_person_does_not_block_a_clean_delta(monkeypatch):
+    """#1440, through dispatch: the listing hands over the thread's
+    resolver and no `isResolved` flag; the check still concludes success."""
+    thread = _thread()
+    del thread["isResolved"]
+    thread["resolvedBy"] = {"login": "a-reviewer"}
+    check, _, _ = _run(monkeypatch, blocking=True, threads=[thread])
+    assert check.conclusion == "success"
+    assert "Elder clear" in check.title
 
 
 def test_outdated_thread_does_not_block(monkeypatch):

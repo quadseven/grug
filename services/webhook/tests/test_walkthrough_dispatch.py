@@ -8,21 +8,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import httpx
-import pytest
 
 from personas.walkthrough import dispatch as wt_dispatch
-from personas.walkthrough.render import MARKER
-
-_OWN_APP_ID = "1"  # matches performed_via_github_app.id in the fixtures below
-
-
-@pytest.fixture(autouse=True)
-def _stub_own_app_id(monkeypatch):
-    """Every test exercises _find_marker_comment's own-app-identity check
-    (#554 peer review round 3) - stub it once rather than per-test, since
-    the real get_app_id() reads GITHUB_APP_ID_SSM (unset in this env)."""
-    monkeypatch.setattr(wt_dispatch, "get_app_id", lambda: _OWN_APP_ID)
-
 
 def _payload(pull_number: int = 7, head_sha: str = "a" * 40) -> dict:
     return {
@@ -62,13 +49,15 @@ def _marker_comment_response(comment_id: int) -> httpx.Response:
     r.status_code = 200
     r.raise_for_status = MagicMock()
     r.json = MagicMock(return_value=[{
-        "id": comment_id, "body": MARKER,
+        "id": comment_id, "body": "<!-- grug-teller:walkthrough -->",
         "performed_via_github_app": {"id": 1, "slug": "grug"},
     }])
     return r
 
 
-def test_dispatch_posts_new_comment_when_no_marker_exists(monkeypatch):
+def test_dispatch_posts_no_new_comment_when_no_marker_exists(monkeypatch):
+    """T1432: with no Teller comment on the PR, the one POST is the Teller
+    check run, never a new comment."""
     monkeypatch.setattr(
         wt_dispatch, "with_install_token_retry",
         lambda inst_id, fn: fn("tok"),
@@ -85,7 +74,8 @@ def test_dispatch_posts_new_comment_when_no_marker_exists(monkeypatch):
         return _diff_response()
 
     def fake_post(url, **kwargs):
-        posted["body"] = kwargs["json"]["body"]
+        posted["url"] = url
+        posted["json"] = kwargs["json"]
         r = MagicMock(spec=httpx.Response)
         r.raise_for_status = MagicMock()
         return r
@@ -97,8 +87,9 @@ def test_dispatch_posts_new_comment_when_no_marker_exists(monkeypatch):
         out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
 
     assert out == {"persona": "walkthrough", "result": "degraded"}
-    assert MARKER in posted["body"]
-    assert "x.py" in posted["body"]
+    assert posted["url"].endswith("/check-runs")
+    assert posted["json"]["name"] == "Grug - Teller"
+    assert "x.py" in posted["json"]["output"]["summary"]
     mock_rcv.assert_called_once()
     assert mock_rcv.call_args.kwargs["conclusion"] == "success"
 
@@ -141,41 +132,6 @@ def test_dispatch_records_the_walkthrough_in_the_canonical_review_session(monkey
     assert kw["head_sha"] == "a" * 40 and kw["trigger"] == "opened"
     assert "x.py" in kw["text"] or "file(s) changed" in kw["text"]
     assert kw["model"] == "deterministic-fallback"
-
-
-def test_dispatch_view_full_review_opens_the_checks_tab_not_the_pr_itself(monkeypatch):
-    """The walkthrough is a comment on the PR, so a button linking the PR
-    page reloaded the page it sits on; the full review is Elder's check run
-    output on the PR's Checks tab."""
-    monkeypatch.setattr(
-        wt_dispatch, "with_install_token_retry",
-        lambda inst_id, fn: fn("tok"),
-    )
-    posted = {}
-
-    def fake_get(url, **kwargs):
-        if url.endswith("/files"):
-            return _files_response([
-                {"filename": "x.py", "additions": 3, "deletions": 1},
-            ])
-        if "/comments" in url:
-            return _empty_comments_response()
-        return _diff_response()
-
-    def fake_post(url, **kwargs):
-        posted["body"] = kwargs["json"]["body"]
-        r = MagicMock(spec=httpx.Response)
-        r.raise_for_status = MagicMock()
-        return r
-
-    with patch("httpx.get", side_effect=fake_get), \
-         patch("httpx.post", side_effect=fake_post), \
-         patch("personas.walkthrough.dispatch.record_check_verdict"), \
-         patch("llm_client.summarize_pr", return_value=None):
-        wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
-
-    assert '<a href="https://github.com/o/r/pull/7/checks">' in posted["body"]
-    assert '<a href="https://github.com/o/r/pull/7">' not in posted["body"]
 
 
 def test_dispatch_posts_nothing_when_the_pr_closed_before_publish(monkeypatch):
@@ -227,7 +183,7 @@ def test_dispatch_still_posts_when_the_state_read_fails(monkeypatch):
         return _diff_response()
 
     def fake_post(url, **kwargs):
-        posted["body"] = kwargs["json"]["body"]
+        posted["json"] = kwargs["json"]
         r = MagicMock(spec=httpx.Response)
         r.raise_for_status = MagicMock()
         return r
@@ -239,17 +195,16 @@ def test_dispatch_still_posts_when_the_state_read_fails(monkeypatch):
         out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
 
     assert out == {"persona": "walkthrough", "result": "degraded"}
-    assert MARKER in posted["body"]
+    assert posted["json"]["name"] == "Grug - Teller"
 
 
-def test_dispatch_patches_existing_marker_comment_in_place(monkeypatch):
-    """Acceptance criterion: updated IN PLACE on a re-dispatch (synchronize)."""
+def test_dispatch_leaves_an_existing_teller_comment_untouched(monkeypatch):
+    """T1432: a comment an older Teller left is neither edited (no edit storm)
+    nor deleted, and no new one is created."""
     monkeypatch.setattr(
         wt_dispatch, "with_install_token_retry",
         lambda inst_id, fn: fn("tok"),
     )
-    patched = {}
-
     def fake_get(url, **kwargs):
         if url.endswith("/files"):
             return _files_response([{"filename": "y.py", "additions": 1, "deletions": 0}])
@@ -257,23 +212,17 @@ def test_dispatch_patches_existing_marker_comment_in_place(monkeypatch):
             return _marker_comment_response(999)
         return _diff_response()
 
-    def fake_patch(url, **kwargs):
-        patched["url"] = url
-        patched["body"] = kwargs["json"]["body"]
-        r = MagicMock(spec=httpx.Response)
-        r.raise_for_status = MagicMock()
-        return r
-
     with patch("httpx.get", side_effect=fake_get), \
-         patch("httpx.patch", side_effect=fake_patch), \
-         patch("httpx.post") as mock_post, \
+         patch("httpx.patch") as mock_patch, \
+         patch("httpx.delete") as mock_delete, \
+         patch("httpx.post", return_value=MagicMock(raise_for_status=MagicMock())) as mock_post, \
          patch("personas.walkthrough.dispatch.record_check_verdict"), \
          patch("llm_client.summarize_pr", return_value=None):
         wt_dispatch.dispatch_walkthrough_review(_payload(head_sha="b" * 40), blocking=False)
 
-    assert patched["url"].endswith("/issues/comments/999")
-    assert MARKER in patched["body"]
-    mock_post.assert_not_called()
+    mock_patch.assert_not_called()
+    mock_delete.assert_not_called()
+    assert all(c.args[0].endswith("/check-runs") for c in mock_post.call_args_list)
 
 
 def test_dispatch_uses_llm_summary_and_per_file_blurbs(monkeypatch):
@@ -293,7 +242,7 @@ def test_dispatch_uses_llm_summary_and_per_file_blurbs(monkeypatch):
         return _diff_response()
 
     def fake_post(url, **kwargs):
-        posted["body"] = kwargs["json"]["body"]
+        posted["json"] = kwargs["json"]
         r = MagicMock(spec=httpx.Response)
         r.raise_for_status = MagicMock()
         return r
@@ -310,9 +259,10 @@ def test_dispatch_uses_llm_summary_and_per_file_blurbs(monkeypatch):
         out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
 
     assert out == {"persona": "walkthrough", "result": "pass"}
-    assert "Adds a null guard to x.py." in posted["body"]
-    assert "added guard clause" in posted["body"]
-    assert "quick" in posted["body"]
+    summary = posted["json"]["output"]["summary"]
+    assert "Adds a null guard to x.py." in summary
+    assert "added guard clause" in summary
+    assert "quick" in summary
 
 
 def test_dispatch_fetch_failure_returns_failed_without_posting(monkeypatch):
@@ -351,27 +301,6 @@ def test_dispatch_publish_failure_does_not_record_activity(monkeypatch):
 
     assert out == {"persona": "walkthrough", "result": "publish_failed"}
     mock_rcv.assert_not_called()
-
-
-def test_find_marker_comment_logs_when_scan_cap_exhausted(caplog):
-    """#554 audit stage 2: giving up at the 20-page cap without finding
-    the marker must be distinguishable from the ordinary 'no marker'
-    exit - silent here means an unbounded duplicate-comment bug on an
-    extreme PR (>2000 comments) would go unnoticed forever."""
-
-    def full_comments_page(url, **kwargs):
-        r = MagicMock(spec=httpx.Response)
-        r.status_code = 200
-        r.raise_for_status = MagicMock()
-        r.json = MagicMock(return_value=[{"id": i, "body": "unrelated"} for i in range(100)])
-        return r
-
-    with patch("httpx.get", side_effect=full_comments_page), \
-         caplog.at_level("WARNING", logger="grug.persona.walkthrough"):
-        result = wt_dispatch._find_marker_comment("tok", "o", "r", 1)
-
-    assert result is None
-    assert "walkthrough_marker_scan_capped" in caplog.text
 
 
 def test_dispatch_diff_fetch_failure_is_phase_tagged(monkeypatch, caplog):
@@ -463,7 +392,7 @@ def test_emit_degraded_metric_failure_is_logged_not_swallowed_silently(caplog):
 
 def test_dispatch_truncated_and_degraded_hedges_the_check_run_summary(monkeypatch):
     """FLINT: record_check_verdict's summary must hedge 'at least N'
-    the same way the posted comment does - the Checks tab shouldn't show
+    the same way the posted summary does - the Checks tab shouldn't show
     a capped count as exact when the comment body already says otherwise."""
     monkeypatch.setattr(
         wt_dispatch, "with_install_token_retry",
@@ -508,39 +437,6 @@ def test_dispatch_token_exchange_runtime_error_degrades_not_raises(monkeypatch):
     mock_rcv.assert_not_called()
 
 
-def test_upsert_marker_lookup_failure_during_publish_degrades_to_publish_failed(monkeypatch):
-    """#554 audit stage 7: diff+files succeed; the comments-list GET INSIDE
-    _find_marker_comment fails during the upsert phase (distinct from the
-    initial diff/files fetch phase already tested). Currently caught
-    correctly by the outer try around with_install_token_retry(upsert) -
-    this pins that so a future refactor that adds local handling inside
-    _find_marker_comment (treating a transient error as 'no marker') can't
-    silently start double-posting duplicate advisory comments."""
-    monkeypatch.setattr(
-        wt_dispatch, "with_install_token_retry",
-        lambda inst_id, fn: fn("tok"),
-    )
-
-    def fake_get(url, **kwargs):
-        if "/comments" in url:
-            raise httpx.ConnectError("dns down")
-        if url.endswith("/files"):
-            return _files_response([{"filename": "x.py", "additions": 1, "deletions": 0}])
-        return _diff_response()
-
-    with patch("httpx.get", side_effect=fake_get), \
-         patch("httpx.post") as mock_post, \
-         patch("httpx.patch") as mock_patch, \
-         patch("personas.walkthrough.dispatch.record_check_verdict") as mock_rcv, \
-         patch("llm_client.summarize_pr", return_value=None):
-        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
-
-    assert out == {"persona": "walkthrough", "result": "publish_failed"}
-    mock_post.assert_not_called()
-    mock_patch.assert_not_called()
-    mock_rcv.assert_not_called()
-
-
 def test_fetch_pr_files_signals_truncation_at_the_page_cap():
     """#554 audit stage 8: GitHub's own /files cap (3000) is far above our
     _MAX_FILE_PAGES bound (500) - a monorepo migration or generated-file
@@ -570,7 +466,7 @@ def test_fetch_pr_files_not_truncated_under_the_cap():
     assert truncated is False
 
 
-def test_dispatch_truncated_files_logs_warning_and_hedges_the_comment(monkeypatch, caplog):
+def test_dispatch_truncated_files_logs_warning_and_hedges_the_check_run(monkeypatch, caplog):
     """The truncation signal must reach BOTH the log (operator visibility)
     and the posted comment (author visibility) - never silently present a
     partial count as exact in either surface."""
@@ -591,7 +487,7 @@ def test_dispatch_truncated_files_logs_warning_and_hedges_the_comment(monkeypatc
         return _diff_response()
 
     def fake_post(url, **kwargs):
-        posted["body"] = kwargs["json"]["body"]
+        posted["json"] = kwargs["json"]
         r = MagicMock(spec=httpx.Response)
         r.raise_for_status = MagicMock()
         return r
@@ -604,8 +500,9 @@ def test_dispatch_truncated_files_logs_warning_and_hedges_the_comment(monkeypatc
         wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
 
     assert "walkthrough_file_fetch_capped" in caplog.text
-    assert "at least 500" in posted["body"]
-    assert "File list is partial" in posted["body"]
+    summary = posted["json"]["output"]["summary"]
+    assert "File list is partial" in summary
+    assert "first 500" in summary
 
 
 def test_dispatch_diff_fetch_failure_enqueues_self_recovery(monkeypatch):
@@ -697,88 +594,105 @@ def test_self_recover_failure_is_swallowed_never_escalates(monkeypatch, caplog):
     assert "walkthrough_self_recover_failed" in caplog.text
 
 
-def test_find_marker_comment_ignores_user_authored_decoy(monkeypatch):
-    """#554 peer review (codex): a PR commenter who posts the literal
-    marker string BEFORE Teller's first run must not be mistaken for
-    Teller's own comment - only `performed_via_github_app` (set
-    server-side, unforgeable by a human commenter) counts."""
-    def fake_get(url, **kwargs):
-        return _files_response([
-            {
-                "id": 111, "body": MARKER,
-                "performed_via_github_app": None,  # human-authored decoy
-            },
-            {
-                "id": 222, "body": MARKER,
-                "performed_via_github_app": {"id": 1, "slug": "grug"},
-            },
-        ])
-
-    with patch("httpx.get", side_effect=fake_get):
-        result = wt_dispatch._find_marker_comment("tok", "o", "r", 1)
-
-    assert result == 222
-
-
-def test_dispatch_ignores_decoy_marker_and_posts_fresh_comment(monkeypatch):
-    """End-to-end: a human-authored decoy marker comment exists, but no
-    genuine app-authored one - Teller must POST a fresh comment, not
-    attempt (and fail) a PATCH against the decoy it cannot edit."""
+def _run_capturing(monkeypatch, *, llm_summary):
+    """One dispatch with every write captured: -> (comment POSTs, check-run
+    JSON bodies, review-session recordings, dispatch result)."""
     monkeypatch.setattr(
         wt_dispatch, "with_install_token_retry",
         lambda inst_id, fn: fn("tok"),
     )
-    posted = {}
+    comments: list[dict] = []
+    checks: list[dict] = []
+    recorded: list[dict] = []
 
     def fake_get(url, **kwargs):
         if url.endswith("/files"):
-            return _files_response([{"filename": "x.py", "additions": 1, "deletions": 0}])
+            return _files_response([{"filename": "x.py", "additions": 3, "deletions": 1}])
         if "/comments" in url:
-            r = MagicMock(spec=httpx.Response)
-            r.status_code = 200
-            r.raise_for_status = MagicMock()
-            r.json = MagicMock(return_value=[{
-                "id": 111, "body": MARKER, "performed_via_github_app": None,
-            }])
-            return r
+            return _empty_comments_response()
         return _diff_response()
 
     def fake_post(url, **kwargs):
-        posted["body"] = kwargs["json"]["body"]
+        (checks if url.endswith("/check-runs") else comments).append(kwargs["json"])
         r = MagicMock(spec=httpx.Response)
         r.raise_for_status = MagicMock()
+        r.json = MagicMock(return_value={})
         return r
 
     with patch("httpx.get", side_effect=fake_get), \
          patch("httpx.post", side_effect=fake_post), \
-         patch("httpx.patch") as mock_patch, \
          patch("personas.walkthrough.dispatch.record_check_verdict"), \
-         patch("llm_client.summarize_pr", return_value=None):
+         patch.object(
+             wt_dispatch.hunt_recorder, "record_walkthrough",
+             side_effect=lambda ref, **kw: recorded.append(kw),
+         ), \
+         patch("llm_client.summarize_pr", return_value=llm_summary):
         out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+    return comments, checks, recorded, out
+
+
+def _llm_summary():
+    from llm_client import WalkthroughSummary
+
+    return WalkthroughSummary(
+        summary="Adds a null guard to x.py.",
+        file_summaries={"x.py": "added guard clause"},
+        effort="quick",
+    )
+
+
+def test_walkthrough_posts_no_comment_and_the_board_holds_its_text(monkeypatch):
+    comments, checks, recorded, out = _run_capturing(
+        monkeypatch, llm_summary=_llm_summary(),
+    )
+
+    assert out == {"persona": "walkthrough", "result": "pass"}
+    assert comments == []
+    [kw] = recorded
+    assert "Adds a null guard to x.py." in kw["text"]
+    assert "grug-teller:walkthrough" not in kw["text"]
+    [check] = checks
+    assert check["name"] == "Grug - Teller"
+    assert check["conclusion"] == "success"
+
+
+def test_teller_check_run_summary_carries_effort_and_files_without_an_edgeless_diagram(
+    monkeypatch,
+):
+    _, checks, recorded, _ = _run_capturing(monkeypatch, llm_summary=_llm_summary())
+
+    summary = checks[0]["output"]["summary"]
+    assert "Review effort" in summary
+    assert "- `x.py` (+3/-1) - added guard clause" in summary
+    assert "mermaid" not in summary
+    assert "Shape of the change" not in summary
+    assert "Review effort" in recorded[0]["text"]
+
+
+def test_deterministic_fallback_renders_no_quiet_sentence_on_board_or_check(monkeypatch):
+    comments, checks, recorded, out = _run_capturing(monkeypatch, llm_summary=None)
 
     assert out == {"persona": "walkthrough", "result": "degraded"}
-    mock_patch.assert_not_called()
-    assert MARKER in posted["body"]
+    assert comments == []
+    for text in (checks[0]["output"]["summary"], recorded[0]["text"]):
+        assert "teller-voice was quiet" not in text
+        assert "x.py" in text  # the file table alone survives
 
 
-def test_find_marker_comment_ignores_different_app_decoy(monkeypatch):
-    """#554 peer review round 3 (codex): a bare non-null performed_via_
-    github_app check only proves SOME GitHub App posted the comment, not
-    that WE did - a decoy from a DIFFERENT installed app (own numeric ID
-    mismatched) must still be ignored, not just a human-authored one."""
-    def fake_get(url, **kwargs):
-        return _files_response([
-            {
-                "id": 111, "body": MARKER,
-                "performed_via_github_app": {"id": 999, "slug": "some-other-app"},
-            },
-            {
-                "id": 222, "body": MARKER,
-                "performed_via_github_app": {"id": int(_OWN_APP_ID), "slug": "grug"},
-            },
-        ])
+def test_related_hunts_go_to_the_check_run_and_not_twice_on_the_board(monkeypatch):
+    """#675: the check run lists related hunts in the walkthrough; the board
+    renders its own Related context list, so its walkthrough text leaves
+    them out."""
+    from personas.walkthrough.related import RelatedPR
 
-    with patch("httpx.get", side_effect=fake_get):
-        result = wt_dispatch._find_marker_comment("tok", "o", "r", 1)
+    related = [RelatedPR(number=101, title="Fix the thing", reason="touched x.py")]
+    monkeypatch.setattr(
+        "personas.walkthrough.related.find_related_prs",
+        lambda *a, **kw: related,
+    )
+    _, checks, recorded, _ = _run_capturing(monkeypatch, llm_summary=_llm_summary())
 
-    assert result == 222
+    assert "Possibly related hunts" in checks[0]["output"]["summary"]
+    assert "#101 Fix the thing" in checks[0]["output"]["summary"]
+    assert "Possibly related hunts" not in recorded[0]["text"]
+    assert recorded[0]["related"] == ("#101 Fix the thing (touched x.py)",)
