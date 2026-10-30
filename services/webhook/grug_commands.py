@@ -53,12 +53,36 @@ class GrugCommand:
     arg: str = ""      # trailing text (`ask`, `learnings`, `accept-removal`)
 
 
+# #822: a free-form question extends `ask` rather than inventing a second
+# vocabulary - "/grug why did you flag this?" is an ask with the question
+# as its arg. Question shape: a trailing "?", or an opening question word.
+# A bare token ("/grug frobnicate") is a typo'd verb, not a question, and
+# stays None; so does declarative prose ("/grug reviewed it").
+_QUESTION_RE = re.compile(r"^\s*/grug\s+(.+)$", re.IGNORECASE | re.MULTILINE)
+_QUESTION_OPENERS = frozenset({
+    "why", "what", "how", "is", "are", "does", "can", "could",
+    "should", "would", "when", "where", "who", "which", "explain",
+})
+
+
+def _as_question(text: str) -> GrugCommand | None:
+    text = text.strip()
+    if not text:
+        return None
+    first = text.split(None, 1)[0].lower().strip("¿?¡!")
+    if text.endswith("?") or first in _QUESTION_OPENERS:
+        return GrugCommand(verb="ask", arg=text)
+    return None
+
+
 def parse_command(body: str) -> GrugCommand | None:
     """First `/grug <verb>` in the comment, or None. If several appear, the
-    first wins (a comment is one intent)."""
+    first wins (a comment is one intent). A `/grug <question>` that names
+    no known verb parses as an `ask` (#822)."""
     m = _CMD_RE.search(body or "")
     if not m:
-        return None
+        q = _QUESTION_RE.search(body or "")
+        return _as_question(q.group(1)) if q else None
     verb = m.group(1).lower()
     verb = _CANON.get(verb, verb)
     return GrugCommand(verb=verb, arg=m.group(2).strip())

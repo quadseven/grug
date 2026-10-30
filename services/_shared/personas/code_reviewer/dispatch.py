@@ -747,6 +747,7 @@ def _carry_into_check(
     *, action: str, evaluation: CodeReviewEvaluation, mode: ReviewMode,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, conclusion: CheckConclusion, title: str, summary: str,
+    threads: list[dict] | None = None,
 ) -> tuple[CheckConclusion, str, str, list[dict] | None]:
     """Fold Elder's earlier findings into the check verdict: still-open ones
     via carry-forward, and ones this push addressed as a title note (#1187),
@@ -758,9 +759,10 @@ def _carry_into_check(
     """
     if action not in _RE_REVIEW_ACTIONS or evaluation.degraded_reason:
         return conclusion, title, summary, None
-    threads = carry_forward.list_threads(
-        installation_id, owner, repo_name, pull_number,
-    )
+    if threads is None:
+        threads = carry_forward.list_threads(
+            installation_id, owner, repo_name, pull_number,
+        )
     if threads is None:
         return conclusion, title, summary, None
     carried = carry_forward.select_carried(threads, evaluation.findings)
@@ -1296,7 +1298,7 @@ def _consolidated_agent_prompt(evaluation: CodeReviewEvaluation) -> str:
     used = sum(len(x) + 1 for x in header)
     included = 0
     for f in findings:
-        cat = _category_for_rule(f.rule_name)
+        cat = _category_for_finding(f)
         entry = (
             f"- {_md_code_span(f.file)}:{f.line} "
             f"[{severity_chip(f.severity)} | {cat} | "
@@ -1445,6 +1447,13 @@ def _category_for_rule(rule_name: str) -> str:
     return _LINKED_ISSUE_RULE_CATEGORIES.get(rule_name, "general")
 
 
+def _category_for_finding(f: Finding) -> str:
+    """The finding's taxonomy category (#683) - the same value the ledger
+    row and the run store carry. An unset one is "general" (criterion 4),
+    never the rule-derived class, so every surface agrees."""
+    return f.category
+
+
 def _why_it_matters(rule_name: str) -> str:
     cat = _category_for_rule(rule_name)
     return _WHY_IT_MATTERS.get(
@@ -1520,7 +1529,7 @@ def _agent_prompt_block(f: Finding) -> str:
     from finding fields - no extra LLM call, so it can never hallucinate
     beyond what the finding already claims. Markings v2 adds a CR-style
     verify/skip/minimal meta contract shared with the consolidated prompt."""
-    cat = _category_for_rule(f.rule_name)
+    cat = _category_for_finding(f)
     content = [
         _AGENT_META_PREAMBLE,
         "",
@@ -1589,7 +1598,7 @@ def _inline_comment_body(
 
     `committable=False` renders any suggestion as fenced prose: dispatch
     passes it when `checked_suggestion` (#1149) could not verify the fix."""
-    cat = _category_for_rule(f.rule_name)
+    cat = _category_for_finding(f)
     # CR-dense header: severity chip | category | rule | effort chip
     chip = (
         f"{severity_chip(f.severity)} | _{_md_code_span(cat)}_ | "
@@ -2075,6 +2084,15 @@ def _upsert_review_stack_comment(
     if section is not None:
         try:
             from personas import board_client
+            found = board_client.find_board(
+                token, owner, repo, pr_number, app_id=get_app_id(),
+            )
+            if found is not None:
+                _, existing_board = found
+                existing_elder = board.extract_section(existing_board, "elder") or ""
+                if "**Closed threads**" in existing_elder and "**Closed threads**" not in section:
+                    closed_part = existing_elder[existing_elder.index("**Closed threads**"):]
+                    section = f"{section.rstrip()}\n\n{closed_part.strip()}"
             board_client.upsert_board_section(
                 token, owner, repo, pr_number,
                 key="elder", section=section, header=header,
@@ -2949,6 +2967,7 @@ def _repo_private(payload: dict[str, Any]) -> bool | None:
 def dispatch_code_review(
     payload: dict[str, Any], *, blocking: bool,
     cancel_event: threading.Event | None = None,
+    rerun_pending: bool = False,
 ) -> dict[str, str]:
     """Entry point — orchestrate one Elder review pass.
 
@@ -2968,6 +2987,12 @@ def dispatch_code_review(
     fires. The caller (rerun.py's `_run_hot_review`) owns setting it, via a
     background watcher that re-fetches the PR every few seconds for as long
     as this call is running.
+
+    `rerun_pending` (grug#1494): the caller will run this review again if it
+    degrades to `all_failed` (every model rung failed). On a blocking repo the
+    check then stays `in_progress` - pending, so the required check still
+    blocks the merge - instead of completing `failure` for a retry that is
+    already queued. Never set for the last scheduled attempt.
     """
     # #1350: when this run began, so a clean verdict can tell Elder's own
     # earlier blocks on this head from one another run posts mid-flight.
@@ -3649,6 +3674,25 @@ def dispatch_code_review(
         correctness_only=correctness_only,
     )
 
+    # Fetch review threads once for re-reviews (#1457): shared between the
+    # lane-work filter and the carry-forward verdict so we only list once.
+    review_threads: list[dict] | None = None
+    if action in _RE_REVIEW_ACTIONS and not evaluation.degraded_reason:
+        review_threads = carry_forward.list_threads(
+            installation_id, owner, repo_name, pull_number,
+        )
+
+    # Filter lane-work findings that match resolved or dismissed Elder threads
+    # (#1457): prevents re-raising weakened-test findings on re-reviews when
+    # the thread was already resolved by a human.
+    if review_threads is not None:
+        filtered = carry_forward.filter_findings_against_resolved_threads(
+            evaluation.findings,
+            installation_id, owner, repo_name, pull_number,
+            threads=review_threads,
+        )
+        evaluation = with_findings(evaluation, filtered)
+
     # Durable reviews can spend several minutes in inference. Re-check the
     # complete input after reasoning so changes to code, base, or intent cannot
     # publish a result for an obsolete snapshot. The durable caller enqueues the
@@ -3676,6 +3720,16 @@ def dispatch_code_review(
             repo=f"{owner}/{repo_name}",
             pr_number=pull_number,
             head_sha=head_sha,
+        )
+
+    if (
+        rerun_pending
+        and blocking
+        and evaluation.degraded_reason == "all_failed"
+    ):
+        return _publish_rerun_pending(
+            installation_id, owner, repo_name, pull_number, head_sha,
+            evaluation.degraded_reason,
         )
 
     # Both clients are independent — a 5xx on review post must not
@@ -3720,6 +3774,7 @@ def dispatch_code_review(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha, conclusion=conclusion,
         title=title, summary=summary,
+        threads=review_threads,
     )
     # grug#1429 pin + closure, then grug#1212's degraded lead: a degraded
     # pass still says so before anything else, the pin line right after.
@@ -4648,7 +4703,6 @@ def _record_hunt_run(
         delta=delta,
         comment_ids=comment_ids,
         check_run_id=check_run_id,
-        category_of=_category_for_rule,
         degraded_reason=real,
     )
 
@@ -5295,6 +5349,51 @@ def _async_deep_append_if_needed(
             "conclusion": conclusion,
         },
     )
+
+
+def _publish_rerun_pending(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str, reason: str,
+) -> dict[str, str]:
+    """Leave the Elder check pending while a queued re-run retries (grug#1494).
+
+    `in_progress` is not a pass: a required check that has not concluded keeps
+    the merge blocked, exactly as the check the enqueue posted. Best-effort -
+    a failed post leaves that earlier pending check in place."""
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: post_check_run(
+                token, owner, repo_name,
+                CheckRunResult(
+                    name=_CHECK_NAME, head_sha=head_sha, status="in_progress",
+                    conclusion=None,
+                    title="Elder waiting on a model - re-run scheduled",
+                    summary=(
+                        f"Every model failed this pass (`{reason}`). Elder "
+                        "re-runs the review automatically. Merge stays "
+                        "blocked until a full review lands; if the re-runs "
+                        "also fail this check fails. Comment `/grug improve` "
+                        "to re-run sooner."
+                    ),
+                ),
+                external_id=(
+                    f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
+                ),
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning(
+            "code_review_rerun_pending_publish_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+    return {
+        "persona": "code_reviewer", "result": "skipped", "degraded_reason": reason,
+    }
 
 
 def _publish_degraded(

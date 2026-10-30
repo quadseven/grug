@@ -237,12 +237,16 @@ def record_ledger_learning(
     from best_practices import derive_practices, practices_to_dicts
     from few_shot import exemplars_from_rows, exemplars_to_dicts
     from ledger import accepted_findings_by_class, parse_row
+    from review_types import category_or_default
 
     base_row: dict = {
         "repo": record["repo"],
         "pr": record["pr_number"],
         "severity": severity,
         "class": rule_name,
+        # #683: the finding's taxonomy category, tagged at publish time
+        # (judge.eval_tags); absent/off-taxonomy degrades, never blocks.
+        "category": category_or_default(tags.get("category")),
         "finding": finding_text,
         "verdict": ledger_verdict,
         # Stable evidence makes a reaction flip overwrite the same ledger row

@@ -167,6 +167,9 @@ def eval_tags(
         "file": f.file,
         "line": str(f.line),
         "severity": f.severity,
+        # #683: the taxonomy category rides the finding identity so the
+        # reaction-time ledger row can carry it (reactions reads it back).
+        "category": f.category,
     }
     if origin is not None:
         tags["source_backend"] = origin.backend.value

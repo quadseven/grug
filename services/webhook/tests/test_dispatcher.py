@@ -1424,3 +1424,52 @@ def test_fetch_pr_for_rerequest_transport_error_skips_that_pr():
         out = dispatch("check_suite", _check_suite_payload())
     assert out["results"][0] == {"status": "skip", "reason": "pr_fetch_failed", "pr_number": 42}
     mock_dispatch.assert_not_called()
+
+
+# --- #822: /grug questions inside review threads ---------------------------
+
+def test_review_thread_question_enqueues_thread_ask_not_learn():
+    payload = _review_reply_payload(
+        comment={"body": "/grug why did you flag this?"},
+    )
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "admin"), \
+         patch("rerun.enqueue_learn") as mock_learn, \
+         patch("rerun.enqueue_ask") as mock_ask:
+        out = dispatch("pull_request_review_comment", payload)
+    assert out == {"status": "dispatched", "kind": "ask"}
+    assert not mock_learn.called
+    kw = mock_ask.call_args.kwargs
+    assert kw["reply_to_comment_id"] == 4000  # the thread root
+    assert kw["comment_id"] == 5001
+    assert kw["question"] == "why did you flag this?"
+
+
+def test_review_thread_root_question_enqueues_thread_ask():
+    # A NEW inline comment (no in_reply_to_id) carrying a question: the
+    # answer replies into the thread that comment starts.
+    payload = _review_reply_payload()
+    del payload["comment"]["in_reply_to_id"]
+    payload["comment"]["body"] = "/grug ask what does this hunk do?"
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "admin"), \
+         patch("rerun.enqueue_ask") as mock_ask:
+        out = dispatch("pull_request_review_comment", payload)
+    assert out == {"status": "dispatched", "kind": "ask"}
+    assert mock_ask.call_args.kwargs["reply_to_comment_id"] == 5001
+
+
+def test_review_thread_question_from_bot_is_ignored():
+    payload = _review_reply_payload(
+        comment={"body": "/grug why did you flag this?",
+                 "user": {"login": "otherbot", "type": "Bot"}},
+        sender={"login": "otherbot"},
+    )
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("rerun.enqueue_ask") as mock_ask:
+        out = dispatch("pull_request_review_comment", payload)
+    assert out["status"] == "no_op"
+    assert not mock_ask.called

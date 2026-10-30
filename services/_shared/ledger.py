@@ -2,7 +2,10 @@
 
 The operator's pipeline emits one row per review finding into
 `logs/review-ledger.jsonl`: {ts, repo, pr, reviewer, severity, class,
-finding, verdict, commit, evidence, head_sha}. `verdict` is the
+category, finding, verdict, commit, evidence, head_sha}. `category`
+(#683, optional) is the finding's taxonomy category
+(`review_types.CATEGORIES`); rows without it parse as "general".
+`verdict` is the
 ground-truth label - `fixed` / `declined` (a real finding acted on or
 consciously kept) vs `false-positive` (the reviewer was wrong).
 
@@ -34,6 +37,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+
+from review_types import DEFAULT_CATEGORY, category_or_default
 
 # Verdicts that mean "the finding was REAL" (the reviewer earned the row),
 # vs the one verdict that means the reviewer was wrong.
@@ -68,6 +73,9 @@ class LedgerRow:
     # #545: the reviewed PR-head SHA, when the writer captured it directly
     # (see module docstring). Optional - most historical rows predate it.
     head_sha: str | None = None
+    # #683: taxonomy category (review_types.CATEGORIES) so precedent and
+    # precision can be sliced per category. Absent or invalid -> "general".
+    category: str = DEFAULT_CATEGORY
 
     @property
     def accepted(self) -> bool:
@@ -101,6 +109,7 @@ def parse_row(d: dict) -> LedgerRow | None:
             ts=str(d.get("ts", "")),
             commit=d.get("commit"),
             head_sha=d.get("head_sha"),
+            category=category_or_default(d.get("category")),
         )
     except (KeyError, ValueError, TypeError):
         return None

@@ -31,6 +31,9 @@ from collections.abc import Callable
 import httpx
 from markdown_safety import neutralize_mentions
 
+from personas.code_reviewer.sanitizer_review import (
+    RULE_CATEGORIES as _SANITIZER_RULE_CATEGORIES,
+)
 from personas.code_reviewer.weakened_verification import (
     RULE_CATEGORIES as _WEAKENED_RULE_CATEGORIES,
 )
@@ -73,6 +76,8 @@ RULE_CATEGORIES = {
     "symptom-only": "requirements",
     # Deterministic lane-work rules (#1367).
     **_WEAKENED_RULE_CATEGORIES,
+    # Text sanitiser rules (#1497).
+    **_SANITIZER_RULE_CATEGORIES,
     "fabricated-result": "requirements",
     "unbacked-claim": "requirements",
     # A linked criterion with no evidence in the diff (#1389).
