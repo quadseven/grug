@@ -16,7 +16,7 @@ when the file is too large for the full-file block.
 The pure core (fixture, evidence, scoring) runs in CI. `replay` makes a
 backend call and is only used by the on-demand eval:
 
-    python -m elder_eval.column_type_mismatch     # print the replay result
+    python -m elder_eval.column_type_mismatch     # print the verdict and recall
 
 `make elder-eval-column` runs the same thing with the webhook dependencies
 installed, the sibling of `make elder-eval`.
@@ -162,7 +162,7 @@ def replay(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Replay the fixture once per configured backend and print the verdict."""
+    """Replay the fixture once per backend and print the verdict and recall."""
     parser = argparse.ArgumentParser(prog="elder_eval.column_type_mismatch")
     parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -184,7 +184,8 @@ def main(argv: list[str] | None = None) -> int:
         hit = caught_finding(run.findings)
         print(
             f"\n=== backend: {backend.name} === "
-            f"{FIXTURE.name}: {'CAUGHT' if hit else 'missed'}"
+            f"{FIXTURE.name}: {'CAUGHT' if hit else 'missed'} "
+            f"recall {recall_for(run.findings):.2f}"
         )
         for finding in run.findings:
             print(f"    finding {finding.path}:{finding.line} {finding.message[:120]}")

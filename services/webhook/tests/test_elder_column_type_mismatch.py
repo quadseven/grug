@@ -188,7 +188,7 @@ def test_module_is_wired_to_an_on_demand_entry_point():
     assert "python -m elder_eval.column_type_mismatch" in makefile
 
 
-def test_main_reports_a_catch(monkeypatch):
+def test_main_reports_a_catch(monkeypatch, capsys):
     monkeypatch.setattr(ctm, "configured_backends", lambda: [_BACKEND])
     monkeypatch.setattr(
         ctm,
@@ -201,6 +201,9 @@ def test_main_reports_a_catch(monkeypatch):
         ),
     )
     assert ctm.main([]) == 0
+    out = capsys.readouterr().out
+    assert "CAUGHT" in out
+    assert "recall 1.00" in out
 
 
 def test_main_refuses_to_read_an_errored_replay_as_a_zero(monkeypatch):
