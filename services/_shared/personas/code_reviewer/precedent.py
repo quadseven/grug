@@ -79,6 +79,28 @@ def class_precision(rows: list[LedgerRow]) -> dict[str, ClassPrecision]:
     }
 
 
+def muted_classes(
+    precisions: dict[str, ClassPrecision], *,
+    min_labeled: int, below_precision: float, locked: frozenset[str],
+) -> dict[str, ClassPrecision]:
+    """Classes whose findings stop posting inline (#1436). Pure.
+
+    A class is muted when it has at least `min_labeled` labeled ledger rows
+    and measured precision strictly below `below_precision`. A class in
+    `locked` is never muted, whatever its precision."""
+    return {
+        cls: cp for cls, cp in precisions.items()
+        if cls not in locked
+        and cp.labeled >= min_labeled
+        and cp.precision < below_precision
+    }
+
+
+def mute_note(cp: ClassPrecision) -> str:
+    """The board/summary marker for a muted class."""
+    return f"muted: fixed in {cp.accepted} of {cp.labeled} past findings"
+
+
 @dataclass(frozen=True, slots=True)
 class PrecedentMatch:
     """A draft finding's precedent + measured confidence, or the no-history
