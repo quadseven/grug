@@ -648,6 +648,25 @@ RULES: tuple[ReviewRule, ...] = (
         'scan(line)',
         severity="medium",
     ),
+    ReviewRule(
+        name="insufficient-assertion",
+        bug_class="test fidelity",
+        description=(
+            "A new or changed test, attester, or guard whose assertion "
+            "checks only a proxy (keyword names, presence, a count) "
+            "instead of the value or behavior it claims to prove. State "
+            "what the check proves against what it claims. Emit a finding "
+            "ONLY when you can write a concrete passing counterexample: "
+            "an input the check accepts although the claim is false. Put "
+            "that counterexample input in the message, e.g. "
+            "`set_repo_config(sentinel_enabled=body.guard_enabled)` or a "
+            "constant passes a check that records only keyword names. "
+            "No counterexample, no finding."
+        ),
+        bad_example="forwarded = _set_repo_config_kwargs(api_tree)",
+        good_example="forwarded = _set_repo_config_forwarding(api_tree)",
+        severity="medium",
+    ),
 )
 
 
