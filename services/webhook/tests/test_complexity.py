@@ -385,3 +385,47 @@ def test_a_repo_specific_cap_changes_which_functions_report():
         )
     assert results[0] == ()
     assert len(results[1]) == 1
+
+
+class TestCarriedRowRescoredAtHead:
+    """A carried high-complexity row is judged against the head's own source."""
+
+    @staticmethod
+    def _record(message: str):
+        import review_session as rs
+
+        return rs.FindingRecord(
+            finding_id="f1", persona="elder", path="a.py", line=2,
+            rule="high-complexity", category="maintainability",
+            severity="medium", confidence=None, message=message, evidence="",
+            source="llm", state="open", state_sha="aaa", first_seen_sha="aaa",
+            last_seen_sha="aaa", history=(),
+        )
+
+    @staticmethod
+    def _body(branches: int) -> str:
+        return "def big(x):\n" + "".join(f"    if x == {i}:\n        pass\n" for i in range(branches))
+
+    def _anchor(self, source: str, message: str):
+        from personas.code_reviewer import hunt_link
+
+        anchors = hunt_link.anchors_for(
+            (self._record(message),), {"a.py": source}, frozenset({"a.py"}), True,
+        )
+        return anchors["f1"]
+
+    def test_function_shrunk_under_the_cap_is_changed(self):
+        msg = "Function `big` too tangled -- cyclomatic 16 (cap 15). Grug say: split."
+        assert self._anchor(self._body(1), msg) == "changed"
+
+    def test_function_removed_is_changed(self):
+        msg = "Function `big` too tangled -- cyclomatic 16 (cap 15). Grug say: split."
+        assert self._anchor("def other():\n    return 1\n", msg) == "changed"
+
+    def test_function_with_a_different_score_is_changed(self):
+        msg = "Function `big` too tangled -- cyclomatic 16 (cap 15). Grug say: split."
+        assert self._anchor(self._body(17), msg) == "changed"
+
+    def test_function_still_at_the_recorded_score_stays_unchanged(self):
+        msg = "Function `big` too tangled -- cyclomatic 16 (cap 15). Grug say: split."
+        assert self._anchor(self._body(15), msg) == "unchanged"
