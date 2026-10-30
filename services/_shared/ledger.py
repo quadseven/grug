@@ -36,6 +36,7 @@ Elder reuse it without a database.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from review_types import DEFAULT_CATEGORY, category_or_default
@@ -129,6 +130,47 @@ def parse_jsonl(text: str) -> list[LedgerRow]:
         row = parse_row(d)
         if row is not None:
             rows.append(row)
+    return rows
+
+
+# Column order of the Findings Ledger table the operator's pipeline posts on a
+# PR (#361): the same fields as a JSONL row, minus repo/pr (the comment's own
+# coordinates supply those).
+_TABLE_COLUMNS = ("reviewer", "severity", "class", "finding", "verdict", "evidence")
+
+
+def _split_table_row(line: str) -> list[str]:
+    """Split one markdown table line on unescaped pipes; `\\|` is a literal."""
+    body = line.strip().strip("|")
+    cells = re.split(r"(?<!\\)\|", body)
+    return [c.replace("\\|", "|").strip() for c in cells]
+
+
+def parse_comment_table(text: str, repo: str, pr: int | None) -> list[dict]:
+    """Findings Ledger markdown table (a PR comment body) -> raw row dicts
+    in the JSONL shape, stamped with the comment's `repo` and `pr`.
+
+    Rows start after a header whose first cells are `reviewer | severity |
+    class | finding | verdict`; a line with fewer cells than the required
+    five is skipped, and text without that header yields []. Output feeds
+    the same `parse_row` gate and `put_ledger_row` store as the JSONL source."""
+    rows: list[dict] = []
+    in_table = False
+    for line in text.splitlines():
+        if not line.strip().startswith("|"):
+            in_table = False
+            continue
+        cells = _split_table_row(line)
+        if [c.lower() for c in cells[:5]] == list(_TABLE_COLUMNS[:5]):
+            in_table = True
+            continue
+        if not in_table or set(line.strip()) <= set("|-: "):
+            continue
+        if len(cells) < 5:
+            continue
+        cells = (cells + [""] * len(_TABLE_COLUMNS))[: len(_TABLE_COLUMNS)]
+        fields = dict(zip(_TABLE_COLUMNS, cells, strict=True))
+        rows.append({"repo": repo, "pr": pr, **fields})
     return rows
 
 

@@ -303,3 +303,70 @@ def test_replay_unparseable_answer_is_errored():
         return httpx.Response(200, text="<html>gateway</html>")
 
     assert mc.replay(_BACKEND, post=post).errored
+
+
+def test_negative_fixture_present_beside_reverse_direction():
+    fixture = _fixture("reverse_direction_fixed_attester_negative")
+    assert fixture.is_negative is True
+    assert fixture.path == mc.ATTESTER_PATH
+    assert fixture.finding_class == "reverse-direction-completeness"
+    assert fixture.reachability == mc.PROMPT_RULE
+    assert fixture.defect_lines == ((227, 238),)
+
+
+def test_negative_fixture_flags_nothing_on_clean_findings():
+    fixture = _fixture("reverse_direction_fixed_attester_negative")
+    # Clean findings or unrelated findings on the fixed attester lines do not trigger
+    clean_findings = [
+        _F(mc.ATTESTER_PATH, 230, "Clean reverse check with live registry keys"),
+        _F(mc.ATTESTER_PATH, 140, "high complexity"),
+    ]
+    assert not mc.caught(fixture, clean_findings)
+
+    # But an erroneous finding alleging a stale mapping entry on the clean lines is detected
+    erroneous_finding = [
+        _F(mc.ATTESTER_PATH, 232, "Reverse check uses stale mapping entry"),
+    ]
+    assert mc.caught(fixture, erroneous_finding)
+
+
+def test_negative_fixture_flags_nothing_in_recorded_baseline():
+    baseline = json.loads(mc.BASELINE_PATH.read_text())
+    for name, measurement in baseline["measurements"].items():
+        assert measurement["caught"]["reverse_direction_fixed_attester_negative"] is False, (
+            f"measurement {name!r} flagged the negative fixture"
+        )
+
+
+def test_cave_baseline_catches_stale_ui_mapping():
+    baseline = json.loads(mc.BASELINE_PATH.read_text())
+    assert "cave" in baseline["measurements"]
+    cave = baseline["measurements"]["cave"]
+    assert cave["caught"]["reverse_direction_stale_ui_mapping"] is True
+    assert cave["caught"]["reverse_direction_fixed_attester_negative"] is False
+    assert cave["recall"] == pytest.approx(1 / 3)
+
+
+def test_recall_excludes_negative_fixtures():
+    # Negative fixtures do not dilute the denominator: 1 out of 3 positive missed classes is 1/3
+    results = {
+        "cross_hop_tpm_default_side_effect": False,
+        "weak_assertion_keyword_only_forwarding": False,
+        "reverse_direction_stale_ui_mapping": True,
+        "reverse_direction_fixed_attester_negative": False,
+    }
+    assert mc.recall(results) == pytest.approx(1 / 3)
+
+
+def test_stale_reverse_check_intermediary_rule_emitted_text_requires_concrete_stale_entry():
+    import code_review_prompt as crp
+
+    rule = next(
+        (r for r in crp.RULES if r.name == "stale-reverse-check-intermediary"),
+        None,
+    )
+    assert rule is not None
+    assert "MUST name the concrete stale entry that would pass" in rule.description
+    for variant in ("v1", "v2"):
+        prompt = crp.build_system_prompt(variant)
+        assert "MUST name the concrete stale entry that would pass" in prompt
