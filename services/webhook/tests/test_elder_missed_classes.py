@@ -370,4 +370,3 @@ def test_stale_reverse_check_intermediary_rule_emitted_text_requires_concrete_st
     for variant in ("v1", "v2"):
         prompt = crp.build_system_prompt(variant)
         assert "MUST name the concrete stale entry that would pass" in prompt
-
