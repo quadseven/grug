@@ -138,14 +138,16 @@ def test_ledger_stranger_403():
     assert exc.value.status_code == 403
 
 
-def test_ledger_filters_by_verdict_and_caps_limit():
-    rows = [_ledger(verdict="fixed"), _ledger(verdict="false-positive"),
-            _ledger(verdict="fixed", pr=8)]
+def test_ledger_pushes_verdict_and_limit_into_the_store():
+    """The filter must run in the store's query, under its LIMIT: filtering the
+    capped rows here would strand matches past the cap (the real-Postgres half
+    is test_pg_stores.test_ledger_verdict_filter_applies_before_limit)."""
+    rows = [_ledger(verdict="fixed")]
     with patch("installations.get_installation", return_value=_LEDGER_INSTALL):
         with patch("installations.list_ledger_rows", return_value=rows) as list_rows:
             out = inst.list_ledger(
-                install_id=1, repo="Alice/r", verdict="fixed", limit=1, user=_user(),
+                install_id=1, repo="Alice/r", verdict="fixed", limit=999, user=_user(),
             )
-    list_rows.assert_called_once_with("Alice/r", limit=1)
+    list_rows.assert_called_once_with("Alice/r", limit=200, verdict="fixed")
     assert [r["pr"] for r in out["ledger"]] == [7]
     assert out["ledger"][0]["class"] == "silent-failure"
