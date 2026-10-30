@@ -1240,23 +1240,32 @@ def put_ledger_row(row: dict[str, Any]) -> None:
         )
 
 
-def list_ledger_rows(repo: str, limit: int | None = None) -> list[dict[str, Any]]:
+def list_ledger_rows(
+    repo: str,
+    limit: int | None = None,
+    verdict: str | None = None,
+) -> list[dict[str, Any]]:
     """Every ledger finding for a repo (the corpus #527 / few-shot read),
-    class-ordered. Same prefix-scan shape as list_check_verdicts."""
+    class-ordered. Same prefix-scan shape as list_check_verdicts. `verdict`
+    filters in the query, so `limit` counts matches rather than scanned rows."""
+    verdict_sql = "" if verdict is None else "AND data->>'verdict' = %(verdict)s"
+    limit_sql = "" if limit is None else "LIMIT %(limit)s"
+    params = {"pk": _ledger_pk(repo), "verdict": verdict, "limit": limit}
     with get_pool().connection() as conn:
         rows = conn.execute(
             f"""
             SELECT pk, sk, data FROM grug_kv
-            WHERE pk = %s AND sk NOT IN ('PRACTICES', 'EXEMPLARS') AND {TTL_LIVE}
+            WHERE pk = %(pk)s AND sk NOT IN ('PRACTICES', 'EXEMPLARS') AND {TTL_LIVE}
+            {verdict_sql}
             -- keep the NOT IN list in lockstep with every derived-cache sk
             -- (PRACTICES #527, EXEMPLARS #538): a cached derivation leaking
             -- into the corpus scan feeds Elder its own output as ground truth
             ORDER BY sk COLLATE "C" ASC
+            {limit_sql}
             """,
-            (_ledger_pk(repo),),
+            params,
         ).fetchall()
-    out = [decode_item(pk, sk, data) for pk, sk, data in rows]
-    return out if limit is None else out[:limit]
+    return [decode_item(pk, sk, data) for pk, sk, data in rows]
 
 
 def put_repo_practices(repo: str, practices: list[dict[str, Any]]) -> None:
