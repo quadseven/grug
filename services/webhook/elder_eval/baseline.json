@@ -1,8 +1,10 @@
 {
   "backends": {
     "cave": {
+      "carried_prompt_sha": "c6456b96f5efdc92b3fd948fd370da475f205f41c7f972b66d8d5b5b237fdd6a",
       "cases_scored": 17,
       "errored_cases": [],
+      "measured_prompt_sha": "7e5e81ea45396acf6845302fed521d58b1ad7d7603700f313dd57fc69008f09d",
       "model": "qwen3-coder-next:q8_0",
       "noise_rate": 0.0,
       "overall_catch": 0.1746031746031746,
