@@ -295,6 +295,24 @@ RULES: tuple[ReviewRule, ...] = (
         severity="low",
     ),
     ReviewRule(
+        name="stale-test-assertion",
+        bug_class="test fidelity",
+        description="The diff changes a value (a user-facing string, "
+        "constant, default, or status code) while an UNCHANGED test still "
+        "asserts the OLD value, so the build breaks on a test the PR never "
+        "touched. Only flag when a cross-file context block actually shows "
+        "the untouched test asserting the old value. ANCHOR the finding on "
+        "the CHANGED line in the diff - never on the unchanged test file - "
+        "and name the test's path and line in the message (e.g. 'tests/"
+        "test_msg.py:4 still asserts the old string'). A test the diff "
+        "also updates is not stale.",
+        bad_example="-    return \"Welcome back, friend\"\n+    return \"Welcome back\"  "
+        "# tests/test_msg.py:4 still asserts == \"Welcome back, friend\"",
+        good_example="+    return \"Welcome back\"  # and the diff updates "
+        "tests/test_msg.py:4 to assert == \"Welcome back\"",
+        severity="medium",
+    ),
+    ReviewRule(
         name="fire-and-forget-task",
         bug_class="async blocker",
         description="An asyncio task created without await/gather/tracking — "

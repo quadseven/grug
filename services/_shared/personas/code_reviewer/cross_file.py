@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Iterable
 from urllib.parse import quote
 
 import httpx
@@ -81,6 +82,15 @@ _STOP_NAMES = frozenset({
     "async", "await",
 })
 
+
+# A quoted string literal on a changed line. No quote characters inside, so
+# the value can ride into a code-search phrase query unescaped. Only
+# natural-language text qualifies (a word character AND whitespace, 4+ chars):
+# short literals ("a", "--", "ok") match everywhere, and a whitespace-free
+# literal is as likely a removed token or key as a message - it must never
+# be sent to code search or logged as a symbol.
+_STRING_LITERAL = re.compile(r"""(?:"([^"\\\n]{4,})"|'([^'"\\\n]{4,})')""")
+_MAX_LITERALS = 2
 
 _PY_LINE_DEF = re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(")
 
@@ -137,6 +147,36 @@ def _enclosing_def_from_content(content: str, first_added_line: int) -> str | No
     return None
 
 
+def _is_prose(lit: str) -> bool:
+    return bool(re.search(r"\w", lit) and re.search(r"\s", lit))
+
+
+def _removed_literals(hunks: tuple[DiffHunk, ...]) -> list[str]:
+    """String literals a hunk REMOVES and does not re-add (#847). A changed
+    user-facing value has no def or call symbol, so these are the only handle
+    for finding an UNCHANGED test that still asserts the old value (the
+    `stale-test-assertion` rule). Pure; first-seen order, capped."""
+    out: list[str] = []
+    for h in hunks:
+        lines = h.body.splitlines()
+        added = set(_line_literals(ln for ln in lines if ln.startswith("+")))
+        for lit in _line_literals(ln for ln in lines if ln.startswith("-")):
+            if _is_prose(lit) and lit not in added and lit not in out:
+                out.append(lit)
+    return out[:_MAX_LITERALS]
+
+
+def _line_literals(diff_lines: Iterable[str]) -> list[str]:
+    """Every whole string literal on `diff_lines` (the +/- marker dropped).
+    Whole literals, not substrings: a removed "Welcome back" that only
+    survives inside an added "Welcome back, friend" is still gone."""
+    return [
+        m.group(1) or m.group(2)
+        for ln in diff_lines
+        for m in _STRING_LITERAL.finditer(ln[1:])
+    ]
+
+
 def extract_symbols(
     hunks: tuple[DiffHunk, ...],
     file_contents: dict[str, str] | None = None,
@@ -153,7 +193,9 @@ def extract_symbols(
        full-file fetch) is available - by walking UP from the first
        added line to the nearest preceding def, covering defs entirely
        outside the diff context window (codex round 4).
-    3. Called names the diff adds that are NOT defined in-diff (their
+    3. String literals the diff removes (#847): an untouched test may
+       still assert the old value.
+    4. Called names the diff adds that are NOT defined in-diff (their
        DEFINITION elsewhere tells the reviewer what the call does).
 
     Pure; capped at `_MAX_SYMBOLS`; dedup preserves first-seen order.
@@ -185,6 +227,7 @@ def extract_symbols(
                 calls.append(name)
 
     out: list[str] = list(defs)
+    out.extend(lit for lit in _removed_literals(hunks) if lit not in out)
     for name in calls:
         # A name defined in-diff needs no definition lookup; as a DEF it
         # is already queued above (callers elsewhere still matter).

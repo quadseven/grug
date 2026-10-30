@@ -115,3 +115,20 @@ Both slices change `code_review_prompt.py`, so each must also re-record
 `elder_eval/baseline.json` for the new `prompt_sha`, and each adds a
 negative fixture (the fixed attester as merged) that its rule must leave
 clean.
+
+## stale-test-assertion: test-gap catch rate, before and after
+
+The `stale-test-assertion` rule (issue 847) targets the `test-gap` class.
+`baseline.json` holds only the `prompt_sha` plus the backends recorded
+against that exact prompt, so the pre-change numbers are kept here.
+
+| Measurement | Prompt sha | Backend | Cases scored | test-gap catch | Overall catch |
+| --- | --- | --- | --- | --- | --- |
+| Before the rule | `8f85cf9da27d...` | cave (`qwen3-coder-next:q8_0`) | 17 | 0.25 | 0.1746 |
+| After the rule | `4d66baea506b...` | not yet measured | - | - | - |
+
+The "after" row needs the benchmark environment's LLM backend, which this
+change could not reach. An operator records it with
+`make elder-eval ARGS="--backend cave --record"` and fills in the row. The
+before numbers come from the `cave` entry that `baseline.json` carried
+before the rule landed (git history of that file).
