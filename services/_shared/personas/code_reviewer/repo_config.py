@@ -1,6 +1,6 @@
 """Optional in-repo `.grug.yaml` review configuration.
 
-Four keys, all optional:
+Seven keys, all optional:
 
   ignore               list of path globs that are never reviewed
   path_instructions    list of {path: glob, instructions: text}; the text is
@@ -15,6 +15,14 @@ Four keys, all optional:
                        (case-insensitive); a title pattern is a glob where
                        only `*` and `?` are special, matched against the
                        whole title, case-insensitive.
+  elder_mute_min_labeled     integer, default 20; labeled ledger rows a finding
+                       class needs before it can be muted
+  elder_mute_below_precision number 0..1, default 0.2; a class with at least
+                       that many labeled rows and a lower fixed-rate is muted:
+                       no inline comment, board and summary only (a critical
+                       finding still posts inline)
+  elder_mute_locked_classes  list of finding classes that stay inline whatever
+                       their precision
 
 The caller reads the file from the PR BASE ref (never the head), so a PR
 cannot loosen its own review. This module is pure: it takes text and returns
@@ -35,9 +43,15 @@ import yaml
 CONFIG_PATH = ".grug.yaml"
 
 _KNOWN_KEYS = frozenset(
-    {"ignore", "path_instructions", "min_inline_severity", "skip_prs"},
+    {
+        "ignore", "path_instructions", "min_inline_severity", "skip_prs",
+        "elder_mute_min_labeled", "elder_mute_below_precision",
+        "elder_mute_locked_classes",
+    },
 )
 _SKIP_PRS_KEYS = ("authors", "labels", "title_patterns")
+DEFAULT_MUTE_MIN_LABELED = 20
+DEFAULT_MUTE_BELOW_PRECISION = 0.2
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 # Bounds so one file cannot blow the prompt budget.
 _MAX_INSTRUCTIONS = 20
@@ -64,6 +78,9 @@ class RepoConfig:
     min_inline_severity: str | None = None
     problems: tuple[str, ...] = ()
     skip_prs: SkipPrs = field(default_factory=SkipPrs)
+    elder_mute_min_labeled: int = DEFAULT_MUTE_MIN_LABELED
+    elder_mute_below_precision: float = DEFAULT_MUTE_BELOW_PRECISION
+    elder_mute_locked_classes: tuple[str, ...] = ()
 
 
 def _string_list(value: object, key: str, problems: list[str]) -> tuple[str, ...]:
@@ -128,6 +145,32 @@ def _skip_prs(value: object, problems: list[str]) -> SkipPrs:
     return SkipPrs(**lists)
 
 
+def _mute_settings(
+    data: dict, problems: list[str],
+) -> tuple[int, float, tuple[str, ...]]:
+    """The three `elder_mute_*` keys; a bad value keeps its default."""
+    min_labeled = DEFAULT_MUTE_MIN_LABELED
+    below = DEFAULT_MUTE_BELOW_PRECISION
+    locked: tuple[str, ...] = ()
+    if "elder_mute_min_labeled" in data:
+        raw = data["elder_mute_min_labeled"]
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+            min_labeled = raw
+        else:
+            problems.append("`elder_mute_min_labeled` must be an integer >= 1")
+    if "elder_mute_below_precision" in data:
+        raw = data["elder_mute_below_precision"]
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and 0 <= raw <= 1:
+            below = float(raw)
+        else:
+            problems.append("`elder_mute_below_precision` must be a number from 0 to 1")
+    if "elder_mute_locked_classes" in data:
+        locked = _string_list(
+            data["elder_mute_locked_classes"], "elder_mute_locked_classes", problems,
+        )
+    return min_labeled, below, locked
+
+
 def parse_repo_config(text: str | None) -> RepoConfig:
     """Parse `.grug.yaml` text. Never raises."""
     if text is None or not text.strip():
@@ -166,7 +209,11 @@ def parse_repo_config(text: str | None) -> RepoConfig:
                 "`min_inline_severity` must be one of low, medium, high, critical"
             )
     skip = _skip_prs(data["skip_prs"], problems) if "skip_prs" in data else SkipPrs()
-    return RepoConfig(ignore, instructions, floor, tuple(problems), skip)
+    min_labeled, below, locked = _mute_settings(data, problems)
+    return RepoConfig(
+        ignore, instructions, floor, tuple(problems), skip,
+        min_labeled, below, locked,
+    )
 
 
 @lru_cache(maxsize=256)
