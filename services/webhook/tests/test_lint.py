@@ -424,6 +424,15 @@ def test_s608_fstring_of_shadowed_constant_stays_high():
     assert _scan_s608(src)[0].severity == "high"
 
 
+def test_s608_fstring_of_rebound_constant_stays_high():
+    src = ("TTL_LIVE = 'expires_at > now()'\n"
+           "TTL_LIVE += input()\n"
+           "def resume(cur):\n"
+           "    query = f'SELECT * FROM t WHERE {TTL_LIVE}'\n"
+           "    cur.execute(query)\n")
+    assert _scan_s608(src)[0].severity == "high"
+
+
 def test_s608_fstring_of_call_stays_high():
     src = ("def resume(cur):\n"
            "    query = f'SELECT * FROM {pick()}'\n"

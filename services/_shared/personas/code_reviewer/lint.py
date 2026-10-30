@@ -459,26 +459,40 @@ def _s608_is_constant(source: str, row: int) -> bool:
                     if isinstance(target, ast.Name):
                         constants[target.id] = value
 
-    for name in _locally_bound_names(tree):
+    for name in _rebound_names(tree):
         constants.pop(name, None)
 
     candidates = _s608_candidates(tree, row)
     return any(_literal_sql(candidate, constants) for candidate in candidates)
 
 
-def _locally_bound_names(tree: ast.Module) -> set[str]:
-    """Names bound by a parameter or a store inside any function or lambda.
-    A module constant of the same name may be shadowed at the flagged row, so
-    those names are never resolved as constants (conservative: high severity)."""
-    bound: set[str] = set()
-    for scope in ast.walk(tree):
-        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            bound.update(a.arg for a in ast.walk(scope.args) if isinstance(a, ast.arg))
-            bound.update(
-                n.id for n in ast.walk(scope)
-                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-            )
-    return bound
+def _binding_names(node: ast.AST) -> list[str]:
+    """Every name `node` itself binds, by any statement or pattern form."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        return [node.id]
+    if isinstance(node, (ast.arg, ast.alias)):
+        name = node.arg if isinstance(node, ast.arg) else (node.asname or node.name.split(".")[0])
+        return [name]
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler,
+                         ast.MatchAs, ast.MatchStar)):
+        return [node.name] if node.name else []
+    if isinstance(node, ast.MatchMapping):
+        return [node.rest] if node.rest else []
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return list(node.names)
+    return []
+
+
+def _rebound_names(tree: ast.Module) -> set[str]:
+    """Names bound more than once anywhere in the file (parameters, other
+    scopes, augmented assignment, imports, ...). A module constant sharing
+    such a name may be shadowed or rebound at the flagged row, so it is never
+    resolved as constant (conservative: high severity)."""
+    counts: dict[str, int] = {}
+    for node in ast.walk(tree):
+        for name in _binding_names(node):
+            counts[name] = counts.get(name, 0) + 1
+    return {name for name, n in counts.items() if n > 1}
 
 
 def _s608_candidates(tree: ast.Module, row: int) -> list[ast.expr]:
