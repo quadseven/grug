@@ -70,6 +70,11 @@ _ELDER_BOT_LOGIN = "grug-tribe[bot]"
 # means no agent bot replies are counted as handled (only human replies and
 # Elder's "Fixed in" replies).
 _AGENT_REPLY_BOTS = os.getenv("GRUG_AGENT_REPLY_BOTS", "").split()
+# Logins of the Loom Apps (station and brain) whose deliberate close of a lane
+# pull request is not an abandoned review. Configured via GRUG_LOOM_APP_LOGINS;
+# empty means no close is exempt (grug#1403).
+_LOOM_APP_LOGINS = frozenset(os.getenv("GRUG_LOOM_APP_LOGINS", "").split())
+_LOOM_LANE_PREFIX = "loom/"
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -360,9 +365,22 @@ def _gather_flag_evidence(
     return abandoned_only, findings_count, summary
 
 
+def _closed_by_loom_on_lane(payload: dict) -> bool:
+    """True when a configured Loom App closed a `loom/...` lane pull request.
+    The factory's close is a deliberate decision recorded on its ticket, so a
+    Haunt notice would tell the operator nothing they can act on."""
+    closer = (payload.get("sender") or {}).get("login")
+    head_ref = ((payload.get("pull_request") or {}).get("head") or {}).get("ref") or ""
+    return (
+        closer in _LOOM_APP_LOGINS and head_ref.startswith(_LOOM_LANE_PREFIX)
+    )
+
+
 def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
     pr = ctx.payload.get("pull_request") or {}
     merged = bool(pr.get("merged"))
+    if not merged and _closed_by_loom_on_lane(ctx.payload):
+        return {"persona": "sentinel", "result": "skipped"}
     # Elder's stored verdict is keyed by the PR HEAD sha (what it actually
     # reviewed) - not the merge commit Warder anchors on for its own,
     # unrelated release-changelog purpose.
