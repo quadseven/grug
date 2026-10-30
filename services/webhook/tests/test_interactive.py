@@ -682,3 +682,74 @@ def test_duplicate_command_no_second_reaction_no_comment(monkeypatch):
     # No reply comments at all
     reply_comments = [c for c in fake.calls if c[0] == "post" and "/comments" in c[1] and "/reactions" not in c[1]]
     assert reply_comments == []
+# --- /grug fix (epic #1311, v1 autofix) -------------------------------------
+
+
+def test_fix_routes_to_fix_module(monkeypatch):
+    """`/grug fix` is routed to autofix.run_fix with the right arguments."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    called = {}
+    import autofix as fix_module
+
+    def fake_run_fix(*, install_id, owner, repo, pr_number,
+                     head_sha, token_fn, **_k):
+        called.update(install_id=install_id, owner=owner, repo=repo,
+                      pr_number=pr_number, head_sha=head_sha)
+        return {"status": "dispatched", "verb": "fix"}
+
+    monkeypatch.setattr(fix_module, "run_fix", fake_run_fix)
+    res = interactive.run_command(
+        "fix", "", install_id=3, owner="o", repo="r", pr_number=9,
+        comment_id=11, token_fn=_tok, claim=lambda k: True, head_sha="a" * 40,
+    )
+    assert res == {"status": "dispatched", "verb": "fix"}
+    assert called == {
+        "install_id": 3, "owner": "o", "repo": "r",
+        "pr_number": 9, "head_sha": "a" * 40,
+    }
+
+
+def test_fix_claims_before_running(monkeypatch):
+    """A redelivered /grug fix comment is not run twice (claim first)."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    claimed = []
+    import autofix as fix_module
+
+    def fake_run_fix(*, install_id, owner, repo, pr_number, comment_id,
+                     head_sha, token_fn, **_k):
+        return {"status": "dispatched", "verb": "fix"}
+
+    monkeypatch.setattr(fix_module, "run_fix", fake_run_fix)
+    res = interactive.run_command(
+        "fix", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=1, token_fn=_tok, claim=lambda k: claimed.append(k) or False,
+        head_sha="a" * 40,
+    )
+    assert res["status"] == "no_op" and "already handled" in res["reason"]
+    assert claimed == ["grugcmd:1"]
+
+
+def test_fix_is_not_an_elder_rerun_verb():
+    """fix must not be in ELDER_RERUN_VERBS - it is not budget-deferred."""
+    from grug_commands import ELDER_RERUN_VERBS
+    assert "fix" not in ELDER_RERUN_VERBS
+
+
+def test_fix_crash_is_answered_not_a_webhook_500(monkeypatch):
+    """The comment is claimed before run_fix runs, so GitHub never redelivers
+    it. A raise inside run_fix must be answered on the PR and returned as a
+    skip, never propagated into a webhook 500 that drops the command."""
+    fake = _FakeHttp(); monkeypatch.setattr(interactive, "httpx", fake)
+    import autofix as fix_module
+
+    def boom(**_k):
+        raise RuntimeError("git data api exploded")
+
+    monkeypatch.setattr(fix_module, "run_fix", boom)
+    res = interactive.run_command(
+        "fix", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=5, token_fn=_tok, claim=lambda k: True, head_sha="a" * 40,
+    )
+    assert res == {"status": "skip", "reason": "fix_failed", "verb": "fix"}
+    replies = [c for c in fake.calls if c[0] == "post"]
+    assert replies and "/grug fix" in replies[0][2]["body"]

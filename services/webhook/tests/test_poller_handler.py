@@ -23,6 +23,9 @@ def _no_ambient_ra_config(monkeypatch):
     # The Chief self-heal pass has its own tests (test_chief_self_heal.py);
     # here it must not reach GitHub through the real token wrapper.
     monkeypatch.setattr("chief_self_heal.self_heal_installs", lambda installs: (0, 0))
+    # The deep publish retry pass reads the store; its own tests live in
+    # test_deep_publish_retry.py.
+    monkeypatch.setattr(poller_handler, "_deep_publish_retry_pass", lambda: (0, 0))
 
 
 def _wire(monkeypatch, *, installs, records_for, retry, poll):
@@ -119,6 +122,8 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
         "check_run_reconcile_failed_installs": 0,
         "chief_self_heal_published": 0,
         "chief_self_heal_failed": 0,
+        "deep_publish_retried": 0,
+        "deep_publish_retry_failed": 0,
         "install_reconciliation_repaired": 0,
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,
@@ -265,6 +270,8 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
         "check_run_reconcile_failed_installs": 0,
         "chief_self_heal_published": 0,
         "chief_self_heal_failed": 0,
+        "deep_publish_retried": 0,
+        "deep_publish_retry_failed": 0,
         "install_reconciliation_repaired": 0,
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,
@@ -518,6 +525,8 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
         "check_run_reconcile_failed_installs": 0,
         "chief_self_heal_published": 0,
         "chief_self_heal_failed": 0,
+        "deep_publish_retried": 0,
+        "deep_publish_retry_failed": 0,
         "install_reconciliation_repaired": 0,
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,
@@ -561,6 +570,8 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
         "check_run_reconcile_failed_installs": 0,
         "chief_self_heal_published": 0,
         "chief_self_heal_failed": 0,
+        "deep_publish_retried": 0,
+        "deep_publish_retry_failed": 0,
         "install_reconciliation_repaired": 0,
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,

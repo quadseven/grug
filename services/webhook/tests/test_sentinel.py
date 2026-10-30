@@ -553,3 +553,60 @@ def test_reply_scan_excludes_unconfigured_bot_replies(monkeypatch):
 
     # Only the finding with the human reply should be handled
     assert sentinel._replied_to_comment_ids("tok", "owner", "repo", 5) == {3}
+
+
+def _closed_payload(closer, head_ref):
+    return {
+        "sender": {"login": closer},
+        "pull_request": {"merged": False, "head": {"ref": head_ref}},
+    }
+
+
+def _arm_blocking_flag(monkeypatch):
+    monkeypatch.setattr(sentinel, "get_check_verdict", lambda iid, sha, persona: _verdict(blocking=True))
+    _no_candidates(monkeypatch)
+    monkeypatch.setattr(sentinel, "_find_marker_comment", lambda token, o, r, pr: None)
+    posted = []
+    monkeypatch.setattr(
+        sentinel.httpx, "post",
+        lambda url, **kw: posted.append(kw["json"]["body"]) or httpx.Response(
+            201, request=httpx.Request("POST", url), json={},
+        ),
+    )
+    monkeypatch.setattr(sentinel, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(sentinel, "record_check_verdict", lambda **kw: None)
+    monkeypatch.setattr(sentinel, "_LOOM_APP_LOGINS", frozenset(("loom-station[bot]",)))
+    return posted
+
+
+def test_skips_lane_pr_closed_by_configured_loom_app(monkeypatch):
+    posted = _arm_blocking_flag(monkeypatch)
+
+    out = sentinel.dispatch_pull_request(
+        _ctx(_closed_payload("loom-station[bot]", "loom/1403-some-ticket")),
+    )
+
+    assert out == {"persona": "sentinel", "result": "skipped"}
+    assert posted == []
+
+
+def test_flags_lane_pr_closed_by_a_person(monkeypatch):
+    posted = _arm_blocking_flag(monkeypatch)
+
+    out = sentinel.dispatch_pull_request(
+        _ctx(_closed_payload("a-person", "loom/1403-some-ticket")),
+    )
+
+    assert out == {"persona": "sentinel", "result": "flagged"}
+    assert len(posted) == 1
+
+
+def test_flags_non_lane_pr_closed_by_loom_app(monkeypatch):
+    posted = _arm_blocking_flag(monkeypatch)
+
+    out = sentinel.dispatch_pull_request(
+        _ctx(_closed_payload("loom-station[bot]", "feature/x")),
+    )
+
+    assert out["result"] == "flagged"
+    assert len(posted) == 1

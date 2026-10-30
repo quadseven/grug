@@ -42,7 +42,7 @@ _MARKER_RE = re.compile(r"<!-- grug-hunt-board:v1 version=(\d+) -->")
 
 _RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 _MAX_TEXT = 200
-_MAX_WALKTHROUGH = 4000
+_MAX_WALKTHROUGH = 16000  # a summary plus a full 60-row file table
 
 _STATUS_TEXT = {
     "pending": "review not started",

@@ -133,6 +133,13 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
             - {name: DD_LOGS_INJECTION, value: "true"}
             - {name: GRUG_ENV, value: prod}
+            # grug#1445: the App bot logins the owner allows to run Elder
+            # re-run commands (/grug improve / resume / review) on a PR they
+            # did not author. Read from GRUG_ALLOWED_APP_BOT_LOGINS. Empty =
+            # feature off; the operator lists the owner's App bots here so a
+            # /grug improve from loom-brain[bot] on a PR it did not open runs
+            # Elder like a write collaborator's instead of being dropped.
+            - {name: GRUG_ALLOWED_APP_BOT_LOGINS, value: "loom-brain[bot],loom-station[bot],loom-lanes[bot]"}
             # Off-Lambda async path (#368). Elder's production hot path is
             # durable SQS below; this flag still enables the local worker used
             # by the other async personas and by Elder only if that lane is
@@ -173,7 +180,13 @@ spec:
             # auto | on_demand. on_demand runs the deep pass only on a
             # "deep review" marker in the PR title or body. Full comments in
             # consumer-deployment.
-            - {name: GRUG_DEEP_ESCALATION, value: auto}
+            # TEMPORARY (2026-10-27): on_demand while both Spark machines are
+            # away for RMA (about a month from 2026-10-27). With the Sparks off
+            # and the free cloud tier exhausted the deep pass ended all_failed
+            # and Elder concluded failure, blocking merges. Revert to auto when
+            # the Spark reasoner returns or paid OpenRouter credits are enabled
+            # (grug#1487).
+            - {name: GRUG_DEEP_ESCALATION, value: "on_demand"}
             # Keep the compatibility worker's staging policy identical to the
             # durable consumer even though production uses the consumer path.
             - {name: GRUG_STAGED_REVIEW_BUDGET_S, value: "700"}

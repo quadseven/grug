@@ -327,6 +327,66 @@ def test_unbounded_structured_output_schema_rule_present():
     assert "maxItems" in rule.description and "maxLength" in rule.description
 
 
+def test_stderr_folded_into_compared_value_rule_present():
+    """Weekly harvest 2026-10-26, routed from the /audit catalogue where it
+    was parked ELDER-ELIGIBLE. A merged CI fix in a sibling repository read an
+    opt-in annotation with `$(... 2>&1)` and compared the result against the
+    exact string `true`. The CLI reached through the kubeconfig exec plugin
+    prints a key-permissions warning on stderr for EVERY call, so the captured
+    value was never exactly `true`: the wait was skipped, and the log said
+    nothing at all. The feature had shipped one PR earlier and its first live
+    run was already silently inert. Two properties make it worse than an
+    ordinary bug -- the contaminating layer is not the command being read, and
+    a false comparison produces a SKIP, which is also what 'not opted in'
+    looks like. So the rule has to carry the logging half of the remedy, not
+    just 'read stdout only'."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "stderr-folded-into-compared-value"),
+        None,
+    )
+    assert rule is not None, (
+        "stderr-folded-into-compared-value missing from RULES"
+    )
+    assert rule.bug_class == "silent failure"
+    assert "stderr-folded-into-compared-value" in crp.build_system_prompt()
+    # Scope: the defect is the COMPARISON, not the redirect. A rule that
+    # flagged every `2>&1` would fire on diagnostics the author wanted.
+    assert "2>&1" in rule.description
+    assert "only logged" in rule.description
+    # The skip is the half a reviewer drops: a silent skip reads as success.
+    assert "SKIP" in rule.description
+
+
+def test_diff_gate_scans_hunk_header_rule_present():
+    """Weekly harvest 2026-10-26, routed from the /audit catalogue where it
+    was parked ELDER-ELIGIBLE. The evidence is a merged fix in the fleet's
+    public reusable-CI repository (left unnamed here: the leak guard blocks
+    cross-repo issue refs, since `owner/repo#N` may name a private repo).
+    Its shared leak scanner read a unified diff and skipped `---`/`+++`
+    but not `@@`. Under
+    `git diff -U0` git appends pre-image context to every hunk header, so a
+    change removing two leaked lines in a row had the second hunk header
+    repeat the first removed line -- and the scanner reported the removal as
+    an addition. That kept a repo's leak-scan enablement red through three
+    model rungs before anyone traced it, because the signal was inverted
+    exactly for the PRs trying to fix the thing it was watching for. The rule
+    has to carry the enumeration (every non-content line kind, not just the
+    two obvious ones) and the `-U0` mechanism, since without the latter a
+    reviewer reads a hunk header as line numbers only and sees nothing
+    wrong."""
+    rule = next(
+        (r for r in crp.RULES if r.name == "diff-gate-scans-hunk-header"),
+        None,
+    )
+    assert rule is not None, "diff-gate-scans-hunk-header missing from RULES"
+    assert rule.bug_class == "correctness"
+    assert "diff-gate-scans-hunk-header" in crp.build_system_prompt()
+    # The mechanism, not just the symptom: -U0 is why @@ carries content.
+    assert "-U0" in rule.description
+    # The inversion is the severity argument -- the gate blocks the remedy.
+    assert "removal as an addition" in rule.description
+
+
 def test_voice_has_mandatory_bookend_structure():
     """#343: the voice instruction mandates the structural bookends that
     keep the caveman cadence from slipping to plain English under technical

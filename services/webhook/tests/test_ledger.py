@@ -7,9 +7,14 @@ import json
 from ledger import (
     LedgerRow,
     accepted_findings_by_class,
+    format_metrics,
+    learning_metrics,
     parse_jsonl,
     parse_row,
     reviewer_precision,
+)
+from ledger import (
+    main as ledger_main,
 )
 
 
@@ -190,3 +195,62 @@ def test_ledger_sk_handles_null_pr():
     assert none_sk != _ledger_sk("silent-failure", 0, "codex", d)
     # and sorts after every numeric pr within the same class
     assert none_sk > _ledger_sk("silent-failure", 9999999, "codex", d)
+
+
+def test_parse_row_carries_category_and_defaults_to_general():
+    assert _row(category="security").category == "security"
+    assert _row().category == "general"
+    assert _row(category="not-a-category").category == "general"
+    assert _row(category=["x"]).category == "general"
+def test_learning_metrics_calculates_overall_and_per_class():
+    rows = [
+        _row(reviewer="codex", finding_class="silent-failure", verdict="fixed"),
+        _row(reviewer="codex", finding_class="silent-failure", verdict="declined"),
+        _row(reviewer="spark", finding_class="silent-failure", verdict="false-positive"),
+        _row(reviewer="spark", finding_class="null-deref", verdict="fixed"),
+    ]
+    m = learning_metrics(rows)
+    assert m["total_rows"] == 4
+    assert m["labeled_rows"] == 4
+    assert m["accepted"] == 3
+    assert m["false_positives"] == 1
+    assert m["precision"] == 0.75
+
+    classes = m["classes"]
+    assert classes["silent-failure"]["accepted"] == 2
+    assert classes["silent-failure"]["false_positives"] == 1
+    assert classes["silent-failure"]["precision"] == 2 / 3
+    assert classes["null-deref"]["accepted"] == 1
+    assert classes["null-deref"]["false_positives"] == 0
+    assert classes["null-deref"]["precision"] == 1.0
+
+
+def test_format_metrics_produces_readable_output():
+    rows = [
+        _row(reviewer="codex", finding_class="silent-failure", verdict="fixed"),
+        _row(reviewer="spark", finding_class="silent-failure", verdict="false-positive"),
+    ]
+    text = format_metrics(rows)
+    assert "ledger: 2 rows, 1 accepted, 1 false positives (precision 0.50)" in text
+    assert "codex: 1/1 accepted (precision 1.00)" in text
+    assert "spark: 0/1 accepted (precision 0.00)" in text
+    assert "silent-failure: 1/2 accepted (precision 0.50)" in text
+
+
+def test_ledger_cli_main_outputs_metrics(capsys):
+    from pathlib import Path
+    p = str(Path(__file__).resolve().parents[3] / "logs" / "review-ledger.jsonl")
+    ret = ledger_main([p])
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert "ledger:" in captured.out
+    assert "accepted" in captured.out
+    assert "reviewers:" in captured.out
+    assert "classes:" in captured.out
+
+
+def test_ledger_cli_main_file_not_found(capsys):
+    ret = ledger_main(["nonexistent-file.jsonl"])
+    assert ret == 1
+    captured = capsys.readouterr()
+    assert "ledger: file not found" in captured.out
