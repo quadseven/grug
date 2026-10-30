@@ -123,6 +123,14 @@ def test_ledger_foreign_repo_404():
     assert exc.value.status_code == 404
 
 
+@pytest.mark.parametrize("repo", ["alice", "alice/", "alice/a/b"])
+def test_ledger_malformed_repo_404(repo):
+    with patch("installations.get_installation", return_value=_LEDGER_INSTALL):
+        with pytest.raises(HTTPException) as exc:
+            inst.list_ledger(install_id=1, repo=repo, user=_user())
+    assert exc.value.status_code == 404
+
+
 def test_ledger_stranger_403():
     with patch("installations.get_installation", return_value=_LEDGER_INSTALL):
         with pytest.raises(HTTPException) as exc:

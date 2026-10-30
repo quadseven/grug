@@ -353,8 +353,12 @@ def list_ledger(
     if not install:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
     _ensure_can_access(install, user)
-    owner = repo.split("/", 1)[0].lower()
-    if owner != str(install.get("account_login", "")).lower():
+    owner, _, name = repo.partition("/")
+    if (
+        not name
+        or "/" in name
+        or owner.lower() != str(install.get("account_login", "")).lower()
+    ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not found")
     limit = max(1, min(limit, 200))
     rows = [
