@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Iterable
 from urllib.parse import quote
 
 import httpx
@@ -158,15 +159,22 @@ def _removed_literals(hunks: tuple[DiffHunk, ...]) -> list[str]:
     out: list[str] = []
     for h in hunks:
         lines = h.body.splitlines()
-        added = "\n".join(ln[1:] for ln in lines if ln.startswith("+"))
-        for ln in lines:
-            if not ln.startswith("-"):
-                continue
-            for m in _STRING_LITERAL.finditer(ln[1:]):
-                lit = m.group(1) or m.group(2)
-                if _is_prose(lit) and lit not in added and lit not in out:
-                    out.append(lit)
+        added = set(_line_literals(ln for ln in lines if ln.startswith("+")))
+        for lit in _line_literals(ln for ln in lines if ln.startswith("-")):
+            if _is_prose(lit) and lit not in added and lit not in out:
+                out.append(lit)
     return out[:_MAX_LITERALS]
+
+
+def _line_literals(diff_lines: Iterable[str]) -> list[str]:
+    """Every whole string literal on `diff_lines` (the +/- marker dropped).
+    Whole literals, not substrings: a removed "Welcome back" that only
+    survives inside an added "Welcome back, friend" is still gone."""
+    return [
+        m.group(1) or m.group(2)
+        for ln in diff_lines
+        for m in _STRING_LITERAL.finditer(ln[1:])
+    ]
 
 
 def extract_symbols(

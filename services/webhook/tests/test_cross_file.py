@@ -585,6 +585,20 @@ def test_extract_symbols_skips_literal_still_present_and_short_ones():
     assert cross_file.extract_symbols(parse_diff(diff)) == ()
 
 
+def test_extract_symbols_keeps_literal_only_contained_in_an_added_one():
+    """A removed literal that survives only as part of a LONGER added
+    literal is still gone: a test asserting `== "Welcome back"` breaks."""
+    diff = """diff --git a/src/messages.py b/src/messages.py
+--- a/src/messages.py
++++ b/src/messages.py
+@@ -3,3 +3,3 @@
+ def greeting():
+-    return "Welcome back"
++    return "Welcome back, friend"
+"""
+    assert "Welcome back" in cross_file.extract_symbols(parse_diff(diff))
+
+
 def test_stale_assertion_in_untouched_test_reaches_the_model():
     """End to end through the fetcher: the removed literal finds the
     unchanged test file and its snippet carries the stale assertion."""
