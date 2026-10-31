@@ -2069,6 +2069,28 @@ def list_hygiene_watch_repos(install_id: int) -> list[dict[str, Any]]:
 _HYGIENE_WATCH_TTL_DAYS = 7
 
 
+def claim_budget_alert(install_id: int, reset_epoch: int) -> bool:
+    """Win-once claim for the low-budget alert of one rate-limit window. The
+    window's reset time is its name, so the next window claims afresh."""
+    pg_base.maybe_purge_expired()
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO NOTHING
+            RETURNING pk
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": f"BUDGETALERT#{int(reset_epoch)}",
+                "data": Jsonb({}),
+                "ttl": int(reset_epoch) + 3600,
+            },
+        ).fetchone()
+    return row is not None
+
+
 def claim_hygiene_watch_report(install_id: int, repo: str) -> bool:
     """Win-once weekly claim for a Guard hygiene quarantine report (#655) -
     same shape as claim_dep_watch_report. A separate `sk` namespace so the
