@@ -680,6 +680,41 @@ def test_hot_review_requeues_latest_when_dispatch_detects_stale(monkeypatch):
     complete.assert_not_called()
 
 
+def test_hot_review_pr_read_403_completes_check_without_redrive(monkeypatch):
+    response = httpx.Response(
+        403,
+        request=httpx.Request(
+            "GET", "https://api.github.com/repos/myorg/myrepo/pulls/7",
+        ),
+    )
+
+    attempts = []
+
+    def denied_then_post(iid, fn):
+        attempts.append(iid)
+        if len(attempts) == 1:
+            raise httpx.HTTPStatusError("Forbidden", request=response.request, response=response)
+        return fn("token")
+
+    posted = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", denied_then_post)
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
+    )
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="head-that-was-queued",
+    ))
+
+    assert status == "pr_read_forbidden"
+    assert len(posted) == 1
+    assert posted[0].title == "Grug cannot read this pull request: 403 from GitHub"
+    assert posted[0].head_sha == "head-that-was-queued"
+    assert posted[0].conclusion == "failure"
+    assert len(attempts) == 2
+
+
 def test_hot_review_gives_up_mid_flight_once_the_redrive_cap_is_exhausted(monkeypatch):
     """grug#773 AC3's other call site: the EXPENSIVE mid-flight staleness
     path (a real dispatch already ran) must also stop redriving once the
