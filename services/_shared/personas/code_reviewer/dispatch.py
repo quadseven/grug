@@ -23,6 +23,7 @@ failing does not skip the other.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -65,8 +66,9 @@ from voice_pack import VoiceSelection, entitled_voice
 from review_evidence import ElderEvidence, assemble_evidence
 from review_types import EFFORTS, SEVERITIES
 from personas.review_publish import (
-    DIFF_FETCH_TIMEOUT, PUBLISHABLE_DEGRADATIONS, ReviewMode, fetch_file_contents,
-    fetch_pr_diff, fetch_pr_diff_with_scope, is_blackout, is_low_confidence,
+    DIFF_FETCH_TIMEOUT, PARTIAL_COVERAGE, PUBLISHABLE_DEGRADATIONS, ReviewMode,
+    fetch_file_contents, fetch_pr_diff, fetch_pr_diff_with_scope, is_blackout, is_low_confidence,
+    fetch_review_comment_body,
     is_partial_coverage, is_real_degradation, plan_publish, prior_finding_keys,
 )
 from personas.code_reviewer.dedup import (
@@ -112,13 +114,18 @@ from personas.code_reviewer.repo_config import (
     with_instructions,
 )
 from personas.code_reviewer.criteria_judge import criteria_judge_for
-from personas.code_reviewer.lane_work import lane_work_findings
+from personas.code_reviewer.deferred_ruff import (
+    MAX_DEFERRED, MAX_SETTLED_TICKETS, DeferredLint, parse_deferred_lint, rule_code,
+    unmet_findings,
+)
+from personas.code_reviewer.lint import ruff_hits
+from personas.code_reviewer.lane_work import is_lane_pr, lane_work_findings
 from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
 from personas.code_reviewer.linked_issue import (
-    build_linked_issue_context, linked_issue_numbers, rendered_criteria,
-    rendered_criteria_with_state, rendered_health_issues,
+    IssueDetailsFetcher, build_linked_issue_context, linked_issue_numbers,
+    rendered_criteria, rendered_criteria_with_state, rendered_health_issues,
 )
 from personas.code_reviewer.pinned_review import pin_line, pin_review
 from personas.tpm.ticket_compliance import closes_refs
@@ -2593,18 +2600,76 @@ def _repo_complexity_caps(
         return None, None
 
 
+# GitHub's answers for an issue that does not exist or was deleted.
+_ISSUE_ABSENT = (httpx.codes.NOT_FOUND, httpx.codes.GONE)
+
+
+def _settled_tickets(body: str, *, owner: str, repo_name: str) -> list[int]:
+    """Tickets this PR must settle: those it closes, every link of a lane PR."""
+    closes = set(closes_refs(body))
+    lane = is_lane_pr(body)
+    return [
+        n for n in linked_issue_numbers(body, owner=owner, repo=repo_name, limit=None)
+        if lane or n in closes
+    ]
+
+
+def _note_deferred_lint(
+    pr_context: PrContext, fetch_issue: IssueDetailsFetcher, *,
+    owner: str, repo_name: str,
+) -> None:
+    """Put the deferred ruff findings of the tickets this PR settles on
+    `pr_context` (#1477), and why that list is incomplete. An issue GitHub
+    does not have defers nothing; any other failure is recorded, so the
+    re-check degrades the review. Bounded here: the criteria block's cap on
+    linked issues would skip a ticket silently."""
+    body = str(pr_context.get("body") or "")
+    unfinished: list[str] = []
+    deferred: list[DeferredLint] = []
+    try:
+        settled = _settled_tickets(body, owner=owner, repo_name=repo_name)
+        if len(settled) > MAX_SETTLED_TICKETS:
+            unfinished.append("too_many_tickets")
+        for number in settled[:MAX_SETTLED_TICKETS]:
+            try:
+                issue = fetch_issue(number)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code not in _ISSUE_ABSENT:
+                    unfinished.append("ticket_unread")
+                continue
+            except httpx.RequestError:
+                unfinished.append("ticket_unread")
+                continue
+            text = issue if isinstance(issue, str) else issue.get("body") or ""
+            deferred.extend(parse_deferred_lint(
+                text, issue=number, owner=owner, repo=repo_name,
+            ))
+    except Exception as e:  # noqa: BLE001 - recorded: the review degrades on it
+        log.warning("code_review_deferred_tickets_failed", extra={"kind": type(e).__name__})
+        unfinished.append("ticket_unread")
+    if len(deferred) > MAX_DEFERRED:
+        unfinished.append("too_many_findings")
+    if deferred:
+        pr_context["deferred_lint"] = tuple(deferred[:MAX_DEFERRED])
+    if unfinished:
+        pr_context["deferred_lint_unfinished"] = tuple(dict.fromkeys(unfinished))
+
+
 def _attach_linked_issue_context(
     pr_context: PrContext, *, installation_id: int, owner: str, repo_name: str,
 ) -> None:
     """Put the linked-issue criteria block on `pr_context` (#904) so every
-    cohort and the deep pass see it. Any failure leaves `pr_context`
-    untouched = today's review."""
+    cohort and the deep pass see it. Any failure leaves the block off =
+    today's review. The tickets this PR settles are read first, under their
+    own bound, and the block reuses those reads (#1477)."""
     try:
+        fetch_issue = functools.lru_cache(maxsize=None)(build_issue_details_fetcher(
+            installation_id=installation_id, owner=owner, repo=repo_name,
+        ))
+        _note_deferred_lint(pr_context, fetch_issue, owner=owner, repo_name=repo_name)
         linked = build_linked_issue_context(
             str(pr_context.get("body") or ""),
-            fetch_issue=build_issue_details_fetcher(
-                installation_id=installation_id, owner=owner, repo=repo_name,
-            ),
+            fetch_issue=fetch_issue,
             owner=owner,
             repo=repo_name,
         )
@@ -2619,6 +2684,12 @@ def _attach_linked_issue_context(
                 "kind": type(e).__name__,
             },
         )
+        # No fetcher means no ticket was read. A PR that settles none still
+        # has nothing to measure; one that settles any must not pass unmeasured.
+        if pr_context.get("deferred_lint") is None and _settled_tickets(
+            str(pr_context.get("body") or ""), owner=owner, repo_name=repo_name,
+        ):
+            pr_context["deferred_lint_unfinished"] = ("ticket_unread",)
 
 
 def _pinned_issues(
@@ -2859,6 +2930,90 @@ def _merge_lane_work(
     )
 
 
+def _deferred_rule_codes(
+    refs: tuple[DeferredLint, ...], installation_id: int, owner: str, repo_name: str,
+) -> tuple[list[tuple[DeferredLint, str]], list[str]]:
+    """(finding, ruff code) for each deferred line, plus why any line has
+    none: its thread is gone, or is not Elder's lint finding, so the rule it
+    names cannot be measured. A read failure raises."""
+    named: list[tuple[DeferredLint, str]] = []
+    unfinished: list[str] = []
+    for ref in refs:
+        try:
+            author, text = with_install_token_retry(
+                installation_id,
+                lambda token, comment_id=ref.comment_id: fetch_review_comment_body(
+                    token, owner, repo_name, comment_id,
+                ),
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != httpx.codes.NOT_FOUND:
+                raise
+            unfinished.append("thread_gone")
+            continue
+        code = rule_code(text) if is_grug(author) else None
+        if code:
+            named.append((ref, code))
+        else:
+            unfinished.append("thread_names_no_rule")
+    return named, unfinished
+
+
+def _measure_deferred_ruff(
+    evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
+    file_contents: dict[str, str], pr_context: PrContext,
+) -> tuple[CodeReviewEvaluation, list[str]]:
+    """The evaluation with each named rule still firing, and what stopped
+    the measurement from covering everything the tickets name."""
+    refs = tuple(pr_context.get("deferred_lint") or ())
+    owner, _, repo_name = str(pr_context.get("repo") or "").partition("/")
+    installation_id = int(pr_context.get("installation_id") or 0)
+    head_sha = str(pr_context.get("head_sha") or "")
+    named, unfinished = _deferred_rule_codes(refs, installation_id, owner, repo_name)
+    paths = tuple(dict.fromkeys(ref.path for ref, _ in named))
+    contents = {p: file_contents[p] for p in paths if p in file_contents}
+    missing = tuple(p for p in paths if p not in contents)
+    if missing:
+        contents.update(with_install_token_retry(
+            installation_id,
+            lambda token: fetch_file_contents(
+                token, owner, repo_name, missing, head_sha, only_404_skips=True,
+            ),
+        ) or {})
+    found = unmet_findings(named, ruff_hits(contents), hunks)
+    return with_extra_findings(evaluation, found), unfinished
+
+
+def _merge_deferred_ruff(
+    evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
+    file_contents: dict[str, str], pr_context: PrContext,
+) -> CodeReviewEvaluation:
+    """Measure the ruff findings the linked tickets defer, at the head
+    (#1477). A file the PR did not change is read here. Anything that stops
+    it covering them all degrades the review: its silence must not read as
+    "fixed". Never raises."""
+    unfinished = list(pr_context.get("deferred_lint_unfinished") or ())
+    if not pr_context.get("deferred_lint") and not unfinished:
+        return evaluation
+    try:
+        evaluation, more = _measure_deferred_ruff(
+            evaluation, hunks, file_contents, pr_context,
+        )
+        unfinished += more
+    except Exception as e:  # noqa: BLE001 - degrades, never passes
+        unfinished.append(type(e).__name__)
+    if not unfinished:
+        return evaluation
+    log.warning(
+        "code_review_deferred_ruff_unfinished",
+        extra={"pr": f"{pr_context.get('repo')}#{pr_context.get('pr_number')}",
+               "reasons": sorted(set(unfinished))},
+    )
+    return with_degradation(evaluation, CodeReviewEvaluation(
+        findings=(), conclusion="neutral", degraded_reason=PARTIAL_COVERAGE,
+    ))
+
+
 @dataclass(frozen=True)
 class _LaneWorkInputs:
     """The whole pull request, as the lane-work checks read it."""
@@ -2928,7 +3083,9 @@ def _merge_lane_work_for_pass(
     """Merge the lane-work findings for one review pass. A full review
     judges the diff it reviewed; a living delta hides callers and the
     commits that met a criterion, so a delta review judges the full PR diff
-    instead (#1343). Never aborts the review."""
+    instead (#1343). The deferred ruff re-check runs apart, so a lane-work
+    failure cannot skip it (#1477). Never aborts the review."""
+    hunks, contents = this_pass.hunks, this_pass.file_contents
     owner, _, repo_name = str(pr_context.get("repo") or "").partition("/")
     pull_number = int(pr_context.get("pr_number") or 0)
     try:
@@ -2940,18 +3097,18 @@ def _merge_lane_work_for_pass(
                 head_sha=str(pr_context.get("head_sha") or ""),
                 known_contents=this_pass.file_contents,
             )
-        if inputs is None:
-            return evaluation
-        return _merge_lane_work(
-            evaluation, inputs.hunks, inputs.diff_text, inputs.file_contents,
-            inputs.base_contents, pr_context, correctness_only=correctness_only,
-        )
+        if inputs is not None:
+            hunks, contents = inputs.hunks, inputs.file_contents
+            evaluation = _merge_lane_work(
+                evaluation, inputs.hunks, inputs.diff_text, inputs.file_contents,
+                inputs.base_contents, pr_context, correctness_only=correctness_only,
+            )
     except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
         log.info(
             "code_review_criteria_coverage_failed",
             extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
         )
-        return evaluation
+    return _merge_deferred_ruff(evaluation, hunks, contents, pr_context)
 
 
 def _filter_checked_shell_commands(
