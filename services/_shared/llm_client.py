@@ -56,6 +56,7 @@ from openrouter_free_limiter import (
     acquire_free_tier_slot,
     is_free_tier_model,
 )
+from repo_file_cache import RepoFileCache
 from voice_pack import VoiceSelection, apply_voice
 from review_types import (
     CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, Severity,
@@ -86,6 +87,7 @@ from secrets_loader import (
     get_opencode_go_api_key,
     get_openrouter_api_key,
     get_poolside_api_key,
+    get_subscription_lane_token,
     get_prompt_experiment_mode,
 )
 
@@ -924,6 +926,9 @@ class _LadderAttempt:
 
 
 _GATEWAY_OUTAGE_REASON = "inference gateway outage"
+# A gateway call the review deadline cut short failed neither way: it does not
+# show the gateway down, and it does not show it up.
+_NEUTRAL_GATEWAY_REASONS = frozenset({ReviewDeadlineReached.__name__})
 
 
 def _with_gateway_outage_named(trail: list[_LadderAttempt]) -> list[_LadderAttempt]:
@@ -933,14 +938,62 @@ def _with_gateway_outage_named(trail: list[_LadderAttempt]) -> list[_LadderAttem
     the other answers is a slow model. The labels reach the check title and
     summary through coverage, and `tried` keeps them past the chunk retry,
     whose skipped calls reach no model and could not name the outage."""
-    gateway = [attempt for attempt in trail if attempt.through_gateway]
+    gateway = [
+        attempt for attempt in trail
+        if attempt.through_gateway and attempt.reason not in _NEUTRAL_GATEWAY_REASONS
+    ]
     if not gateway or not all(attempt.outage_failure for attempt in gateway):
         return trail
     return [
         replace(attempt, reason=f"{_GATEWAY_OUTAGE_REASON}: {attempt.reason}")
-        if attempt.through_gateway else attempt
+        if attempt.through_gateway and attempt.outage_failure else attempt
         for attempt in trail
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class _GatewayCall:
+    """One model call through the inference gateway in a ladder walk
+    (grug#1467). `neutral` marks a call the review deadline cut short, which
+    says nothing about whether the gateway is up."""
+
+    backend: str
+    model: str
+    outage: bool
+    neutral: bool
+
+
+# Every gateway call of the current ladder walk, the cloud chain and the Cave
+# arms alike. Set per walk by `_walk_review_ladder` (and by the Cave path for
+# a direct caller); None elsewhere, so the judge and the deep append are
+# untouched. A deep-mode arm thread gets the same list through its context
+# copy.
+_WALK_GATEWAY_CALLS: contextvars.ContextVar[list[_GatewayCall] | None] = (
+    contextvars.ContextVar("grug_walk_gateway_calls", default=None)
+)
+
+
+def _gateway_down(calls: Sequence[_GatewayCall]) -> bool:
+    """True when the walk reached the gateway and every call that ran to an
+    answer failed the way a down or load-shedding gateway fails. One arm
+    answering, or failing any other way, means the gateway is up."""
+    counted = [call for call in calls if not call.neutral]
+    return bool(counted) and all(call.outage for call in counted)
+
+
+def _record_gateway_call(
+    backend: str, model: str, config: BackendConfig, outcome: AttemptOutcome,
+) -> None:
+    calls = _WALK_GATEWAY_CALLS.get()
+    if calls is None or not _routes_through_gateway(config.url):
+        return
+    reason = _ladder_failure_reason(outcome)
+    calls.append(_GatewayCall(
+        backend=backend,
+        model=model,
+        outage=reason is not None and _is_outage_failure(outcome, reason),
+        neutral=reason in _NEUTRAL_GATEWAY_REASONS,
+    ))
 
 
 # Set by `_ChunkLadder.run` around one chunk's dispatch. `_run_llm_attempt` is
@@ -1025,7 +1078,9 @@ def _opencode_go_extra_body(model: str, wire: str) -> dict:
 
 
 # Operator subscription fallback (grug#1276)
-_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS = 40.0
+# Room for a chunk at its largest (46k chars took 25s of Haiku alone) plus the
+# wait for a slot on a lane that serves one or two calls at a time.
+_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS = 120.0
 _subscription_cap_lock = threading.Lock()
 _subscription_daily_calls: dict[str, int] = {}
 
@@ -1036,6 +1091,15 @@ def _subscription_daily_cap() -> int:
         return max(0, val)
     except (ValueError, TypeError):
         return 50
+
+
+def _subscription_timeout_s() -> float:
+    raw = os.getenv("GRUG_SUBSCRIPTION_TIMEOUT_S", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return _SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS
+    return value if math.isfinite(value) and value > 0 else _SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS
 
 
 def _subscription_today_key() -> str:
@@ -1088,6 +1152,17 @@ def _validate_subscription_key(key: str) -> None:
         )
 
 
+def _load_subscription_key() -> str:
+    return get_subscription_lane_token() or "in-cluster"
+
+
+def _review_author_family() -> str | None:
+    """The author's family for this walk, so a lane that serves two families
+    can keep a model off its own family's work (#1437)."""
+    gate = _FAMILY_GATE.get()
+    return gate[0] if gate else None
+
+
 def _subscription_fallback_config() -> BackendConfig | None:
     """Operator's subscription plan run headless as the last resort."""
     if not _subscription_fallback_enabled():
@@ -1100,14 +1175,15 @@ def _subscription_fallback_config() -> BackendConfig | None:
         backend=Backend.SUBSCRIPTION,
         url=url,
         model=model,
-        key_loader=lambda: "in-cluster",
+        key_loader=_load_subscription_key,
+        dynamic_headers={"X-Review-Author-Family": _review_author_family},
         extra_headers={
             "User-Agent": "grug/1.0 (+https://grug.lol)",
             "X-Spark-Priority": "interactive",
             "X-Spark-Caller": "grug-elder-subscription",
             "X-Loom-Lane-Type": "subscription-headless",
         },
-        timeout_seconds=_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS,
+        timeout_seconds=_subscription_timeout_s(),
         retry_attempts=1,
         transport_retry_attempts=1,
     )
@@ -1351,6 +1427,7 @@ _BENCH_WINDOW_SECONDS = 600.0
 _BENCH_BASE_SECONDS = 3600.0
 _BENCH_MAX_SECONDS = 12 * 3600.0
 _BENCH_CLOUD_BACKENDS = frozenset({Backend.OPENCODE_GO, Backend.OPENROUTER, Backend.POOLSIDE})
+_LIMIT_HOLD_BACKENDS = _BENCH_CLOUD_BACKENDS | {Backend.FREE_POOL}
 # Statuses that are never withdrawal: timeout, too-large, rate limit.
 _BENCH_IGNORED_STATUSES = frozenset({408, 413, 425, 429})
 _BENCH_QUOTA_MARKERS = ("usage limit", "rate limit", "quota", "insufficient credit", "key limit")
@@ -1478,6 +1555,16 @@ _SPENT_LIMIT_MARKERS = (
 _SPENT_RATE_MARKERS = ("per-day", "per day", "daily", "monthly", "gousagelimiterror")
 _provider_breaker_lock = threading.Lock()
 _provider_blocked_until: dict[tuple[str, str], float] = {}
+# A limit that outlasts a throttle reads the same on one response, so the count
+# decides: a second limit refusal within five minutes skips the provider for
+# five minutes, then it is asked again. On 2026-10-31 Poolside answered 1,892 of
+# these in nine hours and the free pool 57, each costing a chunk its retry and
+# its wait before the subscription tier could run.
+_LIMIT_REFUSAL_THRESHOLD = 2
+_LIMIT_REFUSAL_WINDOW_SECONDS = 300.0
+_LIMIT_HOLD_SECONDS = 300.0
+_LIMIT_REFUSAL_MARKERS = ("usage limit", "capacity is reserved")
+_limit_refusals: dict[tuple[str, str], list[float]] = {}
 _warned_disabled_entries: set[str] = set()
 
 
@@ -1550,19 +1637,46 @@ def _is_spent_quota_refusal(resp: httpx.Response) -> bool:
     return any(m in text for m in markers)
 
 
+def _limit_refusals_repeated(config: BackendConfig, resp: httpx.Response) -> bool:
+    """Count one usage-limit 429; True when the count reaches the hold. Any
+    other answer from the provider starts the count over."""
+    key = (config.backend.value, _backend_pool(config.backend, config.model))
+    text = (resp.text or "").lower()
+    limited = resp.status_code == 429 and any(m in text for m in _LIMIT_REFUSAL_MARKERS)
+    now = time.time()
+    with _provider_breaker_lock:
+        if not limited:
+            _limit_refusals.pop(key, None)
+            return False
+        recent = [t for t in _limit_refusals.get(key, []) if now - t < _LIMIT_REFUSAL_WINDOW_SECONDS]
+        recent.append(now)
+        if len(recent) < _LIMIT_REFUSAL_THRESHOLD:
+            _limit_refusals[key] = recent
+            return False
+        _limit_refusals.pop(key, None)
+        return True
+
+
 def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None:
-    """Open the provider breaker on a 401, a 402 or a spent-limit refusal."""
-    if config.backend not in _BENCH_CLOUD_BACKENDS:
-        return
-    if resp.status_code == 401:
-        pools: tuple[str, ...] = _PROVIDER_POOLS
-    elif _is_spent_quota_refusal(resp):
-        pools = (_backend_pool(config.backend, config.model),)
-    else:
-        return
-    # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
-    seconds = _retry_after_seconds(resp)
-    until = time.time() + seconds
+    """Open the provider breaker on a 401, a 402, a spent-limit refusal, or
+    repeated limit refusals."""
+    pool = _backend_pool(config.backend, config.model)
+    if config.backend in _BENCH_CLOUD_BACKENDS:
+        # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
+        if resp.status_code == 401:
+            _open_provider_breaker(config, resp, _PROVIDER_POOLS, time.time() + _retry_after_seconds(resp))
+            return
+        if _is_spent_quota_refusal(resp):
+            _open_provider_breaker(config, resp, (pool,), time.time() + _retry_after_seconds(resp))
+            return
+    if config.backend in _LIMIT_HOLD_BACKENDS and _limit_refusals_repeated(config, resp):
+        _open_provider_breaker(config, resp, (pool,), time.time() + _LIMIT_HOLD_SECONDS)
+
+
+def _open_provider_breaker(
+    config: BackendConfig, resp: httpx.Response, pools: tuple[str, ...], until: float,
+) -> None:
+    seconds = until - time.time()
     with _provider_breaker_lock:
         for pool in pools:
             key = (config.backend.value, pool)
@@ -4123,6 +4237,13 @@ _GUIDELINE_CANDIDATES = (
     ".github/copilot-instructions.md", ".windsurfrules",
 )
 _GUIDELINE_FETCH_TIMEOUT = 10.0
+# Enough for the reviews in flight on one consumer; each entry is one head.
+_GUIDELINE_CACHE_HEADS = 32
+# Only the first `_MAX_GUIDELINES_CHARS` reach the prompt. Keeping more than
+# that leaves room for redaction, and the limit stops a huge file in a pull
+# request from pinning its size in memory for every cached head.
+_GUIDELINE_CACHE_CHARS = 64_000
+_guideline_cache = RepoFileCache(_GUIDELINE_CACHE_HEADS)
 
 
 def _fetch_guideline_files(
@@ -4132,14 +4253,22 @@ def _fetch_guideline_files(
     best-effort (mirrors `dispatch.fetch_file_contents`'s contract, not
     imported from it - llm_client must not import the persona layer): a
     404/binary/timeout on one candidate is skipped, never raised, so one
-    unreadable file cannot cost the others."""
+    unreadable file cannot cost the others.
+
+    Every cohort, chunk and retry of a review lands here, so each file is
+    read once per head (grug#1535). A 404 is remembered too, since most repos
+    carry few of these files. Any other failure is not, so it is retried."""
     from urllib.parse import quote
 
     from github_app_auth import with_install_token_retry  # type: ignore
 
-    def _do(token: str) -> dict[str, str]:
-        found: dict[str, str] = {}
-        for path in _GUIDELINE_CANDIDATES:
+    head = (installation_id, owner, repo, ref)
+    known = _guideline_cache.known(head)
+    missing = [path for path in _GUIDELINE_CANDIDATES if path not in known]
+
+    def _do(token: str) -> dict[str, str | None]:
+        answered: dict[str, str | None] = {}
+        for path in missing:
             try:
                 resp = httpx.get(
                     f"https://api.github.com/repos/{owner}/{repo}/contents/"
@@ -4152,13 +4281,19 @@ def _fetch_guideline_files(
                     },
                     timeout=_GUIDELINE_FETCH_TIMEOUT,
                 )
-                resp.raise_for_status()
-                found[path] = resp.text
+                text = None
+                if resp.status_code != 404:
+                    resp.raise_for_status()
+                    text = resp.text[:_GUIDELINE_CACHE_CHARS]
             except (httpx.HTTPStatusError, httpx.RequestError):
                 continue
-        return found
+            answered[path] = text
+            _guideline_cache.remember(head, path, text)
+        return answered
 
-    return with_install_token_retry(installation_id, _do) or {}
+    if missing:
+        known.update(with_install_token_retry(installation_id, _do) or {})
+    return {path: text for path, text in known.items() if text is not None}
 
 
 # Bounded like the diff cap (#609): a guideline file can be arbitrarily long,
@@ -6075,6 +6210,7 @@ def _run_llm_attempt(
         call_report.end(running)
     if report_direct_call:
         _report_direct_call(backend, config, outcome, time.monotonic() - started)
+    _record_gateway_call(key[0], key[1], config, outcome)
     trail = _LADDER_TRAIL.get()
     reason = _ladder_failure_reason(outcome)
     if trail is not None and reason is not None:
@@ -6873,11 +7009,13 @@ def _review_diff_dispatch(
 
     def walk(gate: tuple[str, bool] | None) -> "LlmReviewResponse":
         token = _FAMILY_GATE.set(gate)
+        calls_token = _WALK_GATEWAY_CALLS.set([])
         try:
             return _walk_review_ladder(
                 evidence, installation_id, voice, cancel_event, review_map,
             )
         finally:
+            _WALK_GATEWAY_CALLS.reset(calls_token)
             _FAMILY_GATE.reset(token)
 
     if not author_family:
@@ -6961,6 +7099,35 @@ def _walk_review_ladder(
     return response
 
 
+def _gateway_outage_order(configs: list[BackendConfig]) -> list[BackendConfig]:
+    """Tier 2's order for this walk (grug#1467).
+
+    Unchanged unless the gateway is down. Then the off-gateway backends come
+    first, so the review's one retry outside the gateway runs before the
+    deadline is spent on a gateway that is not answering, and a gateway arm
+    this walk already saw fail is dropped. A gateway arm not yet tried stays
+    last: the gateway may still serve it."""
+    calls = _WALK_GATEWAY_CALLS.get()
+    if not calls or not _gateway_down(calls):
+        return configs
+    failed = {(call.backend, call.model) for call in calls}
+    off_gateway = [c for c in configs if not _routes_through_gateway(c.url)]
+    untried_gateway = [
+        c for c in configs
+        if _routes_through_gateway(c.url) and (c.backend.value, c.model) not in failed
+    ]
+    ordered = off_gateway + untried_gateway
+    log.warning(
+        "llm_gateway_outage_fallback",
+        extra={
+            "gateway_calls": len(calls),
+            "order": [f"{c.backend.value}/{c.model}" for c in ordered],
+            "off_gateway": len(off_gateway),
+        },
+    )
+    return ordered
+
+
 def _run_free_provider_fallback(
     messages: list[dict[str, str]],
     variant: PromptVariant,
@@ -6969,10 +7136,14 @@ def _run_free_provider_fallback(
     pr_context: Optional[PrContext],
     installation_id: int,
 ) -> tuple[Optional[LlmReviewResponse], Optional[tuple[Backend, Optional[str], str]], str]:
-    """Tier 2: Try free provider pool in fixed order (gateway free pool, then free SaaS)."""
+    """Tier 2: Try free provider pool in fixed order (gateway free pool, then free SaaS).
+
+    When every gateway call of this walk failed the way an outage does, the
+    backends that do not route through the gateway go first and a gateway
+    arm that already failed is not asked again (grug#1467)."""
     first_parse_fail: Optional[tuple[Backend, Optional[str], str]] = None
     last_error = ""
-    for config in _free_provider_fallback_configs():
+    for config in _gateway_outage_order(_free_provider_fallback_configs()):
         backend = config.backend
         attempt = _run_llm_attempt(
             backend=backend,
@@ -7462,15 +7633,22 @@ def route_elder_model_call(
     1. self-hosted (Cave coder/reasoner)
     2. free provider pool (gateway free pool + free SaaS)
     3. subscription (operator's headless subscription lanes: Claude Code / Codex)
-    Order is fixed: never reordered by load or latency.
+    Order is fixed: never reordered by load or latency, except that a down
+    inference gateway sends step 2 off the gateway first (grug#1467).
     """
-    return _review_diff_dispatch_cave_primary(
-        evidence=evidence,
-        installation_id=installation_id,
-        voice=voice,
-        cancel_event=cancel_event,
-        review_map=review_map,
-    )
+    # A walk already tracks its gateway calls; a direct caller gets its own.
+    token = _WALK_GATEWAY_CALLS.set([]) if _WALK_GATEWAY_CALLS.get() is None else None
+    try:
+        return _review_diff_dispatch_cave_primary(
+            evidence=evidence,
+            installation_id=installation_id,
+            voice=voice,
+            cancel_event=cancel_event,
+            review_map=review_map,
+        )
+    finally:
+        if token is not None:
+            _WALK_GATEWAY_CALLS.reset(token)
 
 
 # ---------------------------------------------------------------------------
