@@ -145,6 +145,53 @@ _ALEMBIC_HOOK_RE = re.compile(r"^(?:upgrade|downgrade)(?:_\w+)?$")
 
 
 @dataclass(frozen=True, slots=True)
+class DeferredFinding:
+    path: str
+    rule: str
+    line: str
+
+_DEFERRED_FINDING_RE = re.compile(
+    r"^\s*lint-bug\s+in\s+`?([^`\s]+)`?.*?([A-Z]+[0-9]+).*", re.MULTILINE
+)
+
+def parse_deferred_findings(pr_body: str) -> tuple[DeferredFinding, ...]:
+    found = []
+    for match in _DEFERRED_FINDING_RE.finditer(pr_body or ""):
+        path = match.group(1)
+        rule = match.group(2)
+        found.append(DeferredFinding(path, rule, match.group(0).strip()))
+    return tuple(found)
+
+def unmet_deferred_findings(
+    deferred: tuple[DeferredFinding, ...], lint_findings: tuple[Finding, ...]
+) -> tuple[Finding, ...]:
+    unmet = []
+    fired = {}
+    for f in lint_findings:
+        if f.rule_name == "lint-bug" and f.check_output:
+            parts = f.check_output.split(": ", 1)
+            if len(parts) == 2:
+                code_msg = parts[1].split(" ", 1)
+                if len(code_msg) == 2:
+                    code = code_msg[0]
+                    fired.setdefault((f.file, code), []).append(f)
+
+    for d in deferred:
+        matching = fired.get((d.path, d.rule), [])
+        for m in matching:
+            unmet.append(Finding(
+                file=m.file,
+                line=m.line,
+                severity="high",
+                rule_name="unmet-criterion",
+                message=f"The linked ticket asks to clear this deferred finding: `{d.rule}` on this line, but it still fires.",
+                suggestion=None,
+                effort="heavy-lift",
+            ))
+    return tuple(unmet)
+
+
+@dataclass(frozen=True, slots=True)
 class LinkedCriterion:
     """One acceptance criterion from an issue the PR closes."""
 

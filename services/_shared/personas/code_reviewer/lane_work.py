@@ -40,9 +40,13 @@ import re
 from collections.abc import Iterable
 
 from personas.code_reviewer.criteria_coverage import (
+    DeferredFinding,
     LinkedCriterion,
+    parse_deferred_findings,
     scan_criteria_coverage,
+    unmet_deferred_findings,
 )
+from personas.code_reviewer.lint import scan_ruff
 from personas.code_reviewer.dead_on_arrival import drop_superseded, scan_dead_on_arrival
 from personas.code_reviewer.destructive_edit import scan_destructive_edits
 from personas.code_reviewer.diff_parser import DiffHunk, FileChange, file_changes
@@ -100,6 +104,27 @@ def _open_only(
     return tuple(c for c in criteria if (c.issue, c.number) not in ticked)
 
 
+
+def _synthetic_hunks_for(
+    paths: Iterable[str], file_contents: dict[str, str]
+) -> tuple[DiffHunk, ...]:
+    hunks = []
+    for path in paths:
+        content = file_contents.get(path)
+        if content is None:
+            continue
+        lines = content.splitlines()
+        if not lines:
+            continue
+        body_lines = [f"+{line}" for line in lines]
+        hunks.append(DiffHunk(
+            file_path=path,
+            new_start=1,
+            new_lines=frozenset(range(1, len(lines) + 1)),
+            body=f"@@ -0,0 +1,{len(lines)} @@\n" + "\n".join(body_lines)
+        ))
+    return tuple(hunks)
+
 def lane_work_findings(
     *,
     diff_text: str,
@@ -147,6 +172,14 @@ def lane_work_findings(
     findings.extend(scan_sanitizers(changes, hunks))
     findings.extend(scan_fabricated_results(changes, hunks))
     findings.extend(scan_unbacked_claims(pr_body, criteria=criteria, hunks=hunks))
+
+    deferred = parse_deferred_findings(pr_body)
+    if deferred:
+        paths = {d.path for d in deferred}
+        synthetic_hunks = _synthetic_hunks_for(paths, file_contents)
+        lint_findings = scan_ruff(synthetic_hunks, file_contents, enabled=True)
+        findings.extend(unmet_deferred_findings(deferred, lint_findings))
+
     # A ticked box was delivered by an earlier slice; only open boxes can
     # name what this diff should have changed.
     findings.extend(scan_wrong_target(

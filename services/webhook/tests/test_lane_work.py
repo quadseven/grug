@@ -403,3 +403,49 @@ def test_a_renamed_doc_or_test_meets_no_runtime_criterion():
     assert _rules(_findings(diff, boxes=boxes, title="Rename the util page", base={})) == [
         "intent-mismatch"
     ]
+
+def test_deferred_finding_fires_on_head_gets_unmet_criterion():
+    diff = "diff --git a/a.py b/a.py\nindex 111..222 100644\n--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,2 @@\n x = 1\n+y = []\n"
+    pr_body = "lint-bug in `a.py` with `B006` linked to #123"
+    contents = {"a.py": "def f(a=[]):\n    pass\n"}
+    found = _findings(
+        diff, boxes=[], title="", base={"a.py": 1}, body=pr_body
+    )
+    # Re-call directly since _findings drops custom body if it's set differently? Actually we can pass body directly
+    from personas.code_reviewer.lane_work import lane_work_findings
+    from personas.code_reviewer.diff_parser import parse_diff, file_changes
+    found = lane_work_findings(
+        diff_text=diff, hunks=parse_diff(diff), file_contents=contents,
+        base_line_counts={"a.py": 1}, boxes=[], pr_title="", pr_body=pr_body, changes=file_changes(diff)
+    )
+    unmet = [f for f in found if f.rule_name == "unmet-criterion"]
+    assert len(unmet) == 1
+    assert "clear this deferred finding: `B006`" in unmet[0].message
+    assert unmet[0].file == "a.py"
+    assert unmet[0].line == 1
+
+def test_deferred_finding_fixed_gets_no_unmet_criterion():
+    diff = "diff --git a/a.py b/a.py\nindex 111..222 100644\n--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,2 @@\n x = 1\n+y = 2\n"
+    pr_body = "lint-bug in `a.py` with `B006` linked to #123"
+    contents = {"a.py": "def f(a=None):\n    pass\n"}
+    from personas.code_reviewer.lane_work import lane_work_findings
+    from personas.code_reviewer.diff_parser import parse_diff, file_changes
+    found = lane_work_findings(
+        diff_text=diff, hunks=parse_diff(diff), file_contents=contents,
+        base_line_counts={"a.py": 1}, boxes=[], pr_title="", pr_body=pr_body, changes=file_changes(diff)
+    )
+    unmet = [f for f in found if f.rule_name == "unmet-criterion"]
+    assert not unmet
+
+def test_no_deferred_findings_in_ticket_changes_nothing():
+    diff = "diff --git a/a.py b/a.py\nindex 111..222 100644\n--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,2 @@\n x = 1\n+y = []\n"
+    pr_body = "Nothing here."
+    contents = {"a.py": "def f(a=[]):\n    pass\n"}
+    from personas.code_reviewer.lane_work import lane_work_findings
+    from personas.code_reviewer.diff_parser import parse_diff, file_changes
+    found = lane_work_findings(
+        diff_text=diff, hunks=parse_diff(diff), file_contents=contents,
+        base_line_counts={"a.py": 1}, boxes=[], pr_title="", pr_body=pr_body, changes=file_changes(diff)
+    )
+    unmet = [f for f in found if f.rule_name == "unmet-criterion"]
+    assert not unmet
