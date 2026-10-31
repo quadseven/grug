@@ -102,10 +102,13 @@ _MAX_SETTLE_SECONDS = 300
 _MAX_INTENT_DRIFT_REDRIVES = 3
 
 # grug#1494: a review where every model failed (`all_failed`) raises, so the
-# queue redelivers it. Deliveries below this number leave a blocking repo's
-# Elder check pending; from this one on the failure is published, so a long
-# provider outage still ends in a red check instead of waiting forever. The
-# queue's own dead-letter limit stays the outer bound.
+# queue redelivers it. A partial or low-confidence review with nothing
+# blocking in it rides the same bound: dispatch leaves it pending and marks
+# the result `rerun_scheduled`, which raises below. Deliveries below this
+# number leave a blocking repo's Elder check pending; from this one on the
+# failure is published, so a long provider outage still ends in a red check
+# instead of waiting forever. The queue's own dead-letter limit stays the
+# outer bound.
 _ALL_FAILED_AUTO_RERUN_DELIVERIES = 3
 # A learn job whose classifier backends are all rate limited or down (the
 # OpenRouter key is free-tier only and refuses intermittently - operator
@@ -2915,6 +2918,15 @@ def _run_hot_review(
                 # poison monitor covers a sustained outage.
                 raise RuntimeError(
                     f"Elder review degraded: {degraded_reason}"
+                )
+            if result_status == "skipped" and result.get("rerun_scheduled"):
+                # A partial or low-confidence review on a blocking repo left
+                # the check pending because a re-run is still scheduled
+                # (dispatch's `_rerun_before_failing`). Raise for the queue's
+                # re-run, the same bounded lane all_failed uses; the last
+                # delivery publishes the degraded failure and completes.
+                raise RuntimeError(
+                    f"Elder review degraded: {degraded_reason}; re-run scheduled"
                 )
             if (
                 result_status == "skipped"
