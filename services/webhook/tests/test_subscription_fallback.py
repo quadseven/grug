@@ -459,3 +459,19 @@ def test_a_lane_named_for_no_family_is_not_gated_off_a_reviewed_family(monkeypat
         assert not lc._family_gated("subscription-lane")
     finally:
         lc._FAMILY_GATE.reset(token)
+
+
+def test_the_egress_policy_opens_the_lane_the_manifests_name() -> None:
+    """A manifest URL means nothing if the namespace's egress fence drops it:
+    the first rollout timed out on every call this way (#1546)."""
+    from pathlib import Path
+    from urllib.parse import urlsplit
+
+    k8s = Path(__file__).resolve().parents[3] / "k8s"
+    policy = (k8s / "networkpolicy.yaml").read_text()
+    consumer = (k8s / "consumer-deployment.yaml").read_text()
+    url_line = next(line for line in consumer.splitlines() if "GRUG_SUBSCRIPTION_URL" in line)
+    url = url_line.split("value:")[1].strip(" }")
+    assert urlsplit(url).hostname == "forward.subscription-lane.svc"
+    assert "kubernetes.io/metadata.name: subscription-lane" in policy
+    assert "matchLabels: {app: forward}" in policy
