@@ -56,6 +56,7 @@ from openrouter_free_limiter import (
     acquire_free_tier_slot,
     is_free_tier_model,
 )
+from repo_file_cache import RepoFileCache
 from voice_pack import VoiceSelection, apply_voice
 from review_types import (
     CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, Severity,
@@ -4108,6 +4109,13 @@ _GUIDELINE_CANDIDATES = (
     ".github/copilot-instructions.md", ".windsurfrules",
 )
 _GUIDELINE_FETCH_TIMEOUT = 10.0
+# Enough for the reviews in flight on one consumer; each entry is one head.
+_GUIDELINE_CACHE_HEADS = 32
+# Only the first `_MAX_GUIDELINES_CHARS` reach the prompt. Keeping more than
+# that leaves room for redaction, and the limit stops a huge file in a pull
+# request from pinning its size in memory for every cached head.
+_GUIDELINE_CACHE_CHARS = 64_000
+_guideline_cache = RepoFileCache(_GUIDELINE_CACHE_HEADS)
 
 
 def _fetch_guideline_files(
@@ -4117,14 +4125,22 @@ def _fetch_guideline_files(
     best-effort (mirrors `dispatch.fetch_file_contents`'s contract, not
     imported from it - llm_client must not import the persona layer): a
     404/binary/timeout on one candidate is skipped, never raised, so one
-    unreadable file cannot cost the others."""
+    unreadable file cannot cost the others.
+
+    Every cohort, chunk and retry of a review lands here, so each file is
+    read once per head (grug#1535). A 404 is remembered too, since most repos
+    carry few of these files. Any other failure is not, so it is retried."""
     from urllib.parse import quote
 
     from github_app_auth import with_install_token_retry  # type: ignore
 
-    def _do(token: str) -> dict[str, str]:
-        found: dict[str, str] = {}
-        for path in _GUIDELINE_CANDIDATES:
+    head = (installation_id, owner, repo, ref)
+    known = _guideline_cache.known(head)
+    missing = [path for path in _GUIDELINE_CANDIDATES if path not in known]
+
+    def _do(token: str) -> dict[str, str | None]:
+        answered: dict[str, str | None] = {}
+        for path in missing:
             try:
                 resp = httpx.get(
                     f"https://api.github.com/repos/{owner}/{repo}/contents/"
@@ -4137,13 +4153,19 @@ def _fetch_guideline_files(
                     },
                     timeout=_GUIDELINE_FETCH_TIMEOUT,
                 )
-                resp.raise_for_status()
-                found[path] = resp.text
+                text = None
+                if resp.status_code != 404:
+                    resp.raise_for_status()
+                    text = resp.text[:_GUIDELINE_CACHE_CHARS]
             except (httpx.HTTPStatusError, httpx.RequestError):
                 continue
-        return found
+            answered[path] = text
+            _guideline_cache.remember(head, path, text)
+        return answered
 
-    return with_install_token_retry(installation_id, _do) or {}
+    if missing:
+        known.update(with_install_token_retry(installation_id, _do) or {})
+    return {path: text for path, text in known.items() if text is not None}
 
 
 # Bounded like the diff cap (#609): a guideline file can be arbitrarily long,

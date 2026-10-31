@@ -92,6 +92,15 @@ def mock_transport_client() -> Iterator[Callable[..., httpx.Client]]:
 
 
 @pytest.fixture(autouse=True)
+def _forget_guideline_files() -> Iterator[None]:
+    """The guideline cache outlives a test, and tests reuse one repo and head."""
+    lc = sys.modules.get("llm_client")
+    if lc is not None:
+        lc._guideline_cache.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     """grug#1225: the LLM provider breaker is module state, and a shell's
     GRUG_DISABLED_BACKENDS must not reach a test. Without the reset, one test
