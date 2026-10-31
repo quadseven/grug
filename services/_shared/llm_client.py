@@ -1495,9 +1495,6 @@ def _is_gateway_outage_error(error_text: str) -> bool:
             "read timeout",
             "connecterror",
             "connect error",
-            "timeoutexception",
-            "http_503",
-            "http_504"
         )
     )
 
@@ -6098,16 +6095,13 @@ def _call_llm_attempt(
         findings, model, err = parsed.findings, parsed.model_name, parsed.error
 
         # intercept gateway outage strings
-        if not err and (resp.status_code != 200 if success_kind == "reviewed" else not (200 <= resp.status_code < 300)):
-            err = f"http_{resp.status_code}"
-
         if resp.status_code in (503, 504) or err:
             try:
                 resp_text = resp.text.lower()
                 if "spark_gateway_queue_full" in resp_text:
-                    err = "503 spark_gateway_queue_full"
+                    err = "spark_gateway_queue_full"
                 elif "spark_gateway_queue_wait_exceeded" in resp_text:
-                    err = "504 spark_gateway_queue_wait_exceeded"
+                    err = "spark_gateway_queue_wait_exceeded"
             except Exception:
                 pass
 
