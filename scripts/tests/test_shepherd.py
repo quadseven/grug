@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent))
+import shepherd
 from shepherd import (
     BotFinding,
     BotSurfaces,
@@ -728,3 +729,19 @@ def test_shepherd_main_cli_pr_queue(monkeypatch, capsys):
     assert code == 0
     captured = capsys.readouterr().out
     assert "Queue report for example/test-repo" in captured
+
+
+def test_deployment_chain_verdict_empty_is_broken(monkeypatch):
+    monkeypatch.setattr(shepherd, "deployment_stage_verdicts", lambda service: [])
+    verdict = shepherd.deployment_chain_verdict("webhook")
+    assert verdict.ok is False
+    assert verdict.name == "deploy"
+
+
+def test_deployment_chain_verdict_returns_first_failure(monkeypatch):
+    stages = [
+        shepherd.StageVerdict("reference", True, "ok"),
+        shepherd.StageVerdict("deploy", False, "stale"),
+    ]
+    monkeypatch.setattr(shepherd, "deployment_stage_verdicts", lambda service: stages)
+    assert shepherd.deployment_chain_verdict("webhook") is stages[1]
