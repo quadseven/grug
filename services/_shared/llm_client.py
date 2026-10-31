@@ -915,6 +915,9 @@ class _LadderAttempt:
 
 
 _GATEWAY_OUTAGE_REASON = "inference gateway outage"
+# A gateway call the review deadline cut short failed neither way: it does not
+# show the gateway down, and it does not show it up.
+_NEUTRAL_GATEWAY_REASONS = frozenset({ReviewDeadlineReached.__name__})
 
 
 def _with_gateway_outage_named(trail: list[_LadderAttempt]) -> list[_LadderAttempt]:
@@ -924,14 +927,62 @@ def _with_gateway_outage_named(trail: list[_LadderAttempt]) -> list[_LadderAttem
     the other answers is a slow model. The labels reach the check title and
     summary through coverage, and `tried` keeps them past the chunk retry,
     whose skipped calls reach no model and could not name the outage."""
-    gateway = [attempt for attempt in trail if attempt.through_gateway]
+    gateway = [
+        attempt for attempt in trail
+        if attempt.through_gateway and attempt.reason not in _NEUTRAL_GATEWAY_REASONS
+    ]
     if not gateway or not all(attempt.outage_failure for attempt in gateway):
         return trail
     return [
         replace(attempt, reason=f"{_GATEWAY_OUTAGE_REASON}: {attempt.reason}")
-        if attempt.through_gateway else attempt
+        if attempt.through_gateway and attempt.outage_failure else attempt
         for attempt in trail
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class _GatewayCall:
+    """One model call through the inference gateway in a ladder walk
+    (grug#1467). `neutral` marks a call the review deadline cut short, which
+    says nothing about whether the gateway is up."""
+
+    backend: str
+    model: str
+    outage: bool
+    neutral: bool
+
+
+# Every gateway call of the current ladder walk, the cloud chain and the Cave
+# arms alike. Set per walk by `_walk_review_ladder` (and by the Cave path for
+# a direct caller); None elsewhere, so the judge and the deep append are
+# untouched. A deep-mode arm thread gets the same list through its context
+# copy.
+_WALK_GATEWAY_CALLS: contextvars.ContextVar[list[_GatewayCall] | None] = (
+    contextvars.ContextVar("grug_walk_gateway_calls", default=None)
+)
+
+
+def _gateway_down(calls: Sequence[_GatewayCall]) -> bool:
+    """True when the walk reached the gateway and every call that ran to an
+    answer failed the way a down or load-shedding gateway fails. One arm
+    answering, or failing any other way, means the gateway is up."""
+    counted = [call for call in calls if not call.neutral]
+    return bool(counted) and all(call.outage for call in counted)
+
+
+def _record_gateway_call(
+    backend: str, model: str, config: BackendConfig, outcome: AttemptOutcome,
+) -> None:
+    calls = _WALK_GATEWAY_CALLS.get()
+    if calls is None or not _routes_through_gateway(config.url):
+        return
+    reason = _ladder_failure_reason(outcome)
+    calls.append(_GatewayCall(
+        backend=backend,
+        model=model,
+        outage=reason is not None and _is_outage_failure(outcome, reason),
+        neutral=reason in _NEUTRAL_GATEWAY_REASONS,
+    ))
 
 
 # Set by `_ChunkLadder.run` around one chunk's dispatch. `_run_llm_attempt` is
@@ -6057,6 +6108,7 @@ def _run_llm_attempt(
         call_report.end(running)
     if report_direct_call:
         _report_direct_call(backend, config, outcome, time.monotonic() - started)
+    _record_gateway_call(key[0], key[1], config, outcome)
     trail = _LADDER_TRAIL.get()
     reason = _ladder_failure_reason(outcome)
     if trail is not None and reason is not None:
@@ -6855,11 +6907,13 @@ def _review_diff_dispatch(
 
     def walk(gate: tuple[str, bool] | None) -> "LlmReviewResponse":
         token = _FAMILY_GATE.set(gate)
+        calls_token = _WALK_GATEWAY_CALLS.set([])
         try:
             return _walk_review_ladder(
                 evidence, installation_id, voice, cancel_event, review_map,
             )
         finally:
+            _WALK_GATEWAY_CALLS.reset(calls_token)
             _FAMILY_GATE.reset(token)
 
     if not author_family:
@@ -6943,6 +6997,35 @@ def _walk_review_ladder(
     return response
 
 
+def _gateway_outage_order(configs: list[BackendConfig]) -> list[BackendConfig]:
+    """Tier 2's order for this walk (grug#1467).
+
+    Unchanged unless the gateway is down. Then the off-gateway backends come
+    first, so the review's one retry outside the gateway runs before the
+    deadline is spent on a gateway that is not answering, and a gateway arm
+    this walk already saw fail is dropped. A gateway arm not yet tried stays
+    last: the gateway may still serve it."""
+    calls = _WALK_GATEWAY_CALLS.get()
+    if not calls or not _gateway_down(calls):
+        return configs
+    failed = {(call.backend, call.model) for call in calls}
+    off_gateway = [c for c in configs if not _routes_through_gateway(c.url)]
+    untried_gateway = [
+        c for c in configs
+        if _routes_through_gateway(c.url) and (c.backend.value, c.model) not in failed
+    ]
+    ordered = off_gateway + untried_gateway
+    log.warning(
+        "llm_gateway_outage_fallback",
+        extra={
+            "gateway_calls": len(calls),
+            "order": [f"{c.backend.value}/{c.model}" for c in ordered],
+            "off_gateway": len(off_gateway),
+        },
+    )
+    return ordered
+
+
 def _run_free_provider_fallback(
     messages: list[dict[str, str]],
     variant: PromptVariant,
@@ -6951,10 +7034,14 @@ def _run_free_provider_fallback(
     pr_context: Optional[PrContext],
     installation_id: int,
 ) -> tuple[Optional[LlmReviewResponse], Optional[tuple[Backend, Optional[str], str]], str]:
-    """Tier 2: Try free provider pool in fixed order (gateway free pool, then free SaaS)."""
+    """Tier 2: Try free provider pool in fixed order (gateway free pool, then free SaaS).
+
+    When every gateway call of this walk failed the way an outage does, the
+    backends that do not route through the gateway go first and a gateway
+    arm that already failed is not asked again (grug#1467)."""
     first_parse_fail: Optional[tuple[Backend, Optional[str], str]] = None
     last_error = ""
-    for config in _free_provider_fallback_configs():
+    for config in _gateway_outage_order(_free_provider_fallback_configs()):
         backend = config.backend
         attempt = _run_llm_attempt(
             backend=backend,
@@ -7444,15 +7531,22 @@ def route_elder_model_call(
     1. self-hosted (Cave coder/reasoner)
     2. free provider pool (gateway free pool + free SaaS)
     3. subscription (operator's headless subscription lanes: Claude Code / Codex)
-    Order is fixed: never reordered by load or latency.
+    Order is fixed: never reordered by load or latency, except that a down
+    inference gateway sends step 2 off the gateway first (grug#1467).
     """
-    return _review_diff_dispatch_cave_primary(
-        evidence=evidence,
-        installation_id=installation_id,
-        voice=voice,
-        cancel_event=cancel_event,
-        review_map=review_map,
-    )
+    # A walk already tracks its gateway calls; a direct caller gets its own.
+    token = _WALK_GATEWAY_CALLS.set([]) if _WALK_GATEWAY_CALLS.get() is None else None
+    try:
+        return _review_diff_dispatch_cave_primary(
+            evidence=evidence,
+            installation_id=installation_id,
+            voice=voice,
+            cancel_event=cancel_event,
+            review_map=review_map,
+        )
+    finally:
+        if token is not None:
+            _WALK_GATEWAY_CALLS.reset(token)
 
 
 # ---------------------------------------------------------------------------

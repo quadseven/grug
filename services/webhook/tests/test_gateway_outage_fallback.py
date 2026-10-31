@@ -234,3 +234,72 @@ def test_failures_a_down_gateway_does_not_produce_are_not_outages() -> None:
         assert reason is not None
         assert not lc._is_outage_failure(failed, reason)
     assert not lc._routes_through_gateway(f"https://{_POOLSIDE}/v1/chat/completions")
+
+
+# The gateway's free provider pool is a gateway arm too (`/free` and
+# `/free-public` routes). Production runs it on, ahead of Poolside in the
+# fallback tier, so an outage must not spend the deadline on it before the
+# backend that does not route through the gateway gets its one retry.
+def _free_route_calls(models: _Models) -> int:
+    return sum(url.startswith(f"{_GATEWAY}/free") for url in models.urls)
+
+
+@pytest.mark.parametrize("failure", sorted(GATEWAY_FAILURES))
+def test_gateway_outage_retries_off_gateway_before_the_free_pool(
+    monkeypatch, clock, failure,
+) -> None:
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
+    make_failure = GATEWAY_FAILURES[failure]
+
+    def route(url: str, _kwargs: dict):
+        return make_failure() if url.startswith(_GATEWAY) else _clean_review()
+
+    models = _Models(clock, route)
+    check = _post_review(monkeypatch, models)
+
+    assert models.calls_to(_POOLSIDE) == 1
+    assert _free_route_calls(models) == 0
+    assert check.conclusion == "success"
+    assert check.title == "Elder clear - no markings"
+
+
+@pytest.mark.parametrize("failure", sorted(GATEWAY_FAILURES))
+def test_gateway_outage_does_not_re_ask_a_gateway_arm_that_already_failed(
+    monkeypatch, clock, failure,
+) -> None:
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_DISABLED_BACKENDS", "poolside,openrouter,opencode-go")
+    make_failure = GATEWAY_FAILURES[failure]
+    models = _Models(clock, lambda _url, _kwargs: make_failure())
+
+    check = _post_review(monkeypatch, models)
+
+    assert _free_route_calls(models) == 1
+    assert check.conclusion == "failure"
+    assert _OUTAGE in check.title
+    assert _OUTAGE in check.summary
+    # A read timeout runs the walk into the deadline, which clamps the last
+    # call; allow for the review starting a moment after the fake clock did.
+    assert clock.elapsed <= _BUDGET_S + 1.0
+
+
+@pytest.mark.parametrize("answering_arm", [0, 1], ids=["coder", "reasoner"])
+def test_one_gateway_arm_answering_with_the_free_pool_on_makes_no_fallback_call(
+    monkeypatch, clock, answering_arm,
+) -> None:
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
+    arm_calls: list[str] = []
+
+    def route(url: str, kwargs: dict):
+        model = str(kwargs["json"]["model"])
+        if model not in arm_calls:
+            arm_calls.append(model)
+        return _clean_review() if arm_calls.index(model) == answering_arm else _queue_full()
+
+    models = _Models(clock, route)
+    check = _post_review(monkeypatch, models)
+
+    assert check.conclusion == "success"
+    assert _free_route_calls(models) == 0
+    assert models.calls_to(_POOLSIDE) == models.calls_to(_OPENROUTER) == 0
