@@ -92,6 +92,18 @@ def mock_transport_client() -> Iterator[Callable[..., httpx.Client]]:
 
 
 @pytest.fixture(autouse=True)
+def _every_poller_pass_is_due(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Which run a pass lands on depends on the clock. A test of what a pass
+    DOES must not. test_reaction_cadence pins the real schedule."""
+    poller = sys.modules.get("poller_handler")
+    if poller is not None:
+        monkeypatch.setattr(poller, "_DAILY_TICKS", 1)
+        monkeypatch.setattr(poller, "_ENFORCEMENT_TICKS", 1)
+        monkeypatch.setattr(poller, "get_enforcement_checks", lambda _iid: {})
+        monkeypatch.setattr(poller, "put_enforcement_checks", lambda _iid, _c: None)
+
+
+@pytest.fixture(autouse=True)
 def _forget_guideline_files() -> Iterator[None]:
     """The guideline cache outlives a test, and tests reuse one repo and head."""
     lc = sys.modules.get("llm_client")
