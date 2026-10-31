@@ -1480,6 +1480,27 @@ def _backend_usable(backend: Backend, model: str) -> bool:
     return _backend_enabled(backend, model) and _provider_available(backend, model)
 
 
+
+def _is_gateway_outage_error(error_text: str) -> bool:
+    err = error_text.lower()
+    return any(
+        msg in err
+        for msg in (
+            "connection refused",
+            "503 spark_gateway_queue_full",
+            "spark_gateway_queue_full",
+            "504 spark_gateway_queue_wait_exceeded",
+            "spark_gateway_queue_wait_exceeded",
+            "readtimeout",
+            "read timeout",
+            "connecterror",
+            "connect error",
+            "timeoutexception",
+            "http_503",
+            "http_504"
+        )
+    )
+
 def _is_spent_quota_refusal(resp: httpx.Response) -> bool:
     """A refusal that says the money or the allowance is gone, not overload."""
     status = resp.status_code
@@ -5868,7 +5889,12 @@ def _ladder_failure_reason(outcome: AttemptOutcome) -> str | None:
         return "misconfigured"
     if outcome.error_kind == "parse_failed":
         return "parse_failed"
+
     text = outcome.error_text or outcome.error_kind
+
+    if text and ("spark_gateway" in text.lower() or "connection refused" in text.lower()):
+        return text
+
     return text.rsplit(": ", 1)[-1]
 
 
@@ -6070,6 +6096,21 @@ def _call_llm_attempt(
             )
         parsed = response_parser(resp)
         findings, model, err = parsed.findings, parsed.model_name, parsed.error
+
+        # intercept gateway outage strings
+        if not err and (resp.status_code != 200 if success_kind == "reviewed" else not (200 <= resp.status_code < 300)):
+            err = f"http_{resp.status_code}"
+
+        if resp.status_code in (503, 504) or err:
+            try:
+                resp_text = resp.text.lower()
+                if "spark_gateway_queue_full" in resp_text:
+                    err = "503 spark_gateway_queue_full"
+                elif "spark_gateway_queue_wait_exceeded" in resp_text:
+                    err = "504 spark_gateway_queue_wait_exceeded"
+            except Exception:
+                pass
+
         parsed_status = (
             resp.status_code == 200 if success_kind == "reviewed"
             else 200 <= resp.status_code < 300
@@ -7186,6 +7227,70 @@ def _review_diff_dispatch_cave_primary(
         last_error = outcome.error_text
 
     if not successes and first_parse_fail is None:
+        is_gateway_outage = False
+        for outcome in arm_outcomes:
+            if outcome.error_text and _is_gateway_outage_error(outcome.error_text):
+                is_gateway_outage = True
+
+        trail = _LADDER_TRAIL.get()
+        if trail:
+            for t in trail:
+                if t.reason and _is_gateway_outage_error(t.reason):
+                    is_gateway_outage = True
+
+        if last_error and _is_gateway_outage_error(last_error):
+            is_gateway_outage = True
+
+        if is_gateway_outage:
+            configs = [c for c in _free_provider_fallback_configs() if c.backend not in (Backend.CAVE, Backend.CAVE_REASONER, Backend.FREE_POOL)]
+            if not configs:
+                sub = _subscription_fallback_config()
+                if sub is not None and _backend_usable(sub.backend, sub.model):
+                    configs.append(sub)
+
+            if configs:
+                config = configs[0]
+                if config.backend == Backend.SUBSCRIPTION:
+                    sub_resp = _run_subscription_fallback(messages, variant, pr_tags, hunks, pr_context, installation_id)
+                    if sub_resp:
+                        return sub_resp
+                else:
+                    attempt = _run_llm_attempt(
+                        backend=config.backend,
+                        config=config,
+                        messages=messages,
+                        variant=variant,
+                        pr_tags=pr_tags,
+                        transport_log_event="llm_saas_overload_fallback_transport_failed",
+                    )
+                    if attempt.error_kind not in ("config", "transport") and attempt.raw_response and attempt.raw_response.status_code == 200:
+                        resolved_model = attempt.model or config.model
+                        _emit_tier_served_metric("free-pool", config.backend.value, resolved_model)
+                        _emit_last_resort_metric("free-pool", config.backend.value, resolved_model)
+                        origin = _finding_origin(
+                            backend=config.backend,
+                            model=resolved_model,
+                            review_span_context=attempt.span_context,
+                            pr_context=pr_context,
+                            hunks=hunks,
+                        )
+                        return LlmReviewResponse(
+                            kind="reviewed",
+                            findings=tuple(replace(finding, origins=(origin,)) for finding in attempt.findings),
+                            backend_used=config.backend,
+                            model_name=resolved_model,
+                            review_span_context=attempt.span_context,
+                            backends_used=(config.backend,),
+                            models_used=(resolved_model,),
+                            error=_attempt_truncation_error(attempt),
+                            tier_served="free-pool",
+                        )
+
+            return LlmReviewResponse(
+                kind="all_failed",
+                error="gateway outage: spark_gateway_queue_full or connection failed",
+            )
+
         if cancel_event is not None and cancel_event.is_set():
             # Superseded mid-flight (#635 follow-up): both Cave arms were
             # deliberately aborted because the review input moved, not
