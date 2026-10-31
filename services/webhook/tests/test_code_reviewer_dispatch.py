@@ -3109,6 +3109,16 @@ def test_stack_offers_bulk_fix_for_checked_suggestion():
     assert "/grug fix" in body
 
 
+def test_stack_offers_docstrings_for_changed_undocumented_public_function():
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(), conclusion="success"),
+        conclusion="success", docstring_targets=("pkg/mod.py:1",),
+    )
+    assert "changed public function(s) lack docstrings" in body
+    assert "/grug docstrings" in body
+
+
 def test_worth_an_email_is_findings_or_degraded_only():
     """The gate on whether grug may CREATE a comment - i.e. whether it may
     mail the author. A clean review is not news; the green check-run already

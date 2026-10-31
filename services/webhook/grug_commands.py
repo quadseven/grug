@@ -18,6 +18,7 @@ PR branch):
   /grug accept-removal <path> <sha>  accept one deleted guard path on head <sha> (#1405)
   /grug walkthrough    opt in to Teller walkthrough on this PR
   /grug fix            apply all unresolved committable suggestions as one bot commit
+  /grug docstrings     generate docs for changed public functions as one bot commit
 """
 
 from __future__ import annotations
@@ -29,14 +30,14 @@ from dataclasses import dataclass
 # line in a longer comment; the verb is a known token, everything after is
 # the arg (only `ask`, `learnings` and `accept-removal` consume it). Case-insensitive.
 _CMD_RE = re.compile(
-    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings|accept-removal|accept_removal|walkthrough|fix)\b[ \t]*(.*)$",
+    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings|accept-removal|accept_removal|walkthrough|fix|docstrings)\b[ \t]*(.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 
 _CANON = {"test_gaps": "test-gaps", "accept_removal": "accept-removal"}
 VERBS = frozenset({
     "recheck", "improve", "ask", "test-gaps", "resume", "review", "learnings",
-    "accept-removal", "walkthrough", "fix",
+    "accept-removal", "walkthrough", "fix", "docstrings",
 })
 
 # The verbs that start an ELDER re-run. They are the ones that must not

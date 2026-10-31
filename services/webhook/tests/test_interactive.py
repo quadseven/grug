@@ -639,3 +639,21 @@ def test_fix_crash_is_answered_not_a_webhook_500(monkeypatch):
     assert res == {"status": "skip", "reason": "fix_failed", "verb": "fix"}
     replies = [c for c in fake.calls if c[0] == "post"]
     assert replies and "/grug fix" in replies[0][2]["body"]
+
+
+def test_docstrings_routes_to_docstring_action(monkeypatch):
+    import docstring_action
+    called = {}
+
+    def run_docstrings(**kwargs):
+        called.update(kwargs)
+        return {"status": "dispatched", "verb": "docstrings"}
+
+    monkeypatch.setattr(docstring_action, "run_docstrings", run_docstrings)
+    res = interactive.run_command(
+        "docstrings", "", install_id=3, owner="o", repo="r", pr_number=9,
+        comment_id=11, token_fn=_tok, claim=lambda key: True, head_sha="a" * 40,
+    )
+    assert res == {"status": "dispatched", "verb": "docstrings"}
+    assert called["head_sha"] == "a" * 40
+    assert called["pr_number"] == 9
