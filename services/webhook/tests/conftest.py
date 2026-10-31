@@ -99,6 +99,8 @@ def _every_poller_pass_is_due(monkeypatch: pytest.MonkeyPatch) -> None:
     if poller is not None:
         monkeypatch.setattr(poller, "_DAILY_TICKS", 1)
         monkeypatch.setattr(poller, "_ENFORCEMENT_TICKS", 1)
+        monkeypatch.setattr(poller, "get_enforcement_checks", lambda _iid: {})
+        monkeypatch.setattr(poller, "put_enforcement_checks", lambda _iid, _c: None)
 
 
 @pytest.fixture(autouse=True)

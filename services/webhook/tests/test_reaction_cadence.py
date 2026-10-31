@@ -170,16 +170,76 @@ def test_a_repo_scan_runs_on_its_turn_only(monkeypatch):
     assert sorted(seen) == list(range(96))
 
 
-def test_the_enforcement_pass_runs_every_six_hours(monkeypatch):
-    monkeypatch.setattr(poller_handler, "_ENFORCEMENT_TICKS", 24)
-    ran: list[int] = []
+def _enforcement_pass(monkeypatch, repos, *, ticks, states=None):
+    """Drive real enforcement passes over `ticks` runs with a persisted store,
+    and return the repo ids detected on each run plus the pass results."""
+    monkeypatch.setattr(poller_handler, "_ENFORCEMENT_TICKS", 4)
+    store: dict[str, float] = {}
+    monkeypatch.setattr(poller_handler, "get_enforcement_checks", lambda _i: dict(store))
     monkeypatch.setattr(
-        poller_handler, "with_install_token_retry",
-        lambda iid, _fn: ran.append(iid) or 1,
+        poller_handler, "put_enforcement_checks", lambda _i, c: store.update(c),
     )
-    for t in range(96):
+    monkeypatch.setattr(
+        "adapters.install_store.get_repo_config", lambda _i, _r: {},
+    )
+    monkeypatch.setattr(
+        "github_rulesets_client.list_installation_repos",
+        lambda _t: [{"id": n, "full_name": f"o/r{n}"} for n in repos],
+    )
+    monkeypatch.setattr("observability.emit_enforcement_metric", lambda *a, **k: None)
+    monkeypatch.setattr(poller_handler, "with_install_token_retry", lambda _i, fn: fn("t"))
+    runs: list[list[int]] = []
+    results = []
+
+    def _detect(_token, _owner, name, *_a, **_k):
+        runs[-1].append(int(name[1:]))
+        state = (states or {}).get((len(runs) - 1, int(name[1:])), "grug_managed")
+        if state == "raise":
+            raise RuntimeError("GitHub 502")
+        return type("Detection", (), {"state": state})
+
+    monkeypatch.setattr("github_rulesets_client.detect_enforcement", _detect)
+    for t in ticks:
+        runs.append([])
         monkeypatch.setattr(
             poller_handler, "_now_epoch", lambda t=t: NOW + t * rc.TICK_SECONDS,
         )
-        poller_handler._enforcement_reemission_pass([11])
-    assert ran == [11] * 4
+        results.append(poller_handler._enforcement_reemission_pass([11]))
+    return runs, results
+
+
+def test_a_repo_is_checked_hourly_on_its_own_turn(monkeypatch):
+    runs, _ = _enforcement_pass(monkeypatch, range(8), ticks=range(9))
+    assert sorted(runs[0]) == list(range(8)), "first sight checks everything"
+    per_repo = [sum(run.count(n) for run in runs[1:]) for n in range(8)]
+    assert per_repo == [2] * 8
+    assert all(len(run) <= 2 for run in runs[1:]), "turns spread across runs"
+
+
+def test_a_missed_tick_catches_up_on_the_next_run(monkeypatch):
+    """The poller did not run for three ticks. Every repo older than an hour
+    is checked at once, whatever its turn."""
+    runs, _ = _enforcement_pass(monkeypatch, range(4), ticks=[0, 6])
+    assert sorted(runs[1]) == [0, 1, 2, 3]
+
+
+def test_a_failed_detection_is_retried_next_run(monkeypatch):
+    runs, _ = _enforcement_pass(
+        monkeypatch, [1], ticks=[0, 1], states={(0, 1): "error"},
+    )
+    assert runs[0] == runs[1] == [1], "an error is not a good check"
+
+
+def test_skipped_is_reported_apart_from_emitted_and_failed(monkeypatch):
+    _, results = _enforcement_pass(monkeypatch, range(4), ticks=[0, 1])
+    assert results[0] == (4, 0, 0)
+    emitted, failed, skipped = results[1]
+    assert failed == 0
+    assert emitted + skipped == 4
+    assert skipped >= 3
+
+
+def test_a_ruleset_gap_is_logged_now_that_no_monitor_reads_the_gauge(monkeypatch, caplog):
+    with caplog.at_level("WARNING", logger=poller_handler.log.name):
+        _enforcement_pass(monkeypatch, [1], ticks=[0], states={(0, 1): "none"})
+    assert "enforcement_gap_detected" in [r.msg for r in caplog.records]
