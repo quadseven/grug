@@ -18,9 +18,20 @@ the tests intercept keeps working.
 """
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Callable
+from datetime import datetime
 
 from personas.tpm.dor_checks import IssueFacts, IssueFactsFetcher, IssueFetcher
+from personas.tpm.sibling_evidence import SiblingFetcher, SiblingPr
+
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.tpm.issue_fetcher")
+
+# The timeline carries label churn too; three pages reach the references of
+# any ticket seen so far, and the ones past them only cost evidence.
+_MAX_TIMELINE_PAGES = 3
+_MAX_SIBLINGS = 20
 
 
 def build_issue_fetcher(
@@ -116,6 +127,121 @@ def build_issue_details_fetcher(
         return with_install_token_retry(installation_id, _get)
 
     return _fetch_issue_details
+
+
+def _instant(stamp: str) -> datetime:
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+
+
+def merged_siblings(
+    token: str, owner: str, repo: str, number: int, *, pr_number: int = 0,
+) -> tuple[SiblingPr, ...]:
+    """The merged pull requests of this repository that link issue `number`,
+    other than `pr_number`, whose body is unedited since the merge (grug#1530).
+    A cross-reference alone is a mention, so that body must link the issue the
+    way a review reads a link. One GitHub read per timeline page, one more for
+    the bodies, and no model call. Raises on a failed read."""
+    from urllib.parse import quote
+    import httpx  # type: ignore
+
+    from personas.code_reviewer.linked_issue import linked_issue_numbers
+
+    full_name = f"{owner}/{repo}".casefold()
+    url = (
+        f"https://api.github.com/repos/{quote(owner, safe='')}/"
+        f"{quote(repo, safe='')}/issues/{int(number)}/timeline"
+    )
+    candidates: set[int] = set()
+    for page in range(1, _MAX_TIMELINE_PAGES + 1):
+        r = httpx.get(
+            url,
+            params={"per_page": 100, "page": page},
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        events = r.json() or []
+        for event in events:
+            if event.get("event") != "cross-referenced":
+                continue
+            source = (event.get("source") or {}).get("issue") or {}
+            home = str(source.get("repository_url") or "").casefold()
+            if (
+                (source.get("pull_request") or {}).get("merged_at")
+                and source.get("number") != pr_number
+                and home.endswith(f"/repos/{full_name}")
+            ):
+                candidates.add(int(source["number"]))
+        if len(events) < 100:
+            break
+    numbers = sorted(candidates)[-_MAX_SIBLINGS:]
+    if not numbers:
+        return ()
+    return tuple(
+        pr for pr in _unedited_merged_prs(token, owner, repo, numbers)
+        if int(number) in linked_issue_numbers(pr.body, owner=owner, repo=repo, limit=None)
+    )
+
+
+def _unedited_merged_prs(
+    token: str, owner: str, repo: str, numbers: list[int],
+) -> tuple[SiblingPr, ...]:
+    """The PRs whose body has not been edited since they merged, each with
+    that body. Anyone who can edit a merged PR could otherwise write a gate's
+    evidence into it, so the merged body is the only one that counts. The body
+    comes from the same read as the edit time, and a title is never evidence
+    because `lastEditedAt` does not cover it. One GraphQL read."""
+    import httpx  # type: ignore
+
+    fields = "".join(
+        f"pr{int(n)}: pullRequest(number: {int(n)}) {{ number mergedAt lastEditedAt body }} "
+        for n in numbers
+    )
+    r = httpx.post(
+        "https://api.github.com/graphql",
+        json={
+            "query": (
+                "query($owner: String!, $name: String!) "
+                f"{{ repository(owner: $owner, name: $name) {{ {fields}}} }}"
+            ),
+            "variables": {"owner": owner, "name": repo},
+        },
+        headers={"Authorization": f"bearer {token}"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    payload = r.json() or {}
+    if payload.get("errors"):
+        raise RuntimeError("sibling pull request read returned errors")
+    found: list[SiblingPr] = []
+    for pr in ((payload.get("data") or {}).get("repository") or {}).values():
+        merged, edited = (pr or {}).get("mergedAt"), (pr or {}).get("lastEditedAt")
+        if not merged:
+            continue
+        if edited and _instant(edited) > _instant(merged):
+            log.info("sibling_body_edited_after_merge", extra={"pr": pr.get("number")})
+            continue
+        found.append(SiblingPr(int(pr["number"]), pr.get("body") or ""))
+    return tuple(sorted(found, key=lambda p: p.number))
+
+
+def build_merged_siblings_fetcher(
+    *, installation_id: int, owner: str, repo: str, pr_number: int,
+) -> SiblingFetcher:
+    """Return an `issue number -> merged sibling PRs` callable. Failures
+    raise; a caller then has no sibling evidence, which is the plain check."""
+
+    def _fetch(number: int) -> tuple[SiblingPr, ...]:
+        from github_app_auth import with_install_token_retry  # type: ignore
+        return with_install_token_retry(
+            installation_id,
+            lambda token: merged_siblings(token, owner, repo, number, pr_number=pr_number),
+        )
+
+    return _fetch
 
 
 def issue_facts(token: str, owner: str, repo: str, number: int) -> IssueFacts:

@@ -134,7 +134,9 @@ from personas.tpm.dor_checks import loom_footer_model
 from personas.tpm.persona import is_trusted_operator
 from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
-from personas.tpm.issue_fetcher import build_issue_details_fetcher
+from personas.tpm.issue_fetcher import (
+    build_issue_details_fetcher, build_merged_siblings_fetcher,
+)
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     advisory_when_unrefuted, eval_tags, grade_findings, partition_findings,
@@ -2727,6 +2729,10 @@ def _attach_linked_issue_context(
             fetch_issue=fetch_issue,
             owner=owner,
             repo=repo_name,
+            fetch_siblings=build_merged_siblings_fetcher(
+                installation_id=installation_id, owner=owner, repo=repo_name,
+                pr_number=int(pr_context.get("pr_number") or 0),
+            ),
         )
         if linked:
             pr_context["linked_issue_context"] = linked
