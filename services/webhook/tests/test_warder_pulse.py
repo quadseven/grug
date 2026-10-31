@@ -374,8 +374,9 @@ def test_pulse_label_delivery_marks_idle_and_updates_board_without_comment(monke
     monkeypatch.setattr(pulse, "_stale_prs", lambda *args: [stale])
     monkeypatch.setattr(pulse, "_dor_green", lambda *args: True)
     monkeypatch.setattr(pulse, "_idle_labeled_prs", lambda *args: [])
-    monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda *args: True)
-    monkeypatch.setattr(pulse, "record_check_verdict", lambda **kw: None)
+    claims, verdicts = [], []
+    monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda *args: claims.append(args) or True)
+    monkeypatch.setattr(pulse, "record_check_verdict", lambda **kw: verdicts.append(kw))
     posts, boards = [], []
     monkeypatch.setattr(pulse, "get_app_id", lambda: "1")
     monkeypatch.setattr(pulse.httpx, "get", lambda url, **kw: httpx.Response(200, request=httpx.Request("GET", url), json={}))
@@ -386,6 +387,12 @@ def test_pulse_label_delivery_marks_idle_and_updates_board_without_comment(monke
     assert not any(url.endswith("/comments") for url, _ in posts)
     assert posts[0][1]["json"] == {"labels": ["grug:idle"]}
     assert "Idle since 2020-01-01" in boards[0][1]["section"]
+    # The weekly claim is what keeps the gauge at one neutral row per idle week.
+    assert claims == [(1, "o/r", 8)]
+    assert len(verdicts) == 1
+    assert verdicts[0]["persona_key"] == "pulse"
+    assert verdicts[0]["conclusion"] == "neutral"
+    assert verdicts[0]["findings_count"] == 0
 
 
 def test_pulse_removes_idle_label_when_pr_is_no_longer_stale(monkeypatch):
@@ -401,6 +408,17 @@ def test_pulse_removes_idle_label_when_pr_is_no_longer_stale(monkeypatch):
 
     pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
     assert deletes == ["https://api.github.com/repos/o/r/issues/8/labels/grug%3Aidle"]
+
+
+def test_cleanup_keeps_idle_label_on_pr_that_is_still_stale(monkeypatch):
+    deletes = []
+    monkeypatch.setattr(pulse, "_remove_idle_label", lambda *args: deletes.append(args[3]))
+    still_idle = _pr(8, "2020-01-01T00:00:00Z")
+
+    pulse._cleanup_idle_labels(
+        "tok", "o", "r", "label", [still_idle], [still_idle, _pr(9, "2026-10-30T00:00:00Z")],
+    )
+    assert deletes == [9]
 
 
 def test_pulse_comment_delivery_keeps_weekly_comment_without_label(monkeypatch):
