@@ -11,7 +11,9 @@ failed enqueue is answered on the PR.
 
 from __future__ import annotations
 
+import httpx
 import interactive
+import pytest
 import review_label
 
 
@@ -627,6 +629,37 @@ def test_test_gaps_accepted_posts_reaction_not_comment(monkeypatch):
     assert reactions[0][1] == "https://api.github.com/repos/o/r/issues/comments/102/reactions"
     reply_comments = [c for c in fake.calls if c[0] == "post" and "/comments" in c[1] and "/reactions" not in c[1]]
     assert reply_comments == []
+
+
+def _accept_with_reaction_raising(monkeypatch, error):
+    """Run an accepted command whose acknowledgement reaction raises."""
+    fake = _FakeHttp()
+    fake.HTTPStatusError = httpx.HTTPStatusError
+    fake.RequestError = httpx.RequestError
+    monkeypatch.setattr(interactive, "httpx", fake)
+
+    def _refuse(*_a):
+        raise error
+
+    monkeypatch.setattr(interactive, "_post_reaction", _refuse)
+    return interactive.run_command(
+        "test-gaps", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=105, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: None,
+    )
+
+
+def test_refused_ack_reaction_does_not_fail_the_accepted_command(monkeypatch):
+    """A reaction GitHub refuses leaves the queued command dispatched."""
+    res = _accept_with_reaction_raising(monkeypatch, httpx.ConnectError("down"))
+    assert res["status"] == "dispatched"
+
+
+def test_ack_reaction_bug_is_not_masked_as_a_github_refusal(monkeypatch):
+    """A fault that is not a GitHub failure surfaces instead of being logged
+    as a cosmetic refusal."""
+    with pytest.raises(TypeError):
+        _accept_with_reaction_raising(monkeypatch, TypeError("bad call"))
 
 
 def test_improve_enqueue_failure_still_posts_reply_comment(monkeypatch):

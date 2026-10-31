@@ -469,10 +469,7 @@ def _run_persona_rerun(
                    "head_sha": head_sha[:8], "state": elder_state},
         )
     # Post a reaction to the command comment as acknowledgement (no reply comment)
-    try:
-        token_fn(lambda t: _post_reaction(t, owner, repo, comment_id, "eyes"))
-    except Exception as e:  # noqa: BLE001 - the rerun is enqueued; the ack reaction is cosmetic
-        log.warning("interactive_ack_failed", extra={"verb": verb, "kind": type(e).__name__})
+    _react(token_fn, owner, repo, comment_id, "eyes")
     if queued:
         return {"status": "queued", "reason": "queued_behind_review",
                 "verb": verb, "persona": persona}
