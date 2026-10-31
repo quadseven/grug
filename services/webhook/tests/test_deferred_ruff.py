@@ -15,6 +15,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from personas import review_publish
 from personas.code_reviewer import carry_forward, deferred_ruff, dispatch, thread_resolver
 from personas.code_reviewer.diff_parser import parse_diff
 from personas.code_reviewer.persona import CodeReviewEvaluation
@@ -54,9 +55,13 @@ def _clean() -> CodeReviewEvaluation:
     return CodeReviewEvaluation(findings=(), conclusion="success")
 
 
-def _review(ticket, head, *, body="Closes #1313", diff=_OTHER_DIFF, thread=_THREAD):
+_BOT = "grug-tribe[bot]"
+
+
+def _review(ticket, head, *, body="Closes #1313", diff=_OTHER_DIFF, thread=_THREAD, author=_BOT):
     """One review pass, with GitHub faked at the reads. `head` is the text of
-    the named file at the head; README.md is the only file in the diff."""
+    the named file at the head; README.md is the only file in the diff.
+    `ticket` is one body, or a callable from issue number to body."""
     context = {
         "repo": "acme/widgets", "pr_number": 1470, "installation_id": 7,
         "head_sha": "abc123", "title": "Settle lint", "body": body,
@@ -68,7 +73,10 @@ def _review(ticket, head, *, body="Closes #1313", diff=_OTHER_DIFF, thread=_THRE
         comment_reads.append(comment_id)
         if isinstance(thread, Exception):
             raise thread
-        return thread
+        return author, thread
+
+    def read_issue(number):
+        return {"title": "Settle", "body": ticket(number) if callable(ticket) else ticket}
 
     def read_files(_token, _owner, _repo, paths, ref, **_kwargs):
         file_reads.append((paths, ref))
@@ -76,7 +84,7 @@ def _review(ticket, head, *, body="Closes #1313", diff=_OTHER_DIFF, thread=_THRE
 
     with (
         patch.object(dispatch, "build_issue_details_fetcher",
-                     return_value=lambda _n: {"title": "Settle", "body": ticket}),
+                     return_value=read_issue),
         patch.object(dispatch, "with_install_token_retry", lambda _i, fn: fn("tok")),
         patch.object(dispatch, "fetch_review_comment_body", read_comment),
         patch.object(dispatch, "fetch_file_contents", read_files),
@@ -183,13 +191,154 @@ def test_a_file_gone_at_the_head_has_nothing_firing():
     assert merged == _clean()
 
 
-def test_a_thread_github_no_longer_has_names_nothing():
+def _http_error(status):
     request = httpx.Request("GET", "https://api.github.com/x")
-    gone = httpx.HTTPStatusError(
-        "gone", request=request, response=httpx.Response(404, request=request),
+    return httpx.HTTPStatusError(
+        "failed", request=request, response=httpx.Response(status, request=request),
     )
-    merged, _, _ = _review(_TICKET, _FIRING, thread=gone)
+
+
+def test_a_thread_github_no_longer_has_degrades_the_review():
+    merged, _, _ = _review(_TICKET, _FIRING, thread=_http_error(404))
+    assert merged.findings == ()
+    assert merged.degraded_reason == "partial_review"
+
+
+def test_a_resolved_thread_never_hides_a_rule_measured_at_this_head():
+    # Finding 1: the (rule, file, line) match would drop it.
+    merged, _, _ = _review(_TICKET, _FIRING)
+    finding = merged.findings[0]
+    thread = _thread()
+    thread["isResolved"] = True
+    thread["comments"]["nodes"][0].update(path=finding.file, line=finding.line)
+    assert carry_forward.filter_findings_against_resolved_threads(
+        merged.findings, 7, "acme", "widgets", 1470, threads=[thread],
+    ) == merged.findings
+
+
+_FOUR = "Closes #1\nCloses #2\nCloses #3\nCloses #1313\n"
+
+
+def test_a_fourth_settled_ticket_is_read():
+    # Finding 2: the criteria block reads only the first three links.
+    merged, _, _ = _review(lambda n: _TICKET if n == 1313 else "", _FIRING, body=_FOUR)
+    assert [f.rule_name for f in merged.findings] == ["unmet-criterion"]
+    assert merged.degraded_reason is None
+
+
+def test_tickets_over_the_bound_degrade_and_what_was_read_still_counts():
+    body = "".join(f"Closes #{n}\n" for n in (1313, 2, 3, 4, 5, 6))
+    merged, _, _ = _review(lambda n: _TICKET if n == 1313 else "", _FIRING, body=body)
+    assert [f.rule_name for f in merged.findings] == ["unmet-criterion"]
+    assert merged.degraded_reason == "partial_review"
+
+
+def test_a_ticket_read_that_fails_degrades():
+    def unreadable(_number):
+        raise _http_error(502)
+
+    merged, _, _ = _review(unreadable, _FIRING)
+    assert merged.degraded_reason == "partial_review"
+
+
+def test_a_ticket_github_does_not_have_defers_nothing():
+    def absent(_number):
+        raise _http_error(404)
+
+    merged, _, _ = _review(absent, _FIRING)
     assert merged == _clean()
+
+
+def test_a_degraded_recheck_leaves_the_threads_to_the_next_pass():
+    # Finding 2: an unmeasured finding is not closed as fixed.
+    merged, _, _ = _review(_TICKET, _FIRING, thread=httpx.ConnectError("down"))
+    with patch.object(dispatch, "resolve_fixed_threads") as resolve:
+        dispatch._tidy_fixed_threads(
+            action="synchronize", review_published=True, evaluation=merged,
+            installation_id=7, owner="acme", repo_name="widgets", pull_number=1470,
+            head_sha="abc123",
+        )
+    resolve.assert_not_called()
+
+
+def test_a_lane_work_failure_does_not_skip_the_recheck():
+    # Finding 3.
+    context = {
+        "repo": "acme/widgets", "pr_number": 1470, "installation_id": 7, "head_sha": "abc123",
+        "deferred_lint": (deferred_ruff.DeferredLint(1313, _PATH, 4324290468),),
+    }
+    inputs = dispatch._LaneWorkInputs(_OTHER_DIFF, parse_diff(_OTHER_DIFF), {_PATH: _FIRING}, {})
+    with (
+        patch.object(dispatch, "_merge_lane_work", side_effect=ValueError("bad")),
+        patch.object(dispatch, "with_install_token_retry", lambda _i, fn: fn("tok")),
+        patch.object(dispatch, "fetch_review_comment_body", lambda *_a: (_BOT, _THREAD)),
+    ):
+        merged = dispatch._merge_lane_work_for_pass(
+            _clean(), inputs, context, living_range="", base_sha="b0", correctness_only=False,
+        )
+    assert [f.rule_name for f in merged.findings] == ["unmet-criterion"]
+
+
+def test_any_failure_in_the_recheck_degrades():
+    # Finding 3: not only the failures the re-check expects.
+    with patch.object(dispatch, "ruff_hits", side_effect=ValueError("bad")):
+        merged, _, _ = _review(_TICKET, _FIRING)
+    assert merged.degraded_reason == "partial_review"
+
+
+def test_more_findings_than_the_bound_degrade_and_the_rest_still_count():
+    # Finding 4.
+    lines = "".join(
+        f"- medium | _general_ | `lint-bug` in `{_PATH}`: {_LINK[:-1]}{n}\n"
+        for n in range(deferred_ruff.MAX_DEFERRED + 1)
+    )
+    merged, comment_reads, _ = _review(lines, _FIRING)
+    assert len(comment_reads) == deferred_ruff.MAX_DEFERRED
+    assert [f.rule_name for f in merged.findings] == ["unmet-criterion"]
+    assert merged.degraded_reason == "partial_review"
+
+
+def test_more_files_than_one_read_takes_raises_and_the_review_degrades():
+    # Finding 4: a path past the cap is not "gone from the head".
+    many = tuple(f"f{n}.py" for n in range(21))
+    with pytest.raises(review_publish.ContextFilesTruncated):
+        review_publish.fetch_file_contents("tok", "acme", "widgets", many, "abc", only_404_skips=True)
+    lines = "".join(
+        f"- medium | _general_ | `lint-bug` in `f{n}.py`: {_LINK}{n}\n" for n in range(21)
+    )
+    context = {
+        "repo": "acme/widgets", "pr_number": 1, "installation_id": 7, "head_sha": "abc",
+        "deferred_lint": deferred_ruff.parse_deferred_lint(
+            lines, issue=1, owner="acme", repo="widgets",
+        ),
+    }
+    with (
+        patch.object(dispatch, "with_install_token_retry", lambda _i, fn: fn("tok")),
+        patch.object(dispatch, "fetch_review_comment_body", lambda *_a: (_BOT, _THREAD)),
+    ):
+        merged = dispatch._merge_deferred_ruff(_clean(), (), {}, context)
+    assert merged.degraded_reason == "partial_review"
+
+
+@pytest.mark.parametrize("author,thread", [
+    ("a-person", _THREAD),
+    (_BOT, _THREAD.replace("<!-- grug-rule:lint-bug -->", "")),
+    (_BOT, _THREAD.replace("grug-rule:lint-bug", "grug-rule:dead-code")),
+])
+def test_a_code_counts_only_from_elders_own_lint_comment(author, thread):
+    # Finding 5: the head fires B904, yet this thread cannot name it.
+    merged, _, _ = _review(_TICKET, _FIRING, author=author, thread=thread)
+    assert merged.findings == ()
+    assert merged.degraded_reason == "partial_review"
+
+
+def test_the_comment_read_reports_its_author():
+    response = httpx.Response(
+        200, json={"user": {"login": _BOT}, "body": "text"},
+        request=httpx.Request("GET", "https://api.github.com/x"),
+    )
+    with patch.object(review_publish.httpx, "get", return_value=response):
+        assert review_publish.fetch_review_comment_body("tok", "o", "r", 5) == (_BOT, "text")
 
 
 def test_a_thread_read_that_fails_degrades_instead_of_passing():

@@ -304,6 +304,11 @@ def fetch_pr_diff_with_scope(
 _MAX_CONTEXT_FILES = 20
 
 
+class ContextFilesTruncated(RuntimeError):
+    """More paths than `fetch_file_contents` reads, for a caller that reads
+    an absent file as a fact."""
+
+
 def fetch_file_contents(
     install_token: str,
     owner: str,
@@ -320,8 +325,11 @@ def fetch_file_contents(
     diff-only for that file. Returns path -> content for the files that fetched.
 
     `only_404_skips` is for a caller that reads an absent file as a fact: only
-    a file GitHub says is not there is skipped, and any other failure raises.
+    a file GitHub says is not there is skipped, and any other failure raises,
+    as does a path list over the cap (`ContextFilesTruncated`).
     """
+    if only_404_skips and len(paths) > _MAX_CONTEXT_FILES:
+        raise ContextFilesTruncated(f"{len(paths)} paths over {_MAX_CONTEXT_FILES}")
     contents: dict[str, str] = {}
     for path in paths[:_MAX_CONTEXT_FILES]:
         try:
@@ -360,9 +368,9 @@ def fetch_file_contents(
 
 def fetch_review_comment_body(
     install_token: str, owner: str, repo: str, comment_id: int,
-) -> str:
-    """The body of one inline review comment. Raises on any failure, so the
-    caller can tell a comment GitHub no longer has from one it could not read."""
+) -> tuple[str, str]:
+    """(author login, body) of one inline review comment. Raises on any
+    failure, so an unread comment never reads as an empty one."""
     resp = httpx.get(
         f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
         f"/pulls/comments/{int(comment_id)}",
@@ -374,7 +382,9 @@ def fetch_review_comment_body(
         timeout=DIFF_FETCH_TIMEOUT,
     )
     resp.raise_for_status()
-    return str((resp.json() or {}).get("body") or "")
+    comment = resp.json() or {}
+    author = (comment.get("user") or {}).get("login") or ""
+    return str(author), str(comment.get("body") or "")
 
 
 def _fetch_pr_review_comments(

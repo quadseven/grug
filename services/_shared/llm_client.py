@@ -238,6 +238,8 @@ class PrContext(TypedDict, total=False):
     linked_issue_context: str
     # `deferred_ruff.DeferredLint` rows of the tickets this PR settles (#1477).
     deferred_lint: tuple[Any, ...]
+    # Why that list is incomplete; any entry degrades the review.
+    deferred_lint_unfinished: tuple[str, ...]
     review_scope: str
     sensitive_review: bool
     # The webhook's `repository.private` (grug#1269). Unset means unknown,

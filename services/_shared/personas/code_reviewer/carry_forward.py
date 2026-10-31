@@ -193,9 +193,11 @@ def filter_findings_against_resolved_threads(
         resolved_threads.append((rule, path, line))
     if not resolved_threads:
         return findings
+    # A deferred-ruff finding was measured at this head, and a resolved thread
+    # is not evidence of a fix (#1477).
     return tuple(
         f for f in findings
-        if not any(
+        if f.rule_name == deferred_ruff.RULE or not any(
             f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
             for rule, path, line in resolved_threads
         )

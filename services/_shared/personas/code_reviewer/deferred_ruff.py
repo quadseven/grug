@@ -14,8 +14,11 @@ it again: the same ruff run as `lint.py`, over the named file at the head.
 Only the `lint-*` rule names `lint.py` gives ruff findings are read.
 Model-judged findings such as `dead-code` have nothing to measure.
 
-An unfinished re-check never reads as a clean one: dispatch degrades the
-review, the shape of the removed-reference check (#1401).
+An unfinished re-check never reads as a clean one: a ticket or thread it could
+not read, a thread that names no rule, a bound it hit or a ruff run that failed
+all degrade the review, the shape of the removed-reference check (#1401).
+Degraded, the review neither carries nor closes threads, so a finding the pass
+did not measure stays open.
 
 A FINDING OUTSIDE THE DIFF. GitHub refuses a thread on a line outside the PR's
 diff, and the named file may not be in the diff at all. So a finding sits on
@@ -34,6 +37,7 @@ import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
+from personas.code_reviewer.dedup import parse_rule
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.lint import RuffHit
 from personas.code_reviewer.persona import Finding
@@ -41,8 +45,12 @@ from personas.code_reviewer.persona import Finding
 RULE = "unmet-criterion"
 RULE_CATEGORIES = {RULE: "requirements"}
 
-# Each entry costs one GitHub read and the ticket text is untrusted.
+# Each costs one GitHub read and the ticket text is untrusted. Dispatch applies
+# them and degrades the review when one is hit.
 MAX_DEFERRED = 10
+MAX_SETTLED_TICKETS = 5
+
+_LINT_RULES = frozenset({"lint-bug", "lint-security", "lint-async", "lint-violation"})
 
 _OUTSIDE = "GitHub cannot hold a thread here: this pull request has no free diff line."
 
@@ -81,11 +89,14 @@ def parse_deferred_lint(
             continue
         comment_id = int(m.group(4))
         found.setdefault(comment_id, DeferredLint(issue, m.group(1), comment_id))
-    return tuple(found.values())[:MAX_DEFERRED]
+    return tuple(found.values())
 
 
 def rule_code(comment_body: str) -> str | None:
-    """The ruff code in Elder's review comment, or None for any other text."""
+    """The ruff code in a review comment carrying Elder's lint rule marker,
+    or None. Dispatch checks the comment's author: a marker is plain text."""
+    if parse_rule(comment_body or "") not in _LINT_RULES:
+        return None
     m = _RUFF_CODE_RE.search(comment_body or "")
     return m.group(1) if m else None
 

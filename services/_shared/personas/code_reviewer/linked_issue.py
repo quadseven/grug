@@ -97,9 +97,10 @@ Criterion = tuple[str, str]  # ("open" | "ticked", text)
 
 def linked_issue_numbers(
     pr_body: str, *, owner: str = "", repo: str = "",
-    limit: int = MAX_LINKED_ISSUES,
+    limit: int | None = MAX_LINKED_ISSUES,
 ) -> list[int]:
-    """Same-repo issues the PR links, closing keywords first, deduped, capped."""
+    """Same-repo issues the PR links, closing keywords first, deduped, capped.
+    `limit=None` is every link, for a caller that bounds them itself."""
     body = pr_body or ""
     seen: dict[int, None] = {}
     for n in closes_refs(body):
