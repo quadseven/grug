@@ -63,24 +63,12 @@ _ACCEPTANCE_REACTION_CONTENT = "eyes"
 
 
 def _post_acceptance_reaction(token_fn, owner: str, repo: str, comment_id: int) -> None:
-    """Post an acceptance reaction to the acceptance command comment.
+    """React to the acceptance command comment. The acceptance is recorded
+    and Elder queued by now, so `_react` keeps a refused reaction from
+    raising out of the command."""
+    from interactive import _react  # type: ignore
 
-    GitHub de-duplicates repeated reactions, so a redelivery is harmless."""
-    import httpx  # type: ignore
-    from urllib.parse import quote as _q
-
-    _API = "https://api.github.com"
-    _TIMEOUT = 15.0
-
-    def _react(token: str) -> None:
-        httpx.post(
-            f"{_API}/repos/{_q(owner, safe='')}/{_q(repo, safe='')}/pulls/comments/{comment_id}/reactions",
-            json={"content": _ACCEPTANCE_REACTION_CONTENT},
-            headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
-            timeout=_TIMEOUT,
-        ).raise_for_status()
-
-    token_fn(_react)
+    _react(token_fn, owner, repo, comment_id, _ACCEPTANCE_REACTION_CONTENT)
 
 
 def removal_path(arg: str) -> str:

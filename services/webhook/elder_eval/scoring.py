@@ -349,6 +349,10 @@ def to_baseline_dict(
                 # grug#843: which model these numbers belong to. See
                 # `model_identity` for how the two fields combine.
                 **model_entry(report, model=model),
+                # grug#1511: the prompt these numbers came from. The gate
+                # compares it with the top-level sha, which a hand edit can
+                # move.
+                "measured_prompt_sha": prompt_sha,
                 "overall_catch": report.overall_catch,
                 "per_class_catch": dict(sorted(report.per_class_catch.items())),
                 "noise_rate": report.noise_rate,

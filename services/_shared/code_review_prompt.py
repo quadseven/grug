@@ -589,6 +589,90 @@ RULES: tuple[ReviewRule, ...] = (
         '                             "maxLength": MAX_MESSAGE_CHARS}}}}',
         severity="medium",
     ),
+    # -- stale reverse-check intermediary (PR #751, #752, #1421) --
+    ReviewRule(
+        name="stale-reverse-check-intermediary",
+        bug_class="correctness",
+        description="A check over a bidirectional invariant (two collections "
+        "that must agree in both directions) whose reverse direction is "
+        "validated against a derived, cached, or hand-kept intermediary (such "
+        "as a static mapping table or dictionary values) rather than the live "
+        "source collection. A stale or obsolete entry in the intermediary then "
+        "keeps blessing an orphaned, removed, or ghost entry in the target "
+        "collection, allowing it to pass silently. Build the reverse "
+        "validation set from the live source collection instead. Every "
+        "finding emitted under this rule MUST name the concrete stale entry "
+        "that would pass the check (e.g. a deleted key or orphaned item). If "
+        "you cannot name a concrete stale entry that would pass, do not emit "
+        "the finding.",
+        bad_example="# reverse check against static map: stale entry passes ghost item\n"
+        "for card in cards:\n"
+        "    if card not in REGISTRY_TO_UI.values(): raise Error()",
+        good_example="# reverse check built from live keys: stale mapping entry rejected\n"
+        "live_ui = {REGISTRY_TO_UI[k] for k in live_keys if k in REGISTRY_TO_UI}\n"
+        "for card in cards:\n"
+        "    if card not in live_ui: raise Error()",
+        severity="high",
+    ),
+    ReviewRule(
+        name="stderr-folded-into-compared-value",
+        bug_class="silent failure",
+        description="A command's stderr merged into its stdout -- `2>&1` "
+        "inside `$(...)`, `stderr=subprocess.STDOUT`, "
+        "`check_output(..., stderr=STDOUT)` -- where the captured text is "
+        "then COMPARED, parsed, or used as a value rather than only logged. "
+        "Any layer on the path can write a banner to stderr: a credential "
+        "exec plugin, a cloud CLI wrapper, a shim, a deprecation notice. "
+        "That text is folded into the value, so an equality test or a parse "
+        "silently goes false -- and the contaminating layer is usually one "
+        "nobody in the diff is thinking about, because it is not the command "
+        "being read. Worst where a false comparison means SKIP rather than "
+        "error: the step does nothing, logs nothing, and looks exactly like "
+        "'not opted in'. The merge is nearly always there for diagnostics "
+        "the author wanted in the log. Fix: read stdout alone, send stderr "
+        "somewhere it stays readable, surface its first lines in the error "
+        "on a failed read, and LOG the skip branch so 'skipped' stops being "
+        "indistinguishable from 'absent'. A `2>&1` whose result is only "
+        "echoed or logged is not this.",
+        bad_example='opt=$(some-cli get "$n" -o value 2>&1)   # banner folded in\n'
+        'if [ "$opt" = "true" ]; then wait_for "$n"; fi\n'
+        '# never equal -> silent skip, and nothing is logged',
+        good_example='opt=$(some-cli get "$n" -o value 2>/tmp/opt.err) || {\n'
+        '  echo "read failed: $(head -3 /tmp/opt.err)" >&2; exit 1; }\n'
+        'if [ "$opt" = "true" ]; then wait_for "$n"\n'
+        'else echo "note: $n not waited on (flag=$opt)"; fi',
+        severity="medium",
+    ),
+    ReviewRule(
+        name="diff-gate-scans-hunk-header",
+        bug_class="correctness",
+        description="A scanner, linter or policy gate whose input is a "
+        "unified DIFF rather than a tree, whose skip list enumerates some of "
+        "the diff's non-content line kinds but not `@@`. Under `-U0` git "
+        "appends PRE-IMAGE CONTEXT to every hunk header -- "
+        "`@@ -9 +9 @@ <a line from the OLD file>` -- so when a change removes "
+        "two violations in a row, the second hunk header REPEATS the first "
+        "removed line and the gate reports a removal as an addition. The "
+        "signal then inverts exactly for the change trying to fix what the "
+        "gate watches for, so the offending tree can never go clean and the "
+        "block looks correct from the outside. Require an explicit decision "
+        "for EVERY non-content line kind the format carries -- `diff --git`, "
+        "`index`, `---`, `+++`, `@@`, `\\ No newline at end of file` -- not "
+        "only the two obvious ones; `@@` is the one that gets missed. A skip "
+        "list holding `---`/`+++` and nothing else is the tell. Keep "
+        "`diff --git` path lines scanned where a path is itself information.",
+        bad_example='if line.startswith(("---", "+++")):\n'
+        '    continue              # file headers handled; @@ is not\n'
+        'if line.startswith("-"):\n'
+        '    continue              # removals are a scrub\n'
+        'scan(line)                # "@@ -9 +9 @@ <old text>" scanned as added',
+        good_example='if line.startswith(("---", "+++", "@@")):\n'
+        '    continue              # -U0 appends pre-image context to @@\n'
+        'if line.startswith("-"):\n'
+        '    continue\n'
+        'scan(line)',
+        severity="medium",
+    ),
 )
 
 
@@ -703,7 +787,13 @@ _OUTPUT_CONTRACT = (
     '{"findings": [{"path": str, "line": int, "rule": str, '
     '"severity": "low"|"medium"|"high"|"critical", "message": str, '
     '"suggestion": str (OPTIONAL), "effort": "quick-win"|"heavy-lift" '
-    '(OPTIONAL), "outside_diff_reason": str (OPTIONAL)}]}. '
+    '(OPTIONAL), "category": "correctness"|"security"|"stability"|'
+    '"data-integrity"|"maintainability" (OPTIONAL), '
+    '"outside_diff_reason": str (OPTIONAL), '
+    '"is_finding": bool (OPTIONAL)}]}. '
+    "Only list real defects: when you check a candidate and conclude there "
+    "is nothing wrong, leave it out. If you list one anyway, set "
+    "`is_finding` to false so it is never published. "
     "`rule` MUST be one of the rule names above. `line` is the new-side "
     "line number from the diff. A finding on an UNCHANGED cross-file context "
     "line is allowed only when you provide `outside_diff_reason`, naming the "
@@ -715,7 +805,12 @@ _OUTPUT_CONTRACT = (
     "diff syntax, no backticks; include it ONLY when you are confident "
     "the replacement is complete and line-exact, else omit it. `effort` "
     "estimates the fix: quick-win (small, local) or heavy-lift "
-    "(structural); omit when unsure. No prose, no markdown, no text "
+    "(structural); omit when unsure. `category` is the axis a reviewer "
+    "triages on: correctness (wrong behavior), security, stability (crashes, "
+    "availability, concurrency), data-integrity (data loss, integration "
+    "contracts), maintainability (clarity, tests, types); omit it when "
+    "none fits - it is then recorded as general. No prose, no markdown, "
+    "no text "
     "outside the JSON object."
 )
 

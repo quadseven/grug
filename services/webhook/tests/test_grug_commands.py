@@ -10,6 +10,8 @@ def test_parses_each_verb():
     assert parse_command("/grug improve").verb == "improve"
     assert parse_command("/grug test-gaps").verb == "test-gaps"
     assert parse_command("/grug test_gaps").verb == "test-gaps"  # underscore alias
+    assert parse_command("/grug fix").verb == "fix"
+    assert parse_command("/GRUG Fix").verb == "fix"
 
 
 def test_ask_captures_arg():
@@ -55,3 +57,43 @@ def test_learnings_list_and_delete_parse():
     assert c.verb == "learnings" and c.arg == "delete abc123456789"
     c = parse_command("/GRUG LearNInGs DeLeTe deadbeef")
     assert c.verb == "learnings" and c.arg == "DeLeTe deadbeef"
+
+
+def test_walkthrough_verb_parses():
+    assert parse_command("/grug walkthrough").verb == "walkthrough"
+    assert parse_command("/grug walkthrough").arg == ""
+    assert parse_command("/GRUG WALKTHROUGH").verb == "walkthrough"
+    assert parse_command("please\n/grug walkthrough\nthanks").verb == "walkthrough"
+
+
+# --- #822: a free-form /grug <question> is an ask -------------------------
+
+def test_freeform_question_parses_as_ask():
+    c = parse_command("/grug why did you flag this?")
+    assert c.verb == "ask" and c.arg == "why did you flag this?"
+    c = parse_command("/grug is this actually a race")
+    assert c.verb == "ask" and c.arg == "is this actually a race"
+
+
+def test_freeform_single_word_question_mark_parses_as_ask():
+    c = parse_command("/grug why?")
+    assert c.verb == "ask" and c.arg == "why?"
+
+
+def test_freeform_known_verb_still_wins():
+    assert parse_command("/grug improve").verb == "improve"
+    assert parse_command("/grug ask why").verb == "ask"
+    assert parse_command("/grug ask why").arg == "why"
+
+
+def test_freeform_single_nonsense_word_still_none():
+    # One bare token is a typo'd verb, not a question - it must not spend
+    # an LLM call (the pre-#822 unknown-verb behaviour).
+    assert parse_command("/grug frobnicate") is None
+    assert parse_command("/grug") is None
+
+
+def test_freeform_imperative_is_not_a_question():
+    # Imperatives are statements to the room, not questions to Grug.
+    assert parse_command("/grug do the thing") is None
+    assert parse_command("/grug tell the team this is fine") is None

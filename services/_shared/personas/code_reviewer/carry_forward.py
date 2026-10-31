@@ -20,6 +20,8 @@ thread resolver already needs, and folds them into the check verdict:
   - a finding the new review raises again is not carried (it is already
     counted among the fresh findings);
   - a finding a maintainer dismissed (living review, #1187) is not carried;
+  - a deferred-ruff thread is not carried: its anchor can be a line the
+    fix never touches, and every review measures the rule again (#1477);
   - severity comes from the first line of the inline comment body, which
     `dispatch._inline_comment_body` renders as `<chip> | <category> | ...`
     (read from the original body when living review has annotated it).
@@ -35,7 +37,7 @@ import re
 from dataclasses import dataclass
 
 from github_app_auth import with_install_token_retry
-from personas.code_reviewer import living_review
+from personas.code_reviewer import deferred_ruff, living_review
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.thread_resolver import (
     _NEARBY_LINES,
@@ -103,15 +105,24 @@ def _thread_is_resolved(thread: dict) -> bool:
     return bool(resolver)
 
 
+def _carriable(thread: dict) -> tuple[str, str, int] | None:
+    """`(rule, path, original_line)` of an open, unchanged Elder thread whose
+    rule is not measured again on every review, else None."""
+    if _thread_is_resolved(thread) or thread.get("isOutdated"):
+        return None
+    owned = _owned_rule_and_line(thread)
+    if owned is None or owned[0] == deferred_ruff.RULE:
+        return None
+    return owned
+
+
 def select_carried(
     threads: list[dict], findings: tuple[Finding, ...],
 ) -> tuple[CarriedFinding, ...]:
     """Open, unchanged, Elder-owned threads this review does not re-raise."""
     out: list[CarriedFinding] = []
     for t in threads:
-        if _thread_is_resolved(t) or t.get("isOutdated"):
-            continue
-        owned = _owned_rule_and_line(t)
+        owned = _carriable(t)
         if owned is None:
             continue
         rule, path, original_line = owned
@@ -146,6 +157,58 @@ def list_threads(
             extra={"pr": f"{owner}/{repo}#{pull_number}", "kind": type(e).__name__},
         )
         return None
+
+
+def _thread_is_resolved_or_dismissed(thread: dict) -> bool:
+    """True when the thread is resolved (by a person) or dismissed (living review)."""
+    if _thread_is_resolved(thread):
+        return True
+    first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
+    if living_review.parse_state(first.get("body") or "") == living_review.DISMISSED:
+        return True
+    return False
+
+
+def filter_findings_against_resolved_threads(
+    findings: tuple[Finding, ...],
+    installation_id: int, owner: str, repo: str, pull_number: int,
+    *,
+    threads: list[dict] | None = None,
+) -> tuple[Finding, ...]:
+    """Remove findings that match resolved or dismissed Elder threads.
+
+    A finding matches a thread when they share the same rule, file, and
+    the finding's line is within `_NEARBY_LINES` of the thread's anchor line.
+    This prevents re-raising findings that a human has already addressed.
+
+    If `threads` is provided, it is used instead of fetching a new listing.
+    """
+    if threads is None:
+        threads = list_threads(installation_id, owner, repo, pull_number)
+    if threads is None:
+        return findings
+    resolved_threads: list[tuple[str, str, int]] = []
+    for t in threads:
+        if not _thread_is_resolved_or_dismissed(t):
+            continue
+        owned = _owned_rule_and_line(t)
+        if owned is None:
+            continue
+        rule, path, original_line = owned
+        first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
+        line = int(first.get("line") or original_line)
+        resolved_threads.append((rule, path, line))
+    if not resolved_threads:
+        return findings
+    # A deferred-ruff finding was measured at this head, and a resolved thread
+    # is not evidence of a fix (#1477).
+    return tuple(
+        f for f in findings
+        if f.rule_name == deferred_ruff.RULE or not any(
+            f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
+            for rule, path, line in resolved_threads
+        )
+    )
 
 
 def _summary_block(carried: tuple[CarriedFinding, ...]) -> str:

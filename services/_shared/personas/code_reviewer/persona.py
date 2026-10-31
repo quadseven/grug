@@ -28,9 +28,11 @@ from typing import get_args
 
 from code_review_prompt import COMPLEXITY_CORRECTNESS_MARKER
 from github_checks_client import CheckConclusion
-from llm_client import FindingOrigin, LlmReviewResponse
+from llm_client import FindingOrigin, LlmReviewResponse, is_withdrawn_finding
+from model_family import ReviewFamilies
 from personas.code_reviewer.diff_parser import DiffHunk
-from review_types import Effort, Severity  # single source (#250)
+from personas.code_reviewer.line_refs import align_line_refs, repair_where_refs
+from review_types import DEFAULT_CATEGORY, Category, Effort, Severity  # single source (#250)
 from review_pipeline import ReviewCoverage
 
 # A finding at one of these severities flips the aggregate verdict.
@@ -136,6 +138,9 @@ class Finding:
     # (review_types.Effort) so an off-vocabulary value is a type error at
     # the constructor, not a silently dropped chip. None = no estimate.
     effort: Effort | None = None
+    # #683: reviewer-set taxonomy category; "general" is the criterion-4
+    # default for an unset or invalid value, on every surface.
+    category: Category = DEFAULT_CATEGORY
     # Stable identity for deterministic complexity findings across pushes.
     complexity_function: str | None = None
     # Set only for a validated cross-file snippet anchor. These findings are
@@ -199,6 +204,15 @@ class CodeReviewEvaluation:
     dropped_hallucinations: int = 0
     degraded_reason: str | None = None
     coverage: ReviewCoverage | None = None
+    # grug#1397: candidates the reviewer itself withdrew (`is_finding: false`
+    # or a message ending "No finding."). Never published, never counted
+    # toward the verdict, but counted here so recall stays measurable.
+    dropped_withdrawn: int = 0
+    tier_served: str | None = None
+    reviewability_note: str = ""
+    reviewability_blocking: bool = False
+    # grug#1437: who wrote and who reviewed this pull request, as model families.
+    families: ReviewFamilies | None = None
 
     @property
     def passed(self) -> bool:
@@ -249,8 +263,11 @@ def with_extra_findings(
         findings=combined,
         conclusion=_derive_conclusion(combined, evaluation.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
+        dropped_withdrawn=evaluation.dropped_withdrawn,
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
+        tier_served=evaluation.tier_served,
+        families=evaluation.families,
     )
 
 
@@ -267,8 +284,11 @@ def with_findings(
         findings=findings,
         conclusion=_derive_conclusion(findings, evaluation.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
+        dropped_withdrawn=evaluation.dropped_withdrawn,
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
+        tier_served=evaluation.tier_served,
+        families=evaluation.families,
     )
 
 
@@ -310,8 +330,11 @@ def with_degradation(
         findings=evaluation.findings,
         conclusion=_derive_conclusion(evaluation.findings, other.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
+        dropped_withdrawn=evaluation.dropped_withdrawn,
         degraded_reason=other.degraded_reason,
         coverage=other.coverage,
+        tier_served=evaluation.tier_served or other.tier_served,
+        families=evaluation.families or other.families,
     )
 
 
@@ -356,12 +379,19 @@ def evaluate_diff(
             conclusion="neutral",
             degraded_reason=llm_response.kind,
             coverage=llm_response.coverage,
+            tier_served=llm_response.tier_served,
         )
 
     line_index = _hunk_line_index(hunks)
     kept: list[Finding] = []
     dropped = 0
+    withdrawn = 0
     for raw in llm_response.findings:
+        # grug#1397: the reviewer ruled this candidate out itself. It must
+        # not become a thread or move the verdict; count it and move on.
+        if is_withdrawn_finding(raw):
+            withdrawn += 1
+            continue
         allowed_lines = line_index.get(raw.path)
         outside_diff = allowed_lines is None or raw.line not in allowed_lines
         outside_reason = raw.outside_diff_reason
@@ -385,7 +415,12 @@ def evaluate_diff(
             and _is_static_declarative_scalar(raw.path, raw.line, hunks)
         ):
             continue
-        message = raw.message
+        # grug#1398: a pre-change number for the anchor line becomes the
+        # head-commit number the comment is anchored to; other lines stay.
+        message = repair_where_refs(
+            align_line_refs(raw.message, raw.path, raw.line, hunks),
+            raw.path, raw.line,
+        )
         if outside_diff:
             message = f"OUTSIDE DIFF (advisory): {outside_reason} {message}"
         kept.append(
@@ -400,6 +435,7 @@ def evaluate_diff(
                 # anchors on a line the LLM actually saw.
                 suggestion=raw.suggestion,
                 effort=raw.effort,
+                category=raw.category,
                 origins=raw.origins,
                 outside_diff_reason=outside_reason if outside_diff else None,
             )
@@ -425,8 +461,16 @@ def evaluate_diff(
         # neutral; else success. `conclusion` and `degraded_reason` must never
         # disagree within one CodeReviewEvaluation - a "success" alongside
         # degraded_reason="partial_review" is the bug this closes.
-        conclusion=_derive_conclusion(kept_findings, degraded_reason),
+        conclusion=(
+            "failure" if llm_response.reviewability_blocking
+            else _derive_conclusion(kept_findings, degraded_reason)
+        ),
         dropped_hallucinations=dropped,
+        dropped_withdrawn=withdrawn,
         degraded_reason=degraded_reason,
         coverage=llm_response.coverage,
+        tier_served=llm_response.tier_served,
+        reviewability_note=llm_response.reviewability_note,
+        reviewability_blocking=llm_response.reviewability_blocking,
+        families=llm_response.families,
     )

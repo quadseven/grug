@@ -701,3 +701,39 @@ def test_an_unlinked_commit_author_or_a_truncated_list_refuses_a_trusted_operato
     ), permission="write", commits=commits)
     assert out["status"] == "no_op", out
     assert store.recorded == [] and store.enqueued == []
+
+
+# --- grug#1433: the reaction lands on the issue comment that holds the command
+
+
+class _ReactionHttp:
+    """Records the POST; `status` is what GitHub answers."""
+
+    HTTPStatusError = httpx.HTTPStatusError
+    RequestError = httpx.RequestError
+
+    def __init__(self, status: int = 201) -> None:
+        self.status = status
+        self.posts: list[tuple[str, Any]] = []
+
+    def post(self, url: str, **kw: Any) -> httpx.Response:
+        self.posts.append((url, kw.get("json")))
+        return httpx.Response(self.status, request=httpx.Request("POST", url))
+
+
+def test_acceptance_reaction_goes_to_the_issue_comment_endpoint(monkeypatch):
+    """The command arrives as `issue_comment`, so its reactions live under
+    issues/comments; the pulls/comments path answers 404 for that id."""
+    fake = _ReactionHttp()
+    monkeypatch.setattr(interactive, "httpx", fake)
+    _post_acceptance_reaction(lambda fn: fn("tok"), "o", "r", 7)
+    assert fake.posts == [
+        ("https://api.github.com/repos/o/r/issues/comments/7/reactions", {"content": "eyes"}),
+    ]
+
+
+def test_a_refused_acceptance_reaction_does_not_raise(monkeypatch):
+    """The acceptance is recorded and Elder queued by then, so a reaction
+    GitHub refuses must not turn the delivery into a webhook 500."""
+    monkeypatch.setattr(interactive, "httpx", _ReactionHttp(status=502))
+    _post_acceptance_reaction(lambda fn: fn("tok"), "o", "r", 7)

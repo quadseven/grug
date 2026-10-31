@@ -51,9 +51,12 @@ def _post_reply(token: str, owner: str, repo: str, pr_number: int, body: str) ->
 
 
 def _post_reaction(token: str, owner: str, repo: str, comment_id: int, content: str) -> None:
-    """Add a reaction to a comment. GitHub de-duplicates repeated reactions."""
+    """Add a reaction to a PR conversation comment. A `/grug` command arrives
+    as `issue_comment`, so its reactions live under issues/comments: the
+    pulls/comments path is for review comments on a diff and answers 404 for
+    this id. GitHub de-duplicates repeated reactions."""
     httpx.post(
-        f"{_API}/repos/{_q(owner, safe='')}/{_q(repo, safe='')}/pulls/comments/{comment_id}/reactions",
+        f"{_API}/repos/{_q(owner, safe='')}/{_q(repo, safe='')}/issues/comments/{comment_id}/reactions",
         json={"content": content},
         headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
         timeout=_TIMEOUT,
@@ -460,15 +463,11 @@ def _run_persona_rerun(
             token_fn=token_fn, owner=owner, repo=repo, pr_number=pr_number,
         )
     if queued:
-        note = _queued_note(head_sha, elder_state)
         log.info(
             "interactive_elder_rerun_queued_behind_review",
             extra={"verb": verb, "repo": repo_full, "pr": pr_number,
                    "head_sha": head_sha[:8], "state": elder_state},
         )
-    else:
-        note = ("Elder is re-reviewing this PR." if verb == "improve"
-                else "Smasher is checking for test gaps.")
     # Post a reaction to the command comment as acknowledgement (no reply comment)
     try:
         token_fn(lambda t: _post_reaction(t, owner, repo, comment_id, "eyes"))
@@ -478,6 +477,40 @@ def _run_persona_rerun(
         return {"status": "queued", "reason": "queued_behind_review",
                 "verb": verb, "persona": persona}
     return {"status": "dispatched", "verb": verb, "persona": persona}
+
+
+def _run_autofix(
+    *, install_id: int, owner: str, repo: str, pr_number: int,
+    comment_id: int, token_fn, claim, head_sha: str,
+) -> dict:
+    """`/grug fix` (#676): apply the open committable suggestions as one
+    bot commit.
+
+    The comment is claimed FIRST, since the command writes to the branch
+    and a redelivery must not commit twice. That claim means GitHub never
+    redelivers it, so any raise from the fix path is answered on the PR and
+    returned as a skip instead of becoming a webhook 500 that drops the
+    command in silence (grug#1430)."""
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": "fix"}
+    try:
+        from autofix import run_fix  # type: ignore
+        return run_fix(
+            install_id=install_id, owner=owner, repo=repo,
+            pr_number=pr_number, head_sha=head_sha, token_fn=token_fn,
+        )
+    except Exception as e:  # noqa: BLE001 - claimed: answer, never 500
+        log.warning(
+            "interactive_fix_failed",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number,
+                   "kind": type(e).__name__},
+        )
+        _reply(
+            token_fn, owner, repo, pr_number,
+            "Grug could not apply the suggestions. Nothing was committed. "
+            "Comment `/grug fix` again. So speaks Grug.",
+        )
+        return {"status": "skip", "reason": "fix_failed", "verb": "fix"}
 
 
 def run_command(
@@ -530,6 +563,13 @@ def run_command(
             pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
             enqueue=enqueue, claim=claim, head_sha=head_sha,
             defer_until=defer_until,
+        )
+
+    if verb == "fix":
+        return _run_autofix(
+            install_id=install_id, owner=owner, repo=repo, pr_number=pr_number,
+            comment_id=comment_id, token_fn=token_fn, claim=claim,
+            head_sha=head_sha,
         )
 
     if verb == "ask":
