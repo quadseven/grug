@@ -43,12 +43,17 @@ def test_a_fresh_comment_is_polled_every_run():
 
 
 def test_polling_backs_off_with_age():
-    # polls per day (96 runs): fresh > 1-3d > 3-14d > 14-30d
-    day1, day2, week, month = (_due_count(a, 96) for a in (0.5, 2, 8, 20))
-    assert day1 == 96
-    assert day2 == 24   # hourly
-    assert week == 4    # every 6 hours
-    assert month == 1   # daily
+    # polls per day (96 runs)
+    hours, day1, day2, week = (_due_count(a, 96) for a in (0.1, 0.5, 2, 8))
+    assert hours == 96
+    assert day1 == 24   # hourly
+    assert day2 == 4    # every 6 hours
+    assert week == 1    # daily
+
+
+def test_a_comment_past_two_weeks_is_not_polled():
+    assert _due_count(14.5, 96) == 0
+    assert _due_count(29, 96) == 0
 
 
 def test_unknown_age_is_polled_every_run():
@@ -60,10 +65,15 @@ def test_the_schedule_spreads_across_runs_not_all_at_once():
     for t in range(96):
         now = NOW + t * rc.TICK_SECONDS
         per_tick.append(sum(
-            rc.reaction_poll_due(_rec(cid, 20, now), now) for cid in range(1000, 1960)
+            rc.reaction_poll_due(_rec(cid, 8, now), now) for cid in range(1000, 1960)
         ))
     assert max(per_tick) < 30          # ~10 expected, never a stampede
     assert sum(per_tick) == 960        # each of the 960 polled exactly once a day
+
+
+def test_tick_due_gives_every_key_one_turn_per_period():
+    for key in (0, 7, 95, 1234):
+        assert sum(rc.tick_due(key, 96, NOW + t * rc.TICK_SECONDS) for t in range(96)) == 1
 
 
 def test_the_scan_cost_of_a_full_month_of_records_is_small():
@@ -143,3 +153,33 @@ def test_core_budget_reads_the_rate_limit_endpoint(monkeypatch):
     assert seen["url"].endswith("/rate_limit")
     monkeypatch.setattr(poller_handler.httpx, "get", lambda *a, **k: (_ for _ in ()).throw(httpx.ConnectError("x")))
     assert poller_handler._github_core_budget("tok") is None
+
+
+def test_a_repo_scan_runs_on_its_turn_only(monkeypatch):
+    """The dep and hygiene scans read a whole tree. Live, each ran for every
+    repo on every 15-minute run, and hygiene's weekly claim only limited the
+    write."""
+    monkeypatch.setattr(poller_handler, "_DAILY_TICKS", 96)
+    repos = [{"id": n, "full_name": f"o/r{n}"} for n in range(96)]
+    seen: list[int] = []
+    for t in range(96):
+        monkeypatch.setattr(
+            poller_handler, "_now_epoch", lambda t=t: NOW + t * rc.TICK_SECONDS,
+        )
+        seen += [r["id"] for r in poller_handler._repos_due_today(repos)]
+    assert sorted(seen) == list(range(96))
+
+
+def test_the_enforcement_pass_runs_every_six_hours(monkeypatch):
+    monkeypatch.setattr(poller_handler, "_ENFORCEMENT_TICKS", 24)
+    ran: list[int] = []
+    monkeypatch.setattr(
+        poller_handler, "with_install_token_retry",
+        lambda iid, _fn: ran.append(iid) or 1,
+    )
+    for t in range(96):
+        monkeypatch.setattr(
+            poller_handler, "_now_epoch", lambda t=t: NOW + t * rc.TICK_SECONDS,
+        )
+        poller_handler._enforcement_reemission_pass([11])
+    assert ran == [11] * 4

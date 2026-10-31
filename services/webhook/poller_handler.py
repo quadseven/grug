@@ -43,7 +43,7 @@ from observability import configure_logging
 from personas.code_reviewer.dispatch import deliver_pending_publication
 from personas.code_reviewer.living_review import sync_due_prs
 from personas.code_reviewer.publish_retry import retry_due_publications
-from personas.code_reviewer.reaction_cadence import reaction_poll_due
+from personas.code_reviewer.reaction_cadence import reaction_poll_due, tick_due
 from personas.code_reviewer.reactions import poll_and_annotate
 
 # The CronJob entry is a bare `python -c "... handler({}, None)"` - unlike
@@ -144,10 +144,23 @@ def _comment_nudge_runner(
     return run_comment_nudge_for_install(token, install_id, repos), 0
 
 
+# The default-branch scans read a whole tree plus files, and what they report
+# changes over days, not minutes. Each repo takes its turn once a day. The
+# enforcement gauge reads every repo's rulesets, which rarely change, so it
+# re-emits every 6 hours, inside the 24 hours a monitor group stays held.
+_DAILY_TICKS = 96
+_ENFORCEMENT_TICKS = 24
+
+
+def _repos_due_today(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = _now_epoch()
+    return [r for r in repos if tick_due(int(r.get("id") or 0), _DAILY_TICKS, now)]
+
+
 def _dep_watch_runner(token: str, install_id: int, repos: list[dict[str, Any]]) -> tuple[int, int]:
     from personas.guard.dep_watch import run_dep_watch_for_install
 
-    return run_dep_watch_for_install(token, install_id, repos)
+    return run_dep_watch_for_install(token, install_id, _repos_due_today(repos))
 
 
 def _reopen_watch_runner(token: str, install_id: int, repos: list[dict[str, Any]]) -> tuple[int, int]:
@@ -159,7 +172,7 @@ def _reopen_watch_runner(token: str, install_id: int, repos: list[dict[str, Any]
 def _hygiene_watch_runner(token: str, install_id: int, repos: list[dict[str, Any]]) -> tuple[int, int]:
     from personas.guard.hygiene_watch import run_hygiene_watch_for_install
 
-    return run_hygiene_watch_for_install(token, install_id, repos)
+    return run_hygiene_watch_for_install(token, install_id, _repos_due_today(repos))
 
 
 # The reaction poll is calibration data; Chief and Elder are why the hourly
@@ -360,6 +373,8 @@ def _enforcement_reemission_pass(installs: list[int]) -> tuple[int, int]:
     "convert only what genuinely matches").
 
     Returns (repos_emitted, installs_failed)."""
+    if not tick_due(0, _ENFORCEMENT_TICKS, _now_epoch()):
+        return 0, 0
     enforcement_emitted = 0
     enforcement_failed = 0
     for install_id in installs:

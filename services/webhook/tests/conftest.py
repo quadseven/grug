@@ -92,6 +92,16 @@ def mock_transport_client() -> Iterator[Callable[..., httpx.Client]]:
 
 
 @pytest.fixture(autouse=True)
+def _every_poller_pass_is_due(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Which run a pass lands on depends on the clock. A test of what a pass
+    DOES must not. test_reaction_cadence pins the real schedule."""
+    poller = sys.modules.get("poller_handler")
+    if poller is not None:
+        monkeypatch.setattr(poller, "_DAILY_TICKS", 1)
+        monkeypatch.setattr(poller, "_ENFORCEMENT_TICKS", 1)
+
+
+@pytest.fixture(autouse=True)
 def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     """grug#1225: the LLM provider breaker is module state, and a shell's
     GRUG_DISABLED_BACKENDS must not reach a test. Without the reset, one test
