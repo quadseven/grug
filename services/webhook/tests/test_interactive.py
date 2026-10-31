@@ -11,7 +11,9 @@ failed enqueue is answered on the PR.
 
 from __future__ import annotations
 
+import httpx
 import interactive
+import pytest
 import review_label
 
 
@@ -437,10 +439,12 @@ def test_improve_while_elder_runs_is_queued_behind_the_review(monkeypatch):
     assert res["status"] == "queued" and res["reason"] == "queued_behind_review"
     assert enq == [{"install_id": 1, "repo": "o/r", "pr_number": 2,
                     "persona": "code_reviewer", "comment_id": 41}]
-    bodies = [c[2]["body"] for c in fake.calls if c[0] == "post"]
-    assert len(bodies) == 1
-    assert "already reviewing abc12345" in bodies[0]
-    assert "queued" in bodies[0]
+    reactions = [c[2]["content"] for c in fake.calls if c[0] == "post" and "/reactions" in c[1]]
+    assert len(reactions) == 1
+    assert reactions[0] == "eyes"
+    # No reply comment posted
+    reply_comments = [c for c in fake.calls if c[0] == "post" and "/comments" in c[1] and "/reactions" not in c[1]]
+    assert reply_comments == []
 
 
 def test_resume_while_elder_runs_is_queued_and_lifts_the_pause(monkeypatch):
@@ -476,8 +480,12 @@ def test_an_unreadable_check_state_still_queues_the_command(monkeypatch):
         enqueue=lambda **k: enq.append(k), head_sha="a" * 40,
     )
     assert res["status"] == "queued" and len(enq) == 1
-    bodies = [c[2]["body"] for c in fake.calls if c[0] == "post"]
-    assert "queued" in bodies[0] and "already reviewing" not in bodies[0]
+    reactions = [c[2]["content"] for c in fake.calls if c[0] == "post" and "/reactions" in c[1]]
+    assert len(reactions) == 1
+    assert reactions[0] == "eyes"
+    # No reply comment posted
+    reply_comments = [c for c in fake.calls if c[0] == "post" and "/comments" in c[1] and "/reactions" not in c[1]]
+    assert reply_comments == []
 
 
 def test_every_command_job_carries_its_own_comment_identity(monkeypatch):
@@ -566,6 +574,147 @@ def test_a_headless_command_answer_failure_leaves_it_unclaimed(monkeypatch):
     )
     assert res["status"] == "skip" and res["reason"] == "reply_failed"
     assert claimed == []
+
+
+# --- grug#1433: acknowledge accepted commands with a reaction -------------
+
+
+def test_improve_accepted_posts_reaction_not_comment(monkeypatch, _mock_review_label_http):
+    """An accepted /grug improve adds a reaction to the command comment and
+    the grug:reviewing label, and posts no reply comment."""
+    fake = _FakeHttp()
+    monkeypatch.setattr(interactive, "httpx", fake)
+    monkeypatch.setattr(review_label, "elder_check_state", lambda **k: "concluded")
+    enq = []
+    res = interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=101, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: enq.append(k), head_sha="a" * 40,
+    )
+    assert res["status"] == "dispatched"
+    assert enq[0]["persona"] == "code_reviewer"
+    # Reaction posted to the command comment
+    reactions = [c for c in fake.calls if c[0] == "post" and "/reactions" in c[1]]
+    assert len(reactions) == 1
+    assert reactions[0][2] == {"content": "eyes"}
+    assert reactions[0][1] == "https://api.github.com/repos/o/r/issues/comments/101/reactions"
+    # No reply comment posted
+    reply_comments = [c for c in fake.calls if c[0] == "post" and "/comments" in c[1] and "/reactions" not in c[1]]
+    assert reply_comments == []
+    # grug:reviewing label added
+    attaches = [
+        c for c in _mock_review_label_http.calls
+        if c[0] == "post" and c[1].endswith("/issues/2/labels")
+    ]
+    assert len(attaches) == 1
+    assert attaches[0][2] == {"labels": ["grug:reviewing"]}
+
+
+def test_test_gaps_accepted_posts_reaction_not_comment(monkeypatch):
+    """An accepted /grug test-gaps adds a reaction to the command comment and
+    posts no reply comment."""
+    fake = _FakeHttp()
+    monkeypatch.setattr(interactive, "httpx", fake)
+    enq = []
+    res = interactive.run_command(
+        "test-gaps", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=102, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: enq.append(k),
+    )
+    assert res["status"] == "dispatched"
+    assert enq[0]["persona"] == "smasher"
+    reactions = [c for c in fake.calls if c[0] == "post" and "/reactions" in c[1]]
+    assert len(reactions) == 1
+    assert reactions[0][2] == {"content": "eyes"}
+    assert reactions[0][1] == "https://api.github.com/repos/o/r/issues/comments/102/reactions"
+    reply_comments = [c for c in fake.calls if c[0] == "post" and "/comments" in c[1] and "/reactions" not in c[1]]
+    assert reply_comments == []
+
+
+def _accept_with_reaction_raising(monkeypatch, error):
+    """Run an accepted command whose acknowledgement reaction raises."""
+    fake = _FakeHttp()
+    fake.HTTPStatusError = httpx.HTTPStatusError
+    fake.RequestError = httpx.RequestError
+    monkeypatch.setattr(interactive, "httpx", fake)
+
+    def _refuse(*_a):
+        raise error
+
+    monkeypatch.setattr(interactive, "_post_reaction", _refuse)
+    return interactive.run_command(
+        "test-gaps", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=105, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: None,
+    )
+
+
+def test_refused_ack_reaction_does_not_fail_the_accepted_command(monkeypatch):
+    """A reaction GitHub refuses leaves the queued command dispatched."""
+    res = _accept_with_reaction_raising(monkeypatch, httpx.ConnectError("down"))
+    assert res["status"] == "dispatched"
+
+
+def test_ack_reaction_bug_is_not_masked_as_a_github_refusal(monkeypatch):
+    """A fault that is not a GitHub failure surfaces instead of being logged
+    as a cosmetic refusal."""
+    with pytest.raises(TypeError):
+        _accept_with_reaction_raising(monkeypatch, TypeError("bad call"))
+
+
+def test_improve_enqueue_failure_still_posts_reply_comment(monkeypatch):
+    """A command that fails to enqueue still posts one reply comment naming why."""
+    fake = _FakeHttp()
+    monkeypatch.setattr(interactive, "httpx", fake)
+    monkeypatch.setattr(review_label, "elder_check_state", lambda **k: "concluded")
+    claimed = []
+
+    def _boom(**_k):
+        raise RuntimeError("queue down")
+
+    res = interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=103, token_fn=_tok, claim=lambda k: claimed.append(k) or True,
+        enqueue=_boom, head_sha="a" * 40,
+    )
+    assert res["status"] == "skip" and res["reason"] == "enqueue_failed"
+    assert claimed == []
+    # Reply comment posted with the failure reason
+    reply_comments = [c for c in fake.calls if c[0] == "post" and "/comments" in c[1] and "/reactions" not in c[1]]
+    assert len(reply_comments) == 1
+    assert "Grug could not queue this command" in reply_comments[0][2]["body"]
+    assert "Comment `/grug improve` again" in reply_comments[0][2]["body"]
+    # No reaction posted
+    reactions = [c for c in fake.calls if c[0] == "post" and "/reactions" in c[1]]
+    assert reactions == []
+
+
+def test_duplicate_command_no_second_reaction_no_comment(monkeypatch):
+    """A duplicate delivery of the same command adds no second reaction and no comment."""
+    fake = _FakeHttp()
+    monkeypatch.setattr(interactive, "httpx", fake)
+    monkeypatch.setattr(review_label, "elder_check_state", lambda **k: "concluded")
+    enq = []
+    # First delivery
+    res1 = interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=104, token_fn=_tok, claim=lambda k: True,
+        enqueue=lambda **k: enq.append(k), head_sha="a" * 40,
+    )
+    assert res1["status"] == "dispatched"
+    # Second delivery (same comment_id) - claim returns False
+    res2 = interactive.run_command(
+        "improve", "", install_id=1, owner="o", repo="r", pr_number=2,
+        comment_id=104, token_fn=_tok, claim=lambda k: False,
+        enqueue=lambda **k: enq.append(k), head_sha="a" * 40,
+    )
+    assert res2["status"] == "no_op" and res2["reason"] == "comment already handled"
+    # Only one reaction total (from first delivery)
+    reactions = [c for c in fake.calls if c[0] == "post" and "/reactions" in c[1]]
+    assert len(reactions) == 1
+    # No reply comments at all
+    reply_comments = [c for c in fake.calls if c[0] == "post" and "/comments" in c[1] and "/reactions" not in c[1]]
+    assert reply_comments == []
 
 
 # --- /grug fix (epic #1311, v1 autofix) -------------------------------------
