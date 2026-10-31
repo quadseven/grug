@@ -2066,7 +2066,55 @@ def list_hygiene_watch_repos(install_id: int) -> list[dict[str, Any]]:
     return _list_flag_enabled_repos(install_id, "guard_hygiene_watch_enabled")
 
 
+_ENFORCEMENT_CHECKS_TTL_DAYS = 30
 _HYGIENE_WATCH_TTL_DAYS = 7
+
+
+def claim_budget_alert(install_id: int, reset_epoch: int) -> bool:
+    """Win-once claim for the low-budget alert of one rate-limit window. The
+    window's reset time is its name, so the next window claims afresh."""
+    pg_base.maybe_purge_expired()
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO NOTHING
+            RETURNING pk
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": f"BUDGETALERT#{int(reset_epoch)}",
+                "data": Jsonb({}),
+                "ttl": int(reset_epoch) + 3600,
+            },
+        ).fetchone()
+    return row is not None
+
+
+def get_enforcement_checks(install_id: int) -> dict[str, float]:
+    """Repo id to the epoch second of its last good enforcement check."""
+    item = _get_item(_inst_pk(install_id), "ENFORCEMENTCHECKS") or {}
+    return {str(k): float(v) for k, v in (item.get("checks") or {}).items()}
+
+
+def put_enforcement_checks(install_id: int, checks: Mapping[str, float]) -> None:
+    ttl = int(datetime.now(timezone.utc).timestamp() + _ENFORCEMENT_CHECKS_TTL_DAYS * 86400)
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": "ENFORCEMENTCHECKS",
+                "data": encode_attrs({"checks": dict(checks)}),
+                "ttl": ttl,
+            },
+        )
 
 
 def claim_hygiene_watch_report(install_id: int, repo: str) -> bool:

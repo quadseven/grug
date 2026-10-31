@@ -34,16 +34,19 @@ from adapters.install_store import (  # type: ignore
     list_comment_records,
     list_dep_watch_repos,
     list_hygiene_watch_repos,
+    get_enforcement_checks,
     list_pulse_enabled_repos,
+    put_enforcement_checks,
     list_reopen_watch_repos,
 )
 import httpx
 from github_app_auth import with_install_token_retry
+from github_budget import NONURGENT_FRACTION, budget_is_low
 from observability import configure_logging
 from personas.code_reviewer.dispatch import deliver_pending_publication
 from personas.code_reviewer.living_review import sync_due_prs
 from personas.code_reviewer.publish_retry import retry_due_publications
-from personas.code_reviewer.reaction_cadence import reaction_poll_due
+from personas.code_reviewer.reaction_cadence import reaction_poll_due, tick_due
 from personas.code_reviewer.reactions import poll_and_annotate
 
 # The CronJob entry is a bare `python -c "... handler({}, None)"` - unlike
@@ -144,10 +147,30 @@ def _comment_nudge_runner(
     return run_comment_nudge_for_install(token, install_id, repos), 0
 
 
+# The default-branch scans read a whole tree plus files, and what they report
+# changes over days, not minutes. Each repo takes its turn once a day.
+_DAILY_TICKS = 96
+# Enforcement detection is how a removed ruleset is found, so it stays hourly
+# per repo. A repo whose last good check is older than this catches up on the
+# next run, so a missed tick costs 15 minutes and not another hour.
+_ENFORCEMENT_TICKS = 4
+_ENFORCEMENT_MAX_AGE_S = 3600.0
+# Detection answers that say nothing about the ruleset, so they do not count
+# as a good check.
+_ENFORCEMENT_UNKNOWN_STATES = frozenset({"error", "permission_denied"})
+# What a poll must not stay quiet about.
+_ENFORCEMENT_GAP_STATES = _ENFORCEMENT_UNKNOWN_STATES | {"none"}
+
+
+def _repos_due_today(repos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = _now_epoch()
+    return [r for r in repos if tick_due(int(r.get("id") or 0), _DAILY_TICKS, now)]
+
+
 def _dep_watch_runner(token: str, install_id: int, repos: list[dict[str, Any]]) -> tuple[int, int]:
     from personas.guard.dep_watch import run_dep_watch_for_install
 
-    return run_dep_watch_for_install(token, install_id, repos)
+    return run_dep_watch_for_install(token, install_id, _repos_due_today(repos))
 
 
 def _reopen_watch_runner(token: str, install_id: int, repos: list[dict[str, Any]]) -> tuple[int, int]:
@@ -159,12 +182,12 @@ def _reopen_watch_runner(token: str, install_id: int, repos: list[dict[str, Any]
 def _hygiene_watch_runner(token: str, install_id: int, repos: list[dict[str, Any]]) -> tuple[int, int]:
     from personas.guard.hygiene_watch import run_hygiene_watch_for_install
 
-    return run_hygiene_watch_for_install(token, install_id, repos)
+    return run_hygiene_watch_for_install(token, install_id, _repos_due_today(repos))
 
 
 # The reaction poll is calibration data; Chief and Elder are why the hourly
 # GitHub budget exists. Below this fraction remaining the poll yields.
-_LOW_BUDGET_FRACTION = 0.30
+_LOW_BUDGET_FRACTION = NONURGENT_FRACTION
 
 
 def _now_epoch() -> float:
@@ -271,7 +294,24 @@ def _reaction_poll_pass(installs: list[int]) -> tuple[int, int, int]:
     return polled_records, submitted, failed_installs
 
 
-def _emit_enforcement_for_install(token: str, install_id: int) -> int:
+def _enforcement_checks(install_id: int) -> dict[str, float]:
+    """Each repo's last good check. An unreadable store reads as "never
+    checked", which errs toward detecting."""
+    try:
+        return get_enforcement_checks(install_id)
+    except Exception as e:  # noqa: BLE001 - detection outranks the saving
+        log.warning("enforcement_checks_unreadable", extra={"kind": type(e).__name__})
+        return {}
+
+
+def _enforcement_check_due(repo_id: int, last_good: float, now: float) -> bool:
+    return (
+        now - last_good > _ENFORCEMENT_MAX_AGE_S
+        or tick_due(repo_id, _ENFORCEMENT_TICKS, now)
+    )
+
+
+def _emit_enforcement_for_install(token: str, install_id: int) -> tuple[int, int]:
     """Per-repo body of the enforcement re-emission pass (#460), pulled out
     of `_enforcement_reemission_pass` into its own top-level function
     (grug#767): a nested closure adds its OWN nesting depth to the
@@ -281,13 +321,16 @@ def _emit_enforcement_for_install(token: str, install_id: int) -> int:
     it - extraction removes that penalty without changing any behavior.
 
     Per-REPO best-effort so one repo's GitHub error can't starve the rest
-    of their gauge. Returns the count of repos emitted for."""
+    of their gauge. Returns (repos emitted for, repos not due this run)."""
     from adapters.install_store import get_repo_config
     from enforcement import GRUG_DOR_CHECK_NAME
     from github_rulesets_client import detect_enforcement, list_installation_repos
     from observability import emit_enforcement_metric
 
     n = 0
+    skipped = 0
+    now = _now_epoch()
+    checks = _enforcement_checks(install_id)
     for r in list_installation_repos(token):
         full = r.get("full_name", "")
         owner, sep, name = full.partition("/")
@@ -316,6 +359,9 @@ def _emit_enforcement_for_install(token: str, install_id: int) -> int:
                 emit_enforcement_metric(full, "opted_out")
                 n += 1
                 continue
+            if not _enforcement_check_due(r["id"], checks.get(str(r["id"]), 0.0), now):
+                skipped += 1
+                continue
             state = detect_enforcement(
                 token, owner, name,
                 r.get("default_branch") or "main",
@@ -324,6 +370,13 @@ def _emit_enforcement_for_install(token: str, install_id: int) -> int:
             ).state
             emit_enforcement_metric(full, state)
             n += 1
+            if state not in _ENFORCEMENT_UNKNOWN_STATES:
+                checks[str(r["id"])] = now
+            if state in _ENFORCEMENT_GAP_STATES:
+                log.warning(
+                    "enforcement_gap_detected",
+                    extra={"install_id": install_id, "repo": full, "state": state},
+                )
         except Exception as e:  # noqa: BLE001 - one repo must not starve
             # the install's remaining repos of their gauge
             log.warning(
@@ -339,10 +392,14 @@ def _emit_enforcement_for_install(token: str, install_id: int) -> int:
                 emit_enforcement_metric(full, "error")
             except Exception:  # noqa: BLE001 - best-effort gauge
                 pass
-    return n
+    try:
+        put_enforcement_checks(install_id, checks)
+    except Exception as e:  # noqa: BLE001 - the next run just checks again
+        log.warning("enforcement_checks_unsaved", extra={"kind": type(e).__name__})
+    return n, skipped
 
 
-def _enforcement_reemission_pass(installs: list[int]) -> tuple[int, int]:
+def _enforcement_reemission_pass(installs: list[int]) -> tuple[int, int, int]:
     """Enforcement-gauge re-emission (#460): grug.enforcement.state was only
     emitted on enforcement CONFIG events (dashboard toggle, repo-added
     heal), so in steady state the enforcement-gap monitor sat in permanent
@@ -359,24 +416,26 @@ def _enforcement_reemission_pass(installs: list[int]) -> tuple[int, int]:
     does not fit `_run_repo_scoped_pass` - own function instead (grug#767:
     "convert only what genuinely matches").
 
-    Returns (repos_emitted, installs_failed)."""
+    Returns (repos_emitted, installs_failed, repos_skipped), where skipped
+    means not due this run, which is neither a failure nor a check."""
     enforcement_emitted = 0
     enforcement_failed = 0
+    enforcement_skipped = 0
     for install_id in installs:
         try:
-            enforcement_emitted += (
-                with_install_token_retry(
-                    install_id,
-                    lambda token, iid=install_id: _emit_enforcement_for_install(token, iid),
-                ) or 0
-            )
+            emitted, skipped = with_install_token_retry(
+                install_id,
+                lambda token, iid=install_id: _emit_enforcement_for_install(token, iid),
+            ) or (0, 0)
+            enforcement_emitted += emitted
+            enforcement_skipped += skipped
         except Exception as e:  # noqa: BLE001 - one install must not abort the cron
             log.warning(
                 "enforcement_emit_install_failed",
                 extra={"install_id": install_id, "kind": type(e).__name__},
             )
             enforcement_failed += 1
-    return enforcement_emitted, enforcement_failed
+    return enforcement_emitted, enforcement_failed, enforcement_skipped
 
 
 def _install_reconciliation_pass() -> tuple[int, int, int]:
@@ -495,6 +554,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     if os.getenv("GRUG_POLLER_SMOKE", "").strip() not in ("", "0"):
         return _smoke_check(installs)
     polled_records, submitted, failed_installs = _reaction_poll_pass(installs)
+    # Scheduled reports wait while the budget is low. The passes that repair
+    # reviews and checks, and ruleset detection, run on every installation.
+    spare = [install_id for install_id in installs if not budget_is_low(install_id)]
 
     # Pulse pass (#472): the first SCHEDULED persona rides the same
     # cadence as its OWN loop (the reactions loop `continue`s installs
@@ -505,21 +567,21 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     # ticks cost zero GH calls. Everything inside run_pulse_for_install is
     # capped + per-repo best-effort + store-claim idempotent.
     nudges, pulse_failed = _run_repo_scoped_pass(
-        installs, list_pulse_enabled_repos, _pulse_runner, "pulse_install_failed",
+        spare, list_pulse_enabled_repos, _pulse_runner, "pulse_install_failed",
     )
 
     # Pulse comment-nudge (#656, epic #654): suggested-fix replies on stale
     # review threads. Same store-driven, best-effort, capped shape as Pulse;
     # default OFF per repo (pulse_comment_nudge_enabled).
     comment_nudges, comment_nudge_failed = _run_repo_scoped_pass(
-        installs, list_comment_nudge_repos, _comment_nudge_runner,
+        spare, list_comment_nudge_repos, _comment_nudge_runner,
         "comment_nudge_install_failed",
     )
 
     # Guard dependency watch (#491): the owned dependabot-class pass -
     # same store-driven, best-effort shape as Pulse.
     dep_reports, dep_watch_failed = _run_repo_scoped_pass(
-        installs, list_dep_watch_repos, _dep_watch_runner, "dep_watch_install_failed",
+        spare, list_dep_watch_repos, _dep_watch_runner, "dep_watch_install_failed",
     )
 
     # Guard reopen watch (2026-07-24 audit finding): the close-completeness
@@ -527,7 +589,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     # loop by escalating stale (untouched) guard-reopens. Same store-driven,
     # best-effort shape as dep_watch.
     reopen_escalated, reopen_watch_failed = _run_repo_scoped_pass(
-        installs, list_reopen_watch_repos, _reopen_watch_runner, "reopen_watch_install_failed",
+        spare, list_reopen_watch_repos, _reopen_watch_runner, "reopen_watch_install_failed",
     )
 
     # Guard hygiene watch (#655, epic #654): the fleet lints CI hygiene at
@@ -536,7 +598,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     # default-branch scan, one refreshed report issue per repo. Same
     # store-driven, best-effort shape as dep_watch.
     hygiene_reports, hygiene_watch_failed = _run_repo_scoped_pass(
-        installs, list_hygiene_watch_repos, _hygiene_watch_runner, "hygiene_watch_install_failed",
+        spare, list_hygiene_watch_repos, _hygiene_watch_runner, "hygiene_watch_install_failed",
     )
 
     # Check-run sweep/reconcile (grug#947, epic #887): same store-driven,
@@ -564,7 +626,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     # Enforcement-gauge re-emission (#460): same best-effort shape as the
     # passes above, plus per-REPO best-effort so one repo's GitHub error
     # can't starve the rest of their gauge - see _enforcement_reemission_pass.
-    enforcement_emitted, enforcement_failed = _enforcement_reemission_pass(installs)
+    enforcement_emitted, enforcement_failed, enforcement_skipped = (
+        _enforcement_reemission_pass(installs)
+    )
 
     # Auto-replay missed webhook deliveries (#407), best-effort: a replay
     # failure must never abort the cron, so it's wrapped here on TOP of
@@ -600,6 +664,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
         "install_reconciliation_stale": install_stale,
         "install_reconciliation_failed": install_reconciliation_failed,
         "enforcement_emitted": enforcement_emitted,
+        "enforcement_skipped": enforcement_skipped,
         "enforcement_failed_installs": enforcement_failed,
         **replay,
     }

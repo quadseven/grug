@@ -259,6 +259,15 @@ spec:
             # permanently hot reasoner adjudicates bounded candidate packets;
             # cloud fallback receives redacted evidence only.
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
+            # Elder's last resort (#1276, #1546): the operator's plans, Luna then
+            # Haiku, chosen by the serving side. The model name is deliberately no
+            # family: the reply names the model that ran, and the family gate must
+            # not rule out a lane that serves two families. The serving side keeps
+            # the real daily counts across all pods; this cap is per process.
+            - {name: GRUG_SUBSCRIPTION_URL, value: http://forward.subscription-lane.svc:8080/v1/chat/completions}
+            - {name: GRUG_SUBSCRIPTION_MODEL, value: subscription-lane}
+            - {name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "750"}
+            - {name: GRUG_SUBSCRIPTION_TOKEN_SSM, value: /grug/subscription-lane-token}
             # infra#2451/#2454 precedent: the second GPU host's vLLM resident is not a
             # fixed identity (infra#2452 swapped poolside/Laguna-S-2.1-NVFP4 ->
             # Qwen/Qwen3.8-27B-FP8 same-day). spark_gateway.py's `spark:warm-any`

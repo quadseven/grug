@@ -3265,7 +3265,8 @@ def dispatch_code_review(
     as this call is running.
 
     `rerun_pending` (grug#1494): the caller will run this review again if it
-    degrades to `all_failed` (every model rung failed). On a blocking repo the
+    degrades to `all_failed` (every model rung failed), or to a partial or
+    low-confidence review with nothing blocking in it. On a blocking repo the
     check then stays `in_progress` - pending, so the required check still
     blocks the merge - instead of completing `failure` for a retry that is
     already queued. Never set for the last scheduled attempt.
@@ -4001,14 +4002,10 @@ def dispatch_code_review(
             head_sha=head_sha,
         )
 
-    if (
-        rerun_pending
-        and blocking
-        and evaluation.degraded_reason == "all_failed"
-    ):
+    if rerun_pending and blocking and _rerun_before_failing(evaluation):
         return _publish_rerun_pending(
             installation_id, owner, repo_name, pull_number, head_sha,
-            evaluation.degraded_reason,
+            str(evaluation.degraded_reason),
         )
 
     muted = (
@@ -5643,6 +5640,41 @@ def _async_deep_append_if_needed(
     )
 
 
+def _rerun_before_failing(evaluation: CodeReviewEvaluation) -> bool:
+    """Should a blocking repo's degraded review wait for the scheduled re-run
+    instead of publishing `failure` now?
+
+    `all_failed` (#1494): no model answered. A partial review (a cohort
+    failed or was never walked) and a low-confidence review are degraded the
+    same way and fail closed the same way (#1212), so they get the same
+    bounded re-run - unless the pass already found a blocking problem. That
+    is a real verdict, which a full review would publish too, so it fails
+    now and nothing is re-run."""
+    reason = evaluation.degraded_reason
+    if reason == "all_failed":
+        return True
+    return (
+        reason in PUBLISHABLE_DEGRADATIONS
+        and evaluation.conclusion != "failure"
+    )
+
+
+def _rerun_pending_summary(reason: str) -> str:
+    """What the pending check says about the pass that is being re-run."""
+    if reason == "all_failed":
+        what = f"Every model failed this pass (`{reason}`)."
+    else:
+        what = (
+            f"This pass was degraded (`{reason}`) and found nothing blocking, "
+            "so it is not a full review yet."
+        )
+    return (
+        f"{what} Elder re-runs the review automatically. Merge stays "
+        "blocked until a full review lands; if the re-runs also fail this "
+        "check fails. Comment `/grug improve` to re-run sooner."
+    )
+
+
 def _publish_rerun_pending(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, reason: str,
@@ -5651,7 +5683,11 @@ def _publish_rerun_pending(
 
     `in_progress` is not a pass: a required check that has not concluded keeps
     the merge blocked, exactly as the check the enqueue posted. Best-effort -
-    a failed post leaves that earlier pending check in place."""
+    a failed post leaves that earlier pending check in place.
+
+    The result carries `rerun_scheduled` so the durable lane raises for the
+    queue's re-run even for a reason it would otherwise treat as a completed
+    degraded check (partial or low-confidence review)."""
     try:
         with_install_token_retry(
             installation_id,
@@ -5660,14 +5696,12 @@ def _publish_rerun_pending(
                 CheckRunResult(
                     name=_CHECK_NAME, head_sha=head_sha, status="in_progress",
                     conclusion=None,
-                    title="Elder waiting on a model - re-run scheduled",
-                    summary=(
-                        f"Every model failed this pass (`{reason}`). Elder "
-                        "re-runs the review automatically. Merge stays "
-                        "blocked until a full review lands; if the re-runs "
-                        "also fail this check fails. Comment `/grug improve` "
-                        "to re-run sooner."
+                    title=(
+                        "Elder waiting on a model - re-run scheduled"
+                        if reason == "all_failed"
+                        else "Elder review degraded - re-run scheduled"
                     ),
+                    summary=_rerun_pending_summary(reason),
                 ),
                 external_id=(
                     f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
@@ -5685,6 +5719,7 @@ def _publish_rerun_pending(
         )
     return {
         "persona": "code_reviewer", "result": "skipped", "degraded_reason": reason,
+        "rerun_scheduled": "true",
     }
 
 
