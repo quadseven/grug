@@ -51,7 +51,6 @@ from .missed_classes import (
 log = logging.getLogger("grug.elder_eval.column_type_mismatch")
 
 REPO = "example/bridge"
-PR = 1
 REVIEWED_HEAD = "0badc0d"
 REFERENCE_SOURCE = "independent-verifier"
 
