@@ -2512,7 +2512,39 @@ def _run_hot_review(
     if not sep or not owner or not repo_name:
         raise ValueError(f"invalid repo coordinate: {repo_full!r}")
 
-    before = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+    try:
+        before = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code != 403:
+            raise
+        queued_head_sha = str(job.get("requested_head_sha") or "")
+        log.error(
+            "elder_pr_read_forbidden",
+            extra={
+                "install_id": install_id,
+                "repo": repo_full,
+                "pr": pr_number,
+                "status": 403,
+                "head_sha": queued_head_sha[:8],
+            },
+        )
+        posted = _complete_elder_check_open(
+            install_id=install_id,
+            owner=owner,
+            repo_name=repo_name,
+            pr_number=pr_number,
+            head_sha=queued_head_sha,
+            title="Grug cannot read this pull request: 403 from GitHub",
+            summary=(
+                "GitHub denied Elder's pull request read with HTTP 403. "
+                "Review the GitHub App installation's repository access, "
+                "token permissions, and repository rules before re-running Elder."
+            ),
+            conclusion="failure",
+        )
+        if not posted:
+            raise RuntimeError("Elder 403 check completion did not land") from error
+        return "pr_read_forbidden"
     head_sha = str((before.get("head") or {}).get("sha") or "")
     if not head_sha:
         raise ValueError("current PR has no head SHA")
