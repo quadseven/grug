@@ -647,6 +647,7 @@ def _label_sweep_once() -> int:
     labels are removed per installation. What a cap leaves behind is swept
     by the next pass (grug#1270)."""
     from adapters.install_store import list_allowlisted_installs
+    from github_budget import budget_is_low
     from review_label import sweep_stale_labels
 
     try:
@@ -659,6 +660,8 @@ def _label_sweep_once() -> int:
         return 0
     removed = 0
     for install_id in _sweep_window(list(installs)):
+        if budget_is_low(install_id):
+            continue
         removed += sweep_stale_labels(
             install_id=install_id,
             max_removals=_LABEL_SWEEP_MAX_REMOVALS_PER_INSTALL,
