@@ -458,9 +458,7 @@ def _poll_and_annotate_record(
         if verdict == "false_positive":
             _dismiss_in_session(rec, install_id=install_id, owner=owner, name=name)
         return 1, learned
-    except (
-        httpx.HTTPStatusError, httpx.RequestError, OSError, psycopg.OperationalError,
-    ) as e:
+    except (httpx.HTTPStatusError, httpx.RequestError, OSError, psycopg.OperationalError) as e:
         log.warning(
             "reaction_submit_or_persist_failed",
             extra={"install_id": install_id, "comment_id": comment_id,

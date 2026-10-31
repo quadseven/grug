@@ -588,7 +588,7 @@ def test_poll_and_annotate_baseline_write_failure_skips_count(monkeypatch):
     assert n == 0  # baseline never advanced -> will retry next cycle
 
 
-def test_poll_and_annotate_propagates_programmer_error(monkeypatch):
+def test_psycopg_operational_error_propagates_keyerror_and_typeerror(monkeypatch):
     """Programmer bugs (KeyError, TypeError) must propagate instead of being
     swallowed by the transport retry guard."""
     monkeypatch.setattr(cr_reactions, "submit_reaction_annotation", lambda **kw: None)
@@ -626,7 +626,7 @@ def _poll_two_learning_records(monkeypatch, *, put_ledger_row, update_baseline):
         )
 
 
-def test_database_failure_on_learning_write_does_not_abort_batch(monkeypatch, caplog):
+def test_psycopg_operational_error_on_learning_write_does_not_abort_batch(monkeypatch, caplog):
     """#1491: psycopg.OperationalError is not an OSError. A database failure
     on one record's learning write must leave the next record processed."""
     put_ledger_row = MagicMock(
@@ -652,7 +652,7 @@ def test_database_failure_on_learning_write_does_not_abort_batch(monkeypatch, ca
     assert failures[0].kind == "OperationalError"
 
 
-def test_database_failure_on_baseline_write_does_not_abort_batch(monkeypatch, caplog):
+def test_psycopg_operational_error_on_baseline_write_does_not_abort_batch(monkeypatch, caplog):
     """#1491: same boundary for the baseline write. Record 1 stays uncounted
     and unadvanced; record 2 still advances."""
     update_baseline = MagicMock(
