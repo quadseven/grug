@@ -13,6 +13,8 @@ code survive this pass? Only code this pass READ can be judged:
     addressed, since that is no evidence of a fix;
   - the file was read and the anchored line is no longer in it as a whole line: `changed`
     (addressed, if the pass does not raise it again);
+  - a `high-complexity` row whose function the head's source no longer
+    scores as the row says (gone, or another score): `changed`;
   - anything else, including every file a delta review did not read:
     `unchanged`, so the finding stays open. A moved line, or a file nobody
     looked at, never closes one.
@@ -28,6 +30,7 @@ from typing import Iterable, Mapping, Optional
 
 import review_session as rs
 from personas import hunt_recorder
+from personas.code_reviewer.complexity import recorded_score_is_current
 from personas.code_reviewer.persona import Finding
 from personas.review_publish import PUBLISHABLE_DEGRADATIONS
 
@@ -89,7 +92,14 @@ def _anchor(
         return "gone"
     text = file_contents.get(rec.path)
     needle = _squash(rec.evidence)
-    if text is None or not needle:
+    if text is None:
+        return "unchanged"
+    # A complexity row names a score; judge it against the head's own source,
+    # never by its anchor line, which a carried-forward row keeps from the
+    # review that first raised it.
+    if rec.rule == "high-complexity" and not recorded_score_is_current(rec.message, text):
+        return "changed"
+    if not needle:
         return "unchanged"
     present = needle in {_squash(line) for line in text.splitlines()}
     return "unchanged" if present else "changed"

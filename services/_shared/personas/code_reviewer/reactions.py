@@ -38,6 +38,7 @@ from typing import Callable, Optional
 from urllib.parse import quote
 
 import httpx
+import psycopg
 
 from adapters.install_store import CommentRecord, update_comment_record_reaction
 from llm_client import ReactionVerdict, submit_reaction_annotation
@@ -457,7 +458,9 @@ def _poll_and_annotate_record(
         if verdict == "false_positive":
             _dismiss_in_session(rec, install_id=install_id, owner=owner, name=name)
         return 1, learned
-    except (httpx.HTTPStatusError, httpx.RequestError, OSError) as e:
+    except (
+        httpx.HTTPStatusError, httpx.RequestError, OSError, psycopg.OperationalError,
+    ) as e:
         log.warning(
             "reaction_submit_or_persist_failed",
             extra={"install_id": install_id, "comment_id": comment_id,

@@ -18,6 +18,9 @@ All keys are optional.
 | `path_instructions` | list of `{path, instructions}` | `instructions` is added to the review prompt only when the diff touches a file matching `path`. |
 | `min_inline_severity` | `low`, `medium`, `high`, or `critical` | Findings below this level appear in the check summary but get no inline comment. |
 | `skip_prs` | `{authors, labels, title_patterns}`, each a list of strings | A matching pull request is not reviewed. See below. |
+| `elder_mute_min_labeled` | integer, default `20` | Labeled ledger rows a finding class needs before it can be muted. |
+| `elder_mute_below_precision` | number 0 to 1, default `0.2` | A class with at least `elder_mute_min_labeled` labeled rows and a lower fixed-rate is muted: no inline comment, only the board and check summary, marked "muted: fixed in N of M past findings". A high or critical finding still posts inline and blocks. |
+| `elder_mute_locked_classes` | list of class names | These classes keep their inline comments whatever their precision. |
 
 ### Skipping a whole pull request
 
