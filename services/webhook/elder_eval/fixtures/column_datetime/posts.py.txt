@@ -1,0 +1,25 @@
+"""Bridge post storage helpers (fixture)."""
+
+from datetime import datetime, timedelta
+
+
+def list_posts(conn, author):
+    return conn.execute(
+        "SELECT id, author, created_at FROM posts WHERE author = ?",
+        (author,),
+    ).fetchall()
+
+
+def age_seconds(row):
+    return int(row["created_at"])
+
+
+def list_recent(conn, author, since):
+    rows = list_posts(conn, author)
+    cutoff = since - timedelta(days=1)
+    recent = [row for row in rows if row["created_at"] > cutoff]
+    return recent
+
+
+def created_at(row):
+    return datetime.fromtimestamp(int(row["created_at"]))

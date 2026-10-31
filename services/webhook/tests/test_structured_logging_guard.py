@@ -34,6 +34,7 @@ _ALLOWLIST_RELATIVE = (
     "sast_benchmark/__main__.py",
     "elder_eval/__main__.py",
     "elder_eval/missed_classes.py",
+    "elder_eval/column_type_mismatch.py",
     "review_latency/__main__.py",
     "personas/smasher/trial_worker.py",
     "personas/smasher/trial_deps.py",
