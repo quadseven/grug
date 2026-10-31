@@ -895,10 +895,32 @@ class _LadderAttempt:
     # that a wait can clear. 0 means the failure is final for this chunk
     # (grug#1494).
     retry_after: float = 0.0
+    through_gateway: bool = False
+    outage_failure: bool = False
 
     @property
     def label(self) -> str:
         return f"{self.model} ({self.reason})"
+
+
+_GATEWAY_OUTAGE_REASON = "inference gateway outage"
+
+
+def _with_gateway_outage_named(trail: list[_LadderAttempt]) -> list[_LadderAttempt]:
+    """Name the outage on one failed walk's gateway attempts (grug#1467).
+
+    Only when every gateway attempt failed that way: one arm timing out while
+    the other answers is a slow model. The labels reach the check title and
+    summary through coverage, and `tried` keeps them past the chunk retry,
+    whose skipped calls reach no model and could not name the outage."""
+    gateway = [attempt for attempt in trail if attempt.through_gateway]
+    if not gateway or not all(attempt.outage_failure for attempt in gateway):
+        return trail
+    return [
+        replace(attempt, reason=f"{_GATEWAY_OUTAGE_REASON}: {attempt.reason}")
+        if attempt.through_gateway else attempt
+        for attempt in trail
+    ]
 
 
 # Set by `_ChunkLadder.run` around one chunk's dispatch. `_run_llm_attempt` is
@@ -5135,7 +5157,9 @@ class _ChunkLadder:
                     "kind": response.kind,
                 },
             )
-        tried.extend(trail)
+        tried.extend(
+            trail if response.kind == "reviewed" else _with_gateway_outage_named(trail)
+        )
         waits = [attempt.retry_after for attempt in trail if attempt.retry_after]
         if waits and response.kind != "reviewed":
             self._wait[key] = max(waits)
@@ -5860,6 +5884,34 @@ def _extract_attempt_content(body: dict) -> tuple[str, str]:
     return content, finish_reason
 
 
+_GATEWAY_OUTAGE_STATUSES = frozenset({503, 504})
+# By name, because `AttemptOutcome` keeps only the class name. Not the base
+# `httpx.RequestError`: a cancelled call, a passed deadline and a disabled
+# backend all raise a subclass of it and none of them is an outage.
+_GATEWAY_OUTAGE_TRANSPORT_ERRORS = frozenset(
+    error.__name__
+    for error in (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ReadError,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+    )
+)
+
+
+def _routes_through_gateway(url: str) -> bool:
+    base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
+    return bool(base) and url.startswith(f"{base}/")
+
+
+def _is_outage_failure(outcome: AttemptOutcome, reason: str) -> bool:
+    """Is this failure what a down or load-shedding gateway produces?"""
+    if outcome.error_kind == "transport":
+        return reason in _GATEWAY_OUTAGE_TRANSPORT_ERRORS
+    return outcome.status_code in _GATEWAY_OUTAGE_STATUSES
+
+
 def _ladder_failure_reason(outcome: AttemptOutcome) -> str | None:
     """Short reason for a failed attempt, or None when it answered usably."""
     if outcome.error_kind is None:
@@ -5971,6 +6023,8 @@ def _run_llm_attempt(
         trail.append(_LadderAttempt(
             backend=key[0], model=key[1], reason=reason,
             retry_after=_rate_limit_wait(outcome),
+            through_gateway=_routes_through_gateway(config.url),
+            outage_failure=_is_outage_failure(outcome, reason),
         ))
     return outcome
 

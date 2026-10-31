@@ -102,6 +102,7 @@ class MissedClassFixture:
     reference_finding: str
     counterexample: str
     reachability: str
+    is_negative: bool = False
 
 
 _FIXTURES: tuple[MissedClassFixture, ...] = (
@@ -169,6 +170,22 @@ _FIXTURES: tuple[MissedClassFixture, ...] = (
             "ghostcard: the reverse check passes."
         ),
         reachability=PROMPT_RULE,
+    ),
+    MissedClassFixture(
+        name="reverse_direction_fixed_attester_negative",
+        finding_class="reverse-direction-completeness",
+        path=ATTESTER_PATH,
+        # Reverse check lines in the fixed attester (PR #751 as merged):
+        # built from live registry keys, must emit nothing.
+        defect_lines=((227, 238),),
+        signal_terms=("stale", "orphan", "ghost", "no longer", "deleted", "removed"),
+        reference_finding=(
+            "Clean reverse check: built from live registry keys, so a stale "
+            "mapping entry cannot bless an orphaned dashboard card. Must emit nothing."
+        ),
+        counterexample="",
+        reachability=PROMPT_RULE,
+        is_negative=True,
     ),
 )
 
@@ -248,10 +265,16 @@ def score(
 
 
 def recall(caught_by_name: dict[str, bool]) -> float:
-    """Caught fixtures / fixtures; 0.0 for an empty result."""
-    if not caught_by_name:
+    """Caught fixtures / fixtures; 0.0 for an empty result. Negative fixtures
+    (tests that clean code emits nothing) are excluded from the denominator."""
+    fixtures = {f.name: f for f in load_fixtures()}
+    positives = {
+        k: v for k, v in caught_by_name.items()
+        if not getattr(fixtures.get(k), "is_negative", False) and not k.endswith("_negative")
+    }
+    if not positives:
         return 0.0
-    return sum(caught_by_name.values()) / len(caught_by_name)
+    return sum(positives.values()) / len(positives)
 
 
 @dataclass(frozen=True)
@@ -299,9 +322,15 @@ def _record(name: str, model: str, result: dict[str, bool]) -> None:
 
 
 def _print_result(name: str, result: dict[str, bool], found: Iterable[_FindingLike]) -> None:
+    fixtures = {f.name: f for f in load_fixtures()}
     print(f"\n=== backend: {name} === recall {recall(result):.2f}")
     for fixture_name, hit in result.items():
-        print(f"  {fixture_name:42s} {'CAUGHT' if hit else 'missed'}")
+        fixture = fixtures.get(fixture_name)
+        if fixture and fixture.is_negative:
+            status = "FLAGGED (fail)" if hit else "clean (pass)"
+        else:
+            status = "CAUGHT" if hit else "missed"
+        print(f"  {fixture_name:42s} {status}")
     for f in found:
         print(f"    finding {f.path}:{f.line} {f.message[:120]}")
 

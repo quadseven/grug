@@ -589,6 +589,31 @@ RULES: tuple[ReviewRule, ...] = (
         '                             "maxLength": MAX_MESSAGE_CHARS}}}}',
         severity="medium",
     ),
+    # -- stale reverse-check intermediary (PR #751, #752, #1421) --
+    ReviewRule(
+        name="stale-reverse-check-intermediary",
+        bug_class="correctness",
+        description="A check over a bidirectional invariant (two collections "
+        "that must agree in both directions) whose reverse direction is "
+        "validated against a derived, cached, or hand-kept intermediary (such "
+        "as a static mapping table or dictionary values) rather than the live "
+        "source collection. A stale or obsolete entry in the intermediary then "
+        "keeps blessing an orphaned, removed, or ghost entry in the target "
+        "collection, allowing it to pass silently. Build the reverse "
+        "validation set from the live source collection instead. Every "
+        "finding emitted under this rule MUST name the concrete stale entry "
+        "that would pass the check (e.g. a deleted key or orphaned item). If "
+        "you cannot name a concrete stale entry that would pass, do not emit "
+        "the finding.",
+        bad_example="# reverse check against static map: stale entry passes ghost item\n"
+        "for card in cards:\n"
+        "    if card not in REGISTRY_TO_UI.values(): raise Error()",
+        good_example="# reverse check built from live keys: stale mapping entry rejected\n"
+        "live_ui = {REGISTRY_TO_UI[k] for k in live_keys if k in REGISTRY_TO_UI}\n"
+        "for card in cards:\n"
+        "    if card not in live_ui: raise Error()",
+        severity="high",
+    ),
     ReviewRule(
         name="stderr-folded-into-compared-value",
         bug_class="silent failure",

@@ -9,5 +9,6 @@ Webhook-only tool (NOT mirrored, NOT on the request path), sibling of
 scoring core runs in CI with no LLM; the live runner records the baseline
 on demand. `baseline.json` carries `prompt_sha` - the per-PR CI suite
 fails when `code_review_prompt.py` changes without a re-recorded
-baseline (the #537 CI gate on prompt changes).
+baseline (the #537 CI gate on prompt changes), and when a backend's
+`measured_prompt_sha` is not that sha (grug#1511).
 """
