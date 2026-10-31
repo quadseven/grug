@@ -1101,8 +1101,18 @@ def _defensive_drop_note(count: int) -> str:
     return f"\n\n{count} defensive findings dropped: no reachable caller named"
 
 
-def _tier_served_note(tier_served: str | None) -> str:
-    return f"\n\nTier served: `{tier_served}`." if tier_served else ""
+def _tier_served_text(tier_served: str, models_used: tuple[str, ...]) -> str:
+    """The tier, then the models that answered when a reply named them."""
+    models = ", ".join(f"`{_md_code_span(model)}`" for model in models_used)
+    return f"`{tier_served}` ({models})" if models else f"`{tier_served}`"
+
+
+def _tier_served_note(
+    tier_served: str | None, models_used: tuple[str, ...] = (),
+) -> str:
+    if not tier_served:
+        return ""
+    return f"\n\nTier served: {_tier_served_text(tier_served, models_used)}."
 
 
 _SAME_FAMILY_NOTE = (
@@ -1214,9 +1224,10 @@ def _summary_markdown(
         duplicate_paths,
     )
     defensive_note = _defensive_drop_note(defensive_dropped_count)
-    tier_note = _tier_served_note(getattr(evaluation, "tier_served", None)) + _family_note(
-        getattr(evaluation, "families", None),
-    )
+    tier_note = _tier_served_note(
+        getattr(evaluation, "tier_served", None),
+        getattr(evaluation, "models_used", ()),
+    ) + _family_note(getattr(evaluation, "families", None))
     hunt = _hunt_section(living_range, living_baseline_rejected)
 
     if is_partial_coverage(evaluation.degraded_reason):
@@ -1803,6 +1814,7 @@ def _stack_detail_lines(
     head_sha: str = "", base_sha: str = "",
     tier_served: str | None = None,
     families: ReviewFamilies | None = None,
+    models_used: tuple[str, ...] = (),
 ) -> str:
     """The two facts a skeptical reader asks for: what was looked at, and what
     was withheld. Everything else that used to live here was cut as noise.
@@ -1825,7 +1837,7 @@ def _stack_detail_lines(
     if scope:
         lines.append(f"- Looked at: {scope}")
     if tier_served:
-        lines.append(f"- Tier served: `{tier_served}`")
+        lines.append(f"- Tier served: {_tier_served_text(tier_served, models_used)}")
     if families is not None:
         lines.append(f"- {_family_line(families)}")
         if families.same_family:
@@ -2032,6 +2044,7 @@ def _review_stack_body(
             review_phase, living_range, suppressed_count, head_sha, base_sha,
             tier_served=getattr(evaluation, "tier_served", None),
             families=getattr(evaluation, "families", None),
+            models_used=getattr(evaluation, "models_used", ()),
         ),
     ] if p)
     if detail:

@@ -209,6 +209,9 @@ class CodeReviewEvaluation:
     # toward the verdict, but counted here so recall stays measurable.
     dropped_withdrawn: int = 0
     tier_served: str | None = None
+    # The models that answered, as their replies named them. Empty when no
+    # reply did. Travels with `tier_served`, which it qualifies.
+    models_used: tuple[str, ...] = ()
     reviewability_note: str = ""
     reviewability_blocking: bool = False
     # grug#1437: who wrote and who reviewed this pull request, as model families.
@@ -267,6 +270,7 @@ def with_extra_findings(
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
         tier_served=evaluation.tier_served,
+        models_used=evaluation.models_used,
         families=evaluation.families,
     )
 
@@ -288,6 +292,7 @@ def with_findings(
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
         tier_served=evaluation.tier_served,
+        models_used=evaluation.models_used,
         families=evaluation.families,
     )
 
@@ -326,6 +331,7 @@ def with_degradation(
     no IO."""
     if evaluation.degraded_reason or not other.degraded_reason:
         return evaluation
+    served = evaluation if evaluation.tier_served else other
     return CodeReviewEvaluation(
         findings=evaluation.findings,
         conclusion=_derive_conclusion(evaluation.findings, other.degraded_reason),
@@ -333,7 +339,8 @@ def with_degradation(
         dropped_withdrawn=evaluation.dropped_withdrawn,
         degraded_reason=other.degraded_reason,
         coverage=other.coverage,
-        tier_served=evaluation.tier_served or other.tier_served,
+        tier_served=served.tier_served,
+        models_used=served.models_used,
         families=evaluation.families or other.families,
     )
 
@@ -380,6 +387,7 @@ def evaluate_diff(
             degraded_reason=llm_response.kind,
             coverage=llm_response.coverage,
             tier_served=llm_response.tier_served,
+            models_used=llm_response.models_used,
         )
 
     line_index = _hunk_line_index(hunks)
@@ -470,6 +478,7 @@ def evaluate_diff(
         degraded_reason=degraded_reason,
         coverage=llm_response.coverage,
         tier_served=llm_response.tier_served,
+        models_used=llm_response.models_used,
         reviewability_note=llm_response.reviewability_note,
         reviewability_blocking=llm_response.reviewability_blocking,
         families=llm_response.families,
