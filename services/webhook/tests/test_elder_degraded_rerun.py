@@ -26,6 +26,7 @@ import pytest
 from llm_client import Backend, LlmReviewResponse
 from llm_client import Finding as LlmFinding
 from personas.code_reviewer import dispatch as cr_dispatch
+from personas.code_reviewer.persona import CodeReviewEvaluation
 from review_pipeline import ReviewCoverage
 
 from tests.test_elder_degraded_fail_closed import (
@@ -134,6 +135,32 @@ def test_a_partial_review_with_a_blocking_finding_is_not_rerun(elder) -> None:
     """The blocking finding is a real verdict: it fails at once, the way a
     full review with that finding would, and nothing schedules a re-run."""
     result, posted = elder(_PARTIAL_WITH_BLOCKER, blocking=True, rerun_pending=True)
+
+    assert "rerun_scheduled" not in result
+    assert [(c.status, c.conclusion) for c in posted] == [("completed", "failure")]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["parse_failed", "fetch_or_parse_failed", "diff_too_large", "no_diff", "unknown_reason"],
+)
+def test_a_reason_outside_the_rerun_set_is_not_held_pending(reason) -> None:
+    """Only all_failed and the two publishable degradations wait for a
+    re-run. Any other degraded reason publishes as before."""
+    evaluation = CodeReviewEvaluation(
+        findings=(), conclusion="neutral", degraded_reason=reason,
+    )
+
+    assert cr_dispatch._rerun_before_failing(evaluation) is False
+
+
+def test_parse_failed_is_not_held_pending_by_dispatch(elder) -> None:
+    """End to end: a parse_failed pass with a re-run scheduled still
+    publishes its completed failure and asks for no re-run here."""
+    result, posted = elder(
+        LlmReviewResponse(kind="parse_failed", error="prose, not JSON"),
+        blocking=True, rerun_pending=True,
+    )
 
     assert "rerun_scheduled" not in result
     assert [(c.status, c.conclusion) for c in posted] == [("completed", "failure")]
