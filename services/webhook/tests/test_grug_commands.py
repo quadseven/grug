@@ -11,6 +11,7 @@ def test_parses_each_verb():
     assert parse_command("/grug test-gaps").verb == "test-gaps"
     assert parse_command("/grug test_gaps").verb == "test-gaps"  # underscore alias
     assert parse_command("/grug fix").verb == "fix"
+    assert parse_command("/grug docstrings").verb == "docstrings"
     assert parse_command("/GRUG Fix").verb == "fix"
 
 
