@@ -41,6 +41,7 @@ from adapters.install_store import (  # type: ignore
 )
 import httpx
 from github_app_auth import with_install_token_retry
+from github_budget import NONURGENT_FRACTION, budget_is_low
 from observability import configure_logging
 from personas.code_reviewer.dispatch import deliver_pending_publication
 from personas.code_reviewer.living_review import sync_due_prs
@@ -186,7 +187,7 @@ def _hygiene_watch_runner(token: str, install_id: int, repos: list[dict[str, Any
 
 # The reaction poll is calibration data; Chief and Elder are why the hourly
 # GitHub budget exists. Below this fraction remaining the poll yields.
-_LOW_BUDGET_FRACTION = 0.30
+_LOW_BUDGET_FRACTION = NONURGENT_FRACTION
 
 
 def _now_epoch() -> float:
@@ -553,6 +554,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     if os.getenv("GRUG_POLLER_SMOKE", "").strip() not in ("", "0"):
         return _smoke_check(installs)
     polled_records, submitted, failed_installs = _reaction_poll_pass(installs)
+    # Scheduled reports wait while the budget is low. The passes that repair
+    # reviews and checks, and ruleset detection, run on every installation.
+    spare = [install_id for install_id in installs if not budget_is_low(install_id)]
 
     # Pulse pass (#472): the first SCHEDULED persona rides the same
     # cadence as its OWN loop (the reactions loop `continue`s installs
@@ -563,21 +567,21 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     # ticks cost zero GH calls. Everything inside run_pulse_for_install is
     # capped + per-repo best-effort + store-claim idempotent.
     nudges, pulse_failed = _run_repo_scoped_pass(
-        installs, list_pulse_enabled_repos, _pulse_runner, "pulse_install_failed",
+        spare, list_pulse_enabled_repos, _pulse_runner, "pulse_install_failed",
     )
 
     # Pulse comment-nudge (#656, epic #654): suggested-fix replies on stale
     # review threads. Same store-driven, best-effort, capped shape as Pulse;
     # default OFF per repo (pulse_comment_nudge_enabled).
     comment_nudges, comment_nudge_failed = _run_repo_scoped_pass(
-        installs, list_comment_nudge_repos, _comment_nudge_runner,
+        spare, list_comment_nudge_repos, _comment_nudge_runner,
         "comment_nudge_install_failed",
     )
 
     # Guard dependency watch (#491): the owned dependabot-class pass -
     # same store-driven, best-effort shape as Pulse.
     dep_reports, dep_watch_failed = _run_repo_scoped_pass(
-        installs, list_dep_watch_repos, _dep_watch_runner, "dep_watch_install_failed",
+        spare, list_dep_watch_repos, _dep_watch_runner, "dep_watch_install_failed",
     )
 
     # Guard reopen watch (2026-07-24 audit finding): the close-completeness
@@ -585,7 +589,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     # loop by escalating stale (untouched) guard-reopens. Same store-driven,
     # best-effort shape as dep_watch.
     reopen_escalated, reopen_watch_failed = _run_repo_scoped_pass(
-        installs, list_reopen_watch_repos, _reopen_watch_runner, "reopen_watch_install_failed",
+        spare, list_reopen_watch_repos, _reopen_watch_runner, "reopen_watch_install_failed",
     )
 
     # Guard hygiene watch (#655, epic #654): the fleet lints CI hygiene at
@@ -594,7 +598,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     # default-branch scan, one refreshed report issue per repo. Same
     # store-driven, best-effort shape as dep_watch.
     hygiene_reports, hygiene_watch_failed = _run_repo_scoped_pass(
-        installs, list_hygiene_watch_repos, _hygiene_watch_runner, "hygiene_watch_install_failed",
+        spare, list_hygiene_watch_repos, _hygiene_watch_runner, "hygiene_watch_install_failed",
     )
 
     # Check-run sweep/reconcile (grug#947, epic #887): same store-driven,

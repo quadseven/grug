@@ -38,6 +38,7 @@ import httpx
 
 from adapters.install_store import get_repo_config, is_elder_paused  # type: ignore
 from github_app_auth import get_app_id, with_install_token_retry
+from github_budget import count_review_calls
 from check_run_reconciler import _STUCK_IN_PROGRESS_MAX_AGE_MINUTES
 from github_checks_client import (
     CheckRunResult,
@@ -2762,18 +2763,19 @@ def _run_hot_review(
                 str((after.get("head") or {}).get("sha") or ""),
             )
             try:
-                result = dispatch_code_review(
-                    _review_payload(
-                        install_id=install_id,
-                        owner=owner,
-                        repo_name=repo_name,
-                        pr_number=pr_number,
-                        pr=after,
-                    ),
-                    blocking=elder_blocking,
-                    cancel_event=watch.cancel,
-                    rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
-                )
+                with count_review_calls(repo_full, pr_number):
+                    result = dispatch_code_review(
+                        _review_payload(
+                            install_id=install_id,
+                            owner=owner,
+                            repo_name=repo_name,
+                            pr_number=pr_number,
+                            pr=after,
+                        ),
+                        blocking=elder_blocking,
+                        cancel_event=watch.cancel,
+                        rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
+                    )
             finally:
                 _stop_staleness_watch(watch)
             degraded_reason = result.get("degraded_reason", "")
