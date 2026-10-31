@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from personas.code_reviewer.repo_docs import _MAX_CONTEXT_CHARS, build_repo_docs_context
+from personas.code_reviewer.repo_docs import (
+    _MAX_CONTEXT_CHARS,
+    _select_context,
+    build_repo_docs_context,
+)
 from review_evidence import Hunk
 
 INTRO = "# Glossary\n\nIntro paragraph every review keeps."
@@ -64,6 +68,17 @@ def test_the_budget_holds_and_the_notice_shows() -> None:
     assert len(body) <= _MAX_CONTEXT_CHARS + 200
     assert f"truncated to {_MAX_CONTEXT_CHARS} chars" in block
     assert "Filler399" not in block
+
+
+def test_the_limit_holds_for_tables_sharing_a_header_and_a_table_first_document() -> None:
+    header = "| Term | Meaning |\n|---|---|"
+    tables = "\n\n".join(
+        f"{header}\n| Alpha{i} | stone {i} |\n| Beta{i} | wood {i} |" for i in range(40)
+    )
+    limit = 900
+    selected = _select_context(tables, limit, "CONTEXT.md", {"stone"})
+    assert len(selected) <= limit
+    assert selected.startswith(header)
 
 
 def test_selection_is_deterministic_and_keeps_document_order() -> None:

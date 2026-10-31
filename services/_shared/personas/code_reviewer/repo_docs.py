@@ -113,17 +113,17 @@ def _cap(text: str, limit: int, label: str) -> str:
 _VOCABULARY_RULE_RE = re.compile(r"_Avoid_:|\*\*not\*\*")
 
 
-def _context_units(text: str) -> list[tuple[str, str]]:
-    """Split a glossary into (table header, entry) units: one per table row, one
-    per other paragraph. The header is empty for a paragraph."""
-    units: list[tuple[str, str]] = []
-    for block in text.split("\n\n"):
+def _context_units(text: str) -> list[tuple[int, str, str]]:
+    """Split a glossary into (block number, table header, entry) units: one per
+    table row, one per other paragraph. The header is empty for a paragraph."""
+    units: list[tuple[int, str, str]] = []
+    for number, block in enumerate(text.split("\n\n")):
         lines = block.split("\n")
         if len(lines) > 2 and lines[0].startswith("|") and lines[1].startswith("|-"):
             header = "\n".join(lines[:2])
-            units.extend((header, row) for row in lines[2:])
+            units.extend((number, header, row) for row in lines[2:])
         else:
-            units.append(("", block))
+            units.append((number, "", block))
     return units
 
 
@@ -135,39 +135,40 @@ def _select_context(text: str, limit: int, label: str, changed: set[str]) -> str
         return text
     notice = f"\n... (truncated to {limit} chars; {label} continues)"
     units = _context_units(text)
-    budget = limit - len(notice) - len(units[0][1])
+    first_block, first_header, first_entry = units[0]
+    budget = limit - len(notice) - len(first_entry) - len(first_header) - 1
     if budget < 0:
         return _cap(text, limit, label)
     kept = {0}
-    headers: set[str] = set()
+    tables = {first_block} if first_header else set()
     ranked = sorted(
         range(1, len(units)),
         key=lambda i: (
-            not _VOCABULARY_RULE_RE.search(units[i][1]),
-            -len(_tokens(units[i][1]) & changed),
+            not _VOCABULARY_RULE_RE.search(units[i][2]),
+            -len(_tokens(units[i][2]) & changed),
             i,
         ),
     )
     for index in ranked:
-        header, entry = units[index]
+        block, header, entry = units[index]
         cost = len(entry) + 2
-        if header and header not in headers:
-            cost += len(header) + 2
+        if header and block not in tables:
+            cost += len(header) + 1
         if cost > budget:
             continue
         budget -= cost
         kept.add(index)
         if header:
-            headers.add(header)
+            tables.add(block)
     parts: list[str] = []
-    open_header = ""
+    open_table = -1
     for index in sorted(kept):
-        header, entry = units[index]
-        if header and header == open_header:
+        block, header, entry = units[index]
+        if header and block == open_table:
             parts[-1] += "\n" + entry
         else:
             parts.append(f"{header}\n{entry}" if header else entry)
-        open_header = header
+        open_table = block if header else -1
     return "\n\n".join(parts) + notice
 
 
