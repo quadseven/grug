@@ -310,12 +310,17 @@ def fetch_file_contents(
     repo: str,
     paths: tuple[str, ...],
     ref: str,
+    *,
+    only_404_skips: bool = False,
 ) -> dict[str, str]:
     """Fetch the full content of each changed file at `ref` (head SHA) so the
     Elder + judge can see mitigations outside the diff hunk (#336 - the #1149
     false-positive class). Best-effort: a per-file fetch failure (deleted file,
     binary, 404, timeout) is skipped, not raised - the review still runs
     diff-only for that file. Returns path -> content for the files that fetched.
+
+    `only_404_skips` is for a caller that reads an absent file as a fact: only
+    a file GitHub says is not there is skipped, and any other failure raises.
     """
     contents: dict[str, str] = {}
     for path in paths[:_MAX_CONTEXT_FILES]:
@@ -338,6 +343,11 @@ def fetch_file_contents(
             resp.raise_for_status()
             contents[path] = resp.text
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            if only_404_skips and not (
+                isinstance(e, httpx.HTTPStatusError)
+                and e.response.status_code == httpx.codes.NOT_FOUND
+            ):
+                raise
             # Deleted-in-PR / binary / rename-old-path / transient - diff-only
             # is the correct, safe degrade. Log so a systemic fetch outage is
             # visible (not silently reverting every review to hunk-blind).
@@ -346,6 +356,26 @@ def fetch_file_contents(
                 extra={"path": path, "ref": ref, "error": str(e)},
             )
     return contents
+
+
+def fetch_review_comment_body(
+    install_token: str, owner: str, repo: str, comment_id: int,
+) -> str:
+    """The body of one inline review comment. Raises on any failure, so the
+    caller can tell a comment GitHub no longer has from one it could not read."""
+    resp = httpx.get(
+        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+        f"/pulls/comments/{int(comment_id)}",
+        headers={
+            "Authorization": f"Bearer {install_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=DIFF_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return str((resp.json() or {}).get("body") or "")
+
 
 def _fetch_pr_review_comments(
     install_token: str, owner: str, repo: str, pull_number: int,

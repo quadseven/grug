@@ -236,6 +236,8 @@ class PrContext(TypedDict, total=False):
     cohort_count: int
     # Pre-rendered, already-sanitized linked-issue criteria block (#904).
     linked_issue_context: str
+    # `deferred_ruff.DeferredLint` rows of the tickets this PR settles (#1477).
+    deferred_lint: tuple[Any, ...]
     review_scope: str
     sensitive_review: bool
     # The webhook's `repository.private` (grug#1269). Unset means unknown,

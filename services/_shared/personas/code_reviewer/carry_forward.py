@@ -20,6 +20,8 @@ thread resolver already needs, and folds them into the check verdict:
   - a finding the new review raises again is not carried (it is already
     counted among the fresh findings);
   - a finding a maintainer dismissed (living review, #1187) is not carried;
+  - a deferred-ruff thread is not carried: its anchor can be a line the
+    fix never touches, and every review measures the rule again (#1477);
   - severity comes from the first line of the inline comment body, which
     `dispatch._inline_comment_body` renders as `<chip> | <category> | ...`
     (read from the original body when living review has annotated it).
@@ -35,7 +37,7 @@ import re
 from dataclasses import dataclass
 
 from github_app_auth import with_install_token_retry
-from personas.code_reviewer import living_review
+from personas.code_reviewer import deferred_ruff, living_review
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.thread_resolver import (
     _NEARBY_LINES,
@@ -115,6 +117,8 @@ def select_carried(
         if owned is None:
             continue
         rule, path, original_line = owned
+        if rule == deferred_ruff.RULE:
+            continue
         first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
         severity = _standing_severity(first.get("body") or "")
         if severity is None:

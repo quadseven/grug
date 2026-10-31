@@ -65,8 +65,9 @@ from voice_pack import VoiceSelection, entitled_voice
 from review_evidence import ElderEvidence, assemble_evidence
 from review_types import EFFORTS, SEVERITIES
 from personas.review_publish import (
-    DIFF_FETCH_TIMEOUT, PUBLISHABLE_DEGRADATIONS, ReviewMode, fetch_file_contents,
-    fetch_pr_diff, fetch_pr_diff_with_scope, is_blackout, is_low_confidence,
+    DIFF_FETCH_TIMEOUT, PARTIAL_COVERAGE, PUBLISHABLE_DEGRADATIONS, ReviewMode,
+    fetch_file_contents, fetch_pr_diff, fetch_pr_diff_with_scope, is_blackout, is_low_confidence,
+    fetch_review_comment_body,
     is_partial_coverage, is_real_degradation, plan_publish, prior_finding_keys,
 )
 from personas.code_reviewer.dedup import (
@@ -112,7 +113,12 @@ from personas.code_reviewer.repo_config import (
     with_instructions,
 )
 from personas.code_reviewer.criteria_judge import criteria_judge_for
-from personas.code_reviewer.lane_work import lane_work_findings
+from personas.code_reviewer.deferred_ruff import (
+    DeferredLint, parse_deferred_lint, rule_code, unmet_findings,
+)
+from personas.code_reviewer.lint import ruff_hits
+from personas.code_reviewer.analyzer_sandbox import AnalyzerSkip
+from personas.code_reviewer.lane_work import is_lane_pr, lane_work_findings
 from personas.code_reviewer.linked_issue import (
     RULE_CATEGORIES as _LINKED_ISSUE_RULE_CATEGORIES,
 )
@@ -2597,19 +2603,34 @@ def _attach_linked_issue_context(
     pr_context: PrContext, *, installation_id: int, owner: str, repo_name: str,
 ) -> None:
     """Put the linked-issue criteria block on `pr_context` (#904) so every
-    cohort and the deep pass see it. Any failure leaves `pr_context`
-    untouched = today's review."""
+    cohort and the deep pass see it. The same read notes the deferred ruff
+    findings of the tickets this PR settles (#1477). Any failure leaves
+    `pr_context` untouched = today's review."""
+    body = str(pr_context.get("body") or "")
+    settles = set(closes_refs(body))
+    lane = is_lane_pr(body)
+    deferred: list[DeferredLint] = []
     try:
+        fetch_issue = build_issue_details_fetcher(
+            installation_id=installation_id, owner=owner, repo=repo_name,
+        )
+
+        def read_issue(number: int) -> str | dict[str, str]:
+            issue = fetch_issue(number)
+            if lane or number in settles:
+                text = issue if isinstance(issue, str) else issue.get("body") or ""
+                deferred.extend(parse_deferred_lint(
+                    text, issue=number, owner=owner, repo=repo_name,
+                ))
+            return issue
+
         linked = build_linked_issue_context(
-            str(pr_context.get("body") or ""),
-            fetch_issue=build_issue_details_fetcher(
-                installation_id=installation_id, owner=owner, repo=repo_name,
-            ),
-            owner=owner,
-            repo=repo_name,
+            body, fetch_issue=read_issue, owner=owner, repo=repo_name,
         )
         if linked:
             pr_context["linked_issue_context"] = linked
+        if deferred:
+            pr_context["deferred_lint"] = tuple(deferred)
     except Exception as e:  # noqa: BLE001 - additive; never break the review
         log.info(
             "linked_issue_context_degraded",
@@ -2859,6 +2880,69 @@ def _merge_lane_work(
     )
 
 
+def _deferred_rule_codes(
+    refs: tuple[DeferredLint, ...], installation_id: int, owner: str, repo_name: str,
+) -> list[tuple[DeferredLint, str]]:
+    """(finding, ruff code) for each deferred line whose thread names a code.
+    A thread GitHub no longer has names nothing; any other failure raises."""
+    named: list[tuple[DeferredLint, str]] = []
+    for ref in refs:
+        try:
+            text = with_install_token_retry(
+                installation_id,
+                lambda token, comment_id=ref.comment_id: fetch_review_comment_body(
+                    token, owner, repo_name, comment_id,
+                ),
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != httpx.codes.NOT_FOUND:
+                raise
+            log.info("code_review_deferred_thread_gone", extra={"comment_id": ref.comment_id})
+            continue
+        code = rule_code(text)
+        if code:
+            named.append((ref, code))
+    return named
+
+
+def _merge_deferred_ruff(
+    evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
+    file_contents: dict[str, str], pr_context: PrContext,
+) -> CodeReviewEvaluation:
+    """Measure the ruff findings the linked tickets defer, at the head
+    (#1477). A file the PR did not change is read here. A re-check that could
+    not finish degrades the review: its silence must not read as "fixed"."""
+    refs = tuple(pr_context.get("deferred_lint") or ())
+    if not refs:
+        return evaluation
+    owner, _, repo_name = str(pr_context.get("repo") or "").partition("/")
+    installation_id = int(pr_context.get("installation_id") or 0)
+    head_sha = str(pr_context.get("head_sha") or "")
+    try:
+        named = _deferred_rule_codes(refs, installation_id, owner, repo_name)
+        paths = tuple(dict.fromkeys(ref.path for ref, _ in named))
+        contents = {p: file_contents[p] for p in paths if p in file_contents}
+        missing = tuple(p for p in paths if p not in contents)
+        if missing:
+            contents.update(with_install_token_retry(
+                installation_id,
+                lambda token: fetch_file_contents(
+                    token, owner, repo_name, missing, head_sha, only_404_skips=True,
+                ),
+            ) or {})
+        hits = ruff_hits(contents)
+    except (httpx.HTTPStatusError, httpx.RequestError, AnalyzerSkip) as e:
+        log.warning(
+            "code_review_deferred_ruff_unfinished",
+            extra={"pr": f"{pr_context.get('repo')}#{pr_context.get('pr_number')}",
+                   "kind": type(e).__name__},
+        )
+        return with_degradation(evaluation, CodeReviewEvaluation(
+            findings=(), conclusion="neutral", degraded_reason=PARTIAL_COVERAGE,
+        ))
+    return with_extra_findings(evaluation, unmet_findings(named, hits, hunks))
+
+
 @dataclass(frozen=True)
 class _LaneWorkInputs:
     """The whole pull request, as the lane-work checks read it."""
@@ -2941,10 +3025,15 @@ def _merge_lane_work_for_pass(
                 known_contents=this_pass.file_contents,
             )
         if inputs is None:
-            return evaluation
-        return _merge_lane_work(
-            evaluation, inputs.hunks, inputs.diff_text, inputs.file_contents,
-            inputs.base_contents, pr_context, correctness_only=correctness_only,
+            return _merge_deferred_ruff(
+                evaluation, this_pass.hunks, this_pass.file_contents, pr_context,
+            )
+        return _merge_deferred_ruff(
+            _merge_lane_work(
+                evaluation, inputs.hunks, inputs.diff_text, inputs.file_contents,
+                inputs.base_contents, pr_context, correctness_only=correctness_only,
+            ),
+            inputs.hunks, inputs.file_contents, pr_context,
         )
     except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
         log.info(
