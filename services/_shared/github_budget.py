@@ -13,6 +13,7 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from urllib.parse import urlsplit
 
 from github_app_auth import core_rate_limit, with_install_token_retry
 from observability import emit_gauge
@@ -73,8 +74,11 @@ class _GitHubCallCounter(logging.Handler):
         counter = _review_calls.get()
         if counter is None:
             return
-        message = record.getMessage()
-        if "https://api.github.com/" in message and " 304 " not in message:
+        # httpx logs (method, url, http_version, status_code, reason).
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 4:
+            return
+        if urlsplit(str(args[1])).hostname == "api.github.com" and args[3] != 304:
             counter[0] += 1
 
 

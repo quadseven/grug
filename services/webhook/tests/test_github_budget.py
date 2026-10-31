@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 
 import github_budget
+import httpx
 import poller_handler
 import pytest
 
@@ -68,10 +69,14 @@ def test_a_failed_alert_claim_still_answers(budget, monkeypatch):
     assert github_budget.budget_is_low(1) is True
 
 
-def _github_log(status: str) -> None:
+def _http_log(url: str, status: int) -> None:
+    """The record httpx itself writes for a request."""
     logging.getLogger("httpx").info(
-        'HTTP Request: GET https://api.github.com/repos/o/r/pulls/1 "HTTP/1.1 %s"', status,
+        'HTTP Request: %s %s "%s %d %s"', "GET", httpx.URL(url), "HTTP/1.1", status, "",
     )
+
+
+_PR_URL = "https://api.github.com/repos/o/r/pulls/1"
 
 
 def test_a_review_counts_charged_calls_only(monkeypatch, caplog):
@@ -81,11 +86,12 @@ def test_a_review_counts_charged_calls_only(monkeypatch, caplog):
     monkeypatch.setattr(httpx_log, "level", logging.INFO)
     with caplog.at_level(logging.INFO, logger="grug.github_budget"):
         with github_budget.count_review_calls("o/r", 1):
-            _github_log("200 OK")
-            _github_log("404 Not Found")
-            _github_log("304 Not Modified")
-            httpx_log.info('HTTP Request: POST http://cave.test/v1 "HTTP/1.1 200 OK"')
-        _github_log("200 OK")
+            _http_log(_PR_URL, 200)
+            _http_log(_PR_URL, 404)
+            _http_log(_PR_URL, 304)
+            _http_log("https://api.github.com.example.test/x", 200)
+            _http_log("http://cave.test/v1", 200)
+        _http_log(_PR_URL, 200)
     assert gauges == [2.0]
     line = next(r for r in caplog.records if r.msg == "elder_review_github_calls")
     assert line.calls == 2
