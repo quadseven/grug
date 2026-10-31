@@ -116,6 +116,11 @@ _LOOM_FOOTER_PAT = re.compile(r"^Loom ticket ", re.MULTILINE)
 _LOOM_FOOTER_LANE_PAT = re.compile(
     r"^Loom ticket [^\n]*?,\s*lane\s+([\w.-]+)", re.MULTILINE,
 )
+# The model the footer names (`..., model <name>`). Elder reads it to pick a
+# reviewer of another model family (#1437).
+_LOOM_FOOTER_MODEL_PAT = re.compile(
+    r"^Loom ticket [^\n]*?,\s*model\s+([\w.:/-]+)", re.MULTILINE,
+)
 _LOOM_TICKET_REF_PAT = re.compile(
     r"\b(?:refs|part\s+of|fixes|closes)\s+quadseven/loom#\d+",
     re.IGNORECASE,
@@ -308,6 +313,13 @@ def loom_footer_lane(body: str) -> str | None:
     persona and the footer check share one parser (#1318)."""
     match = _LOOM_FOOTER_LANE_PAT.search(body or "")
     # A sentence-final footer (`..., lane x.`) keeps its dot off the name.
+    return match.group(1).rstrip(".") if match else None
+
+
+def loom_footer_model(body: str) -> str | None:
+    """The model the Loom audit footer names, or None when there is no footer
+    or it names no model. Same parser home as `loom_footer_lane`."""
+    match = _LOOM_FOOTER_MODEL_PAT.search(body or "")
     return match.group(1).rstrip(".") if match else None
 
 

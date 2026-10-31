@@ -14,6 +14,10 @@ their own installs even before admin allowlists them so they know to wait):
        → recent Check verdicts (Activity feed, PRD #301), newest-first,
          badge derived server-side; `?verdict=` filter, `limit` cap
 
+  GET  /api/v1/installations/{install_id}/ledger?repo=owner/name
+       -> review-findings ledger rows (#361) for one of the install
+         account's repos; `?verdict=` filter, `limit` cap
+
   PUT  /api/v1/installations/{install_id}/repos/{repo_id}/config
        → upsert per-repo persona override (e.g. {"tpm_enabled": false})
 
@@ -31,6 +35,7 @@ from adapters.install_store import (
     get_installation,
     get_repo_config,
     list_check_verdicts,
+    list_ledger_rows,
     list_user_installations,
     set_repo_config,
 )
@@ -326,10 +331,41 @@ def list_activity(
             "summary": r["summary"],
             "findings_count": r["findings_count"],
             "created_at": r["created_at"],
+            # Elder rows of a footer-named author only (grug#1437).
+            **{k: r[k] for k in ("author_family", "reviewer_family") if k in r},
         })
         if len(out) >= limit:
             break
     return {"activity": out}
+
+
+@router.get("/installations/{install_id}/ledger")
+def list_ledger(
+    install_id: int,
+    repo: str,
+    user: Annotated[UserIdentity, Depends(require_authenticated)],
+    verdict: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Review-findings ledger (#361): the stored findings for `repo`, read with
+    the same install-owner gate and `?verdict=` / `limit` shape as the
+    activity feed. Ledger rows are repo-scoped, so `repo` must belong to the
+    install's account (404 otherwise - never confirm another account's repo)."""
+    install = get_installation(install_id)
+    if not install:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
+    _ensure_can_access(install, user)
+    owner, _, name = repo.partition("/")
+    if (
+        not name
+        or "/" in name
+        or owner.lower() != str(install.get("account_login", "")).lower()
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not found")
+    limit = max(1, min(limit, 200))
+    # The store filters before its LIMIT: filtering the capped rows here would
+    # let a sparse `?verdict=` under-return (matches stranded past the cap).
+    return {"ledger": list_ledger_rows(repo, limit=limit, verdict=verdict)}
 
 
 @router.post(
