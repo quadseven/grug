@@ -124,4 +124,5 @@ def test_a_low_budget_holds_reports_and_keeps_repairs(monkeypatch):
     poller_handler.handler({}, None)
     assert seen.pop("reconcile") == [1, 2]
     assert seen.pop("self_heal") == [1, 2]
+    assert seen.pop("enforcement") == [1, 2], "ruleset detection never waits"
     assert seen and all(installs == [2] for installs in seen.values()), seen

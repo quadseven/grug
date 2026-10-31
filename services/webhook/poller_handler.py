@@ -496,8 +496,8 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     if os.getenv("GRUG_POLLER_SMOKE", "").strip() not in ("", "0"):
         return _smoke_check(installs)
     polled_records, submitted, failed_installs = _reaction_poll_pass(installs)
-    # Scheduled reports and gauges wait while the budget is low. The passes
-    # that repair reviews and checks still run on every installation.
+    # Scheduled reports wait while the budget is low. The passes that repair
+    # reviews and checks, and ruleset detection, run on every installation.
     spare = [install_id for install_id in installs if not budget_is_low(install_id)]
 
     # Pulse pass (#472): the first SCHEDULED persona rides the same
@@ -568,7 +568,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     # Enforcement-gauge re-emission (#460): same best-effort shape as the
     # passes above, plus per-REPO best-effort so one repo's GitHub error
     # can't starve the rest of their gauge - see _enforcement_reemission_pass.
-    enforcement_emitted, enforcement_failed = _enforcement_reemission_pass(spare)
+    enforcement_emitted, enforcement_failed = _enforcement_reemission_pass(installs)
 
     # Auto-replay missed webhook deliveries (#407), best-effort: a replay
     # failure must never abort the cron, so it's wrapped here on TOP of
