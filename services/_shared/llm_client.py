@@ -77,6 +77,7 @@ from reviewability import (
     dimension_score,
 )
 from review_evidence import Hunk, ElderEvidence, seal
+from model_family import ReviewFamilies, model_family, review_families
 from datadog_switch import datadog_enabled
 import call_report
 import shared_benches
@@ -236,11 +237,18 @@ class PrContext(TypedDict, total=False):
     cohort_count: int
     # Pre-rendered, already-sanitized linked-issue criteria block (#904).
     linked_issue_context: str
+    # `deferred_ruff.DeferredLint` rows of the tickets this PR settles (#1477).
+    deferred_lint: tuple[Any, ...]
+    # Why that list is incomplete; any entry degrades the review.
+    deferred_lint_unfinished: tuple[str, ...]
     review_scope: str
     sensitive_review: bool
     # The webhook's `repository.private` (grug#1269). Unset means unknown,
     # which every reader treats as private.
     repo_private: bool
+    # The model family that wrote this pull request, read from its footer
+    # (grug#1437). Unset means unknown, which keeps today's arm order.
+    author_family: str
 
 
 def _elapsed_ms(start_ns: int) -> int:
@@ -883,6 +891,9 @@ class LlmReviewResponse:
     tier_served: Optional[str] = None
     reviewability_note: str = ""
     reviewability_blocking: bool = False
+    # grug#1437: author and reviewer families of a finished review of a pull
+    # request whose footer names a known family. None otherwise.
+    families: ReviewFamilies | None = None
 
 
 # grug#1196: one failed model call inside a chunk's ladder walk.
@@ -934,6 +945,22 @@ _LADDER_TRAIL: contextvars.ContextVar[list[_LadderAttempt] | None] = (
 _LADDER_SKIP: contextvars.ContextVar[frozenset[tuple[str, str]]] = (
     contextvars.ContextVar("grug_ladder_skip", default=frozenset())
 )
+# Set by `_review_diff_dispatch` for a pull request with a known author family
+# (grug#1437): (author family, same_family_only). The first walk runs with
+# False and skips the author's family; the walk back runs with True and asks
+# only that family, so no other model is asked twice.
+_FAMILY_GATE: contextvars.ContextVar[tuple[str, bool] | None] = (
+    contextvars.ContextVar("grug_family_gate", default=None)
+)
+
+
+def _family_gated(model: str) -> bool:
+    """True when the current walk must not ask `model`."""
+    gate = _FAMILY_GATE.get()
+    if gate is None:
+        return False
+    author_family, same_family_only = gate
+    return (model_family(model) == author_family) != same_family_only
 
 
 # Test hook — replaced with a no-op in unit tests to avoid real sleeps.
@@ -5591,6 +5618,10 @@ def review_diff(
         result,
         reviewability_note=note,
         reviewability_blocking=assessment.decision == "block",
+        families=(
+            review_families(ctx.get("author_family"), result.models_used)
+            if result.kind == "reviewed" else None
+        ),
     )
 
 
@@ -5988,13 +6019,22 @@ def _run_llm_attempt(
 
     Inside `_ChunkLadder.run`, a model that already failed on this chunk is
     skipped without a network call, so a retry moves on to the next model in
-    the ladder instead of re-asking the one that just failed. The skip reads
-    as a config miss, which every caller already steps past. Each real
-    failure is appended to the chunk's trail so the neutral check can name
+    the ladder instead of re-asking the one that just failed. A model the
+    family gate rules out for this walk is skipped the same way (grug#1437).
+    The skip reads as a config miss, which every caller already steps past.
+    Each real failure is appended to the chunk's trail so the neutral check can name
     it. Outside a chunk both context variables are empty and this is a plain
     pass-through. Interactive callers supply a response parser and span name;
     they skip review-specific direct-call reporting."""
     key = (backend.value, config.model)
+    if _family_gated(config.model):
+        return AttemptOutcome(
+            backend=backend, model=None, findings=(), content="",
+            error_kind="config",
+            error_text=f"{backend.value}: {config.model} is gated out by model family",
+            status_code=None, finish_reason="", usage_metrics={},
+            span_context=None, raw_response=None,
+        )
     if key in _LADDER_SKIP.get():
         return AttemptOutcome(
             backend=backend, model=None, findings=(), content="",
@@ -6801,8 +6841,45 @@ def _review_diff_dispatch(
     cancel_event: threading.Event | None,
     review_map: str = "",
 ) -> "LlmReviewResponse":
-    """Dispatch one (unstaged or single-cohort) review, per
-    `GRUG_REVIEW_BACKEND_PRIORITY` (grug#906).
+    """Dispatch one review chunk, keeping the author's model family off it
+    while any other family can answer (grug#1437).
+
+    With no known author family this is the plain ladder walk. Otherwise the
+    whole ladder runs once without that family, in its usual order, so a
+    failed arm hands on to the next one as it always does. Only when nothing
+    answered does a second walk ask the author's family, and only that family:
+    a same-family review beats no review, and the check says which it was. A
+    second walk with nothing to ask leaves the first walk's failure standing.
+    """
+    author_family = (evidence.pr_context or {}).get("author_family")
+
+    def walk(gate: tuple[str, bool] | None) -> "LlmReviewResponse":
+        token = _FAMILY_GATE.set(gate)
+        try:
+            return _walk_review_ladder(
+                evidence, installation_id, voice, cancel_event, review_map,
+            )
+        finally:
+            _FAMILY_GATE.reset(token)
+
+    if not author_family:
+        return walk(None)
+    response = walk((author_family, False))
+    if response.kind == "reviewed" or (cancel_event and cancel_event.is_set()):
+        return response
+    same_family = walk((author_family, True))
+    return same_family if same_family.kind == "reviewed" else response
+
+
+def _walk_review_ladder(
+    evidence: ElderEvidence,
+    installation_id: int,
+    voice: VoiceSelection,
+    cancel_event: threading.Event | None,
+    review_map: str = "",
+) -> "LlmReviewResponse":
+    """Walk the review ladder once, per `GRUG_REVIEW_BACKEND_PRIORITY`
+    (grug#906).
 
     "cave" (default): delegates straight to
     `_review_diff_dispatch_cave_primary`, UNCHANGED - every deployment

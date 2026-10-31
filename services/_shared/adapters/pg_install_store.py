@@ -648,6 +648,8 @@ class CheckVerdictRecord(TypedDict):
     verdict: str
     created_at: str
     degraded_reason: NotRequired[Optional[str]]
+    author_family: NotRequired[str]
+    reviewer_family: NotRequired[str]
 
 
 _CHECK_VERDICT_TTL_DAYS = 90
@@ -670,6 +672,8 @@ def put_check_verdict(
     blocking: bool,
     created_at: str,
     degraded_reason: Optional[str] = None,
+    author_family: Optional[str] = None,
+    reviewer_family: Optional[str] = None,
 ) -> None:
     """Upsert a Check verdict; the denormalized `verdict` badge is DERIVED
     via review_types.verdict (never a parameter) - ADR-0003 invariant
@@ -694,6 +698,10 @@ def put_check_verdict(
     }
     if degraded_reason:
         attrs["degraded_reason"] = degraded_reason
+    if author_family:
+        attrs["author_family"] = author_family
+    if reviewer_family:
+        attrs["reviewer_family"] = reviewer_family
     with get_pool().connection() as conn:
         conn.execute(
             """
@@ -760,6 +768,9 @@ def list_check_verdicts(
         }
         if "degraded_reason" in item:
             rec["degraded_reason"] = item["degraded_reason"]
+        for family_key in ("author_family", "reviewer_family"):
+            if family_key in item:
+                rec[family_key] = str(item[family_key])
         out.append(rec)
     return out if limit is None else out[:limit]
 

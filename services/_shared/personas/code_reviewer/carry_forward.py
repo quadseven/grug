@@ -20,6 +20,8 @@ thread resolver already needs, and folds them into the check verdict:
   - a finding the new review raises again is not carried (it is already
     counted among the fresh findings);
   - a finding a maintainer dismissed (living review, #1187) is not carried;
+  - a deferred-ruff thread is not carried: its anchor can be a line the
+    fix never touches, and every review measures the rule again (#1477);
   - severity comes from the first line of the inline comment body, which
     `dispatch._inline_comment_body` renders as `<chip> | <category> | ...`
     (read from the original body when living review has annotated it).
@@ -35,7 +37,7 @@ import re
 from dataclasses import dataclass
 
 from github_app_auth import with_install_token_retry
-from personas.code_reviewer import living_review
+from personas.code_reviewer import deferred_ruff, living_review
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.thread_resolver import (
     _NEARBY_LINES,
@@ -103,15 +105,24 @@ def _thread_is_resolved(thread: dict) -> bool:
     return bool(resolver)
 
 
+def _carriable(thread: dict) -> tuple[str, str, int] | None:
+    """`(rule, path, original_line)` of an open, unchanged Elder thread whose
+    rule is not measured again on every review, else None."""
+    if _thread_is_resolved(thread) or thread.get("isOutdated"):
+        return None
+    owned = _owned_rule_and_line(thread)
+    if owned is None or owned[0] == deferred_ruff.RULE:
+        return None
+    return owned
+
+
 def select_carried(
     threads: list[dict], findings: tuple[Finding, ...],
 ) -> tuple[CarriedFinding, ...]:
     """Open, unchanged, Elder-owned threads this review does not re-raise."""
     out: list[CarriedFinding] = []
     for t in threads:
-        if _thread_is_resolved(t) or t.get("isOutdated"):
-            continue
-        owned = _owned_rule_and_line(t)
+        owned = _carriable(t)
         if owned is None:
             continue
         rule, path, original_line = owned
@@ -189,9 +200,11 @@ def filter_findings_against_resolved_threads(
         resolved_threads.append((rule, path, line))
     if not resolved_threads:
         return findings
+    # A deferred-ruff finding was measured at this head, and a resolved thread
+    # is not evidence of a fix (#1477).
     return tuple(
         f for f in findings
-        if not any(
+        if f.rule_name == deferred_ruff.RULE or not any(
             f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
             for rule, path, line in resolved_threads
         )

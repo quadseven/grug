@@ -31,6 +31,9 @@ from collections.abc import Callable
 import httpx
 from markdown_safety import neutralize_mentions
 
+from personas.code_reviewer.deferred_ruff import (
+    RULE_CATEGORIES as _DEFERRED_RUFF_RULE_CATEGORIES,
+)
 from personas.code_reviewer.sanitizer_review import (
     RULE_CATEGORIES as _SANITIZER_RULE_CATEGORIES,
 )
@@ -78,6 +81,8 @@ RULE_CATEGORIES = {
     **_WEAKENED_RULE_CATEGORIES,
     # Text sanitiser rules (#1497).
     **_SANITIZER_RULE_CATEGORIES,
+    # A deferred ruff finding still firing at the head (#1477).
+    **_DEFERRED_RUFF_RULE_CATEGORIES,
     "fabricated-result": "requirements",
     "unbacked-claim": "requirements",
     # A linked criterion with no evidence in the diff (#1389).
@@ -92,9 +97,10 @@ Criterion = tuple[str, str]  # ("open" | "ticked", text)
 
 def linked_issue_numbers(
     pr_body: str, *, owner: str = "", repo: str = "",
-    limit: int = MAX_LINKED_ISSUES,
+    limit: int | None = MAX_LINKED_ISSUES,
 ) -> list[int]:
-    """Same-repo issues the PR links, closing keywords first, deduped, capped."""
+    """Same-repo issues the PR links, closing keywords first, deduped, capped.
+    `limit=None` is every link, for a caller that bounds them itself."""
     body = pr_body or ""
     seen: dict[int, None] = {}
     for n in closes_refs(body):

@@ -75,7 +75,7 @@ def evaluate_chain(checks: list[tuple[str, StageCheck]]) -> StageVerdict | None:
     Stages run in order and the first failure wins, so a broken chain names
     exactly one stage with the evidence that says so.
     """
-    for name, check in checks:
+    for _, check in checks:
         verdict = check()
         if not verdict.ok:
             return verdict
@@ -265,6 +265,27 @@ def get_latest_push_digest(service: str) -> tuple[str, str]:
     return "", ""
 
 
+def check_deployment(service: str) -> bool:
+    """Return True if the deployed image matches the pushed image.
+
+    The function compares the digests of the latest deployed
+    instance and the most recent tag pushed for the service.
+    """
+    verdicts = deployment_stage_verdicts(service)
+    return bool(verdicts) and all(v.ok for v in verdicts)
+
+
+def deployment_chain_verdict(service: str) -> StageVerdict:
+    """Collapse the stage verdicts into one: the first failure, else the last.
+
+    An empty verdict list is itself broken, so callers never index into it.
+    """
+    verdicts = deployment_stage_verdicts(service)
+    if not verdicts:
+        return StageVerdict("deploy", False, "no stage verdicts produced")
+    return next((v for v in verdicts if not v.ok), verdicts[-1])
+
+
 def deployment_status(service: str) -> str:
     """Distinguish a stale deployment from missing reference evidence."""
     _, deployed_digest = get_latest_digest(service)
@@ -305,6 +326,16 @@ def main(service: str = "webhook", *args: str) -> int:
         )
         print(report)
         return 0
+
+    if service == "escalate-deployment":
+        target = args[0] if args else "webhook"
+
+        def _notify(message, stage, evidence):
+            print(f"{message}: {evidence}", file=sys.stderr)
+
+        checks = [("deploy", lambda: deployment_chain_verdict(target))]
+        result = escalate_once(checks, notify=_notify)
+        return 0 if result != "broken" else 1
 
     status = deployment_status(service)
     if status == "deployed":
@@ -969,7 +1000,5 @@ def report_shepherd_pr_queue(
 
 
 if __name__ == "__main__":
-    import sys
-
     svc = sys.argv[1] if len(sys.argv) > 1 else "webhook"
     sys.exit(main(svc))
