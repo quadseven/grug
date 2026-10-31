@@ -139,7 +139,7 @@ spec:
             # feature off; the operator lists the owner's App bots here so a
             # /grug improve from loom-brain[bot] on a PR it did not open runs
             # Elder like a write collaborator's instead of being dropped.
-            - {name: GRUG_ALLOWED_APP_BOT_LOGINS, value: "loom-brain[bot],loom-station[bot],loom-lanes[bot],agent-anthropic-claude-code[bot],agent-meta-muse[bot],agent-openai-dot[bot],agent-google-gemini[bot]"}
+            - {name: GRUG_ALLOWED_APP_BOT_LOGINS, value: "loom-brain[bot],loom-station[bot],loom-lanes[bot],agent-anthropic-claude-code[bot],agent-meta-muse[bot],agent-openai-dot[bot],agent-openai-codex-luna[bot],agent-google-gemini[bot]"}
             # Off-Lambda async path (#368). Elder's production hot path is
             # durable SQS below; this flag still enables the local worker used
             # by the other async personas and by Elder only if that lane is
