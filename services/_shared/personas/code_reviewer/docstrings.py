@@ -21,7 +21,9 @@ def _added_lines(diff_text: str) -> dict[str, set[int]]:
     for hunk in parse_diff(diff_text):
         line = hunk.new_start
         changed: set[int] = set()
-        for row in hunk.body.splitlines()[1:]:
+        for row in hunk.body.splitlines():
+            if row.startswith("@@"):
+                continue
             if row.startswith("+"):
                 changed.add(line)
                 line += 1
@@ -83,6 +85,8 @@ def insert_docstring(source: str, *, line: int, docstring: str) -> str:
     )
     if node is None:
         raise ValueError("function no longer exists at the expected line")
+    if not node.body:
+        raise ValueError("function has an empty body")
     if node.body[0].lineno == node.lineno:
         raise ValueError("function body shares its definition line")
     lines = source.splitlines(keepends=True)

@@ -1956,6 +1956,7 @@ def _review_stack_body(
     base_sha: str = "",
     file_contents: dict[str, str] | None = None,
     docstring_targets: tuple[str, ...] = (),
+    docstring_skips: tuple[tuple[str, str], ...] = (),
     linked_issues: tuple[int, ...] = (),
     muted: dict[str, ClassPrecision] | None = None,
 ) -> str:
@@ -2021,6 +2022,9 @@ def _review_stack_body(
             f"**Finishing touch:** {len(docstring_targets)} changed public "
             "function(s) lack docstrings. Run `/grug docstrings` to generate them."
         )
+    if docstring_skips:
+        skipped = "; ".join(f"{path}: {reason}" for path, reason in docstring_skips)
+        parts.append(f"**Docstring candidates skipped:** {skipped}.")
     # Phase, Status and Check-run used to live in the fold. All three were cut:
     # Status restated the summary line verbatim, Phase ("Tier-1 coder arm") is
     # internal vocabulary that means nothing to the author, and the check-run
@@ -4217,6 +4221,9 @@ def dispatch_code_review(
     # that already published. Skipped when the check never landed.
     if not check_publish_failed:
         try:
+            docstring_targets, docstring_skips = find_docstring_targets(
+                diff_text, file_contents,
+            )
             stack_body = _review_stack_body(
                 evaluation,
                 conclusion=conclusion,
@@ -4229,8 +4236,9 @@ def dispatch_code_review(
                 file_contents=file_contents,
                 docstring_targets=tuple(
                     f"{target.path}:{target.line}"
-                    for target in find_docstring_targets(diff_text, file_contents)[0]
+                    for target in docstring_targets
                 ),
+                docstring_skips=tuple(docstring_skips),
                 linked_issues=pinned_issues,
                 muted=muted,
             )

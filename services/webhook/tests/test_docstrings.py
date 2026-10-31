@@ -22,6 +22,20 @@ def test_find_docstring_targets_selects_changed_public_functions_without_docstri
     assert skipped == []
 
 
+def test_added_lines_skips_header_without_dropping_first_content_line(monkeypatch):
+    from types import SimpleNamespace
+
+    from personas.code_reviewer.docstrings import _added_lines
+
+    monkeypatch.setattr(
+        "personas.code_reviewer.docstrings.parse_diff",
+        lambda _: (SimpleNamespace(
+            new_start=1, file_path="pkg/mod.py", body="+def fresh():",
+        ),),
+    )
+    assert _added_lines("unused") == {"pkg/mod.py": {1}}
+
+
 def test_insert_docstring_preserves_function_body_and_indentation():
     source = "def fresh(value):\n    return value\n"
     out = insert_docstring(source, line=1, docstring="Return the supplied value.")
@@ -29,6 +43,28 @@ def test_insert_docstring_preserves_function_body_and_indentation():
         'def fresh(value):\n    """Return the supplied value."""\n'
         "    return value\n"
     )
+
+
+def test_insert_docstring_rejects_empty_function_body(monkeypatch):
+    import ast
+
+    import pytest
+
+    function = ast.FunctionDef(
+        name="fresh", args=ast.arguments(
+            posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[],
+            defaults=[],
+        ), body=[], decorator_list=[],
+    )
+    function.lineno = function.end_lineno = 1
+    function.col_offset = 0
+    module = ast.Module(body=[function], type_ignores=[])
+    monkeypatch.setattr(
+        "personas.code_reviewer.docstrings.ast.parse",
+        lambda *_args, **_kwargs: module,
+    )
+    with pytest.raises(ValueError, match="empty body"):
+        insert_docstring("def fresh():\n", line=1, docstring="Description.")
 
 
 def test_run_docstrings_commits_once_and_reports_changed_file():
