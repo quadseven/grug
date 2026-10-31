@@ -113,7 +113,7 @@ def test_a_low_budget_holds_reports_and_keeps_repairs(monkeypatch):
     monkeypatch.setattr(poller_handler, "_run_repo_scoped_pass", _pass)
     monkeypatch.setattr(
         poller_handler, "_enforcement_reemission_pass",
-        lambda i: seen.__setitem__("enforcement", list(i)) or (0, 0),
+        lambda i: seen.__setitem__("enforcement", list(i)) or (0, 0, 0),
     )
     monkeypatch.setattr(poller_handler, "_deep_publish_retry_pass", lambda: (0, 0))
     monkeypatch.setattr(poller_handler, "_install_reconciliation_pass", lambda: (0, 0, 0))

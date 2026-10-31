@@ -1853,6 +1853,33 @@ def _fetch_current_pr(
     )
 
 
+def _fetch_pr_if_changed(
+    install_id: int, owner: str, repo_name: str, pr_number: int, etag: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Read the PR only if it moved since `etag`: the PR and its new ETag, or
+    None and the same ETag on a 304. GitHub does not charge a 304 against the
+    rate limit, so a poll on an unchanged PR is free (grug#1537)."""
+    url = (
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
+        f"/pulls/{pr_number}"
+    )
+
+    def _do(token: str) -> tuple[dict[str, Any] | None, str]:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        if etag:
+            headers["If-None-Match"] = etag
+        resp = httpx.get(url, headers=headers, timeout=_FETCH_TIMEOUT)
+        if resp.status_code == 304:
+            return None, etag
+        resp.raise_for_status()
+        return resp.json(), resp.headers.get("ETag", "")
+
+    return with_install_token_retry(install_id, _do)
+
+
 def _elder_blocking_from_pr(install_id: int, pr: dict[str, Any]) -> bool | None:
     """The repo's `code_reviewer_blocking` for an already-fetched PR, or
     None when it cannot be read. Callers hand None to `degraded_conclusion`,
@@ -2118,10 +2145,16 @@ def _review_staleness_watch_loop(
     already known stale.
 
     A transient GitHub hiccup must never cancel a genuinely current review,
-    so a fetch failure is logged and skipped, not treated as staleness."""
+    so a fetch failure is logged and skipped, not treated as staleness.
+
+    Polls are conditional: only the first one, and one after the PR changes,
+    spends a call from the installation's budget (grug#1537)."""
+    etag = ""
     while not stop.wait(_STALENESS_WATCH_INTERVAL_S):
         try:
-            latest = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+            latest, etag = _fetch_pr_if_changed(
+                install_id, owner, repo_name, pr_number, etag,
+            )
         except Exception as error:  # noqa: BLE001 - transient fetch failure, keep watching
             log.warning(
                 "elder_review_staleness_watch_fetch_failed",
@@ -2131,6 +2164,8 @@ def _review_staleness_watch_loop(
                     "kind": type(error).__name__,
                 },
             )
+            continue
+        if latest is None:
             continue
         # HEAD SHA DECIDES. Killing a running review is only justified when
         # the DIFF changed, because that is the only case where the answer
