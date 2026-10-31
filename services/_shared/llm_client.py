@@ -4380,6 +4380,8 @@ class _SuccessfulReview:
     # includes a truncated review must fold this into the final `error` via
     # `_truncation_error`/`_partial_review_reason` -- never publish it clean.
     truncated: bool = False
+    # Same meaning as `_ArmOutcome.model_unconfirmed`.
+    model_unconfirmed: bool = False
 
 
 _SEVERITY_RANK = {
@@ -4624,6 +4626,16 @@ def _unwalked_paths(plan: ReviewPlan, failed_indexes: Sequence[int]) -> tuple[st
         if 1 <= index <= len(plan.cohorts):
             paths.update(plan.cohorts[index - 1].paths)
     return tuple(sorted(paths))
+
+
+def _served_models(model: str | None) -> tuple[str, ...]:
+    """`models_used` for one answer: the model its reply named, or nothing.
+
+    A reply with no `model` falls back to the configured name for logs and
+    `model_name`. That name is what was requested, and on a lane that picks
+    its own model it is not a model at all, so a report of who served the
+    review must not repeat it."""
+    return (model,) if model else ()
 
 
 def _cohort_attribution(
@@ -5150,7 +5162,7 @@ def _deep_response(
             model_name=outcome.model,
             review_span_context=outcome.span_context,
             backends_used=(Backend.CAVE_REASONER,),
-            models_used=(outcome.model,),
+            models_used=outcome.served_models,
             error=_truncation_error(
                 (Backend.CAVE_REASONER,) if outcome.truncated else (),
             ),
@@ -5754,7 +5766,12 @@ def review_diff(
         reviewability_note=note,
         reviewability_blocking=assessment.decision == "block",
         families=(
-            review_families(ctx.get("author_family"), result.models_used)
+            review_families(
+                ctx.get("author_family"),
+                # A silent reply still names a family through its request: a
+                # same-family warning errs safe where a served name must not.
+                result.models_used or ((result.model_name,) if result.model_name else ()),
+            )
             if result.kind == "reviewed" else None
         ),
     )
@@ -5796,6 +5813,9 @@ class _ArmOutcome:
     kind: Literal["config_error", "transport_error", "success", "parse_failed", "http_failed"]
     error_text: str = ""
     model: str | None = None
+    # The reply named no model, so `model` is only the configured request
+    # name. It stays usable as a label but never counts as the served model.
+    model_unconfirmed: bool = False
     findings: tuple["Finding", ...] = ()
     span_context: dict | None = None
     # Raw `_parse_response` error string (distinct from `error_text`, the
@@ -5817,6 +5837,10 @@ class _ArmOutcome:
     # completion over a large prompt (`_is_degenerate_empty_review`). The
     # cloud chain treats it as a miss and moves to the next tier.
     degenerate: bool = False
+
+    @property
+    def served_models(self) -> tuple[str, ...]:
+        return () if self.model_unconfirmed else _served_models(self.model)
 
 
 # A model that answers a 10-20k-token diff with `{"findings": []}` in 7
@@ -6470,6 +6494,7 @@ def _run_review_arm(
                 backend=backend,
                 kind="success",
                 model=resolved_model,
+                model_unconfirmed=not model,
                 findings=findings,
                 span_context=attempt.span_context,
                 truncated=attempt.truncated,
@@ -6479,6 +6504,7 @@ def _run_review_arm(
             backend=backend,
             kind="success",
             model=resolved_model,
+            model_unconfirmed=not model,
             findings=findings,
             span_context=attempt.span_context,
             truncated=attempt.truncated,
@@ -6760,7 +6786,7 @@ def _cloud_tier_success(
         model_name=outcome.model,
         review_span_context=outcome.span_context,
         backends_used=(backend,),
-        models_used=(outcome.model,),
+        models_used=outcome.served_models,
         error=_truncation_error((backend,) if outcome.truncated else ()),
         tier_served="free-pool",
     )
@@ -7178,7 +7204,7 @@ def _run_free_provider_fallback(
                     model_name=resolved_model,
                     review_span_context=span_context,
                     backends_used=(backend,),
-                    models_used=(resolved_model,),
+                    models_used=_served_models(model),
                     error=_attempt_truncation_error(attempt),
                     tier_served="free-pool",
                 ),
@@ -7302,7 +7328,7 @@ def _run_subscription_fallback(
             model_name=resolved_model,
             review_span_context=span_context,
             backends_used=(Backend.SUBSCRIPTION,),
-            models_used=(resolved_model,),
+            models_used=_served_models(model),
             error=_attempt_truncation_error(attempt),
             tier_served="subscription",
         )
@@ -7464,6 +7490,7 @@ def _review_diff_dispatch_cave_primary(
                 ),
                 review_span_context=outcome.span_context,
                 truncated=outcome.truncated,
+                model_unconfirmed=outcome.model_unconfirmed,
             ))
             if early_exit:
                 _emit_tier_served_metric("self-hosted", backend.value, resolved_model)
@@ -7474,7 +7501,7 @@ def _review_diff_dispatch_cave_primary(
                     model_name=resolved_model,
                     review_span_context=outcome.span_context,
                     backends_used=(backend,),
-                    models_used=(resolved_model,),
+                    models_used=outcome.served_models,
                     error=_truncation_error((backend,) if outcome.truncated else ()),
                     tier_served="self-hosted",
                 )
@@ -7579,7 +7606,10 @@ def _review_diff_dispatch_cave_primary(
             model_name=first.model,
             review_span_context=first.review_span_context,
             backends_used=tuple(review.backend for review in successes),
-            models_used=tuple(review.model for review in successes),
+            models_used=tuple(
+                review.model for review in successes
+                if not review.model_unconfirmed
+            ),
             # Only the concurrent dual-arm (`run_both`) merge reaches here
             # with successes - `fast`/`tiered` early-exit on the first success
             # above - so `review_backends` is exactly the set of arms that
