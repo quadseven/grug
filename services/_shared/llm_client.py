@@ -86,6 +86,7 @@ from secrets_loader import (
     get_opencode_go_api_key,
     get_openrouter_api_key,
     get_poolside_api_key,
+    get_subscription_lane_token,
     get_prompt_experiment_mode,
 )
 
@@ -1016,7 +1017,9 @@ def _opencode_go_extra_body(model: str, wire: str) -> dict:
 
 
 # Operator subscription fallback (grug#1276)
-_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS = 40.0
+# Room for a chunk at its largest (46k chars took 25s of Haiku alone) plus the
+# wait for a slot on a lane that serves one or two calls at a time.
+_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS = 120.0
 _subscription_cap_lock = threading.Lock()
 _subscription_daily_calls: dict[str, int] = {}
 
@@ -1027,6 +1030,15 @@ def _subscription_daily_cap() -> int:
         return max(0, val)
     except (ValueError, TypeError):
         return 50
+
+
+def _subscription_timeout_s() -> float:
+    raw = os.getenv("GRUG_SUBSCRIPTION_TIMEOUT_S", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return _SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS
+    return value if math.isfinite(value) and value > 0 else _SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS
 
 
 def _subscription_today_key() -> str:
@@ -1079,6 +1091,17 @@ def _validate_subscription_key(key: str) -> None:
         )
 
 
+def _load_subscription_key() -> str:
+    return get_subscription_lane_token() or "in-cluster"
+
+
+def _review_author_family() -> str | None:
+    """The author's family for this walk, so a lane that serves two families
+    can keep a model off its own family's work (#1437)."""
+    gate = _FAMILY_GATE.get()
+    return gate[0] if gate else None
+
+
 def _subscription_fallback_config() -> BackendConfig | None:
     """Operator's subscription plan run headless as the last resort."""
     if not _subscription_fallback_enabled():
@@ -1091,14 +1114,15 @@ def _subscription_fallback_config() -> BackendConfig | None:
         backend=Backend.SUBSCRIPTION,
         url=url,
         model=model,
-        key_loader=lambda: "in-cluster",
+        key_loader=_load_subscription_key,
+        dynamic_headers={"X-Review-Author-Family": _review_author_family},
         extra_headers={
             "User-Agent": "grug/1.0 (+https://grug.lol)",
             "X-Spark-Priority": "interactive",
             "X-Spark-Caller": "grug-elder-subscription",
             "X-Loom-Lane-Type": "subscription-headless",
         },
-        timeout_seconds=_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS,
+        timeout_seconds=_subscription_timeout_s(),
         retry_attempts=1,
         transport_retry_attempts=1,
     )
@@ -1342,6 +1366,7 @@ _BENCH_WINDOW_SECONDS = 600.0
 _BENCH_BASE_SECONDS = 3600.0
 _BENCH_MAX_SECONDS = 12 * 3600.0
 _BENCH_CLOUD_BACKENDS = frozenset({Backend.OPENCODE_GO, Backend.OPENROUTER, Backend.POOLSIDE})
+_LIMIT_HOLD_BACKENDS = _BENCH_CLOUD_BACKENDS | {Backend.FREE_POOL}
 # Statuses that are never withdrawal: timeout, too-large, rate limit.
 _BENCH_IGNORED_STATUSES = frozenset({408, 413, 425, 429})
 _BENCH_QUOTA_MARKERS = ("usage limit", "rate limit", "quota", "insufficient credit", "key limit")
@@ -1469,6 +1494,16 @@ _SPENT_LIMIT_MARKERS = (
 _SPENT_RATE_MARKERS = ("per-day", "per day", "daily", "monthly", "gousagelimiterror")
 _provider_breaker_lock = threading.Lock()
 _provider_blocked_until: dict[tuple[str, str], float] = {}
+# A limit that outlasts a throttle reads the same on one response, so the count
+# decides: a second limit refusal within five minutes skips the provider for
+# five minutes, then it is asked again. On 2026-10-31 Poolside answered 1,892 of
+# these in nine hours and the free pool 57, each costing a chunk its retry and
+# its wait before the subscription tier could run.
+_LIMIT_REFUSAL_THRESHOLD = 2
+_LIMIT_REFUSAL_WINDOW_SECONDS = 300.0
+_LIMIT_HOLD_SECONDS = 300.0
+_LIMIT_REFUSAL_MARKERS = ("usage limit", "capacity is reserved")
+_limit_refusals: dict[tuple[str, str], list[float]] = {}
 _warned_disabled_entries: set[str] = set()
 
 
@@ -1541,19 +1576,46 @@ def _is_spent_quota_refusal(resp: httpx.Response) -> bool:
     return any(m in text for m in markers)
 
 
+def _limit_refusals_repeated(config: BackendConfig, resp: httpx.Response) -> bool:
+    """Count one usage-limit 429; True when the count reaches the hold. Any
+    other answer from the provider starts the count over."""
+    key = (config.backend.value, _backend_pool(config.backend, config.model))
+    text = (resp.text or "").lower()
+    limited = resp.status_code == 429 and any(m in text for m in _LIMIT_REFUSAL_MARKERS)
+    now = time.time()
+    with _provider_breaker_lock:
+        if not limited:
+            _limit_refusals.pop(key, None)
+            return False
+        recent = [t for t in _limit_refusals.get(key, []) if now - t < _LIMIT_REFUSAL_WINDOW_SECONDS]
+        recent.append(now)
+        if len(recent) < _LIMIT_REFUSAL_THRESHOLD:
+            _limit_refusals[key] = recent
+            return False
+        _limit_refusals.pop(key, None)
+        return True
+
+
 def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None:
-    """Open the provider breaker on a 401, a 402 or a spent-limit refusal."""
-    if config.backend not in _BENCH_CLOUD_BACKENDS:
-        return
-    if resp.status_code == 401:
-        pools: tuple[str, ...] = _PROVIDER_POOLS
-    elif _is_spent_quota_refusal(resp):
-        pools = (_backend_pool(config.backend, config.model),)
-    else:
-        return
-    # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
-    seconds = _retry_after_seconds(resp)
-    until = time.time() + seconds
+    """Open the provider breaker on a 401, a 402, a spent-limit refusal, or
+    repeated limit refusals."""
+    pool = _backend_pool(config.backend, config.model)
+    if config.backend in _BENCH_CLOUD_BACKENDS:
+        # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
+        if resp.status_code == 401:
+            _open_provider_breaker(config, resp, _PROVIDER_POOLS, time.time() + _retry_after_seconds(resp))
+            return
+        if _is_spent_quota_refusal(resp):
+            _open_provider_breaker(config, resp, (pool,), time.time() + _retry_after_seconds(resp))
+            return
+    if config.backend in _LIMIT_HOLD_BACKENDS and _limit_refusals_repeated(config, resp):
+        _open_provider_breaker(config, resp, (pool,), time.time() + _LIMIT_HOLD_SECONDS)
+
+
+def _open_provider_breaker(
+    config: BackendConfig, resp: httpx.Response, pools: tuple[str, ...], until: float,
+) -> None:
+    seconds = until - time.time()
     with _provider_breaker_lock:
         for pool in pools:
             key = (config.backend.value, pool)

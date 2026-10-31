@@ -403,7 +403,6 @@ def test_the_free_per_day_cap_blocks_the_free_tier_and_is_not_retried() -> None:
 
 @pytest.mark.parametrize("resp", [
     # Poolside's short-lived throttle (live 2026-10-17, no Retry-After).
-    _err(429, "usage limit exceeded"),
     _err(429, "quota exceeded, try again shortly"),
     _err(429, "Rate limit exceeded: free-models-per-min."),
     _err(429, "slow down"),
@@ -492,6 +491,57 @@ def test_a_poolside_usage_limit_429_keeps_poolside_in_the_chain() -> None:
     assert post.call_count == 2
     assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
     assert Backend.POOLSIDE in [t.backend for t in lc._cloud_chain_tiers()]
+
+
+def _poolside_call(resp: httpx.Response) -> None:
+    cfg = lc.replace(lc._BACKEND_CONFIGS[Backend.POOLSIDE], retry_attempts=1)
+    with patch.object(httpx, "post", return_value=resp):
+        lc._call_backend(cfg, _MESSAGES)
+
+
+def test_repeated_limit_refusals_skip_poolside_then_it_is_asked_again(monkeypatch) -> None:
+    """The second refusal in five minutes holds Poolside for five minutes
+    (#1546), so the review reaches a tier that can answer, and Poolside
+    comes back on its own."""
+    now = 1_000_000.0
+    monkeypatch.setattr(lc.time, "time", lambda: now)
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    _poolside_call(limited)
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert Backend.POOLSIDE not in lc._usable_saas_fallback_backends()
+    assert Backend.POOLSIDE not in [t.backend for t in lc._cloud_chain_tiers()]
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL, now + 301)
+
+
+def test_repeated_capacity_refusals_skip_the_free_pool(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
+    pool = lc._free_pool_chain_config()
+    limited = _err(429, "free pool capacity is reserved for higher-priority callers: openrouter (daily)")
+    with patch.object(httpx, "post", return_value=limited):
+        lc._call_backend(pool, _MESSAGES)
+        lc._call_backend(pool, _MESSAGES)
+    assert lc._free_provider_fallback_configs()[0].backend != Backend.FREE_POOL
+    assert Backend.FREE_POOL not in [t.backend for t in lc._cloud_chain_tiers()]
+
+
+def test_a_success_between_limit_refusals_starts_the_count_over() -> None:
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    _poolside_call(_ok())
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+
+
+def test_limit_refusals_spread_past_the_window_never_hold(monkeypatch) -> None:
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(lc.time, "time", lambda: now["t"])
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    now["t"] += 301
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
 
 
 def test_opencode_go_monthly_usage_limit_still_trips_the_breaker() -> None:
