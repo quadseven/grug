@@ -2604,6 +2604,16 @@ def _repo_complexity_caps(
 _ISSUE_ABSENT = (httpx.codes.NOT_FOUND, httpx.codes.GONE)
 
 
+def _settled_tickets(body: str, *, owner: str, repo_name: str) -> list[int]:
+    """Tickets this PR must settle: those it closes, every link of a lane PR."""
+    closes = set(closes_refs(body))
+    lane = is_lane_pr(body)
+    return [
+        n for n in linked_issue_numbers(body, owner=owner, repo=repo_name, limit=None)
+        if lane or n in closes
+    ]
+
+
 def _note_deferred_lint(
     pr_context: PrContext, fetch_issue: IssueDetailsFetcher, *,
     owner: str, repo_name: str,
@@ -2617,12 +2627,7 @@ def _note_deferred_lint(
     unfinished: list[str] = []
     deferred: list[DeferredLint] = []
     try:
-        closes = set(closes_refs(body))
-        lane = is_lane_pr(body)
-        settled = [
-            n for n in linked_issue_numbers(body, owner=owner, repo=repo_name, limit=None)
-            if lane or n in closes
-        ]
+        settled = _settled_tickets(body, owner=owner, repo_name=repo_name)
         if len(settled) > MAX_SETTLED_TICKETS:
             unfinished.append("too_many_tickets")
         for number in settled[:MAX_SETTLED_TICKETS]:
@@ -2657,11 +2662,11 @@ def _attach_linked_issue_context(
     cohort and the deep pass see it. Any failure leaves the block off =
     today's review. The tickets this PR settles are read first, under their
     own bound, and the block reuses those reads (#1477)."""
-    fetch_issue = functools.lru_cache(maxsize=None)(build_issue_details_fetcher(
-        installation_id=installation_id, owner=owner, repo=repo_name,
-    ))
-    _note_deferred_lint(pr_context, fetch_issue, owner=owner, repo_name=repo_name)
     try:
+        fetch_issue = functools.lru_cache(maxsize=None)(build_issue_details_fetcher(
+            installation_id=installation_id, owner=owner, repo=repo_name,
+        ))
+        _note_deferred_lint(pr_context, fetch_issue, owner=owner, repo_name=repo_name)
         linked = build_linked_issue_context(
             str(pr_context.get("body") or ""),
             fetch_issue=fetch_issue,
@@ -2679,6 +2684,12 @@ def _attach_linked_issue_context(
                 "kind": type(e).__name__,
             },
         )
+        # No fetcher means no ticket was read. A PR that settles none still
+        # has nothing to measure; one that settles any must not pass unmeasured.
+        if pr_context.get("deferred_lint") is None and _settled_tickets(
+            str(pr_context.get("body") or ""), owner=owner, repo_name=repo_name,
+        ):
+            pr_context["deferred_lint_unfinished"] = ("ticket_unread",)
 
 
 def _pinned_issues(

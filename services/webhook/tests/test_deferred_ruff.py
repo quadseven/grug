@@ -241,6 +241,16 @@ def test_a_ticket_read_that_fails_degrades():
     assert merged.degraded_reason == "partial_review"
 
 
+def test_a_fetcher_that_cannot_be_built_degrades_a_pr_that_settles_a_ticket():
+    context = {"repo": "acme/widgets", "pr_number": 1, "body": "Closes #1313"}
+    with patch.object(dispatch, "build_issue_details_fetcher", side_effect=RuntimeError("no")):
+        dispatch._attach_linked_issue_context(
+            context, installation_id=7, owner="acme", repo_name="widgets",
+        )
+    merged = dispatch._merge_deferred_ruff(_clean(), (), {}, context)
+    assert merged.degraded_reason == "partial_review"
+
+
 def test_a_ticket_github_does_not_have_defers_nothing():
     def absent(_number):
         raise _http_error(404)
