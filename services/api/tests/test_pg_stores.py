@@ -814,6 +814,25 @@ def test_re_auth_with_new_refresh_replaces(pg, fake_kms):
     assert got.oauth_refresh_token == "r2"
 
 
+def test_check_verdict_families_round_trip_and_stay_sparse(pg):
+    from adapters import pg_install_store as store
+
+    common = dict(
+        install_id=778, persona="elder", repo="o/r", pr_number=1,
+        conclusion="success", summary="s", findings_count=0, blocking=False,
+        created_at="2026-05-16T00:00:00+00:00",
+    )
+    store.put_check_verdict(
+        head_sha="a" * 40, author_family="claude", reviewer_family="laguna", **common,
+    )
+    store.put_check_verdict(head_sha="b" * 40, **common)
+    rows = {row["head_sha"][0]: row for row in store.list_check_verdicts(778)}
+    assert rows["a"]["author_family"] == "claude"
+    assert rows["a"]["reviewer_family"] == "laguna"
+    assert "author_family" not in rows["b"]
+    assert "reviewer_family" not in rows["b"]
+
+
 def test_check_verdict_degraded_reason_round_trips_as_errored(pg):
     """/activity's errored filter depends on the degraded write arm; the
     sparse-when-absent arm alone leaves it unexecuted."""

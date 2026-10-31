@@ -65,6 +65,20 @@ def test_activity_verdict_is_derived_server_side_not_the_stored_value():
     assert "STALE" not in {a["verdict"] for a in acts}
 
 
+def test_activity_row_carries_families_only_when_recorded():
+    install = {"installed_by_user_id": "100"}
+    rows = [
+        _row(author_family="claude", reviewer_family="laguna"),
+        _row(head_sha="def"),
+    ]
+    with patch("installations.get_installation", return_value=install):
+        with patch("installations.list_check_verdicts", return_value=rows):
+            out = inst.list_activity(install_id=1, user=_user(user_id="100"))
+    named, plain = out["activity"]
+    assert (named["author_family"], named["reviewer_family"]) == ("claude", "laguna")
+    assert "author_family" not in plain and "reviewer_family" not in plain
+
+
 def test_activity_verdict_filter():
     install = {"installed_by_user_id": "100"}
     rows = [

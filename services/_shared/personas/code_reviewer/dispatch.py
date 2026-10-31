@@ -29,6 +29,7 @@ import os
 import re
 import threading
 from collections import deque
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -37,6 +38,7 @@ from urllib.parse import quote
 import httpx
 
 from activity_log import record_check_verdict
+from model_family import ReviewFamilies, model_family
 from code_review_prompt import RULES
 from github_app_auth import (
     get_app_id, installation_permission_summary_note, with_install_token_retry,
@@ -128,6 +130,8 @@ from personas.code_reviewer.linked_issue import (
     rendered_criteria, rendered_criteria_with_state, rendered_health_issues,
 )
 from personas.code_reviewer.pinned_review import pin_line, pin_review
+from personas.tpm.dor_checks import loom_footer_model
+from personas.tpm.persona import is_trusted_operator
 from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
 from personas.tpm.issue_fetcher import build_issue_details_fetcher
@@ -1099,6 +1103,49 @@ def _tier_served_note(tier_served: str | None) -> str:
     return f"\n\nTier served: `{tier_served}`." if tier_served else ""
 
 
+_SAME_FAMILY_NOTE = (
+    "same-family review: no arm of another model family answered, so this "
+    "pull request was read by a model family that shares its author's blind spots."
+)
+
+
+def _family_line(families: ReviewFamilies) -> str:
+    return (
+        f"Author family: `{families.author}`. "
+        f"Reviewer family: `{families.reviewer}`."
+    )
+
+
+def _family_note(families: ReviewFamilies | None) -> str:
+    """Who wrote and who reviewed this pull request (grug#1437). Both names
+    come from the closed family table, never from the pull request body."""
+    if families is None:
+        return ""
+    note = f"\n\n{_family_line(families)}"
+    return f"{note}\n\n{_SAME_FAMILY_NOTE}" if families.same_family else note
+
+
+def _activity_families(families: ReviewFamilies | None) -> dict[str, str]:
+    """The two family columns of an activity row; none without an author."""
+    if families is None:
+        return {}
+    return {
+        "author_family": families.author,
+        "reviewer_family": families.reviewer,
+    }
+
+
+def _author_family(pr: Mapping[str, Any]) -> str | None:
+    """The family of the model a trusted operator's Loom footer names, or None.
+
+    Chief's parser, so the two agree. The body is the author's own text, so a
+    stranger's footer is ignored: it could otherwise steer the review off an
+    arm, or onto a paid tier."""
+    if not is_trusted_operator(pr):
+        return None
+    return model_family(loom_footer_model(str(pr.get("body") or "")))
+
+
 def _hunt_title(title: str, living_range: str) -> str:
     return f"Living Hunt {living_range} - {title}" if living_range else title
 
@@ -1165,7 +1212,9 @@ def _summary_markdown(
         duplicate_paths,
     )
     defensive_note = _defensive_drop_note(defensive_dropped_count)
-    tier_note = _tier_served_note(getattr(evaluation, "tier_served", None))
+    tier_note = _tier_served_note(getattr(evaluation, "tier_served", None)) + _family_note(
+        getattr(evaluation, "families", None),
+    )
     hunt = _hunt_section(living_range, living_baseline_rejected)
 
     if is_partial_coverage(evaluation.degraded_reason):
@@ -1751,6 +1800,7 @@ def _stack_detail_lines(
     review_phase: str, living_range: str, suppressed_count: int,
     head_sha: str = "", base_sha: str = "",
     tier_served: str | None = None,
+    families: ReviewFamilies | None = None,
 ) -> str:
     """The two facts a skeptical reader asks for: what was looked at, and what
     was withheld. Everything else that used to live here was cut as noise.
@@ -1774,6 +1824,10 @@ def _stack_detail_lines(
         lines.append(f"- Looked at: {scope}")
     if tier_served:
         lines.append(f"- Tier served: `{tier_served}`")
+    if families is not None:
+        lines.append(f"- {_family_line(families)}")
+        if families.same_family:
+            lines.append(f"- {_SAME_FAMILY_NOTE}")
     if suppressed_count:
         lines.append(f"- Grug swallow {suppressed_count} weak thought(s).")
     return "\n".join(lines)
@@ -1975,6 +2029,7 @@ def _review_stack_body(
         _stack_detail_lines(
             review_phase, living_range, suppressed_count, head_sha, base_sha,
             tier_served=getattr(evaluation, "tier_served", None),
+            families=getattr(evaluation, "families", None),
         ),
     ] if p)
     if detail:
@@ -3240,6 +3295,9 @@ def dispatch_code_review(
     private = _repo_private(payload)
     if private is not None:
         pr_context["repo_private"] = private
+    author_family = _author_family(pr)
+    if author_family:
+        pr_context["author_family"] = author_family
     labels = _pr_labels(pr)
     pr_context["sensitive_review"] = "class:sensitive" in labels
 
@@ -4252,6 +4310,7 @@ def dispatch_code_review(
         findings_count=len(evaluation.findings),
         blocking=blocking,
         degraded_reason=outcome.feed_degraded_reason,
+        **_activity_families(evaluation.families),
     )
     # Living Hunt: remember this head only when the check actually landed
     # and the review was not an infra skip (so the next push can delta).
