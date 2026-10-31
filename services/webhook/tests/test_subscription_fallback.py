@@ -416,3 +416,62 @@ def test_attribution_in_metrics(monkeypatch) -> None:
 
     last_resort_metrics = [c for c in emitted_counts if c[0] == "grug.elder.last_resort_call"]
     assert any(tags.get("tier") == "subscription" for _, _, tags in last_resort_metrics)
+
+
+def test_the_subscription_timeout_leaves_room_for_a_queued_call(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
+    monkeypatch.delenv("GRUG_SUBSCRIPTION_TIMEOUT_S", raising=False)
+    assert lc._subscription_fallback_config().timeout_seconds == 120.0
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("90", 90.0), ("", 120.0), ("soon", 120.0), ("0", 120.0), ("-5", 120.0), ("nan", 120.0), ("inf", 120.0),
+])
+def test_the_subscription_timeout_env_is_read_and_a_bad_value_is_ignored(
+    monkeypatch, raw: str, expected: float,
+) -> None:
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_TIMEOUT_S", raw)
+    assert lc._subscription_fallback_config().timeout_seconds == expected
+
+
+def test_the_lane_bearer_comes_from_ssm_when_a_path_is_set(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
+    monkeypatch.setattr(lc, "get_subscription_lane_token", lambda: "lane-token")
+    cfg = lc._subscription_fallback_config()
+    assert lc._merged_headers(cfg, cfg.key_loader())["Authorization"] == "Bearer lane-token"
+
+
+def test_the_author_family_reaches_the_lane_only_inside_a_gated_walk(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
+    cfg = lc._subscription_fallback_config()
+    assert "X-Review-Author-Family" not in lc._merged_headers(cfg, "k")
+    token = lc._FAMILY_GATE.set(("gpt", False))
+    try:
+        assert lc._merged_headers(cfg, "k")["X-Review-Author-Family"] == "gpt"
+    finally:
+        lc._FAMILY_GATE.reset(token)
+
+
+def test_a_lane_named_for_no_family_is_not_gated_off_a_reviewed_family(monkeypatch) -> None:
+    token = lc._FAMILY_GATE.set(("gpt", False))
+    try:
+        assert not lc._family_gated("subscription-lane")
+    finally:
+        lc._FAMILY_GATE.reset(token)
+
+
+def test_the_egress_policy_opens_the_lane_the_manifests_name() -> None:
+    """A manifest URL means nothing if the namespace's egress fence drops it:
+    the first rollout timed out on every call this way (#1546)."""
+    from pathlib import Path
+    from urllib.parse import urlsplit
+
+    k8s = Path(__file__).resolve().parents[3] / "k8s"
+    policy = (k8s / "networkpolicy.yaml").read_text()
+    consumer = (k8s / "consumer-deployment.yaml").read_text()
+    url_line = next(line for line in consumer.splitlines() if "GRUG_SUBSCRIPTION_URL" in line)
+    url = url_line.split("value:")[1].strip(" }")
+    assert urlsplit(url).hostname == "forward.subscription-lane.svc"
+    assert "kubernetes.io/metadata.name: subscription-lane" in policy
+    assert "matchLabels: {app: forward}" in policy

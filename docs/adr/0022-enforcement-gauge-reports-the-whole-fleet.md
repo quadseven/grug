@@ -78,3 +78,20 @@ see when something is wrong cannot distinguish "fine" from "gone".
 
 `min:grug.enforcement.state{env:prod} by {repo}` immediately after the query
 change: 16 repos in scope, 14 at 0.5, 2 at 1.0, **none** breaching.
+
+## Addendum (2026-10-31): hourly per repo, and no monitor
+
+Reading every repo's rulesets on every 15-minute run cost about 65 calls a
+run, so the decision above changes in one respect: a repo reports on its hourly
+turn, not on every poll cycle. Opted-out repos cost no GitHub call and still
+report on every cycle.
+
+Detection stays hourly because it is how a removed ruleset is found. Turns are
+spread by `tick_due(repo_id, ...)`. Each repo's last good check is stored, so a
+missed run catches up on the next one, and an `error` or `permission_denied`
+answer does not count as good. A repo that is not due counts as
+`enforcement_skipped`, apart from emitted and failed.
+
+Datadog is off and the monitor no longer exists (#1223), so the 24-hour latch
+this ADR describes does not apply today, and nothing reads the gauge. A `none`,
+`error` or `permission_denied` state now also logs `enforcement_gap_detected`.
