@@ -560,9 +560,11 @@ class _InteractiveHttp:
 
     def __init__(self) -> None:
         self.posts: list[dict] = []
+        self.urls: list[str] = []
 
     def post(self, url: str, **kw: object):
         self.posts.append(kw.get("json") or {})
+        self.urls.append(url)
         return _Ok()
 
     def get(self, url: str, **kw: object):
@@ -809,8 +811,12 @@ def test_allowed_app_bot_queues_improve_with_no_collaborator_record(
     assert enqueued[0]["persona"] == "code_reviewer"
     assert enqueued[0]["repo"] == "myorg/myrepo"
     # Only the PR fetch is made - the collaborator lookup is short circuited.
-    assert len(http.posts) == 1
-    assert "Elder is re-reviewing this PR" in str(http.posts[0].get("body", ""))
+    # The command is an `issue_comment`, so the reaction goes to issues/comments
+    # and is the only post: no reply comment (grug#1433).
+    assert http.urls == [
+        "https://api.github.com/repos/myorg/myrepo/issues/comments/777/reactions",
+    ]
+    assert http.posts == [{"content": "eyes"}]
 
 
 def test_unknown_app_bot_is_refused_with_a_reply(
