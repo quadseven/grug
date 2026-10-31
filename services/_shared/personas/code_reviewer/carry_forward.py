@@ -105,20 +105,27 @@ def _thread_is_resolved(thread: dict) -> bool:
     return bool(resolver)
 
 
+def _carriable(thread: dict) -> tuple[str, str, int] | None:
+    """`(rule, path, original_line)` of an open, unchanged Elder thread whose
+    rule is not measured again on every review, else None."""
+    if _thread_is_resolved(thread) or thread.get("isOutdated"):
+        return None
+    owned = _owned_rule_and_line(thread)
+    if owned is None or owned[0] == deferred_ruff.RULE:
+        return None
+    return owned
+
+
 def select_carried(
     threads: list[dict], findings: tuple[Finding, ...],
 ) -> tuple[CarriedFinding, ...]:
     """Open, unchanged, Elder-owned threads this review does not re-raise."""
     out: list[CarriedFinding] = []
     for t in threads:
-        if _thread_is_resolved(t) or t.get("isOutdated"):
-            continue
-        owned = _owned_rule_and_line(t)
+        owned = _carriable(t)
         if owned is None:
             continue
         rule, path, original_line = owned
-        if rule == deferred_ruff.RULE:
-            continue
         first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
         severity = _standing_severity(first.get("body") or "")
         if severity is None:

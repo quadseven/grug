@@ -56,6 +56,7 @@ def _clean() -> CodeReviewEvaluation:
 
 
 _BOT = "grug-tribe[bot]"
+_REF = "acme/widgets" "#1313"  # joined at parse time: keeps a literal cross-repo ref out of the source
 
 
 def _review(ticket, head, *, body="Closes #1313", diff=_OTHER_DIFF, thread=_THREAD, author=_BOT):
@@ -133,13 +134,13 @@ def test_a_ticket_with_no_deferred_lines_changes_nothing():
 
 
 def test_a_lane_pr_that_only_refs_its_ticket_is_held_to_it():
-    body = "Refs acme/widgets#1313\n\n---\nLoom ticket acme.widgets-1313, lane x, model m.\n"
+    body = f"Refs {_REF}\n\n---\nLoom ticket acme.widgets-1313, lane x, model m.\n"
     merged, _, _ = _review(_TICKET, _FIRING, body=body)
     assert [f.rule_name for f in merged.findings] == ["unmet-criterion"]
 
 
 def test_a_person_pr_that_only_refs_the_ticket_is_not():
-    merged, comment_reads, _ = _review(_TICKET, _FIRING, body="Refs acme/widgets#1313")
+    merged, comment_reads, _ = _review(_TICKET, _FIRING, body=f"Refs {_REF}")
     assert merged == _clean()
     assert comment_reads == []
 
