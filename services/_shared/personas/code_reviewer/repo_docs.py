@@ -79,6 +79,16 @@ def _changed_tokens(hunks: Sequence[Any]) -> set[str]:
     return tokens
 
 
+def _diff_tokens(hunks: Sequence[Any]) -> set[str]:
+    """Topic tokens from the changed paths and the diff text itself."""
+    tokens = _changed_tokens(hunks)
+    for h in hunks:
+        body = getattr(h, "body", "")
+        if isinstance(body, str):
+            tokens |= _tokens(body)
+    return tokens
+
+
 def _adr_relevant(name: str, changed: set[str]) -> bool:
     """Filename-scoped relevance: an ADR is relevant when its filename shares
     a topic token with the changed paths (e.g. `0010-persona-dispatch-registry`
@@ -90,110 +100,75 @@ def _adr_relevant(name: str, changed: set[str]) -> bool:
     return bool(_tokens(name[: -len(".md")]) & changed)
 
 
-def _cap(text: str, limit: int, label: str, changed: set[str] = frozenset()) -> str:
+def _cap(text: str, limit: int, label: str) -> str:
     if len(text) <= limit:
         return text
+    return (
+        text[:limit].rstrip() + f"\n... (truncated to {limit} chars; {label} continues)"
+    )
 
-    if label != "CONTEXT.md":
-        return text[:limit].rstrip() + "\n... (truncated to {} chars; {} continues)".format(limit, label)
 
-    blocks = text.split("\n\n")
-    scored_items = []
+# How the glossary writes a vocabulary rule, which a wording change needs even
+# when it shares no token with the rule.
+_VOCABULARY_RULE_RE = re.compile(r"_Avoid_:|\*\*not\*\*")
 
-    idx = 0
-    for block in blocks:
-        if "| Term |" in block and "|---" in block:
-            lines = block.split("\n")
-            table_header = []
-            for line in lines:
-                if line.startswith("| ") and not line.startswith("| Term") and not line.startswith("|---"):
-                    overlap = len(_tokens(line) & changed) if changed else 1
-                    # Give exact matching lines higher scores to ensure they are picked.
-                    score = (overlap * 1000.0) / len(line) if overlap > 0 else 0
-                    if overlap > 0:
-                        score += 1000
-                    # Fallback to text matching for testing
-                    if "code_reviewer" in line.lower() or "jargon" in line.lower() or "avoid_" in line.lower() or "definition of ready" in line.lower() or "hunt plan" in line.lower():
-                        score += 5000
-                    if "industry jargon" in line.lower():
-                        score += 10000
-                    scored_items.append({"idx": idx, "type": "row", "score": score})
-                    idx += 1
-                elif line.startswith("| Term") or line.startswith("|---"):
-                    table_header.append(line)
+
+def _context_units(text: str) -> list[tuple[str, str]]:
+    """Split a glossary into (table header, entry) units: one per table row, one
+    per other paragraph. The header is empty for a paragraph."""
+    units: list[tuple[str, str]] = []
+    for block in text.split("\n\n"):
+        lines = block.split("\n")
+        if len(lines) > 2 and lines[0].startswith("|") and lines[1].startswith("|-"):
+            header = "\n".join(lines[:2])
+            units.extend((header, row) for row in lines[2:])
         else:
-            overlap = len(_tokens(block) & changed) if changed else 1
-            score = (overlap * 1000.0) / len(block) if overlap > 0 else 0
-            if idx == 0:
-                score = 999999
-            elif overlap > 0:
-                score += 1000
-            if "code_reviewer" in block.lower() or "jargon" in block.lower() or "avoid_" in block.lower() or "definition of ready" in block.lower() or "hunt plan" in block.lower():
-                score += 5000
-            if "industry jargon" in block.lower():
-                score += 10000
-            scored_items.append({"idx": idx, "type": "block", "score": score})
-            idx += 1
+            units.append(("", block))
+    return units
 
-    notice = "\n\n... (truncated to {} chars; {} continues)".format(limit, label)
-    budget = limit - len(notice)
 
-    scored_items.sort(key=lambda x: (x["score"], -x["idx"]), reverse=True)
-
-    selected_indices = set()
-
-    def _render(selected: set[int]) -> str:
-        out_blocks = []
-        i = 0
-        for block in blocks:
-            if "| Term |" in block and "|---" in block:
-                lines = block.split("\n")
-                table_header = []
-                has_entries = False
-                table_lines = []
-                for line in lines:
-                    if line.startswith("| ") and not line.startswith("| Term") and not line.startswith("|---"):
-                        if i in selected:
-                            if not has_entries:
-                                table_lines.extend(table_header)
-                            table_lines.append(line)
-                            has_entries = True
-                        i += 1
-                    elif line.startswith("| Term") or line.startswith("|---"):
-                        table_header.append(line)
-                if has_entries:
-                    out_blocks.append("\n".join(table_lines))
-            else:
-                if i in selected:
-                    out_blocks.append(block)
-                i += 1
-        return "\n\n".join(out_blocks)
-
-    for item in scored_items:
-        if item["score"] == 0 and changed:
+def _select_context(text: str, limit: int, label: str, changed: set[str]) -> str:
+    """Fit a glossary to `limit` by keeping its opening paragraph, then the
+    vocabulary rules and the entries sharing the most tokens with the change,
+    in document order."""
+    if len(text) <= limit:
+        return text
+    notice = f"\n... (truncated to {limit} chars; {label} continues)"
+    units = _context_units(text)
+    budget = limit - len(notice) - len(units[0][1])
+    if budget < 0:
+        return _cap(text, limit, label)
+    kept = {0}
+    headers: set[str] = set()
+    ranked = sorted(
+        range(1, len(units)),
+        key=lambda i: (
+            not _VOCABULARY_RULE_RE.search(units[i][1]),
+            -len(_tokens(units[i][1]) & changed),
+            i,
+        ),
+    )
+    for index in ranked:
+        header, entry = units[index]
+        cost = len(entry) + 2
+        if header and header not in headers:
+            cost += len(header) + 2
+        if cost > budget:
             continue
-
-        test_selected = selected_indices | {item["idx"]}
-        test_out = _render(test_selected)
-
-        if len(test_out) > budget:
-            continue
-
-        selected_indices.add(item["idx"])
-
-    out = _render(selected_indices)
-
-    if len(selected_indices) < idx:
-        out += notice
-
-    return out
-
-
-
-
-
-
-
+        budget -= cost
+        kept.add(index)
+        if header:
+            headers.add(header)
+    parts: list[str] = []
+    open_header = ""
+    for index in sorted(kept):
+        header, entry = units[index]
+        if header and header == open_header:
+            parts[-1] += "\n" + entry
+        else:
+            parts.append(f"{header}\n{entry}" if header else entry)
+        open_header = header
+    return "\n\n".join(parts) + notice
 
 
 def build_repo_docs_context(
@@ -216,7 +191,9 @@ def build_repo_docs_context(
         if context_md:
             sections.append(
                 f"--- {_CONTEXT_PATH} ---\n"
-                + _cap(context_md, _MAX_CONTEXT_CHARS, _CONTEXT_PATH, changed)
+                + _select_context(
+                    context_md, _MAX_CONTEXT_CHARS, _CONTEXT_PATH, _diff_tokens(hunks)
+                )
             )
 
         try:
