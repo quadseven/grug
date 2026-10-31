@@ -104,6 +104,15 @@ def _every_poller_pass_is_due(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _forget_guideline_files() -> Iterator[None]:
+    """The guideline cache outlives a test, and tests reuse one repo and head."""
+    lc = sys.modules.get("llm_client")
+    if lc is not None:
+        lc._guideline_cache.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     """grug#1225: the LLM provider breaker is module state, and a shell's
     GRUG_DISABLED_BACKENDS must not reach a test. Without the reset, one test
@@ -114,6 +123,7 @@ def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     lc = sys.modules.get("llm_client")
     if lc is not None:
         monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
+        monkeypatch.setattr(lc, "_limit_refusals", {}, raising=False)
 
 
 @pytest.fixture(autouse=True)
