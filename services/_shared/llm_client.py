@@ -50,7 +50,7 @@ from typing import Any, Callable, Iterator, Literal, Optional, Sequence, TypedDi
 
 import httpx
 
-from code_review_prompt import PromptVariant, build_system_prompt
+from code_review_prompt import _RULE_NAME_RE, PromptVariant, build_system_prompt
 from openrouter_free_limiter import (
     RateLimitTimeoutError,
     acquire_free_tier_slot,
@@ -755,6 +755,9 @@ _WITHDRAWN_TAIL = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+# grug#1529: a hint, never a verdict. It decides nothing but a note and a log
+# line; only the structured verdict removes a candidate.
+_OMIT_HINT = re.compile(r"^omit(?: [-\u2013\u2014] not a secret)?\.?$", re.IGNORECASE)
 
 
 def is_withdrawn_finding(finding: "Finding") -> bool:
@@ -766,6 +769,12 @@ def is_withdrawn_finding(finding: "Finding") -> bool:
         return True
     sentences = [s for s in _SENTENCE_SPLIT.split(finding.message.strip()) if s]
     return bool(sentences) and bool(_WITHDRAWN_TAIL.match(sentences[-1].strip()))
+
+
+def concludes_omit(finding: "Finding") -> bool:
+    """Whether the message's final sentence says to omit it (grug#1529)."""
+    sentences = [s for s in _SENTENCE_SPLIT.split(finding.message.strip()) if s]
+    return bool(sentences) and bool(_OMIT_HINT.match(sentences[-1].strip()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -2950,6 +2959,12 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         return None, f"bad_type:{type(e).__name__}"
     if severity not in SEVERITIES:
         return None, f"invalid_severity:{severity[:32]}"
+    # The rule reaches log lines and comment markers. Model output that is not
+    # a rule name degrades to a placeholder, and the finding still lands. The
+    # digest keeps two distinct rules apart in merge and dedupe.
+    if not _RULE_NAME_RE.fullmatch(rule):
+        digest = hashlib.sha256(rule.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+        rule = f"unknown-rule-{digest}"
     # #553 optional fields: malformed values DEGRADE (finding still lands),
     # never reject - a hostile model must not be able to drop a real
     # finding by attaching a bad suggestion.
@@ -4308,6 +4323,9 @@ def _merge_review_findings(
             other = current if preferred is finding else finding
             merged[key] = replace(
                 current,
+                # Both sides are out here. A preferred message need not carry
+                # the withdrawal, so the flag must.
+                withdrawn=current_out,
                 severity=severity,
                 # Prefer the explanation from the model that assigned the
                 # stronger severity; use length only as a same-severity
