@@ -17,15 +17,24 @@ import review_label
 class _Resp:
     """Minimal httpx.Response stand-in."""
 
-    def __init__(self, status_code: int, body: dict | None = None) -> None:
+    def __init__(
+        self, status_code: int, body: dict | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self._body = body or {}
+        self.headers = headers or {}
 
     def json(self) -> dict:
         return self._body
 
     def raise_for_status(self) -> None:
         return None
+
+
+@pytest.fixture(autouse=True)
+def _forget_label_lists():
+    review_label._label_lists.clear()
 
 
 class _FakeHttp:
@@ -349,3 +358,55 @@ def test_one_unreadable_repo_does_not_stop_the_sweep(monkeypatch):
     deletes = [c[1] for c in fake.calls if c[0] == "delete"]
     assert removed == 3
     assert all("/myorg/second/" in u for u in deletes)
+
+
+# --- conditional sweep reads -----------------------------------------------
+
+
+def _scripted_issues(monkeypatch, answers: list[_Resp]) -> list[str]:
+    sent: list[str] = []
+
+    def _get(_url: str, **kw: object) -> _Resp:
+        sent.append(kw["headers"].get("If-None-Match", ""))  # type: ignore[attr-defined]
+        return answers.pop(0)
+
+    monkeypatch.setattr(review_label.httpx, "get", _get)
+    return sent
+
+
+def test_an_unchanged_label_list_costs_no_budget_and_keeps_its_prs(monkeypatch):
+    """A 304 is free, and it still means "these PRs carry the label", so the
+    sweep must go on checking them."""
+    sent = _scripted_issues(monkeypatch, [
+        _Resp(200, [{"number": 7}], {"ETag": '"one"'}),
+        _Resp(304),
+        _Resp(304),
+    ])
+    for _ in range(3):
+        assert review_label._labeled_prs_for_repo("tok", "o", "r") == [7]
+    assert sent == ["", '"one"', '"one"']
+
+
+def test_a_changed_label_list_replaces_the_remembered_one(monkeypatch):
+    sent = _scripted_issues(monkeypatch, [
+        _Resp(200, [{"number": 7}], {"ETag": '"one"'}),
+        _Resp(200, [{"number": 8}], {"ETag": '"two"'}),
+        _Resp(304),
+    ])
+    review_label._labeled_prs_for_repo("tok", "o", "r")
+    assert review_label._labeled_prs_for_repo("tok", "o", "r") == [8]
+    assert review_label._labeled_prs_for_repo("tok", "o", "r") == [8]
+    assert sent == ["", '"one"', '"two"']
+
+
+def test_a_list_past_one_page_is_not_remembered(monkeypatch):
+    """A 304 on page one says nothing about page two."""
+    full = [{"number": n} for n in range(1, 101)]
+    answers = [
+        _Resp(200, full, {"ETag": '"p1"'}),
+        _Resp(200, [{"number": 101}], {"ETag": '"p2"'}),
+    ]
+    sent = _scripted_issues(monkeypatch, [*answers, *answers])
+    assert len(review_label._labeled_prs_for_repo("tok", "o", "r")) == 101
+    assert len(review_label._labeled_prs_for_repo("tok", "o", "r")) == 101
+    assert sent == ["", "", "", ""]

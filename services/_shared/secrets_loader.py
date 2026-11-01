@@ -84,6 +84,12 @@ def get_poolside_api_key() -> str:
     return _get_ssm_secure_string(name)
 
 
+def get_subscription_lane_token() -> str:
+    """Bearer for the subscription lane, or "" when no SSM path is set."""
+    name = os.getenv("GRUG_SUBSCRIPTION_TOKEN_SSM", "")
+    return _get_ssm_secure_string(name) if name else ""
+
+
 def get_opencode_go_api_key() -> str:
     """grug#910. SSM param `/infra/llm/opencode_go_api_key` per this repo's
     `/infra/llm/<provider>_api_key` convention."""

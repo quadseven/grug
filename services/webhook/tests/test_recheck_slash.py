@@ -523,11 +523,13 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     seen = {}
     monkeypatch.setattr(fetchers, "build_issue_fetcher", lambda **kw: "F")
     monkeypatch.setattr(fetchers, "build_issue_facts_fetcher", lambda **kw: "FF")
+    monkeypatch.setattr(fetchers, "build_merged_siblings_fetcher", lambda **kw: "S")
 
     def _eval(body, fetch_issue=None, fetch_issue_facts=None, author_trusted=False,
-              fetch_changed_files=None, advisory_checks=None):
+              fetch_changed_files=None, advisory_checks=None, fetch_siblings=None):
         seen["eval"] = (body, fetch_issue, fetch_issue_facts, fetch_changed_files,
                         advisory_checks)
+        seen["siblings"] = fetch_siblings
         seen["trusted"] = author_trusted
         return "EVAL"
 
@@ -542,7 +544,7 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     )
     assert evaluation == "EVAL" and result_map["result"] == "pass"
     body, fi, ff, fcf, ac = seen["eval"]
-    assert body == "B" and fi == "F" and ff == "FF"
+    assert body == "B" and fi == "F" and ff == "FF" and seen["siblings"] == "S"
     assert callable(fcf)  # the shared changed-files fetcher is wired through
     assert "in-scope" in ac  # advisory set passed through
     assert seen["trusted"] is False  # default keeps the pre-#1251 skip
@@ -560,9 +562,11 @@ class _InteractiveHttp:
 
     def __init__(self) -> None:
         self.posts: list[dict] = []
+        self.urls: list[str] = []
 
     def post(self, url: str, **kw: object):
         self.posts.append(kw.get("json") or {})
+        self.urls.append(url)
         return _Ok()
 
     def get(self, url: str, **kw: object):
@@ -809,8 +813,12 @@ def test_allowed_app_bot_queues_improve_with_no_collaborator_record(
     assert enqueued[0]["persona"] == "code_reviewer"
     assert enqueued[0]["repo"] == "myorg/myrepo"
     # Only the PR fetch is made - the collaborator lookup is short circuited.
-    assert len(http.posts) == 1
-    assert "Elder is re-reviewing this PR" in str(http.posts[0].get("body", ""))
+    # The command is an `issue_comment`, so the reaction goes to issues/comments
+    # and is the only post: no reply comment (grug#1433).
+    assert http.urls == [
+        "https://api.github.com/repos/myorg/myrepo/issues/comments/777/reactions",
+    ]
+    assert http.posts == [{"content": "eyes"}]
 
 
 def test_unknown_app_bot_is_refused_with_a_reply(
@@ -859,5 +867,6 @@ def test_deployed_allowed_app_bot_logins_is_not_empty():
     logins = {name.lower() for name in value.replace(",", " ").split()}
     assert {"loom-brain[bot]", "loom-station[bot]", "loom-lanes[bot]",
             "agent-anthropic-claude-code[bot]", "agent-meta-muse[bot]",
-            "agent-openai-dot[bot]", "agent-google-gemini[bot]"} <= logins
+            "agent-openai-dot[bot]", "agent-openai-codex-luna[bot]",
+            "agent-google-gemini[bot]"} <= logins
 

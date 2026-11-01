@@ -2129,9 +2129,9 @@ def _run_watch_once(monkeypatch, current_pr, expected_pr):
 
     def _fetch(*_a, **_kw):
         stop.set()  # one iteration only
-        return current_pr
+        return current_pr, "etag"
 
-    monkeypatch.setattr(rerun, "_fetch_current_pr", _fetch)
+    monkeypatch.setattr(rerun, "_fetch_pr_if_changed", _fetch)
     rerun._review_staleness_watch_loop(
         1, "o", "r", 7,
         rerun.review_freshness_id_from_pr(expected_pr),
@@ -2175,13 +2175,64 @@ def test_staleness_watch_ignores_a_transient_fetch_failure(monkeypatch):
         stop.set()
         raise RuntimeError("GitHub 502")
 
-    monkeypatch.setattr(rerun, "_fetch_current_pr", _boom)
+    monkeypatch.setattr(rerun, "_fetch_pr_if_changed", _boom)
     rerun._review_staleness_watch_loop(
         1, "o", "r", 7,
         rerun.review_freshness_id_from_pr(_pr("aaaa1111")),
         "aaaa1111", stop, cancel,
     )
     assert cancel.is_set() is False
+
+
+def _watch_github(monkeypatch, answers):
+    """Run the real staleness loop against scripted GitHub answers and return
+    each request's If-None-Match plus whether the review was cancelled."""
+    import threading
+
+    monkeypatch.setattr(rerun, "_STALENESS_WATCH_INTERVAL_S", 0.001)
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _i, fn: fn("tok"))
+    stop, cancel = threading.Event(), threading.Event()
+    sent, pending = [], list(answers)
+
+    def _get(_url, headers=None, timeout=None):
+        sent.append(headers.get("If-None-Match", ""))
+        if len(pending) == 1:
+            stop.set()
+        return pending.pop(0)
+
+    monkeypatch.setattr(rerun.httpx, "get", _get)
+    rerun._review_staleness_watch_loop(
+        1, "o", "r", 7, "freshness", "aaaa1111", stop, cancel,
+    )
+    return sent, cancel.is_set()
+
+
+def _pr_answer(head_sha, etag):
+    request = httpx.Request("GET", "https://api.github.com/repos/o/r/pulls/7")
+    return httpx.Response(
+        200, json=_pr(head_sha), headers={"ETag": etag}, request=request,
+    )
+
+
+def test_staleness_watch_pays_once_for_an_unchanged_pull_request(monkeypatch):
+    """Only the first poll is a full read. Every later one sends the ETag and
+    a 304 keeps the review running, which costs no rate limit."""
+    request = httpx.Request("GET", "https://api.github.com/repos/o/r/pulls/7")
+    unchanged = [httpx.Response(304, request=request) for _ in range(3)]
+    sent, cancelled = _watch_github(
+        monkeypatch, [_pr_answer("aaaa1111", 'W/"one"'), *unchanged],
+    )
+    assert sent == ["", 'W/"one"', 'W/"one"', 'W/"one"']
+    assert cancelled is False
+
+
+def test_staleness_watch_still_cancels_when_the_etag_moves(monkeypatch):
+    sent, cancelled = _watch_github(monkeypatch, [
+        _pr_answer("aaaa1111", 'W/"one"'),
+        _pr_answer("bbbb2222", 'W/"two"'),
+    ])
+    assert sent == ["", 'W/"one"']
+    assert cancelled is True
 
 
 def test_diff_too_large_completes_instead_of_redriving(monkeypatch):

@@ -134,7 +134,9 @@ from personas.tpm.dor_checks import loom_footer_model
 from personas.tpm.persona import is_trusted_operator
 from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
-from personas.tpm.issue_fetcher import build_issue_details_fetcher
+from personas.tpm.issue_fetcher import (
+    build_issue_details_fetcher, build_merged_siblings_fetcher,
+)
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     advisory_when_unrefuted, eval_tags, grade_findings, partition_findings,
@@ -1099,8 +1101,18 @@ def _defensive_drop_note(count: int) -> str:
     return f"\n\n{count} defensive findings dropped: no reachable caller named"
 
 
-def _tier_served_note(tier_served: str | None) -> str:
-    return f"\n\nTier served: `{tier_served}`." if tier_served else ""
+def _tier_served_text(tier_served: str, models_used: tuple[str, ...]) -> str:
+    """The tier, then the models that answered when a reply named them."""
+    models = ", ".join(f"`{_md_code_span(model)}`" for model in models_used)
+    return f"`{tier_served}` ({models})" if models else f"`{tier_served}`"
+
+
+def _tier_served_note(
+    tier_served: str | None, models_used: tuple[str, ...] = (),
+) -> str:
+    if not tier_served:
+        return ""
+    return f"\n\nTier served: {_tier_served_text(tier_served, models_used)}."
 
 
 _SAME_FAMILY_NOTE = (
@@ -1212,9 +1224,10 @@ def _summary_markdown(
         duplicate_paths,
     )
     defensive_note = _defensive_drop_note(defensive_dropped_count)
-    tier_note = _tier_served_note(getattr(evaluation, "tier_served", None)) + _family_note(
-        getattr(evaluation, "families", None),
-    )
+    tier_note = _tier_served_note(
+        getattr(evaluation, "tier_served", None),
+        getattr(evaluation, "models_used", ()),
+    ) + _family_note(getattr(evaluation, "families", None))
     hunt = _hunt_section(living_range, living_baseline_rejected)
 
     if is_partial_coverage(evaluation.degraded_reason):
@@ -1801,6 +1814,7 @@ def _stack_detail_lines(
     head_sha: str = "", base_sha: str = "",
     tier_served: str | None = None,
     families: ReviewFamilies | None = None,
+    models_used: tuple[str, ...] = (),
 ) -> str:
     """The two facts a skeptical reader asks for: what was looked at, and what
     was withheld. Everything else that used to live here was cut as noise.
@@ -1823,7 +1837,7 @@ def _stack_detail_lines(
     if scope:
         lines.append(f"- Looked at: {scope}")
     if tier_served:
-        lines.append(f"- Tier served: `{tier_served}`")
+        lines.append(f"- Tier served: {_tier_served_text(tier_served, models_used)}")
     if families is not None:
         lines.append(f"- {_family_line(families)}")
         if families.same_family:
@@ -2030,6 +2044,7 @@ def _review_stack_body(
             review_phase, living_range, suppressed_count, head_sha, base_sha,
             tier_served=getattr(evaluation, "tier_served", None),
             families=getattr(evaluation, "families", None),
+            models_used=getattr(evaluation, "models_used", ()),
         ),
     ] if p)
     if detail:
@@ -2727,6 +2742,10 @@ def _attach_linked_issue_context(
             fetch_issue=fetch_issue,
             owner=owner,
             repo=repo_name,
+            fetch_siblings=build_merged_siblings_fetcher(
+                installation_id=installation_id, owner=owner, repo=repo_name,
+                pr_number=int(pr_context.get("pr_number") or 0),
+            ),
         )
         if linked:
             pr_context["linked_issue_context"] = linked
@@ -3259,7 +3278,8 @@ def dispatch_code_review(
     as this call is running.
 
     `rerun_pending` (grug#1494): the caller will run this review again if it
-    degrades to `all_failed` (every model rung failed). On a blocking repo the
+    degrades to `all_failed` (every model rung failed), or to a partial or
+    low-confidence review with nothing blocking in it. On a blocking repo the
     check then stays `in_progress` - pending, so the required check still
     blocks the merge - instead of completing `failure` for a retry that is
     already queued. Never set for the last scheduled attempt.
@@ -3995,14 +4015,10 @@ def dispatch_code_review(
             head_sha=head_sha,
         )
 
-    if (
-        rerun_pending
-        and blocking
-        and evaluation.degraded_reason == "all_failed"
-    ):
+    if rerun_pending and blocking and _rerun_before_failing(evaluation):
         return _publish_rerun_pending(
             installation_id, owner, repo_name, pull_number, head_sha,
-            evaluation.degraded_reason,
+            str(evaluation.degraded_reason),
         )
 
     muted = (
@@ -5637,6 +5653,41 @@ def _async_deep_append_if_needed(
     )
 
 
+def _rerun_before_failing(evaluation: CodeReviewEvaluation) -> bool:
+    """Should a blocking repo's degraded review wait for the scheduled re-run
+    instead of publishing `failure` now?
+
+    `all_failed` (#1494): no model answered. A partial review (a cohort
+    failed or was never walked) and a low-confidence review are degraded the
+    same way and fail closed the same way (#1212), so they get the same
+    bounded re-run - unless the pass already found a blocking problem. That
+    is a real verdict, which a full review would publish too, so it fails
+    now and nothing is re-run."""
+    reason = evaluation.degraded_reason
+    if reason == "all_failed":
+        return True
+    return (
+        reason in PUBLISHABLE_DEGRADATIONS
+        and evaluation.conclusion != "failure"
+    )
+
+
+def _rerun_pending_summary(reason: str) -> str:
+    """What the pending check says about the pass that is being re-run."""
+    if reason == "all_failed":
+        what = f"Every model failed this pass (`{reason}`)."
+    else:
+        what = (
+            f"This pass was degraded (`{reason}`) and found nothing blocking, "
+            "so it is not a full review yet."
+        )
+    return (
+        f"{what} Elder re-runs the review automatically. Merge stays "
+        "blocked until a full review lands; if the re-runs also fail this "
+        "check fails. Comment `/grug improve` to re-run sooner."
+    )
+
+
 def _publish_rerun_pending(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, reason: str,
@@ -5645,7 +5696,11 @@ def _publish_rerun_pending(
 
     `in_progress` is not a pass: a required check that has not concluded keeps
     the merge blocked, exactly as the check the enqueue posted. Best-effort -
-    a failed post leaves that earlier pending check in place."""
+    a failed post leaves that earlier pending check in place.
+
+    The result carries `rerun_scheduled` so the durable lane raises for the
+    queue's re-run even for a reason it would otherwise treat as a completed
+    degraded check (partial or low-confidence review)."""
     try:
         with_install_token_retry(
             installation_id,
@@ -5654,14 +5709,12 @@ def _publish_rerun_pending(
                 CheckRunResult(
                     name=_CHECK_NAME, head_sha=head_sha, status="in_progress",
                     conclusion=None,
-                    title="Elder waiting on a model - re-run scheduled",
-                    summary=(
-                        f"Every model failed this pass (`{reason}`). Elder "
-                        "re-runs the review automatically. Merge stays "
-                        "blocked until a full review lands; if the re-runs "
-                        "also fail this check fails. Comment `/grug improve` "
-                        "to re-run sooner."
+                    title=(
+                        "Elder waiting on a model - re-run scheduled"
+                        if reason == "all_failed"
+                        else "Elder review degraded - re-run scheduled"
                     ),
+                    summary=_rerun_pending_summary(reason),
                 ),
                 external_id=(
                     f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
@@ -5679,6 +5732,7 @@ def _publish_rerun_pending(
         )
     return {
         "persona": "code_reviewer", "result": "skipped", "degraded_reason": reason,
+        "rerun_scheduled": "true",
     }
 
 

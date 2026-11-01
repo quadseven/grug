@@ -38,6 +38,7 @@ import httpx
 
 from adapters.install_store import get_repo_config, is_elder_paused  # type: ignore
 from github_app_auth import get_app_id, with_install_token_retry
+from github_budget import count_review_calls
 from check_run_reconciler import _STUCK_IN_PROGRESS_MAX_AGE_MINUTES
 from github_checks_client import (
     CheckRunResult,
@@ -101,10 +102,13 @@ _MAX_SETTLE_SECONDS = 300
 _MAX_INTENT_DRIFT_REDRIVES = 3
 
 # grug#1494: a review where every model failed (`all_failed`) raises, so the
-# queue redelivers it. Deliveries below this number leave a blocking repo's
-# Elder check pending; from this one on the failure is published, so a long
-# provider outage still ends in a red check instead of waiting forever. The
-# queue's own dead-letter limit stays the outer bound.
+# queue redelivers it. A partial or low-confidence review with nothing
+# blocking in it rides the same bound: dispatch leaves it pending and marks
+# the result `rerun_scheduled`, which raises below. Deliveries below this
+# number leave a blocking repo's Elder check pending; from this one on the
+# failure is published, so a long provider outage still ends in a red check
+# instead of waiting forever. The queue's own dead-letter limit stays the
+# outer bound.
 _ALL_FAILED_AUTO_RERUN_DELIVERIES = 3
 # A learn job whose classifier backends are all rate limited or down (the
 # OpenRouter key is free-tier only and refuses intermittently - operator
@@ -1852,6 +1856,33 @@ def _fetch_current_pr(
     )
 
 
+def _fetch_pr_if_changed(
+    install_id: int, owner: str, repo_name: str, pr_number: int, etag: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Read the PR only if it moved since `etag`: the PR and its new ETag, or
+    None and the same ETag on a 304. GitHub does not charge a 304 against the
+    rate limit, so a poll on an unchanged PR is free (grug#1537)."""
+    url = (
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
+        f"/pulls/{pr_number}"
+    )
+
+    def _do(token: str) -> tuple[dict[str, Any] | None, str]:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        if etag:
+            headers["If-None-Match"] = etag
+        resp = httpx.get(url, headers=headers, timeout=_FETCH_TIMEOUT)
+        if resp.status_code == 304:
+            return None, etag
+        resp.raise_for_status()
+        return resp.json(), resp.headers.get("ETag", "")
+
+    return with_install_token_retry(install_id, _do)
+
+
 def _elder_blocking_from_pr(install_id: int, pr: dict[str, Any]) -> bool | None:
     """The repo's `code_reviewer_blocking` for an already-fetched PR, or
     None when it cannot be read. Callers hand None to `degraded_conclusion`,
@@ -2117,10 +2148,16 @@ def _review_staleness_watch_loop(
     already known stale.
 
     A transient GitHub hiccup must never cancel a genuinely current review,
-    so a fetch failure is logged and skipped, not treated as staleness."""
+    so a fetch failure is logged and skipped, not treated as staleness.
+
+    Polls are conditional: only the first one, and one after the PR changes,
+    spends a call from the installation's budget (grug#1537)."""
+    etag = ""
     while not stop.wait(_STALENESS_WATCH_INTERVAL_S):
         try:
-            latest = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+            latest, etag = _fetch_pr_if_changed(
+                install_id, owner, repo_name, pr_number, etag,
+            )
         except Exception as error:  # noqa: BLE001 - transient fetch failure, keep watching
             log.warning(
                 "elder_review_staleness_watch_fetch_failed",
@@ -2130,6 +2167,8 @@ def _review_staleness_watch_loop(
                     "kind": type(error).__name__,
                 },
             )
+            continue
+        if latest is None:
             continue
         # HEAD SHA DECIDES. Killing a running review is only justified when
         # the DIFF changed, because that is the only case where the answer
@@ -2759,18 +2798,19 @@ def _run_hot_review(
                 str((after.get("head") or {}).get("sha") or ""),
             )
             try:
-                result = dispatch_code_review(
-                    _review_payload(
-                        install_id=install_id,
-                        owner=owner,
-                        repo_name=repo_name,
-                        pr_number=pr_number,
-                        pr=after,
-                    ),
-                    blocking=elder_blocking,
-                    cancel_event=watch.cancel,
-                    rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
-                )
+                with count_review_calls(repo_full, pr_number):
+                    result = dispatch_code_review(
+                        _review_payload(
+                            install_id=install_id,
+                            owner=owner,
+                            repo_name=repo_name,
+                            pr_number=pr_number,
+                            pr=after,
+                        ),
+                        blocking=elder_blocking,
+                        cancel_event=watch.cancel,
+                        rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
+                    )
             finally:
                 _stop_staleness_watch(watch)
             degraded_reason = result.get("degraded_reason", "")
@@ -2910,6 +2950,15 @@ def _run_hot_review(
                 # poison monitor covers a sustained outage.
                 raise RuntimeError(
                     f"Elder review degraded: {degraded_reason}"
+                )
+            if result_status == "skipped" and result.get("rerun_scheduled"):
+                # A partial or low-confidence review on a blocking repo left
+                # the check pending because a re-run is still scheduled
+                # (dispatch's `_rerun_before_failing`). Raise for the queue's
+                # re-run, the same bounded lane all_failed uses; the last
+                # delivery publishes the degraded failure and completes.
+                raise RuntimeError(
+                    f"Elder review degraded: {degraded_reason}; re-run scheduled"
                 )
             if (
                 result_status == "skipped"

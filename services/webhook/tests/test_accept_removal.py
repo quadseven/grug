@@ -21,6 +21,8 @@ import pytest
 import rerun
 from adapters import install_store, pg_install_store
 from grug_commands import GrugCommand, parse_command
+import interactive  # type: ignore
+from accept_removal import _post_acceptance_reaction  # type: ignore
 
 from tests.test_removed_files import (  # noqa: F401 - _patch_token is an autouse fixture
     _DELETION_DIFF,
@@ -86,6 +88,7 @@ class _Store:
         self.recorded: list[dict[str, Any]] = []
         self.enqueued: list[dict[str, Any]] = []
         self.replies: list[str] = []
+        self.reactions: list[str] = []
         self.marked: list[int] = []
         self.claimed: set[str] = set()
 
@@ -134,10 +137,14 @@ def _dispatch(monkeypatch, payload: dict[str, Any], *, permission: str = "admin"
     )
     monkeypatch.setattr(pg_install_store, "claim_delivery", store.claim)
     monkeypatch.setattr(rerun, "enqueue_rerun", lambda **k: store.enqueued.append(k))
-    import interactive
+    import interactive  # type: ignore
     monkeypatch.setattr(
         interactive, "_mark_reviewing",
         lambda **k: store.marked.append(k["pr_number"]) or True,
+    )
+    monkeypatch.setattr(
+        "accept_removal._post_acceptance_reaction",
+        lambda token_fn, owner, repo, comment_id: store.reactions.append("eyes") or True,
     )
 
     class _Resp:
@@ -208,7 +215,8 @@ def test_an_admin_records_the_acceptance_on_the_head(monkeypatch):
     # Elder re-reviews, so the check updates with no further step.
     assert [j["persona"] for j in store.enqueued] == ["code_reviewer"]
     assert store.enqueued[0]["dedup_key"]
-    assert any(_SHA[:8] in r and _WORKFLOW in r for r in store.replies)
+    # The acceptance posts a reaction "eyes" to the command comment instead of a reply comment.
+    assert store.reactions == ["eyes"]
     # The same sign `/grug improve` raises while Elder re-reviews.
     assert store.marked == [42]
 
@@ -693,3 +701,39 @@ def test_an_unlinked_commit_author_or_a_truncated_list_refuses_a_trusted_operato
     ), permission="write", commits=commits)
     assert out["status"] == "no_op", out
     assert store.recorded == [] and store.enqueued == []
+
+
+# --- grug#1433: the reaction lands on the issue comment that holds the command
+
+
+class _ReactionHttp:
+    """Records the POST; `status` is what GitHub answers."""
+
+    HTTPStatusError = httpx.HTTPStatusError
+    RequestError = httpx.RequestError
+
+    def __init__(self, status: int = 201) -> None:
+        self.status = status
+        self.posts: list[tuple[str, Any]] = []
+
+    def post(self, url: str, **kw: Any) -> httpx.Response:
+        self.posts.append((url, kw.get("json")))
+        return httpx.Response(self.status, request=httpx.Request("POST", url))
+
+
+def test_acceptance_reaction_goes_to_the_issue_comment_endpoint(monkeypatch):
+    """The command arrives as `issue_comment`, so its reactions live under
+    issues/comments; the pulls/comments path answers 404 for that id."""
+    fake = _ReactionHttp()
+    monkeypatch.setattr(interactive, "httpx", fake)
+    _post_acceptance_reaction(lambda fn: fn("tok"), "o", "r", 7)
+    assert fake.posts == [
+        ("https://api.github.com/repos/o/r/issues/comments/7/reactions", {"content": "eyes"}),
+    ]
+
+
+def test_a_refused_acceptance_reaction_does_not_raise(monkeypatch):
+    """The acceptance is recorded and Elder queued by then, so a reaction
+    GitHub refuses must not turn the delivery into a webhook 500."""
+    monkeypatch.setattr(interactive, "httpx", _ReactionHttp(status=502))
+    _post_acceptance_reaction(lambda fn: fn("tok"), "o", "r", 7)
