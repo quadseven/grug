@@ -581,3 +581,52 @@ def test_stale_prs_paginates_past_ineligible_prefix(monkeypatch):
     out = pulse._stale_prs("tok", "o", "r")
     assert len(out) == 31           # 30 from page 1 + 1 stale from page 2
     assert all(p_["number"] != 31 for p_ in out)  # fresh PR excluded, scan ended
+
+
+def test_idle_labeled_prs_scans_every_page_past_a_large_backlog(monkeypatch):
+    """A repo with more than 500 labeled items still gets every page read:
+    a label past page five must stay reachable by cleanup. A short page
+    ends the scan."""
+    full_pages = 6
+    pages = {
+        page: [
+            {"number": (page - 1) * 100 + i, "pull_request": {}}
+            for i in range(100)
+        ]
+        for page in range(1, full_pages + 1)
+    }
+    last_number = full_pages * 100
+    pages[full_pages + 1] = [{"number": last_number, "pull_request": {}}]
+    requested = []
+
+    def fake_get(url, params=None, **kw):
+        page = params["page"]
+        requested.append(page)
+        return httpx.Response(200, json=pages[page], request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(pulse.httpx, "get", fake_get)
+    out = pulse._idle_labeled_prs("tok", "o", "r")
+    assert requested == list(range(1, full_pages + 2))
+    assert len(out) == last_number + 1
+    assert out[-1]["number"] == last_number
+
+
+def test_idle_labeled_prs_reads_newest_updated_first_and_logs_at_the_cap(
+    monkeypatch, caplog,
+):
+    """The scan is bounded even when every page is full, says so in the log,
+    and sorts so the labels cleanup must remove are read first."""
+    requested = []
+
+    def fake_get(url, params=None, **kw):
+        requested.append(params)
+        body = [{"number": i, "pull_request": {}} for i in range(100)]
+        return httpx.Response(200, json=body, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(pulse.httpx, "get", fake_get)
+    with caplog.at_level("WARNING", logger=pulse.log.name):
+        out = pulse._idle_labeled_prs("tok", "o", "r")
+    assert len(requested) == pulse._MAX_LABEL_PAGES
+    assert len(out) == pulse._MAX_LABEL_PAGES * 100
+    assert (requested[0]["sort"], requested[0]["direction"]) == ("updated", "desc")
+    assert "pulse_idle_label_scan_page_cap" in caplog.text

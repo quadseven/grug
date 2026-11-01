@@ -67,6 +67,7 @@ def _headers(token: str) -> dict[str, str]:
 
 
 _MAX_PR_PAGES = 5
+_MAX_LABEL_PAGES = 50
 
 
 def _stale_prs(token: str, owner: str, repo: str) -> list[dict[str, Any]]:
@@ -125,19 +126,31 @@ def _recent_nudge_exists(token: str, owner: str, repo: str, pr_number: int) -> b
 
 
 def _idle_labeled_prs(token: str, owner: str, repo: str) -> list[dict[str, Any]]:
-    """All labeled pull requests, including closed ones, for label cleanup."""
+    """Labeled pull requests, including closed ones, for label cleanup.
+
+    Newest-updated first: a PR that moved or closed sorts ahead of the
+    still-idle PRs that keep their labels, so the ones cleanup must act on
+    are read first and each removal shifts the next ones forward. Anyone
+    with triage rights can apply the label, plain issues included, so the
+    scan keeps a hard page cap as the backstop (logged, never silent)."""
     out: list[dict[str, Any]] = []
-    for page in range(1, _MAX_PR_PAGES + 1):
+    for page in range(1, _MAX_LABEL_PAGES + 1):
         resp = httpx.get(
             f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/issues",
-            params={"state": "all", "labels": _IDLE_LABEL, "per_page": 100, "page": page},
+            params={"state": "all", "labels": _IDLE_LABEL, "sort": "updated",
+                    "direction": "desc", "per_page": 100, "page": page},
             headers=_headers(token), timeout=_FETCH_TIMEOUT,
         )
         resp.raise_for_status()
         batch = resp.json() or []
         out.extend(item for item in batch if "pull_request" in item)
         if len(batch) < 100:
-            break
+            return out
+    log.warning(
+        "pulse_idle_label_scan_page_cap",
+        extra={"repo": f"{owner}/{repo}", "pages": _MAX_LABEL_PAGES,
+               "labeled_found": len(out)},
+    )
     return out
 
 
