@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import functools
 import logging
+from math import ceil
 import os
 import re
 import threading
+import time
 from collections import deque
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -65,6 +67,7 @@ from llm_client import (
     review_reasoner_diff,
 )
 from voice_pack import VoiceSelection, entitled_voice
+from llm_client import JUDGE_BATCH_SIZE, _review_deadline, _staged_review_budget_s
 from review_evidence import ElderEvidence, assemble_evidence
 from review_types import EFFORTS, SEVERITIES
 from personas.review_publish import (
@@ -145,6 +148,13 @@ from personas.code_reviewer.judge import (
 )
 from personas.code_reviewer.intent_filter import (
     filter_intent_mismatch_findings, scope_intent_mismatch_to_claimed_boxes,
+)
+from personas.code_reviewer.quarantine import (
+    UNAVAILABLE_NOTE as QUARANTINE_UNAVAILABLE_NOTE,
+    merge_by_fingerprint,
+    quarantined_evidence,
+    quarantined_pass_enabled,
+    sensitive_paths,
 )
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_degradation,
@@ -3409,6 +3419,7 @@ def dispatch_code_review(
     # #1350: when this run began, so a clean verdict can tell Elder's own
     # earlier blocks on this head from one another run posts mid-flight.
     run_started_at = datetime.now(timezone.utc)
+    run_started_monotonic = time.monotonic()
     mode: ReviewMode = "blocking" if blocking else "advisory"
     started_at = hunt_now()
     action = payload.get("action", "")
@@ -3983,6 +3994,19 @@ def dispatch_code_review(
     )
     if surviving != evaluation.findings:
         evaluation = with_findings(evaluation, surviving)
+
+    evaluation, quarantine_gap = _run_quarantined_pass(
+        evaluation, hunks, evidence, installation_id,
+        repo_config=repo_config, started=run_started_monotonic,
+        owner=owner, repo_name=repo_name, pull_number=pull_number,
+        head_sha=head_sha,
+        skip=(
+            correctness_only or llm_response.kind != "reviewed"
+            or (cancel_event is not None and cancel_event.is_set())
+        ),
+    )
+    if quarantine_gap:
+        config_note = f"{config_note}\n\n{quarantine_gap}".strip()
 
     # #532: deterministic complexity source. A changed Python function over the
     # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no
@@ -4599,6 +4623,85 @@ def dispatch_code_review(
 
 
 
+def _run_quarantined_pass(
+    evaluation: CodeReviewEvaluation,
+    hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
+    installation_id: int,
+    *,
+    repo_config: RepoConfig,
+    started: float,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    head_sha: str,
+    skip: bool,
+) -> tuple[CodeReviewEvaluation, str]:
+    """The code-only security pass (grug#1569): reviews the sensitive paths
+    without author text, adjudicates with the same quarantined evidence, and
+    merges one way into `evaluation`. Returns the evaluation and a summary
+    note, empty unless the pass failed. The pass is additive, so a failure
+    leaves the normal review standing and names the gap in the summary. It
+    shares the review's wall-clock budget, so it cannot run past the job
+    timeout. One `elder_quarantined_pass` row per run reports calls per PR."""
+    if skip or not quarantined_pass_enabled():
+        return evaluation, ""
+    paths = sensitive_paths(
+        dict.fromkeys(h.path for h in evidence.hunks), repo_config,
+    )
+    if not paths:
+        return evaluation, ""
+    quarantined = quarantined_evidence(evidence, paths)
+    pr = f"{owner}/{repo_name}#{pull_number}"
+    outcome = "unavailable"
+    merged = None
+    model_calls = 0
+    try:
+        with _review_deadline(started + _staged_review_budget_s()):
+            response = review_diff(quarantined, installation_id=installation_id)
+            coverage = response.coverage
+            model_calls = coverage.total_cohorts if coverage else 1
+            if response.kind == "reviewed":
+                graded, _, _, _ = _grade_deep_response(
+                    response, hunks, quarantined, installation_id,
+                    pr_context=quarantined.pr_context or {}, owner=owner,
+                    repo_name=repo_name, pull_number=pull_number,
+                    head_sha=head_sha, arm="quarantined",
+                )
+                merged = merge_by_fingerprint(evaluation.findings, graded.findings)
+                outcome = "partial" if response.error else "reviewed"
+                model_calls += _adjudication_calls(response)
+    except Exception as e:  # noqa: BLE001 - additive; the normal review stands
+        log.warning(
+            "elder_quarantined_pass_failed",
+            extra={"pr": pr, "kind": type(e).__name__}, exc_info=True,
+        )
+    log.info(
+        "elder_quarantined_pass",
+        extra={
+            "installation_id": installation_id,
+            "pr": pr,
+            "outcome": outcome,
+            "sensitive_paths": len(paths),
+            "model_calls": model_calls,
+            "added": merged.added if merged else 0,
+            "raised": merged.raised if merged else 0,
+        },
+    )
+    if merged is not None and merged.findings != evaluation.findings:
+        evaluation = with_findings(evaluation, merged.findings)
+    return evaluation, "" if outcome == "reviewed" else QUARANTINE_UNAVAILABLE_NOTE
+
+
+def _adjudication_calls(response: LlmReviewResponse) -> int:
+    """Judge and refute batches for what the model returned."""
+    blocking = sum(1 for f in response.findings if f.severity in ("high", "critical"))
+    return (
+        ceil(len(response.findings) / JUDGE_BATCH_SIZE)
+        + ceil(blocking / JUDGE_BATCH_SIZE)
+    )
+
+
 def _apply_refute_gate(
     findings, evidence, installation_id, *, owner, repo_name, pull_number, arm,
     plain_findings=(), plain_verdicts=(),
@@ -4862,6 +4965,7 @@ def _grade_deep_response(
     repo_name: str,
     pull_number: int,
     head_sha: str = "",
+    arm: str = "deep",
 ) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
     deep_eval = evaluate_diff(
         hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
@@ -4897,11 +5001,11 @@ def _grade_deep_response(
         owner=owner,
         repo_name=repo_name,
         pull_number=pull_number,
-        arm="deep",
+        arm=arm,
     )
     deep_eval = _apply_bound_name_downgrade(
         deep_eval, evidence.file_contents, installation_id=installation_id,
-        owner=owner, repo_name=repo_name, pull_number=pull_number, arm="deep",
+        owner=owner, repo_name=repo_name, pull_number=pull_number, arm=arm,
     )
     deep_surviving = _apply_refute_gate(
         deep_eval.findings,
@@ -4910,7 +5014,7 @@ def _grade_deep_response(
         owner=owner,
         repo_name=repo_name,
         pull_number=pull_number,
-        arm="deep",
+        arm=arm,
         plain_findings=deep_graded,
         plain_verdicts=deep_verdicts,
     )
