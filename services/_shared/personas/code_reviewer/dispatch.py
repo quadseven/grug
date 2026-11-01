@@ -3230,7 +3230,7 @@ def _fetch_pr_title_and_body(
             return str(body.get("title") or ""), str(body.get("body") or "")
 
         return with_install_token_retry(installation_id, _get)
-    except Exception as e:  # noqa: BLE001 - review-time refresh never aborts review
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
         log.info(
             "code_review_pr_refresh_failed",
             extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},

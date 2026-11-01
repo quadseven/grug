@@ -540,3 +540,35 @@ def test_merge_lane_work_reads_review_time_title_and_criteria_making_removal_non
     wv_high = [f for f in merged_high.findings if f.rule_name == "weakened-test"]
     assert len(wv_high) == 1
     assert wv_high[0].severity == "high"
+
+
+def test_fetch_pr_title_and_body_handles_http_errors_and_propagates_unexpected():
+    from personas.code_reviewer.dispatch import _fetch_pr_title_and_body
+
+    # Short-circuits on falsy inputs
+    assert _fetch_pr_title_and_body(0, "owner", "repo", 1) is None
+
+    # Expected HTTPStatusError returns None
+    with patch("personas.code_reviewer.dispatch.with_install_token_retry") as mock_retry:
+        req = httpx.Request("GET", "https://api.github.com/repos/owner/repo/pulls/1")
+        resp = httpx.Response(404, request=req)
+        mock_retry.side_effect = httpx.HTTPStatusError("not found", request=req, response=resp)
+        assert _fetch_pr_title_and_body(11, "owner", "repo", 1) is None
+
+    # Expected RequestError returns None
+    with patch("personas.code_reviewer.dispatch.with_install_token_retry") as mock_retry:
+        req = httpx.Request("GET", "https://api.github.com/repos/owner/repo/pulls/1")
+        mock_retry.side_effect = httpx.RequestError("connect fail", request=req)
+        assert _fetch_pr_title_and_body(11, "owner", "repo", 1) is None
+
+    # Expected ValueError (e.g. invalid json) returns None
+    with patch("personas.code_reviewer.dispatch.with_install_token_retry") as mock_retry:
+        mock_retry.side_effect = ValueError("bad json")
+        assert _fetch_pr_title_and_body(11, "owner", "repo", 1) is None
+
+    # Bug like TypeError is not swallowed (#1457)
+    with patch("personas.code_reviewer.dispatch.with_install_token_retry") as mock_retry:
+        mock_retry.side_effect = TypeError("bug in code")
+        with pytest.raises(TypeError, match="bug in code"):
+            _fetch_pr_title_and_body(11, "owner", "repo", 1)
+
