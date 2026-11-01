@@ -231,7 +231,11 @@ class PrContext(TypedDict, total=False):
     repo: str
     pr_number: int
     head_sha: str
+    # The diff's start: on a Living Hunt this is the last reviewed head, a PR
+    # commit, so nothing that steers a review may read it.
     base_sha: str
+    # The PR's own base commit, on every pass. Steering files read this (#1574).
+    pr_base_sha: str
     title: str
     body: str
     review_phase: str
@@ -4214,7 +4218,7 @@ def _repo_guidelines_block(pr_context: Optional[PrContext]) -> str:
     owner, repo_name = repo.split("/", 1)
     # The base commit, never the head (#1574): this text steers the review
     # from the system prompt, so a PR must not be able to write it.
-    ref = str(pr_context.get("base_sha", ""))
+    ref = str(pr_context.get("pr_base_sha", ""))
     if not ref:
         return ""
     try:
@@ -4240,12 +4244,12 @@ _GUIDELINE_CANDIDATES = (
 )
 _GUIDELINE_FETCH_TIMEOUT = 10.0
 # Enough for the reviews in flight on one consumer; each entry is one base commit.
-_GUIDELINE_CACHE_HEADS = 32
+_GUIDELINE_CACHE_REFS = 32
 # Only the first `_MAX_GUIDELINES_CHARS` reach the prompt. Keeping more than
 # that leaves room for redaction, and the limit stops a huge file in a pull
 # request from pinning its size in memory for every cached head.
 _GUIDELINE_CACHE_CHARS = 64_000
-_guideline_cache = RepoFileCache(_GUIDELINE_CACHE_HEADS)
+_guideline_cache = RepoFileCache(_GUIDELINE_CACHE_REFS)
 
 
 def _fetch_guideline_files(
@@ -4258,14 +4262,14 @@ def _fetch_guideline_files(
     unreadable file cannot cost the others.
 
     Every cohort, chunk and retry of a review lands here, so each file is
-    read once per head (grug#1535). A 404 is remembered too, since most repos
+    read once per ref (grug#1535). A 404 is remembered too, since most repos
     carry few of these files. Any other failure is not, so it is retried."""
     from urllib.parse import quote
 
     from github_app_auth import with_install_token_retry  # type: ignore
 
-    head = (installation_id, owner, repo, ref)
-    known = _guideline_cache.known(head)
+    key = (installation_id, owner, repo, ref)
+    known = _guideline_cache.known(key)
     missing = [path for path in _GUIDELINE_CANDIDATES if path not in known]
 
     def _do(token: str) -> dict[str, str | None]:
@@ -4290,7 +4294,7 @@ def _fetch_guideline_files(
             except (httpx.HTTPStatusError, httpx.RequestError):
                 continue
             answered[path] = text
-            _guideline_cache.remember(head, path, text)
+            _guideline_cache.remember(key, path, text)
         return answered
 
     if missing:

@@ -15,15 +15,15 @@ data. No repository code runs in a pod that holds a credential.
 
 ## Execution
 
-| Surface | PR-controlled input | Boundary | State |
-| --- | --- | --- | --- |
-| ruff (`lint.py`) | Changed `.py` file text | Scrubbed environment, read-only copy, `--isolated`, no config on disk | Convention only, #1576 |
-| opengrep analyzer (`analyzers.py`) | Changed JS and TS file text | Scrubbed environment, read-only copy, Grug's rules | Convention only, #1576 |
-| opengrep scan (`sast.py`) | All changed file text | Same as above since #1574; a PR's own ignore files are dropped | Convention only, #1576 |
-| Smasher Trial (`smasher/`) | The repo's code and tests | Separate Job, no credential, read-only checkout, deny-all egress policy (ADR-0013) | Sandboxed; off by default |
-| Trial dependency install | Requirements files | Wheels only, in the prep pod, so no build backend runs | Sandboxed; off by default |
-| Trial tarball unpack | Archive member names | Members outside the destination and links are skipped | Handled in code |
-| Grug's own CI | This repo's PRs | No `pull_request_target`; previews run for same-repo PRs only | Handled in config |
+| Surface | PR-controlled input | Read from | Boundary | State |
+| --- | --- | --- | --- | --- |
+| ruff (`lint.py`) | Changed `.py` file text | Head | Scrubbed environment, read-only copy, `--isolated`, no config on disk | Convention only, #1576 |
+| opengrep analyzer (`analyzers.py`) | Changed JS and TS file text | Head | Scrubbed environment, read-only copy, Grug's rules | Convention only, #1576 |
+| opengrep scan (`sast.py`) | All changed file text | Head | Same as above since #1574; a PR's own ignore files are dropped | Convention only, #1576 |
+| Smasher Trial (`smasher/`) | The repo's code and tests | Head | Separate Job, no credential, read-only checkout; deny-all egress needs a policy-enforcing CNI (ADR-0013) | Sandboxed; off by default |
+| Trial dependency install | Requirements files | Head | Wheels only and no build backend, but the prep pod's egress can be steered by the file, #1580 | Partly sandboxed; off by default |
+| Trial tarball unpack | Archive member names | Head | Members outside the destination and links are skipped | Handled in code |
+| Grug's own CI | This repo's PRs | Head | No `pull_request_target`; previews run for same-repo PRs only | Handled in config |
 
 "Convention only" means the child process shares the pod's user id, network and
 filesystem view. Scrubbing keeps secrets out of its environment, and no analyzer
@@ -41,9 +41,11 @@ meet an operating-system boundary.
 | Reply-mined learnings | System prompt | Stored, write access required | Gated by the author's access |
 | `/grug` commands | Reruns, `/grug fix`, removal acceptance | Comment | Gated by the commenter's access |
 | Diff, changed files, PR title and body, linked issues | Prompt, labeled as untrusted data | Head | Data, and #1569 quarantines metadata on sensitive paths |
+| CI check-run names | Prompt, labeled as data | Head | Data |
 | Inline suppression comments | Which analyzer findings exist | Head | Open, #1579 |
 
-"Base commit" is the PR's base, which is not always the default branch: see
+"Base commit" is the PR's own base on every pass, kept apart from a Living
+Hunt's diff start, which is a PR commit. It is not always the default branch: see
 #1578.
 
 Review models have no tools. They read text and return structured findings, and

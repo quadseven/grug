@@ -29,7 +29,7 @@ import os
 import re
 import threading
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -483,7 +483,8 @@ def _load_repo_config(
 
 
 def _load_repo_docs(
-    token: str, owner: str, repo_name: str, base_ref: str, hunks,
+    token: str, owner: str, repo_name: str, base_ref: str,
+    hunks: Sequence[DiffHunk],
 ) -> str | None:
     """CONTEXT.md and the relevant ADRs at the PR BASE. The model reads these
     as the repo's source of truth, so a PR must not be able to write them
@@ -3446,6 +3447,7 @@ def dispatch_code_review(
         "pr_number": pull_number,
         "head_sha": head_sha,
         "base_sha": base_sha,
+        "pr_base_sha": base_sha,
         "title": str(pr.get("title") or ""),
         "body": str(pr.get("body") or ""),
     }
@@ -3840,7 +3842,7 @@ def dispatch_code_review(
         repo_docs_context = with_install_token_retry(
             installation_id,
             lambda token: _load_repo_docs(
-                token, owner, repo_name, str(pr_context.get("base_sha") or ""), hunks,
+                token, owner, repo_name, str(pr_context.get("pr_base_sha") or ""), hunks,
             ),
         )
     except Exception as e:  # noqa: BLE001 — repo docs are additive; never break the review
@@ -4043,7 +4045,7 @@ def dispatch_code_review(
 
     ruff_policy_dropped: list[int] = []
     analyzer_skips: list[tuple[str, str]] = []
-    policy_base = str(pr_context.get("base_sha") or "")
+    policy_base = str(pr_context.get("pr_base_sha") or "")
     ruff_policy = _load_repo_ruff_policy(installation_id, owner, repo_name, policy_base)
     analyzer_engines = configured_engines()
     if not correctness_only and analyzer_engines:

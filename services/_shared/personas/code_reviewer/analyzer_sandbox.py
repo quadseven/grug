@@ -2,7 +2,7 @@
 
 An analyzer is a parser, never a runner: it reads the changed files and
 reports what it sees. Three properties keep it that way, and every analyzer
-(ruff in lint.py, the engines in analyzers.py) goes through this module to
+(ruff in lint.py, the engines in analyzers.py, the scan in sast.py) goes through this module to
 get them:
 
 1. NO CHECKOUT. The analyzer sees only a temp copy of the changed files'
@@ -38,8 +38,7 @@ _WRITABLE_FILE = _READ_ONLY_FILE | stat.S_IWUSR
 _WRITABLE_DIR = _READ_ONLY_DIR | stat.S_IWUSR
 
 
-# Files opengrep reads as settings from the tree it scans, at any depth. The
-# repo's own list is read at the PR base and written in by the caller.
+# Files opengrep reads as settings from the tree it scans, at any depth.
 _ENGINE_CONFIG_NAMES = frozenset({".semgrepignore", ".opengrepignore", ".gitignore"})
 
 

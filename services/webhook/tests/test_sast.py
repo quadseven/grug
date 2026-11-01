@@ -196,7 +196,7 @@ def test_scan_opengrep_run_failure_fails_safe(monkeypatch):
     assert scan_opengrep((_hunk("a.py", {1}),), {"a.py": "x"}) == ()
 
 
-def test_scan_opengrep_points_home_at_writable_scan_dir(monkeypatch):
+def test_scan_opengrep_points_home_beside_the_scanned_tree(monkeypatch):
     """Semgrep initializes ~/.semgrep at startup. The pods run as uid 10001
     with --no-create-home on a readOnlyRootFilesystem, so inheriting the pod
     HOME crashed semgrep with a mkdir PermissionError (exit 1) before it

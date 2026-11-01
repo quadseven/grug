@@ -171,8 +171,7 @@ def _budget_files(file_contents: dict[str, str]) -> tuple[dict[str, str], list[s
     kept: dict[str, str] = {}
     skipped: list[str] = []
     total = 0
-    scannable = without_engine_config(file_contents)
-    for path, content in sorted(scannable.items(), key=lambda kv: len(kv[1])):
+    for path, content in sorted(file_contents.items(), key=lambda kv: len(kv[1])):
         size = len(content.encode("utf-8", "ignore"))
         if total + size > _MAX_SCAN_BYTES:
             skipped.append(path)
@@ -210,8 +209,8 @@ def _opengrep_home_env(scan_tmp: str) -> dict[str, str]:
     instead of once per scan, outside both the scanned tree and the
     size-capped `tmp` volume.
 
-    Returns the scan dir instead when that path is unset or not writable.
-    That is the pre-#865 behaviour: correct but wasteful, and it keeps a
+    Returns `scan_tmp` instead when that path is unset or not writable, which
+    the caller keeps beside the scanned tree: wasteful, but it keeps a
     self-hosted deploy that has not added the volume working rather than
     crashing on an unwritable HOME (the 2026-07-13 zero-findings regression).
     """
@@ -247,7 +246,7 @@ def scan_opengrep(
     """
     if not file_contents:
         return ()
-    kept_files, skipped = _budget_files(file_contents)
+    kept_files, skipped = _budget_files(without_engine_config(file_contents))
     if skipped:
         log.info("sast_opengrep_files_skipped_over_budget", extra={"skipped": len(skipped)})
     if not kept_files:
@@ -285,8 +284,8 @@ def scan_opengrep(
             # A dedicated cache volume fixes all three: extract once per pod,
             # never inside the scanned tree, never against the tmp cap.
             #
-            # Falls back to the old scan-dir behaviour when the cache dir is
-            # unset or not writable, so a self-hosted deploy without the extra
+            # Falls back to a per-run home when the cache dir is unset or not
+            # writable, so a self-hosted deploy without the extra
             # volume still scans (degraded to re-extracting, never broken).
             #
             # The sandbox rules every analyzer follows (#1254) apply here too

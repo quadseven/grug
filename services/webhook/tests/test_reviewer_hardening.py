@@ -279,7 +279,11 @@ def test_guideline_files_steer_a_review_from_the_base_commit_only(monkeypatch):
             "model": "test-model-id",
         })
 
-    context = {"repo": "o/r", "installation_id": 1, "head_sha": _HEAD, "base_sha": _BASE}
+    # A Living Hunt's base_sha is the last reviewed head, a PR commit.
+    context = {
+        "repo": "o/r", "installation_id": 1, "head_sha": _HEAD,
+        "base_sha": _HEAD, "pr_base_sha": _BASE,
+    }
     hunks = [Hunk(path="a.py", body="@@ -1 +1 @@\n+x = 1\n")]
     with patch.object(httpx, "get", side_effect=get), \
             patch.object(httpx, "post", side_effect=post):
