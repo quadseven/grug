@@ -18,6 +18,7 @@ All keys are optional.
 | `path_instructions` | list of `{path, instructions}` | `instructions` is added to the review prompt only when the diff touches a file matching `path`. |
 | `min_inline_severity` | `low`, `medium`, `high`, or `critical` | Findings below this level appear in the check summary but get no inline comment. |
 | `skip_prs` | `{authors, labels, title_patterns}`, each a list of strings | A matching pull request is not reviewed. See below. |
+| `security_review_paths` | list of path globs | Replaces the default sensitive-path list of the code-only security pass. An empty list turns the pass off for this repo. See below. |
 | `elder_mute_min_labeled` | integer, default `20` | Labeled ledger rows a finding class needs before it can be muted. |
 | `elder_mute_below_precision` | number 0 to 1, default `0.2` | A class with at least `elder_mute_min_labeled` labeled rows and a lower fixed-rate is muted: no inline comment, only the board and check summary, marked "muted: fixed in N of M past findings". A high or critical finding still posts inline and blocks. |
 | `elder_mute_locked_classes` | list of class names | These classes keep their inline comments whatever their precision. |
@@ -58,6 +59,10 @@ Elder also reads the repo's agent-guideline files (`CLAUDE.md`, `AGENTS.md`, `.c
 3. Taught rules (learnings).
 
 Path instructions come first because they name specific files. `.grug.yaml` and the guideline files are all read from the base commit, so a PR cannot use its own `CLAUDE.md` to steer its own review; a change to one takes effect once it merges. Both prompt blocks state this order to the model.
+
+## Code-only security pass
+
+When `GRUG_QUARANTINED_SECURITY_PASS` is set on the deployment, a pull request touching a sensitive path gets a second security review of those paths. That pass, its judge, and its refute gate read the diff and code context only: no title, body, linked issue, repo docs, or agent guideline files. Its findings merge with the normal review by file, line, and rule at the stricter severity, and it can never remove a finding. The default list is auth, crypto, payment, secret, and credential paths plus `.github/workflows/`, `.github/actions/`, and `.grug.yaml`.
 
 ## Example
 

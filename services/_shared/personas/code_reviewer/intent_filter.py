@@ -30,7 +30,7 @@ from collections.abc import Iterable
 
 from personas.code_reviewer.persona import Finding
 
-_INTENT_MISMATCH = "intent-mismatch"
+INTENT_MISMATCH = "intent-mismatch"
 
 # A quote is a double-quoted span long enough to carry a real sentence,
 # not a lone identifier the model quoted for emphasis. 12 is the tuned
@@ -112,7 +112,7 @@ def filter_intent_mismatch_findings(
     dropped = 0
     lowered = 0
     for finding in findings:
-        if finding.rule_name != _INTENT_MISMATCH:
+        if finding.rule_name != INTENT_MISMATCH:
             kept.append(finding)
             continue
         spans = _quoted_spans(finding.message)
@@ -293,7 +293,7 @@ def scope_intent_mismatch_to_claimed_boxes(
     kept: list[Finding] = []
     counts = {"kept": 0, "dropped": 0, "lowered": 0}
     for finding in findings:
-        if finding.rule_name != _INTENT_MISMATCH or not scope.boxes:
+        if finding.rule_name != INTENT_MISMATCH or not scope.boxes:
             kept.append(finding)
             continue
         result, outcome = _scoped(finding, scope)

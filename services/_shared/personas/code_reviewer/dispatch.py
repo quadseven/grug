@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import functools
 import logging
+from math import ceil
 import os
 import re
 import threading
+import time
 from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
@@ -57,7 +59,10 @@ from llm_client import (
     DeepEscalationDecision,
     Hunk as LlmHunk,
     LlmReviewResponse,
+    JUDGE_BATCH_SIZE,
     PrContext,
+    _review_deadline,
+    _staged_review_budget_s,
     decide_deep_escalation,
     review_cohort_char_budget,
     review_diff,
@@ -140,11 +145,19 @@ from personas.tpm.issue_fetcher import (
 )
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
-    advisory_when_unrefuted, eval_tags, grade_findings, partition_findings,
-    partition_refuted, refute_with_outcome, submit_evals,
+    advisory_when_unrefuted, eval_tags, falsification_verifier_enabled,
+    falsify_with_outcome, grade_findings, partition_findings,
+    partition_refuted, refute_with_outcome, submit_evals, verifier_rows,
 )
 from personas.code_reviewer.intent_filter import (
     filter_intent_mismatch_findings, scope_intent_mismatch_to_claimed_boxes,
+)
+from personas.code_reviewer.quarantine import (
+    UNAVAILABLE_NOTE as QUARANTINE_UNAVAILABLE_NOTE,
+    merge_by_fingerprint,
+    quarantined_evidence,
+    quarantined_pass_enabled,
+    sensitive_paths,
 )
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation, Finding, evaluate_diff, with_degradation,
@@ -775,7 +788,11 @@ def _enrich_claim_check_sources(
     return merged
 
 
-_RE_REVIEW_ACTIONS = {"synchronize", "reopened", "review"}
+# "rerun" is a `/grug improve` re-review (rerun._dispatch_elder_rerun). It
+# re-reads a PR that already carries Elder threads, so it carries earlier
+# findings forward and withdraws a block it clears like any re-review
+# (grug#1581: without it a clean `/grug improve` left the block standing).
+_RE_REVIEW_ACTIONS = {"synchronize", "reopened", "review", "rerun"}
 
 
 def _carry_into_check(
@@ -838,8 +855,8 @@ def _tidy_fixed_threads(
     """
     # Any re-review of a PR that may already carry Elder threads. Production
     # reviews arrive through the durable queue as action="review"
-    # (rerun._review_payload), so "synchronize" alone never matched live.
-    # Same set the prior-finding dedup uses.
+    # (rerun._review_payload), so "synchronize" alone never matched live;
+    # a `/grug improve` re-review arrives as action="rerun".
     if (
         action not in _RE_REVIEW_ACTIONS
         or not review_published
@@ -3425,6 +3442,7 @@ def dispatch_code_review(
     # #1350: when this run began, so a clean verdict can tell Elder's own
     # earlier blocks on this head from one another run posts mid-flight.
     run_started_at = datetime.now(timezone.utc)
+    run_started_monotonic = time.monotonic()
     mode: ReviewMode = "blocking" if blocking else "advisory"
     started_at = hunt_now()
     action = payload.get("action", "")
@@ -3995,6 +4013,20 @@ def dispatch_code_review(
     if surviving != evaluation.findings:
         evaluation = with_findings(evaluation, surviving)
 
+    evaluation, quarantine_gap = _run_quarantined_pass(
+        evaluation, hunks, evidence, installation_id,
+        repo_config=repo_config, started=run_started_monotonic,
+        voice=voice, cancel_event=cancel_event,
+        owner=owner, repo_name=repo_name, pull_number=pull_number,
+        head_sha=head_sha,
+        skip=(
+            llm_response.kind != "reviewed"
+            or (cancel_event is not None and cancel_event.is_set())
+        ),
+    )
+    if quarantine_gap:
+        config_note = f"{config_note}\n\n{quarantine_gap}".strip()
+
     # #532: deterministic complexity source. A changed Python function over the
     # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no
     # judge (it is precise by construction). It rides the SAME merge rule as the
@@ -4224,6 +4256,7 @@ def dispatch_code_review(
     )
     check_publish_failed = False
     check_run_id: int | None = None
+    check_run_url = ""
     try:
         check_resp = with_install_token_retry(
             installation_id,
@@ -4233,6 +4266,7 @@ def dispatch_code_review(
             ),
         )
         check_run_id = (check_resp or {}).get("id")
+        check_run_url = str((check_resp or {}).get("html_url") or "")
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.error(
             "code_review_check_run_publish_failed",
@@ -4306,20 +4340,23 @@ def dispatch_code_review(
 
     # A blocking review from an earlier commit stays GitHub's standing verdict
     # until it is dismissed; a clean re-review alone does not clear it.
-    # Withdraw it only when the FINAL verdict is clean: a degraded run read
-    # nothing, `conclusion` already folds in earlier findings still open
-    # (carry-forward), and `listed_threads is None` means that fold could not
-    # run, so a living-range review cannot vouch for the commits it skipped.
+    # Withdraw it when the published Elder CHECK concludes `success` on this
+    # head (grug#1581): the dismissal follows the check, so advisory findings
+    # that leave the check green never keep a block alive, while `failure`
+    # and `neutral` keep it. A degraded run read nothing, `conclusion`
+    # already folds in earlier findings still open (carry-forward), and
+    # `listed_threads is None` means that fold could not run, so a
+    # living-range review cannot vouch for the commits it skipped.
     if (
         not evaluation.degraded_reason
-        and evaluation.conclusion != "failure"
-        and conclusion != "failure"
+        and conclusion == "success"
         and listed_threads is not None
         and not check_publish_failed
     ):
         _dismiss_stale_blocks(
             installation_id, owner, repo_name, pull_number, head_sha,
             run_started_at,
+            clean_url=check_run_url or str((review_resp or {}).get("html_url") or ""),
         )
 
     # Capture inline-comment IDs for later reaction polling (#247). BEST-
@@ -4605,6 +4642,106 @@ def dispatch_code_review(
 
 
 
+def _run_quarantined_pass(
+    evaluation: CodeReviewEvaluation,
+    hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
+    installation_id: int,
+    *,
+    repo_config: RepoConfig,
+    started: float,
+    voice: VoiceSelection,
+    cancel_event: threading.Event | None,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    head_sha: str,
+    skip: bool,
+) -> tuple[CodeReviewEvaluation, str]:
+    """The code-only security pass (grug#1569): reviews the sensitive paths
+    without author text, adjudicates with the same quarantined evidence, and
+    merges one way into `evaluation`. Returns the evaluation and a summary
+    note, empty unless the pass failed. The pass is additive, so a failure
+    leaves the normal review standing and names the gap in the summary. It
+    shares the review's wall-clock budget, so it cannot run past the job
+    timeout. One `elder_quarantined_pass` row per run reports calls per PR."""
+    if skip or not quarantined_pass_enabled():
+        return evaluation, ""
+    paths = sensitive_paths(
+        dict.fromkeys(h.path for h in evidence.hunks), repo_config,
+    )
+    if not paths:
+        return evaluation, ""
+    quarantined = quarantined_evidence(evidence, paths)
+    pr = f"{owner}/{repo_name}#{pull_number}"
+    outcome = "unavailable"
+    merged = None
+    model_calls = 0
+    try:
+        with _review_deadline(started + _staged_review_budget_s()):
+            response = review_diff(
+                quarantined, installation_id=installation_id, voice=voice,
+                cancel_event=cancel_event,
+            )
+            coverage = response.coverage
+            model_calls = coverage.total_cohorts if coverage else 1
+            if response.kind == "reviewed":
+                graded, judged, verdicts, _ = _grade_deep_response(
+                    response, hunks, quarantined, installation_id,
+                    pr_context=quarantined.pr_context or {}, owner=owner,
+                    repo_name=repo_name, pull_number=pull_number,
+                    head_sha=head_sha, arm="quarantined",
+                )
+                submit_evals(
+                    judged, verdicts,
+                    review_span_context=response.review_span_context,
+                )
+                merged = merge_by_fingerprint(evaluation.findings, graded.findings)
+                outcome = "partial" if response.error else "reviewed"
+                model_calls += _adjudication_calls(response)
+    except Exception as e:  # noqa: BLE001 - additive; the normal review stands
+        log.warning(
+            "elder_quarantined_pass_failed",
+            extra={"pr": pr, "kind": type(e).__name__}, exc_info=True,
+        )
+    log.info(
+        "elder_quarantined_pass",
+        extra={
+            "installation_id": installation_id,
+            "pr": pr,
+            "outcome": outcome,
+            "sensitive_paths": len(paths),
+            "model_calls": model_calls,
+            "added": merged.added if merged else 0,
+            "raised": merged.raised if merged else 0,
+        },
+    )
+    if merged is not None and merged.findings != evaluation.findings:
+        evaluation = with_findings(evaluation, merged.findings)
+    return evaluation, "" if outcome == "reviewed" else QUARANTINE_UNAVAILABLE_NOTE
+
+
+def _adjudication_calls(response: LlmReviewResponse) -> int:
+    """Judge and refute batches for what the model returned."""
+    blocking = sum(1 for f in response.findings if f.severity in ("high", "critical"))
+    return (
+        ceil(len(response.findings) / JUDGE_BATCH_SIZE)
+        + ceil(blocking / JUDGE_BATCH_SIZE)
+    )
+
+
+def put_verifier_verdicts(rows: list[dict]) -> None:
+    """Store verifier verdicts in the findings ledger. Best-effort per row: a
+    store failure never changes what publishes."""
+    from adapters.install_store import put_ledger_row
+
+    for row in rows:
+        try:
+            put_ledger_row(row)
+        except Exception as e:  # noqa: BLE001 - telemetry never breaks the review
+            log.warning("elder_verifier_ledger_failed", extra={"kind": type(e).__name__})
+
+
 def _apply_refute_gate(
     findings, evidence, installation_id, *, owner, repo_name, pull_number, arm,
     plain_findings=(), plain_verdicts=(),
@@ -4625,9 +4762,32 @@ def _apply_refute_gate(
     high = tuple(f for f in findings if f.severity in ("high", "critical"))
     if not high:
         return findings
-    outcome = refute_with_outcome(high, evidence, installation_id)
+    cost = None
+    if falsification_verifier_enabled():
+        outcome, cost = falsify_with_outcome(high, evidence, installation_id)
+    else:
+        outcome = refute_with_outcome(high, evidence, installation_id)
     verdicts = outcome.verdicts
     _, refuted = partition_refuted(high, verdicts) if verdicts else ((), ())
+    if cost is not None:
+        head_sha = str((evidence.pr_context or {}).get("head_sha") or "")
+        put_verifier_verdicts(verifier_rows(
+            high, outcome, refuted, repo=f"{owner}/{repo_name}",
+            pull_number=pull_number, head_sha=head_sha, arm=arm,
+        ))
+        log.info(
+            "elder_verifier",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "arm": arm,
+                "findings": len(high),
+                "refuted": len(refuted),
+                "unavailable": len(outcome.unavailable),
+                "model_calls": cost.model_calls,
+                "estimated_prompt_tokens": cost.estimated_prompt_tokens,
+            },
+        )
     if refuted:
         from personas.code_reviewer.verify import KilledFinding
         _record_verification_kills(
@@ -4868,6 +5028,7 @@ def _grade_deep_response(
     repo_name: str,
     pull_number: int,
     head_sha: str = "",
+    arm: str = "deep",
 ) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
     deep_eval = evaluate_diff(
         hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
@@ -4903,11 +5064,11 @@ def _grade_deep_response(
         owner=owner,
         repo_name=repo_name,
         pull_number=pull_number,
-        arm="deep",
+        arm=arm,
     )
     deep_eval = _apply_bound_name_downgrade(
         deep_eval, evidence.file_contents, installation_id=installation_id,
-        owner=owner, repo_name=repo_name, pull_number=pull_number, arm="deep",
+        owner=owner, repo_name=repo_name, pull_number=pull_number, arm=arm,
     )
     deep_surviving = _apply_refute_gate(
         deep_eval.findings,
@@ -4916,7 +5077,7 @@ def _grade_deep_response(
         owner=owner,
         repo_name=repo_name,
         pull_number=pull_number,
-        arm="deep",
+        arm=arm,
         plain_findings=deep_graded,
         plain_verdicts=deep_verdicts,
     )
@@ -5047,7 +5208,7 @@ def _submitted_before(review: dict[str, Any], moment: datetime) -> bool:
 
 def _dismiss_stale_blocks(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-    head_sha: str, run_started_at: datetime,
+    head_sha: str, run_started_at: datetime, *, clean_url: str = "",
 ) -> int:
     """Dismiss Elder's own REQUEST_CHANGES reviews this clean run supersedes.
 
@@ -5055,6 +5216,9 @@ def _dismiss_stale_blocks(
     head submitted before `run_started_at` (#1350): a same-head block that
     landed after this run began was never weighed by it and stays. A
     same-head block with no usable `submitted_at` stays too.
+
+    The dismissal message links `clean_url`, the clean check run (or the
+    clean review), so the PR timeline names what superseded the block.
 
     Best-effort: a failure is logged and never changes the review outcome.
     Matches only reviews by the Grug app itself that carry the
@@ -5065,6 +5229,11 @@ def _dismiss_stale_blocks(
     pr = f"{owner}/{repo_name}#{pull_number}"
     tag = _REVIEW_PERSONA_TAG.format("elder")
     dismissed = 0
+    message = (
+        f"Superseded: the Elder check on {head_sha[:7]} concluded success "
+        "with nothing blocking"
+        + (f": {clean_url}" if clean_url else ".")
+    )
     try:
         reviews = with_install_token_retry(
             installation_id,
@@ -5088,11 +5257,7 @@ def _dismiss_stale_blocks(
                 installation_id,
                 lambda token, rid=review_id: dismiss_review(
                     token, owner, repo_name, pull_number=pull_number,
-                    review_id=rid,
-                    message=(
-                        f"Superseded: a later Elder review of {head_sha[:7]} "
-                        "found nothing blocking."
-                    ),
+                    review_id=rid, message=message,
                 ),
             )
             dismissed += 1

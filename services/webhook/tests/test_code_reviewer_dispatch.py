@@ -4091,7 +4091,8 @@ _HEAD = "abcd1234efgh"
 
 
 def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
-                 carried_conclusion=None):
+                 carried_conclusion=None, action="synchronize", messages=None,
+                 check_run=None):
     dismissed = []
     listed = []
     monkeypatch.setattr(
@@ -4105,7 +4106,9 @@ def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
                 (carried_conclusion, title, summary),
         )
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
-    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run", check_run or (lambda *a, **kw: {}),
+    )
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
     monkeypatch.setattr(
         cr_dispatch, "list_reviews",
@@ -4113,10 +4116,14 @@ def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
     )
     monkeypatch.setattr(
         cr_dispatch, "dismiss_review",
-        lambda *a, **kw: dismissed.append(kw["review_id"]) or {},
+        lambda *a, **kw: (
+            dismissed.append(kw["review_id"])
+            or (messages is not None and messages.append(kw["message"]))
+            or {}
+        ),
     )
     with patch("httpx.get", return_value=_diff_response()):
-        cr_dispatch.dispatch_code_review(_payload(action="synchronize"), blocking=blocking)
+        cr_dispatch.dispatch_code_review(_payload(action=action), blocking=blocking)
     return listed, dismissed
 
 
@@ -4222,6 +4229,109 @@ def test_degraded_review_never_unblocks(monkeypatch):
     listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)])
     assert listed == []
     assert dismissed == []
+
+
+# --- grug#1581: a clean `/grug improve` re-review withdraws the block -------
+
+_CLEAN_CHECK_URL = "https://github.com/myorg/myrepo/runs/424242"
+
+
+def _medium_finding() -> LlmFinding:
+    return LlmFinding(
+        path="src/x.py", line=2, rule="sanitizer-missing-negative-test",
+        severity="medium", message="m",  # type: ignore[arg-type]
+    )
+
+
+def test_clean_improve_rerun_dismisses_same_head_block(monkeypatch):
+    """grug#1581: Elder requested changes on a head, then a `/grug improve`
+    re-review (action "rerun") of the same head came back clean. The check
+    turned green but the block stayed, and GitHub refused the merge."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)]
+    _, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=reviews, action="rerun",
+    )
+    assert dismissed == [1]
+
+
+def test_advisory_findings_with_a_green_check_still_dismiss(monkeypatch):
+    """grug#1581: a re-review that repeats only an advisory (medium) finding
+    concludes the check `success`; the dismissal follows the check, not a
+    zero-finding count, so the block is withdrawn."""
+    llm = LlmReviewResponse(
+        kind="reviewed", findings=(_medium_finding(),), backend_used=Backend.POOLSIDE,
+    )
+    recorded: dict = {}
+
+    def _check(_token, _owner, _repo, result, **_kw):
+        recorded["conclusion"] = result.conclusion
+        return {}
+
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN), _review(2)]
+    for action in ("rerun", "synchronize"):
+        _, dismissed = _run_dismiss(
+            monkeypatch, llm, reviews=reviews, action=action, check_run=_check,
+        )
+        assert dismissed == [1, 2], action
+    assert recorded["conclusion"] == "success"
+
+
+def test_failing_improve_rerun_keeps_the_block(monkeypatch):
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="high", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)]
+    listed, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=reviews, action="rerun",
+    )
+    assert listed == []
+    assert dismissed == []
+
+
+def test_neutral_check_keeps_the_block(monkeypatch):
+    """Only a `success` check withdraws a block: an advisory-mode `neutral`
+    check is not a clear verdict."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)]
+    listed, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=reviews, action="synchronize", blocking=False,
+    )
+    assert listed == []
+    assert dismissed == []
+
+
+def test_clean_improve_rerun_never_touches_a_human_block(monkeypatch):
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [
+        _review(1, commit=_HEAD, submitted_at=_BEFORE_RUN, login="a-human"),
+        _review(2, login="a-human", body=_ELDER_TAG),
+    ]
+    listed, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=reviews, action="rerun",
+    )
+    assert listed == [7]
+    assert dismissed == []
+
+
+def test_dismissal_message_links_the_clean_check_run(monkeypatch):
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    messages: list[str] = []
+    _, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=[_review(1)], action="rerun",
+        messages=messages,
+        check_run=lambda *a, **kw: {"id": 424242, "html_url": _CLEAN_CHECK_URL},
+    )
+    assert dismissed == [1]
+    assert messages == [(
+        "Superseded: the Elder check on abcd123 concluded success with "
+        f"nothing blocking: {_CLEAN_CHECK_URL}"
+    )]
 
 
 def test_dismiss_failure_does_not_change_the_result(monkeypatch):

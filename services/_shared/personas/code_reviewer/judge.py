@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import Optional, cast
 
 from llm_client import (
     BackendConfig,
@@ -31,13 +32,19 @@ from llm_client import (
     JUDGE_BATCH_SIZE,
     JUDGE_MAX_FINDINGS,
     JudgeFindingRepr,
+    PrContext,
     _cave_judge_config,
     cloud_judge_configs,
     judge_findings,
     submit_finding_evaluation,
 )
+from model_family import model_family
+from personas.code_reviewer.intent_filter import INTENT_MISMATCH
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+from personas.code_reviewer.quarantine import quarantined_evidence, switch_on
 from personas.code_reviewer.sast import EXPOSED_SECRET
+from ledger import VERIFIER_REVIEWER
+from redact import redact_secrets
 from review_evidence import ElderEvidence
 from review_types import Severity
 
@@ -72,6 +79,7 @@ def _judge_evidence_packet(
     installation_id: int,
     *,
     refute: bool = False,
+    avoid_families: frozenset[str] = frozenset(),
 ) -> tuple[FindingJudgement, ...]:
     """Grade one evidence packet, trying backends in order until one returns
     a complete verdict set.
@@ -81,7 +89,9 @@ def _judge_evidence_packet(
     the in-cluster Cave judge, capped at 4,096 output tokens, is the last
     resort. Under `cave` priority the Cave goes first, then the per-install
     SaaS pick, as before. A partial or empty answer, including one cut off
-    at its output cap, is a failed attempt, never a verdict."""
+    at its output cap, is a failed attempt, never a verdict. `avoid_families`
+    moves a backend of those model families behind the others, so a different
+    lineage answers first when the pool has one (#1567)."""
     expected_indices = set(range(len(findings)))
 
     def attempt(config: BackendConfig | None, *, redact: bool, label: str):
@@ -115,7 +125,10 @@ def _judge_evidence_packet(
         return None
 
     cave_config: BackendConfig | None = _cave_judge_config()
-    cloud_configs = cloud_judge_configs()
+    cloud_configs = sorted(
+        cloud_judge_configs(),
+        key=lambda config: model_family(config.model) in avoid_families,
+    )
     if cloud_configs:
         for config in cloud_configs:
             verdicts = attempt(config, redact=True, label=config.backend.value)
@@ -412,6 +425,9 @@ def run_judge(
 # HIGH/CRITICAL findings (narrowing the #467-era always-publish rule for
 # exactly this gate).
 _REFUTE_CONFIDENCE_FLOOR = 0.9
+# Wall-clock cap on one arm's verifier calls. Past it the remaining findings
+# stay unverified, so the job timeout cannot cut the review short.
+_VERIFIER_BUDGET_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -475,6 +491,130 @@ def refute_with_outcome(
             if 0 <= v.finding_index < len(reprs)
         )
     return RefuteOutcome(tuple(verdicts), frozenset(unavailable))
+
+
+def falsification_verifier_enabled() -> bool:
+    """`GRUG_FALSIFICATION_VERIFIER`, off unless set. When on, each blocking
+    finding gets its own fresh-context call in place of the batched gate."""
+    return switch_on("GRUG_FALSIFICATION_VERIFIER")
+
+
+def _verifier_evidence(finding: Finding, evidence: ElderEvidence) -> ElderEvidence:
+    """The candidate's file diff and code, with no author text and no scope
+    line. A requirement finding keeps the linked criteria: without them it
+    looks unsupported and is wrongly refuted (#904)."""
+    fresh = quarantined_evidence(evidence, (finding.file,))
+    context = cast(dict, dict(fresh.pr_context or {}))
+    context.pop("review_scope", None)
+    context["fresh_verifier"] = True
+    criteria = (evidence.pr_context or {}).get("linked_issue_context")
+    if finding.rule_name == INTENT_MISMATCH and criteria:
+        context["linked_issue_context"] = criteria
+    return replace(fresh, pr_context=cast(PrContext, context))
+
+
+def _reviewer_families(finding: Finding) -> frozenset[str]:
+    """Known families only: an unknown model names no lineage to avoid."""
+    families = (model_family(origin.model) for origin in finding.origins)
+    return frozenset(family for family in families if family)
+
+
+@dataclass(frozen=True)
+class VerifierCost:
+    """What one verifier run spent, so its precision gain can be priced.
+    Tokens are estimated at four characters each, retries excluded."""
+
+    model_calls: int
+    estimated_prompt_tokens: int
+
+
+def falsify_with_outcome(
+    findings: tuple[Finding, ...],
+    evidence: ElderEvidence,
+    installation_id: int,
+) -> tuple[RefuteOutcome, VerifierCost]:
+    """The falsification verifier (#1567): one fresh-context call per
+    blocking finding, in the same outcome shape as the batched gate, so the
+    kill floor and outage softening stay the same. Fail-open per finding."""
+    verdicts: list[FindingJudgement] = []
+    unavailable: set[int] = set()
+    calls = chars = 0
+    deadline = time.monotonic() + _VERIFIER_BUDGET_SECONDS
+    for index, finding in enumerate(findings):
+        if time.monotonic() >= deadline:
+            unavailable.add(index)
+            continue
+        packet = _verifier_evidence(finding, evidence)
+        calls += 1
+        chars += len(packet.judge_view().text)
+        try:
+            answered = _judge_evidence_packet(
+                [_finding_to_repr(finding)], packet,
+                installation_id=installation_id, refute=True,
+                avoid_families=_reviewer_families(finding),
+            )
+        except Exception as e:  # noqa: BLE001 - fail-open, mirror the gate
+            log.error(
+                "falsification_verifier_failed",
+                extra={"kind": type(e).__name__, "rule": finding.rule_name},
+                exc_info=True,
+            )
+            answered = ()
+        if not answered or answered[0].finding_index != 0:
+            unavailable.add(index)
+            continue
+        verdict = replace(answered[0], finding_index=index)
+        if not verdict.is_real_bug and not verdict.reasoning.strip():
+            # A refutation must name its counter-argument.
+            verdict = replace(verdict, confidence=0.0)
+        verdicts.append(verdict)
+    outcome = RefuteOutcome(tuple(verdicts), frozenset(unavailable))
+    return outcome, VerifierCost(calls, chars // 4)
+
+
+def verifier_rows(
+    findings: tuple[Finding, ...],
+    outcome: RefuteOutcome,
+    refuted: tuple[Finding, ...],
+    *,
+    repo: str,
+    pull_number: int,
+    head_sha: str,
+    arm: str,
+) -> list[dict]:
+    """One ledger row per finding, so precision can be measured per tier.
+    `reviewer` keeps these out of the reaction-labeled rows, and these
+    verdicts count as neither accepted nor false-positive."""
+    by_index = {v.finding_index: v for v in outcome.verdicts}
+    killed = {id(f) for f in refuted}
+    rows: list[dict] = []
+    for index, finding in enumerate(findings):
+        verdict = by_index.get(index)
+        if verdict is None:
+            label = "unavailable"
+        elif id(finding) in killed:
+            label = "refuted"
+        else:
+            label = "confirmed" if verdict.is_real_bug else "doubted"
+        rows.append({
+            "repo": repo,
+            "pr": pull_number,
+            "reviewer": VERIFIER_REVIEWER,
+            "severity": finding.severity,
+            "class": finding.rule_name,
+            "category": finding.category,
+            "finding": redact_secrets(finding.message),
+            "verdict": label,
+            "evidence": f"elder-verifier:{head_sha}:{finding.file}:{finding.line}",
+            "refutation": redact_secrets(verdict.reasoning) if verdict else "",
+            "confidence": verdict.confidence if verdict else None,
+            "is_real_bug": verdict.is_real_bug if verdict else None,
+            "arm": arm,
+            "ts": "",
+            "commit": head_sha or None,
+            "head_sha": head_sha or None,
+        })
+    return rows
 
 
 def refute_findings(

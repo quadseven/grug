@@ -46,6 +46,11 @@ from review_types import DEFAULT_CATEGORY, category_or_default
 _ACCEPTED = frozenset({"fixed", "declined"})
 _REJECTED = frozenset({"false-positive"})
 
+# Verifier rows (#1567) carry `refuted`, `doubted`, `confirmed`, or
+# `unavailable`: a model's verdict, not ground truth, so they count as neither
+# accepted nor false-positive and never become eval cases.
+VERIFIER_REVIEWER = "elder-verifier"
+
 # CRITICAL first; unknown labels sort last (consumers use .get(sev, 4)).
 # The ONE severity-ranking convention - few_shot (and any future consumer)
 # imports this instead of keeping a drift-prone copy.

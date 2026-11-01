@@ -142,6 +142,10 @@ The single copy of every cross-service module lives in `services/_shared/` - a P
 | **HITL prerequisite** | A human-in-the-loop step that must precede automated work (e.g. App registration on github.com, SSM secret pre-load). Documented in [`docs/HITL_PREREQUISITES.md`](docs/HITL_PREREQUISITES.md). |
 | **Self-host** | Operator deploys Grug against their own AWS + Cloudflare account. Step-by-step in [`docs/SELF_HOST.md`](docs/SELF_HOST.md). AGPL-3.0 network-service compliance applies. |
 
+**Quarantined pass.** A second Elder security review of a PR's sensitive paths that reads diff and code context only, never author text. It can add a finding or raise a severity, never remove or lower one (#1569).
+
+**Falsification verifier.** A fresh-context call per blocking finding that must disprove it from the code alone. It replaces the batched refute gate when `GRUG_FALSIFICATION_VERIFIER` is set, filters only, and stores every verdict in the findings ledger (#1567).
+
 ## Vocabulary debt (named for future cleanup)
 
 These terms exist in the codebase but are inconsistent or under-named. Resolving them is out of scope for the initial CONTEXT.md authoring; track in dedicated issues.

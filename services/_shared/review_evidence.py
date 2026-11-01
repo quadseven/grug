@@ -25,7 +25,7 @@ from __future__ import annotations
 import ast
 import re
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Iterable, NamedTuple, Optional, Sequence
+from typing import TYPE_CHECKING, Iterable, NamedTuple, Optional, Sequence, cast
 
 from redact import redact_secrets
 
@@ -347,6 +347,23 @@ def _render_pr_intent(pr_context: Optional[PrContext]) -> str:
         f"Body:\n{body or '[not provided]'}"
         f"\nReview scope: {scope}."
         + (" This PR has class:sensitive; perform full review depth." if sensitive else "")
+    )
+
+
+# Everything a PR author writes in prose (grug#1569). A deterministic finding
+# and a quarantined pass read none of it.
+_AUTHOR_TEXT_KEYS = ("title", "body", "linked_issue_context")
+
+
+def without_author_text(pr_context: Optional[PrContext]) -> Optional[PrContext]:
+    """`pr_context` minus the PR's title, body, and linked-issue text.
+    Identity and routing keys stay, so traces and the private-repo gate
+    still work."""
+    if pr_context is None:
+        return None
+    return cast(
+        "PrContext",
+        {k: v for k, v in pr_context.items() if k not in _AUTHOR_TEXT_KEYS},
     )
 
 

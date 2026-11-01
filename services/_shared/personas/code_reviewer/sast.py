@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from llm_client import _cave_judge_config, FindingJudgement, Hunk, JudgeFindingRepr, PrContext, judge_findings
-from review_evidence import assemble_evidence
+from review_evidence import assemble_evidence, without_author_text
 
 from .analyzer_sandbox import read_only_tree, sandbox_env, without_engine_config
 from .diff_parser import DiffHunk
@@ -581,9 +581,10 @@ def _judge_batch(
     if not candidates:
         return (), True
     reprs = [_candidate_to_repr(c) for c in candidates]
+    # grug#1569: author prose must never talk the judge out of a detection.
     evidence = assemble_evidence(
         (Hunk(path=h.file_path, body=h.body) for h in hunks),
-        pr_context=pr_context, file_contents=file_contents,
+        pr_context=without_author_text(pr_context), file_contents=file_contents,
     )
     try:
         judgements = judge_findings(
