@@ -499,13 +499,13 @@ def _poolside_call(resp: httpx.Response) -> None:
         lc._call_backend(cfg, _MESSAGES)
 
 
-def test_repeated_limit_refusals_skip_poolside_then_it_is_asked_again(monkeypatch) -> None:
-    """The second refusal in five minutes holds Poolside for five minutes
-    (#1546), so the review reaches a tier that can answer, and Poolside
-    comes back on its own."""
+def test_repeated_capacity_refusals_skip_poolside_then_it_is_asked_again(monkeypatch) -> None:
+    """The second 'capacity is reserved' refusal in five minutes holds
+    Poolside for five minutes (#1546), so the review reaches a tier that
+    can answer, and Poolside comes back on its own."""
     now = 1_000_000.0
     monkeypatch.setattr(lc.time, "time", lambda: now)
-    limited = _err(429, "usage limit exceeded")
+    limited = _err(429, "capacity is reserved")
     _poolside_call(limited)
     assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
     _poolside_call(limited)
@@ -526,18 +526,18 @@ def test_repeated_capacity_refusals_skip_the_free_pool(monkeypatch) -> None:
     assert Backend.FREE_POOL not in [t.backend for t in lc._cloud_chain_tiers()]
 
 
-def test_a_success_between_limit_refusals_starts_the_count_over() -> None:
-    limited = _err(429, "usage limit exceeded")
+def test_a_success_between_capacity_refusals_starts_the_count_over() -> None:
+    limited = _err(429, "capacity is reserved")
     _poolside_call(limited)
     _poolside_call(_ok())
     _poolside_call(limited)
     assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
 
 
-def test_limit_refusals_spread_past_the_window_never_hold(monkeypatch) -> None:
+def test_capacity_refusals_spread_past_the_window_never_hold(monkeypatch) -> None:
     now = {"t": 1_000_000.0}
     monkeypatch.setattr(lc.time, "time", lambda: now["t"])
-    limited = _err(429, "usage limit exceeded")
+    limited = _err(429, "capacity is reserved")
     _poolside_call(limited)
     now["t"] += 301
     _poolside_call(limited)
@@ -549,3 +549,130 @@ def test_opencode_go_monthly_usage_limit_still_trips_the_breaker() -> None:
     with patch.object(httpx, "post", return_value=httpx.Response(429, json=body)):
         lc._call_backend(_go("longcat-2.5-preview-free"), _MESSAGES)
     assert not lc._provider_available(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
+
+
+# --- grug#1545: Poolside escalating hold for "usage limit exceeded" -------
+
+def _poolside_hold_reset(monkeypatch) -> None:
+    """Reset Poolside hold state between tests."""
+    monkeypatch.setattr(lc, "_poolside_hold_state", {}, raising=False)
+    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
+
+
+def _limited_429(body: str = "usage limit exceeded") -> httpx.Response:
+    return httpx.Response(429, json={"error": {"message": body}})
+
+
+def test_poolside_escalating_hold_first_refusal_sets_two_minute_hold(
+    monkeypatch,
+) -> None:
+    """First 'usage limit exceeded' sets a 2-minute hold."""
+    _poolside_hold_reset(monkeypatch)
+    now = 1_000_000.0
+    monkeypatch.setattr(lc.time, "time", lambda: now)
+    limited = _limited_429()
+    _poolside_call(limited)
+    # After first refusal, Poolside should be held for 2 minutes (120s)
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    # The hold should expire after 120 seconds
+    monkeypatch.setattr(lc.time, "time", lambda: now + 121)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+
+
+def test_poolside_escalating_hold_second_refusal_doubles_to_four_minutes(
+    monkeypatch,
+) -> None:
+    """Second 'usage limit exceeded' doubles the hold to 4 minutes."""
+    _poolside_hold_reset(monkeypatch)
+    now = 1_000_000.0
+    monkeypatch.setattr(lc.time, "time", lambda: now)
+    limited = _limited_429()
+    _poolside_call(limited)  # First: 2 min hold
+    _poolside_call(limited)  # Second: 4 min hold
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    # Should be held for 4 minutes (240s)
+    monkeypatch.setattr(lc.time, "time", lambda: now + 181)  # Past 2 min, before 4 min
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    monkeypatch.setattr(lc.time, "time", lambda: now + 241)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+
+
+def test_poolside_escalating_hold_caps_at_thirty_minutes(monkeypatch) -> None:
+    """Hold doubles up to 30-minute cap (6 doublings: 2,4,8,16,30,30,30...)."""
+    _poolside_hold_reset(monkeypatch)
+    now = 1_000_000.0
+    monkeypatch.setattr(lc.time, "time", lambda: now)
+    limited = _limited_429()
+    # 6 refusals: 2, 4, 8, 16, 30, 30 minutes
+    for i in range(6):
+        _poolside_call(limited)
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    # After 6 refusals, hold should be 30 min (1800s)
+    monkeypatch.setattr(lc.time, "time", lambda: now + 1799)
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    monkeypatch.setattr(lc.time, "time", lambda: now + 1801)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+
+
+def test_poolside_success_clears_hold(monkeypatch) -> None:
+    """First successful response clears the hold immediately."""
+    _poolside_hold_reset(monkeypatch)
+    now = 1_000_000.0
+    monkeypatch.setattr(lc.time, "time", lambda: now)
+    limited = _limited_429()
+    _poolside_call(limited)  # 2 min hold
+    _poolside_call(limited)  # 4 min hold
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    # Successful response clears hold
+    _poolside_call(_ok())
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    # Next refusal starts from 2 min again
+    _poolside_call(limited)
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    monkeypatch.setattr(lc.time, "time", lambda: now + 121)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+
+
+def test_poolside_hold_shared_across_workers(monkeypatch) -> None:
+    """Hold state is shared via shared_benches; another worker sees it."""
+    _poolside_hold_reset(monkeypatch)
+    monkeypatch.setenv("GRUG_SHARED_BENCHES", "true")
+    monkeypatch.setenv("GRUG_DATABASE_URL", "sqlite:///:memory:")
+    now = 1_000_000.0
+    monkeypatch.setattr(lc.time, "time", lambda: now)
+    limited = _limited_429()
+    _poolside_call(limited)
+    # Simulate another worker by clearing local state but keeping shared
+    lc._poolside_hold_state.clear()
+    # The hold should still be visible via shared state
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    monkeypatch.setattr(lc.time, "time", lambda: now + 121)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+
+
+def test_poolside_hold_marks_review_degraded(monkeypatch) -> None:
+    """Review running while Poolside is in hold gets degraded_reason='poolside_hold'."""
+    _poolside_hold_reset(monkeypatch)
+    now = 1_000_000.0
+    monkeypatch.setattr(lc.time, "time", lambda: now)
+    limited = _limited_429()
+    _poolside_call(limited)  # Hold Poolside
+    # The poolside hold should make _poolside_is_held return True
+    assert lc._poolside_is_held(Backend.POOLSIDE.value, now=now + 10)
+    # Now simulate a review that succeeds via another tier
+    from personas.code_reviewer.persona import evaluate_diff
+    from llm_client import LlmReviewResponse
+    # Create a mock response as if review succeeded but Poolside was held
+    response = LlmReviewResponse(
+        kind="reviewed",
+        findings=(),
+        coverage=None,
+        backend_used=Backend.OPENROUTER,
+        model_name="test-model",
+        models_used=("test-model",),
+        poolside_hold=True,  # This is what review_diff sets when Poolside is held
+    )
+    evaluation = evaluate_diff((), response)
+    assert evaluation.degraded_reason == "poolside_hold"
+    assert evaluation.conclusion == "neutral"

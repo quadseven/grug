@@ -389,6 +389,16 @@ def evaluate_diff(
             tier_served=llm_response.tier_served,
             models_used=llm_response.models_used,
         )
+    # grug#1545: review succeeded but Poolside was in escalating hold.
+    if llm_response.poolside_hold:
+        return CodeReviewEvaluation(
+            findings=(),
+            conclusion="neutral",
+            degraded_reason="poolside_hold",
+            coverage=llm_response.coverage,
+            tier_served=llm_response.tier_served,
+            models_used=llm_response.models_used,
+        )
 
     line_index = _hunk_line_index(hunks)
     kept: list[Finding] = []

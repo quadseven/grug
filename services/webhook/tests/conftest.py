@@ -124,6 +124,7 @@ def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     if lc is not None:
         monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
         monkeypatch.setattr(lc, "_limit_refusals", {}, raising=False)
+        monkeypatch.setattr(lc, "_poolside_hold_state", {}, raising=False)
 
 
 @pytest.fixture(autouse=True)

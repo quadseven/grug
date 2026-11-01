@@ -891,6 +891,11 @@ class LlmReviewResponse:
     attempts: tuple[str, ...] = field(default_factory=tuple)
     # grug#1276: which tier served this review ("self-hosted", "free-pool", "subscription").
     tier_served: Optional[str] = None
+    # grug#1545: true when the review ran while Poolside was in an escalating
+    # hold for "usage limit exceeded". The review may have succeeded via
+    # another tier, but is marked degraded because the primary cloud tier
+    # was unavailable.
+    poolside_hold: bool = False
     reviewability_note: str = ""
     reviewability_blocking: bool = False
     # grug#1437: author and reviewer families of a finished review of a pull
@@ -1435,6 +1440,12 @@ class _BenchEntry:
     next_seconds: float = _BENCH_BASE_SECONDS
 
 
+@dataclass
+class _PoolsideHoldEntry:
+    hold_until: float = 0.0
+    next_seconds: float = _POOLSIDE_HOLD_BASE_SECONDS
+
+
 _bench_lock = threading.Lock()
 _bench_state: dict[tuple[str, str], _BenchEntry] = {}
 
@@ -1500,6 +1511,9 @@ def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
             _slow_bench_state.pop(key, None)
         shared_benches.clear("bench", *key)
         shared_benches.clear("slow", *key)
+        # Clear Poolside escalating hold on first success (grug#1545).
+        if config.backend == Backend.POOLSIDE:
+            _clear_poolside_hold(config.backend.value)
         return
     if not _is_benchable_failure(resp):
         return
@@ -1543,6 +1557,8 @@ _SPENT_LIMIT_MARKERS = (
 # no Retry-After; reading that as spent blocked the one working cloud tier
 # for an hour (live, 2026-10-17). OpenCode Go's monthly 429 carries the
 # `GoUsageLimitError` type, and its own breaker above honours Retry-After.
+# A 75-minute spell on 2026-10-31 produced 1,473 llm_backend_rate_limited
+# events (~1,180/hour), leading to the escalating hold in grug#1545.
 _SPENT_RATE_MARKERS = ("per-day", "per day", "daily", "monthly", "gousagelimiterror")
 _provider_breaker_lock = threading.Lock()
 _provider_blocked_until: dict[tuple[str, str], float] = {}
@@ -1556,6 +1572,18 @@ _LIMIT_REFUSAL_WINDOW_SECONDS = 300.0
 _LIMIT_HOLD_SECONDS = 300.0
 _LIMIT_REFUSAL_MARKERS = ("usage limit", "capacity is reserved")
 _limit_refusals: dict[tuple[str, str], list[float]] = {}
+
+# Poolside escalating hold for "usage limit exceeded" (grug#1545).
+# Poolside answers short-lived throttling with 429 "usage limit exceeded"
+# and no Retry-After. A fixed hold kept re-triggering (1,892 in 9 hours
+# on 2026-10-31). Instead: 2 min, doubling to 30 min cap, cleared on
+# first success. A 75-minute spell on 2026-10-31 produced 1,473
+# llm_backend_rate_limited events (~1,180/hour).
+_POOLSIDE_HOLD_BASE_SECONDS = 120.0
+_POOLSIDE_HOLD_MAX_SECONDS = 1800.0
+_poolside_hold_lock = threading.Lock()
+_poolside_hold_state: dict[str, _PoolsideHoldEntry] = {}
+
 _warned_disabled_entries: set[str] = set()
 
 
@@ -1650,7 +1678,8 @@ def _limit_refusals_repeated(config: BackendConfig, resp: httpx.Response) -> boo
 
 def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None:
     """Open the provider breaker on a 401, a 402, a spent-limit refusal, or
-    repeated limit refusals."""
+    repeated limit refusals. Poolside's 'usage limit exceeded' gets an
+    escalating hold instead (grug#1545)."""
     pool = _backend_pool(config.backend, config.model)
     if config.backend in _BENCH_CLOUD_BACKENDS:
         # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
@@ -1659,6 +1688,21 @@ def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None
             return
         if _is_spent_quota_refusal(resp):
             _open_provider_breaker(config, resp, (pool,), time.time() + _retry_after_seconds(resp))
+            return
+    # Poolside: escalating hold for "usage limit exceeded" 429 (short-lived
+    # throttling, not a spent limit). Other backends use the fixed hold.
+    if config.backend == Backend.POOLSIDE:
+        text = (resp.text or "").lower()
+        if resp.status_code == 429 and "usage limit exceeded" in text:
+            now = time.time()
+            seconds = _record_poolside_hold(config.backend.value, now)
+            if seconds is not None:
+                until = now + seconds
+                with _provider_breaker_lock:
+                    key = (config.backend.value, pool)
+                    _provider_blocked_until[key] = max(_provider_blocked_until.get(key, 0.0), until)
+                shared_benches.publish("provider", config.backend.value, pool, until)
+                _announce_poolside_hold(config.backend.value, seconds)
             return
     if config.backend in _LIMIT_HOLD_BACKENDS and _limit_refusals_repeated(config, resp):
         _open_provider_breaker(config, resp, (pool,), time.time() + _LIMIT_HOLD_SECONDS)
@@ -1769,6 +1813,59 @@ def _note_model_timeout(backend: Backend, model: str, exc: BaseException) -> Non
     if seconds is not None:
         shared_benches.publish("slow", *key, now + seconds)
         _announce_model_slow_benched(*key, seconds)
+
+
+# Poolside escalating hold for "usage limit exceeded" (grug#1545).
+# 2 min base, doubling to 30 min cap, cleared on first success.
+
+def _poolside_hold_key(backend: str) -> str:
+    """Poolside hold is per backend (only Poolside uses this)."""
+    return backend
+
+
+def _poolside_is_held(backend: str, now: float | None = None) -> bool:
+    """True when Poolside is in an escalating hold."""
+    current = time.time() if now is None else now
+    with _poolside_hold_lock:
+        entry = _poolside_hold_state.get(_poolside_hold_key(backend))
+        local = entry.hold_until if entry is not None else 0.0
+    shared = shared_benches.blocked_until("poolside_hold", backend, "paid")
+    return current < max(local, shared)
+
+
+def _record_poolside_hold(backend: str, now: float) -> float | None:
+    """Record one Poolside 'usage limit exceeded'; return hold duration when it trips."""
+    with _poolside_hold_lock:
+        key = _poolside_hold_key(backend)
+        entry = _poolside_hold_state.setdefault(key, _PoolsideHoldEntry())
+        if now < entry.hold_until:
+            return None
+        seconds = entry.next_seconds
+        entry.hold_until = now + seconds
+        entry.next_seconds = min(seconds * 2, _POOLSIDE_HOLD_MAX_SECONDS)
+    shared_benches.publish("poolside_hold", backend, "paid", now + seconds)
+    return seconds
+
+
+def _clear_poolside_hold(backend: str) -> None:
+    """Clear Poolside hold on first success."""
+    with _poolside_hold_lock:
+        key = _poolside_hold_key(backend)
+        if key in _poolside_hold_state:
+            del _poolside_hold_state[key]
+    shared_benches.clear("poolside_hold", backend, "paid")
+
+
+def _announce_poolside_hold(backend: str, seconds: float) -> None:
+    log.warning(
+        "llm_poolside_hold",
+        extra={"backend": backend, "hold_seconds": seconds},
+    )
+    try:
+        from observability import emit_count  # type: ignore  # late: webhook-image only
+        emit_count("grug.elder.poolside_hold", 1, tags={"backend": backend})
+    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
+        log.debug("poolside_hold_metric_failed", extra={"kind": type(e).__name__})
 
 
 def _free_tier_chain_config() -> "BackendConfig | None":
@@ -5760,11 +5857,16 @@ def review_diff(
         result = review.run_whole_diff(plan)
     else:
         result = review.run_staged(plan)
+    # grug#1545: mark review as degraded if Poolside was in hold during review.
+    poolside_held = False
+    if result.kind == "reviewed":
+        poolside_held = _poolside_is_held(Backend.POOLSIDE.value)
     note = _render_reviewability_note(assessment)
     return replace(
         result,
         reviewability_note=note,
         reviewability_blocking=assessment.decision == "block",
+        poolside_hold=poolside_held,
         families=(
             review_families(
                 ctx.get("author_family"),

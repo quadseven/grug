@@ -49,9 +49,10 @@ EXIT_FLUSH_WAIT_S = 3.0
 # one a reader still needs; readers compare `until` themselves.
 TTL_SLACK_S = 60
 # The kinds llm_client shares: the 4xx bench and the slow bench per
-# (backend, model), the provider breaker per (backend, pool), and the
-# OpenCode Go usage-limit breaker.
-KINDS = frozenset({"bench", "slow", "provider", "go"})
+# (backend, model), the provider breaker per (backend, pool), the
+# OpenCode Go usage-limit breaker, and the Poolside escalating hold
+# for "usage limit exceeded" (grug#1545).
+KINDS = frozenset({"bench", "slow", "provider", "go", "poolside_hold"})
 
 # The snapshot and the queue change together under one lock, so a re-read
 # of the table can never drop an entry whose write is still queued.
