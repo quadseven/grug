@@ -1150,12 +1150,20 @@ def _activity_families(families: ReviewFamilies | None) -> dict[str, str]:
 def _author_family(pr: Mapping[str, Any]) -> str | None:
     """The family of the model a trusted operator's Loom footer names, or None.
 
-    Chief's parser, so the two agree. The body is the author's own text, so a
-    stranger's footer is ignored: it could otherwise steer the review off an
-    arm, or onto a paid tier."""
-    if not is_trusted_operator(pr):
-        return None
-    return model_family(loom_footer_model(str(pr.get("body") or "")))
+    For trusted operator humans, uses the Loom footer. For App authors (bots),
+    uses a trusted source mapping App logins to model families (grug#1553).
+    Both are "trusted source" but differ in how the family is derived.
+    """
+    if is_trusted_operator(pr):
+        return model_family(loom_footer_model(str(pr.get("body") or "")))
+
+    user = pr.get("user")
+    if isinstance(user, Mapping) and user.get("type") == "Bot":
+        app_login = user.get("login")
+        from model_family import app_author_family
+        return app_author_family(str(app_login) if app_login else None)
+
+    return None
 
 
 def _hunt_title(title: str, living_range: str) -> str:

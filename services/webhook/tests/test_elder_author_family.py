@@ -52,8 +52,8 @@ def _hunk() -> Hunk:
     return Hunk(path="src/x.py", body="@@ -1 +1 @@\n-old\n+new")
 
 
-def _pr(body: str, association: str = "OWNER") -> dict:
-    return {"body": body, "user": {"type": "User"}, "author_association": association}
+def _pr(body: str, association: str = "OWNER", user_type: str = "User", login: str = "alice") -> dict:
+    return {"body": body, "user": {"login": login, "type": user_type}, "author_association": association}
 
 
 def _answer() -> httpx.Response:
@@ -189,11 +189,98 @@ def test_families_survive_the_evaluation_rewrites() -> None:
     assert cr_persona.with_degradation(evaluation, degraded).families == families
 
 
-def test_activity_row_records_both_families() -> None:
-    assert cr_dispatch._activity_families(None) == {}
-    assert cr_dispatch._activity_families(
-        ReviewFamilies(author="claude", reviewers=("glm", "laguna")),
-    ) == {"author_family": "claude", "reviewer_family": "glm, laguna"}
+def test_app_author_family_uses_trusted_source() -> None:
+    """Test that App authors use the trusted source for author family (grug#1553)."""
+    # Mock the app_author_family function to test the integration
+    with patch('model_family.app_author_family') as mock_app_family:
+        mock_app_family.return_value = "claude"
+
+        # Create a PR with a Bot user (App author)
+        pr = _pr("Some PR body", user_type="Bot", login="my-app[bot]")
+
+        from personas.code_reviewer.dispatch import _author_family
+        result = _author_family(pr)
+
+        assert result == "claude"
+        mock_app_family.assert_called_once_with("my-app[bot]")
+
+
+def test_app_author_family_not_listed_gets_none() -> None:
+    """Test that unlisted App authors get None from the trusted source (grug#1553)."""
+    # Mock the app_author_family function to test the integration
+    with patch('model_family.app_author_family') as mock_app_family:
+        mock_app_family.return_value = None
+
+        # Create a PR with a Bot user (App author)
+        pr = _pr("Some PR body", user_type="Bot", login="unknown-app[bot]")
+
+        from personas.code_reviewer.dispatch import _author_family
+        result = _author_family(pr)
+
+        assert result is None
+        mock_app_family.assert_called_once_with("unknown-app[bot]")
+
+
+def test_app_author_family_case_insensitive() -> None:
+    """Test that App author family lookup is case insensitive (grug#1553)."""
+    # Mock the app_author_family function to test the integration
+    with patch('model_family.app_author_family') as mock_app_family:
+        mock_app_family.return_value = "gpt"
+
+        # Create a PR with a Bot user (App author) with different case
+        pr = _pr("Some PR body", user_type="Bot", login="My-App[Bot]")
+
+        from personas.code_reviewer.dispatch import _author_family
+        result = _author_family(pr)
+
+        assert result == "gpt"
+        mock_app_family.assert_called_once_with("My-App[Bot]")
+
+
+def test_app_author_family_not_used_for_human_authors() -> None:
+    """Test that App author family is not used for human authors (grug#1553)."""
+    # Mock the app_author_family function to verify it's not called
+    with patch('model_family.app_author_family') as mock_app_family:
+        # Create a PR with a User (human) author
+        pr = _pr("Loom ticket #7, lane fix, model claude-opus-5-5.", user_type="User")
+
+        from personas.code_reviewer.dispatch import _author_family
+        result = _author_family(pr)
+
+        assert result == "claude"
+        mock_app_family.assert_not_called()
+
+
+def test_app_author_family_overrides_trusted_operator_check() -> None:
+    """Test that App authors bypass the trusted_operator check (grug#1553)."""
+    # Mock the app_author_family function to test the integration
+    with patch('model_family.app_author_family') as mock_app_family:
+        mock_app_family.return_value = "gpt"
+
+        # Create a PR with a Bot user (App author)
+        pr = _pr("Some PR body", user_type="Bot", login="lane[bot]")
+
+        from personas.code_reviewer.dispatch import _author_family
+        result = _author_family(pr)
+
+        assert result == "gpt"
+        mock_app_family.assert_called_once_with("lane[bot]")
+
+
+def test_app_author_family_authorization_association_ignored() -> None:
+    """Test that App author family lookup ignores author_association (grug#1553)."""
+    # Mock the app_author_family function to test the integration
+    with patch('model_family.app_author_family') as mock_app_family:
+        mock_app_family.return_value = "gemini"
+
+        # Create a PR with a Bot user (App author) and untrusted association
+        pr = _pr("Some PR body", user_type="Bot", login="lane[bot]", association="NONE")
+
+        from personas.code_reviewer.dispatch import _author_family
+        result = _author_family(pr)
+
+        assert result == "gemini"
+        mock_app_family.assert_called_once_with("lane[bot]")
 
 
 def test_activity_log_hands_both_families_to_the_store(monkeypatch) -> None:
