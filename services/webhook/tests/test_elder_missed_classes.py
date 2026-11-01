@@ -333,7 +333,8 @@ def test_negative_fixture_flags_nothing_on_clean_findings():
 def test_negative_fixture_flags_nothing_in_recorded_baseline():
     baseline = json.loads(mc.BASELINE_PATH.read_text())
     for name, measurement in baseline["measurements"].items():
-        assert measurement["caught"]["reverse_direction_fixed_attester_negative"] is False, (
+        # A measurement of one other fixture never ran this one.
+        assert measurement["caught"].get("reverse_direction_fixed_attester_negative") is not True, (
             f"measurement {name!r} flagged the negative fixture"
         )
 
