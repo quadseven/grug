@@ -475,3 +475,121 @@ def test_the_egress_policy_opens_the_lane_the_manifests_name() -> None:
     assert urlsplit(url).hostname == "forward.subscription-lane.svc"
     assert "kubernetes.io/metadata.name: subscription-lane" in policy
     assert "matchLabels: {app: forward}" in policy
+
+
+def _subscription_reply(served_model: str | None) -> str:
+    body = json.loads(_finding_body())
+    if served_model is None:
+        del body["model"]
+    else:
+        body["model"] = served_model
+    return json.dumps(body)
+
+
+def _review_through_subscription(reply: str) -> lc.LlmReviewResponse:
+    recorder = _Recorder({
+        _CAVE_URL: httpx.ConnectTimeout("cave down"),
+        _FREE_GATEWAY_URL: httpx.ConnectTimeout("free gateway down"),
+        _POOLSIDE_URL: httpx.ConnectTimeout("poolside down"),
+        _OPENROUTER_URL: httpx.ConnectTimeout("openrouter down"),
+        _SUBSCRIPTION_URL: reply,
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        return review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+
+@pytest.mark.parametrize("served", ["gpt-6-luna", "claude-haiku-5-5"])
+def test_models_used_is_the_model_the_lane_replied_with(monkeypatch, served) -> None:
+    """The lane picks its model per call, so the request names neither."""
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_MODEL", "subscription-lane")
+    resp = _review_through_subscription(_subscription_reply(served))
+
+    assert resp.models_used == (served,)
+    evaluation = cr_persona.evaluate_diff((), resp)
+    assert evaluation.models_used == (served,)
+    _, summary = cr_dispatch._summary_markdown(evaluation)
+    assert f"Tier served: `subscription` (`{served}`)." in summary
+
+
+def test_a_reply_naming_no_model_never_reports_the_requested_one(monkeypatch) -> None:
+    """A wrong name is worse than none: the configured name is a request."""
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_MODEL", "subscription-lane")
+    resp = _review_through_subscription(_subscription_reply(None))
+
+    assert resp.kind == "reviewed"
+    assert resp.model_name == "subscription-lane"
+    assert resp.models_used == ()
+    _, summary = cr_dispatch._summary_markdown(
+        cr_persona.evaluate_diff((), resp),
+    )
+    assert "Tier served: `subscription`." in summary
+    assert "subscription-lane" not in summary
+
+
+def test_a_cloud_arm_reply_naming_no_model_reports_none(monkeypatch) -> None:
+    """The same rule on the free tier, which reaches models_used through an arm."""
+    recorder = _Recorder({
+        _CAVE_URL: httpx.ConnectTimeout("cave down"),
+        _FREE_GATEWAY_URL: _subscription_reply(None),
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert resp.tier_served == "free-pool"
+    assert resp.model_name
+    assert resp.models_used == ()
+
+
+def test_summary_and_detail_name_the_served_models() -> None:
+    clean = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="success", tier_served="subscription",
+        models_used=("gpt-6-luna", "claude-haiku-5-5"),
+    )
+    _, summary = cr_dispatch._summary_markdown(clean)
+    assert "Tier served: `subscription` (`gpt-6-luna`, `claude-haiku-5-5`)." in summary
+
+    detail = cr_dispatch._stack_detail_lines(
+        review_phase="tier1", living_range="", suppressed_count=0,
+        tier_served="subscription", models_used=("gpt-6-luna",),
+    )
+    assert "- Tier served: `subscription` (`gpt-6-luna`)" in detail
+
+
+def test_a_backend_supplied_model_name_cannot_break_the_code_span() -> None:
+    clean = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="success", tier_served="free-pool",
+        models_used=("bad`name",),
+    )
+    _, summary = cr_dispatch._summary_markdown(clean)
+    assert "`bad`name`" not in summary
+
+
+def test_every_rebuild_keeps_the_models_with_their_tier() -> None:
+    finding = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="success",
+        tier_served="subscription", models_used=("gpt-6-luna",),
+    )
+    assert cr_persona.with_extra_findings(
+        finding, (lc.Finding(path="a.py", line=1, severity="low", rule="r", message="m"),),
+    ).models_used == ("gpt-6-luna",)
+    assert cr_persona.with_findings(finding, ()).models_used == ("gpt-6-luna",)
+
+    other = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="neutral", degraded_reason="partial_review",
+        tier_served="free-pool", models_used=("other-model",),
+    )
+    assert cr_persona.with_degradation(finding, other).models_used == ("gpt-6-luna",)
+
+
+def test_a_degradation_takes_the_models_only_with_their_tier() -> None:
+    """The name must never sit beside another pass's tier."""
+    other = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="neutral", degraded_reason="partial_review",
+        tier_served="free-pool", models_used=("other-model",),
+    )
+    untiered = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="success", models_used=("cave-model",),
+    )
+    merged = cr_persona.with_degradation(untiered, other)
+    assert merged.tier_served == "free-pool"
+    assert merged.models_used == ("other-model",)

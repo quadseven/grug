@@ -27,6 +27,7 @@ from personas.tpm.ticket_compliance import (
     diff_signals,
     unaddressed_criteria,
 )
+from personas.tpm.sibling_evidence import delivered_criteria
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.tpm.ticket_compliance")
 
@@ -223,8 +224,27 @@ def _upsert_comment(
         )
 
 
+def _less_delivered(
+    token: str, owner: str, repo: str, number: int, pr_number: int,
+    gaps: list[str], ticket_body: str,
+) -> list[str]:
+    """`gaps` less those a merged PR on the ticket delivered (grug#1530). A
+    failed read leaves them: the advisory says more, never less."""
+    from personas.tpm.issue_fetcher import merged_siblings
+
+    try:
+        siblings = merged_siblings(token, owner, repo, number, pr_number=pr_number)
+    except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
+        log.warning("ticket_compliance_siblings_failed",
+                    extra={"issue": number, "err": type(e).__name__})
+        return gaps
+    met = delivered_criteria(gaps, siblings, ticket_body)
+    return [g for g in gaps if g not in met]
+
+
 def _collect_unaddressed(
     token: str, owner: str, repo: str, refs: list[int], signals: set[str],
+    pr_number: int = 0,
 ) -> dict[int, list[str]]:
     """`{issue number: criteria that look unaddressed}` for each linked issue.
 
@@ -243,6 +263,8 @@ def _collect_unaddressed(
         if body is None:
             continue
         gaps = unaddressed_criteria(acceptance_criteria(body), signals)
+        if gaps:
+            gaps = _less_delivered(token, owner, repo, n, pr_number, gaps, body)
         if gaps:
             out[n] = gaps
     return out
@@ -337,7 +359,9 @@ def run_ticket_compliance(
         return {"checked": 0, "reason": "files fetch failed"}
     signals = diff_signals(changed, pr_body)
 
-    all_unaddressed = _collect_unaddressed(token, owner, repo, refs, signals)
+    all_unaddressed = _collect_unaddressed(
+        token, owner, repo, refs, signals, pr_number,
+    )
 
     # One comment for the whole PR: concatenate per-issue advisories, or a
     # cleared note when a prior advisory is now satisfied.

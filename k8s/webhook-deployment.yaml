@@ -139,7 +139,7 @@ spec:
             # feature off; the operator lists the owner's App bots here so a
             # /grug improve from loom-brain[bot] on a PR it did not open runs
             # Elder like a write collaborator's instead of being dropped.
-            - {name: GRUG_ALLOWED_APP_BOT_LOGINS, value: "loom-brain[bot],loom-station[bot],loom-lanes[bot],agent-anthropic-claude-code[bot],agent-meta-muse[bot],agent-openai-dot[bot],agent-google-gemini[bot]"}
+            - {name: GRUG_ALLOWED_APP_BOT_LOGINS, value: "loom-brain[bot],loom-station[bot],loom-lanes[bot],agent-anthropic-claude-code[bot],agent-meta-muse[bot],agent-openai-dot[bot],agent-openai-codex-luna[bot],agent-google-gemini[bot]"}
             # Off-Lambda async path (#368). Elder's production hot path is
             # durable SQS below; this flag still enables the local worker used
             # by the other async personas and by Elder only if that lane is
@@ -166,6 +166,11 @@ spec:
             # their existing lower-cost OpenRouter model configuration.
             # Tiered Elder (#645): see consumer-deployment for full comments.
             - {name: GRUG_REVIEW_DEPTH, value: tiered}
+            # grug#1553: GitHub App logins whose PRs carry an author family, as
+            # `login:family` pairs split by `;` (e.g. `lane-app[bot]:claude`). Exact
+            # login match only; family must be in model_family.py's table. Empty =
+            # no App gets a family (Elder keeps its usual arm order for App PRs).
+            - {name: GRUG_APP_AUTHOR_FAMILIES, value: ""}
             # Deep escalation (#645). WAS 500 lines / 0.05 sample, tuned for
             # speed. Measured 2026-08-12: grug's own PRs run 18-260 added
             # lines, so 5 of 6 never escalated and only ever saw the tier-1

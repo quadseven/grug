@@ -38,7 +38,7 @@ from urllib.parse import quote
 import httpx
 
 from activity_log import record_check_verdict
-from model_family import ReviewFamilies, model_family
+from model_family import ReviewFamilies, app_author_family, model_family
 from code_review_prompt import RULES
 from github_app_auth import (
     get_app_id, installation_permission_summary_note, with_install_token_retry,
@@ -134,7 +134,9 @@ from personas.tpm.dor_checks import loom_footer_model
 from personas.tpm.persona import is_trusted_operator
 from personas.tpm.ticket_compliance import closes_refs
 from personas.code_reviewer.repo_docs import build_repo_docs_context
-from personas.tpm.issue_fetcher import build_issue_details_fetcher
+from personas.tpm.issue_fetcher import (
+    build_issue_details_fetcher, build_merged_siblings_fetcher,
+)
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     advisory_when_unrefuted, eval_tags, grade_findings, partition_findings,
@@ -1099,8 +1101,18 @@ def _defensive_drop_note(count: int) -> str:
     return f"\n\n{count} defensive findings dropped: no reachable caller named"
 
 
-def _tier_served_note(tier_served: str | None) -> str:
-    return f"\n\nTier served: `{tier_served}`." if tier_served else ""
+def _tier_served_text(tier_served: str, models_used: tuple[str, ...]) -> str:
+    """The tier, then the models that answered when a reply named them."""
+    models = ", ".join(f"`{_md_code_span(model)}`" for model in models_used)
+    return f"`{tier_served}` ({models})" if models else f"`{tier_served}`"
+
+
+def _tier_served_note(
+    tier_served: str | None, models_used: tuple[str, ...] = (),
+) -> str:
+    if not tier_served:
+        return ""
+    return f"\n\nTier served: {_tier_served_text(tier_served, models_used)}."
 
 
 _SAME_FAMILY_NOTE = (
@@ -1138,12 +1150,19 @@ def _activity_families(families: ReviewFamilies | None) -> dict[str, str]:
 def _author_family(pr: Mapping[str, Any]) -> str | None:
     """The family of the model a trusted operator's Loom footer names, or None.
 
-    Chief's parser, so the two agree. The body is the author's own text, so a
-    stranger's footer is ignored: it could otherwise steer the review off an
-    arm, or onto a paid tier."""
-    if not is_trusted_operator(pr):
-        return None
-    return model_family(loom_footer_model(str(pr.get("body") or "")))
+    For trusted operator humans, uses the Loom footer. For App authors (bots),
+    uses a trusted source mapping App logins to model families (grug#1553).
+    Both are "trusted source" but differ in how the family is derived.
+    """
+    if is_trusted_operator(pr):
+        return model_family(loom_footer_model(str(pr.get("body") or "")))
+
+    user = pr.get("user")
+    if isinstance(user, Mapping) and user.get("type") == "Bot":
+        app_login = user.get("login")
+        return app_author_family(str(app_login) if app_login else None)
+
+    return None
 
 
 def _hunt_title(title: str, living_range: str) -> str:
@@ -1212,9 +1231,10 @@ def _summary_markdown(
         duplicate_paths,
     )
     defensive_note = _defensive_drop_note(defensive_dropped_count)
-    tier_note = _tier_served_note(getattr(evaluation, "tier_served", None)) + _family_note(
-        getattr(evaluation, "families", None),
-    )
+    tier_note = _tier_served_note(
+        getattr(evaluation, "tier_served", None),
+        getattr(evaluation, "models_used", ()),
+    ) + _family_note(getattr(evaluation, "families", None))
     hunt = _hunt_section(living_range, living_baseline_rejected)
 
     if is_partial_coverage(evaluation.degraded_reason):
@@ -1801,6 +1821,7 @@ def _stack_detail_lines(
     head_sha: str = "", base_sha: str = "",
     tier_served: str | None = None,
     families: ReviewFamilies | None = None,
+    models_used: tuple[str, ...] = (),
 ) -> str:
     """The two facts a skeptical reader asks for: what was looked at, and what
     was withheld. Everything else that used to live here was cut as noise.
@@ -1823,7 +1844,7 @@ def _stack_detail_lines(
     if scope:
         lines.append(f"- Looked at: {scope}")
     if tier_served:
-        lines.append(f"- Tier served: `{tier_served}`")
+        lines.append(f"- Tier served: {_tier_served_text(tier_served, models_used)}")
     if families is not None:
         lines.append(f"- {_family_line(families)}")
         if families.same_family:
@@ -2030,6 +2051,7 @@ def _review_stack_body(
             review_phase, living_range, suppressed_count, head_sha, base_sha,
             tier_served=getattr(evaluation, "tier_served", None),
             families=getattr(evaluation, "families", None),
+            models_used=getattr(evaluation, "models_used", ()),
         ),
     ] if p)
     if detail:
@@ -2739,6 +2761,10 @@ def _attach_linked_issue_context(
             fetch_issue=fetch_issue,
             owner=owner,
             repo=repo_name,
+            fetch_siblings=build_merged_siblings_fetcher(
+                installation_id=installation_id, owner=owner, repo=repo_name,
+                pr_number=int(pr_context.get("pr_number") or 0),
+            ),
         )
         if linked:
             pr_context["linked_issue_context"] = linked
