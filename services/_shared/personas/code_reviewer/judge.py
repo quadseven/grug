@@ -36,8 +36,12 @@ from llm_client import (
     judge_findings,
     submit_finding_evaluation,
 )
+from model_family import model_family
+from personas.code_reviewer.intent_filter import INTENT_MISMATCH
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+from personas.code_reviewer.quarantine import quarantined_evidence
 from personas.code_reviewer.sast import EXPOSED_SECRET
+from redact import redact_secrets
 from review_evidence import ElderEvidence
 from review_types import Severity
 
@@ -72,6 +76,7 @@ def _judge_evidence_packet(
     installation_id: int,
     *,
     refute: bool = False,
+    avoid_families: frozenset[str] = frozenset(),
 ) -> tuple[FindingJudgement, ...]:
     """Grade one evidence packet, trying backends in order until one returns
     a complete verdict set.
@@ -81,7 +86,9 @@ def _judge_evidence_packet(
     the in-cluster Cave judge, capped at 4,096 output tokens, is the last
     resort. Under `cave` priority the Cave goes first, then the per-install
     SaaS pick, as before. A partial or empty answer, including one cut off
-    at its output cap, is a failed attempt, never a verdict."""
+    at its output cap, is a failed attempt, never a verdict. `avoid_families`
+    moves a backend of those model families behind the others, so a different
+    lineage answers first when the pool has one (#1567)."""
     expected_indices = set(range(len(findings)))
 
     def attempt(config: BackendConfig | None, *, redact: bool, label: str):
@@ -115,7 +122,10 @@ def _judge_evidence_packet(
         return None
 
     cave_config: BackendConfig | None = _cave_judge_config()
-    cloud_configs = cloud_judge_configs()
+    cloud_configs = sorted(
+        cloud_judge_configs(),
+        key=lambda config: model_family(config.model) in avoid_families,
+    )
     if cloud_configs:
         for config in cloud_configs:
             verdicts = attempt(config, redact=True, label=config.backend.value)
@@ -412,6 +422,8 @@ def run_judge(
 # HIGH/CRITICAL findings (narrowing the #467-era always-publish rule for
 # exactly this gate).
 _REFUTE_CONFIDENCE_FLOOR = 0.9
+_FALSE_VALUES = frozenset({"", "0", "false", "off", "no"})
+VERIFIER_REVIEWER = "elder-verifier"
 
 
 @dataclass(frozen=True)
@@ -475,6 +487,111 @@ def refute_with_outcome(
             if 0 <= v.finding_index < len(reprs)
         )
     return RefuteOutcome(tuple(verdicts), frozenset(unavailable))
+
+
+def falsification_verifier_enabled() -> bool:
+    """`GRUG_FALSIFICATION_VERIFIER`, off unless set. When on, each blocking
+    finding gets its own fresh-context call in place of the batched gate."""
+    raw = os.getenv("GRUG_FALSIFICATION_VERIFIER", "")
+    return raw.strip().lower() not in _FALSE_VALUES
+
+
+def _verifier_evidence(finding: Finding, evidence: ElderEvidence) -> ElderEvidence:
+    """The candidate plus its file's diff and code. A requirement finding
+    keeps the linked criteria: without them it looks unsupported and is
+    wrongly refuted (#904)."""
+    if finding.rule_name == INTENT_MISMATCH:
+        return evidence.scoped_to((finding.file,))
+    return quarantined_evidence(evidence, (finding.file,))
+
+
+def _reviewer_families(finding: Finding) -> frozenset[str]:
+    return frozenset(model_family(origin.model) for origin in finding.origins)
+
+
+@dataclass(frozen=True)
+class VerifierCost:
+    """What one verifier run spent, so its precision gain can be priced.
+    Tokens are estimated at four characters each, retries excluded."""
+
+    model_calls: int
+    estimated_prompt_tokens: int
+
+
+def falsify_with_outcome(
+    findings: tuple[Finding, ...],
+    evidence: ElderEvidence,
+    installation_id: int,
+) -> tuple[RefuteOutcome, VerifierCost]:
+    """The falsification verifier (#1567): one fresh-context call per
+    blocking finding, in the same outcome shape as the batched gate, so the
+    kill floor and outage softening stay the same. Fail-open per finding."""
+    verdicts: list[FindingJudgement] = []
+    unavailable: set[int] = set()
+    calls = chars = 0
+    for index, finding in enumerate(findings):
+        packet = _verifier_evidence(finding, evidence)
+        calls += 1
+        chars += len(packet.judge_view().text)
+        try:
+            answered = _judge_evidence_packet(
+                [_finding_to_repr(finding)], packet,
+                installation_id=installation_id, refute=True,
+                avoid_families=_reviewer_families(finding),
+            )
+        except Exception as e:  # noqa: BLE001 - fail-open, mirror the gate
+            log.error(
+                "falsification_verifier_failed",
+                extra={"kind": type(e).__name__, "rule": finding.rule_name},
+                exc_info=True,
+            )
+            answered = ()
+        if not answered:
+            unavailable.add(index)
+            continue
+        verdicts.append(replace(answered[0], finding_index=index))
+    outcome = RefuteOutcome(tuple(verdicts), frozenset(unavailable))
+    return outcome, VerifierCost(calls, chars // 4)
+
+
+def verifier_rows(
+    findings: tuple[Finding, ...],
+    outcome: RefuteOutcome,
+    refuted: tuple[Finding, ...],
+    *,
+    repo: str,
+    pull_number: int,
+    head_sha: str,
+) -> list[dict]:
+    """One ledger row per finding, so precision can be measured per tier.
+    `reviewer` keeps these out of the reaction-labeled rows, and these
+    verdicts count as neither accepted nor false-positive."""
+    by_index = {v.finding_index: v for v in outcome.verdicts}
+    killed = {id(f) for f in refuted}
+    rows: list[dict] = []
+    for index, finding in enumerate(findings):
+        verdict = by_index.get(index)
+        if verdict is None:
+            label = "unavailable"
+        else:
+            label = "refuted" if id(finding) in killed else "confirmed"
+        rows.append({
+            "repo": repo,
+            "pr": pull_number,
+            "reviewer": VERIFIER_REVIEWER,
+            "severity": finding.severity,
+            "class": finding.rule_name,
+            "category": finding.category,
+            "finding": redact_secrets(finding.message),
+            "verdict": label,
+            "evidence": f"elder-verifier:{head_sha}:{finding.file}:{finding.line}",
+            "refutation": redact_secrets(verdict.reasoning) if verdict else "",
+            "confidence": verdict.confidence if verdict else None,
+            "ts": "",
+            "commit": head_sha or None,
+            "head_sha": head_sha or None,
+        })
+    return rows
 
 
 def refute_findings(

@@ -145,8 +145,9 @@ from personas.tpm.issue_fetcher import (
 )
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
-    advisory_when_unrefuted, eval_tags, grade_findings, partition_findings,
-    partition_refuted, refute_with_outcome, submit_evals,
+    advisory_when_unrefuted, eval_tags, falsification_verifier_enabled,
+    falsify_with_outcome, grade_findings, partition_findings,
+    partition_refuted, refute_with_outcome, submit_evals, verifier_rows,
 )
 from personas.code_reviewer.intent_filter import (
     filter_intent_mismatch_findings, scope_intent_mismatch_to_claimed_boxes,
@@ -4714,6 +4715,18 @@ def _adjudication_calls(response: LlmReviewResponse) -> int:
     )
 
 
+def put_verifier_verdicts(rows: list[dict]) -> None:
+    """Store verifier verdicts in the findings ledger. Best-effort: a store
+    failure never changes what publishes."""
+    try:
+        from adapters.install_store import put_ledger_row
+
+        for row in rows:
+            put_ledger_row(row)
+    except Exception as e:  # noqa: BLE001 - telemetry never breaks the review
+        log.warning("elder_verifier_ledger_failed", extra={"kind": type(e).__name__})
+
+
 def _apply_refute_gate(
     findings, evidence, installation_id, *, owner, repo_name, pull_number, arm,
     plain_findings=(), plain_verdicts=(),
@@ -4734,9 +4747,32 @@ def _apply_refute_gate(
     high = tuple(f for f in findings if f.severity in ("high", "critical"))
     if not high:
         return findings
-    outcome = refute_with_outcome(high, evidence, installation_id)
+    verifying = falsification_verifier_enabled()
+    if verifying:
+        outcome, cost = falsify_with_outcome(high, evidence, installation_id)
+    else:
+        outcome, cost = refute_with_outcome(high, evidence, installation_id), None
     verdicts = outcome.verdicts
     _, refuted = partition_refuted(high, verdicts) if verdicts else ((), ())
+    if verifying and cost is not None:
+        head_sha = str((evidence.pr_context or {}).get("head_sha") or "")
+        put_verifier_verdicts(verifier_rows(
+            high, outcome, refuted, repo=f"{owner}/{repo_name}",
+            pull_number=pull_number, head_sha=head_sha,
+        ))
+        log.info(
+            "elder_verifier",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "arm": arm,
+                "findings": len(high),
+                "refuted": len(refuted),
+                "unavailable": len(outcome.unavailable),
+                "model_calls": cost.model_calls,
+                "estimated_prompt_tokens": cost.estimated_prompt_tokens,
+            },
+        )
     if refuted:
         from personas.code_reviewer.verify import KilledFinding
         _record_verification_kills(
