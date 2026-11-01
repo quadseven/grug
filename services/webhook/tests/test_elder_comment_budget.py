@@ -81,6 +81,30 @@ def test_a_cap_of_zero_means_no_cap():
     assert len(split.inline) == 9
 
 
+def test_a_low_confidence_non_blocking_finding_is_held():
+    doubted = _finding(line=2, severity="medium")
+    confidence = {finding_key("a.py", 2, "r"): (True, 0.4)}
+
+    split = split_for_budget((doubted,), cap=5, open_blocking=0, confidence=confidence)
+
+    assert split.held == (doubted,)
+
+
+def test_a_finding_the_judge_rejects_ranks_below_one_it_confirms():
+    rejected = _finding(line=1)
+    confirmed = _finding(line=2)
+    confidence = {
+        finding_key("a.py", 1, "r"): (False, 0.8),
+        finding_key("a.py", 2, "r"): (True, 0.6),
+    }
+
+    split = split_for_budget(
+        (rejected, confirmed), cap=1, open_blocking=0, confidence=confidence,
+    )
+
+    assert split.inline == (confirmed,)
+
+
 def test_held_lines_rank_highest_first_in_one_block():
     text = held_lines((_finding(line=1), _finding(line=2, severity="critical")), {})
 
@@ -193,6 +217,81 @@ def cr_dispatch_outcome():
     from personas.code_reviewer.judge import RefuteOutcome
 
     return RefuteOutcome((), frozenset())
+
+
+def test_a_failed_prior_fetch_holds_nothing_back_as_late(monkeypatch):
+    monkeypatch.setenv("GRUG_COMMENT_BUDGET", "1")
+    changed = cr_dispatch._round_changed_lines(
+        (), prior_review_head="abc", head_sha="abc", delta_reviewed=False,
+        keys_known=False,
+    )
+
+    assert changed is None
+
+
+def test_open_threads_spend_the_budget_on_a_delta_round():
+    from personas.code_reviewer.carry_forward import open_blocking_count
+
+    def _thread(body, resolved=False):
+        return {"isResolved": resolved, "comments": {"nodes": [{"body": body}]}}
+
+    threads = [
+        _thread("\U0001F534 critical | x <!-- grug-rule:a -->"),
+        _thread("\U0001F7E1 medium | x <!-- grug-rule:b -->"),
+        _thread("\U0001F534 critical | x <!-- grug-rule:c -->", resolved=True),
+    ]
+
+    assert open_blocking_count(threads) == 1
+
+
+def test_a_held_blocking_finding_keeps_the_review_baseline(monkeypatch):
+    """The next push must review this ground again, or a held finding with no
+    thread would vanish from the check."""
+    import adapters.install_store as store
+
+    monkeypatch.setenv("GRUG_COMMENT_BUDGET", "1")
+    stored: list = []
+    monkeypatch.setattr(
+        store, "put_elder_last_reviewed", lambda **kw: stored.append(kw),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_current_review_snapshot",
+        lambda *a, **kw: ("s", "abcd1234", "b", "t"),
+    )
+
+    _review_with_eight_blocking(monkeypatch)
+
+    assert stored == []
+
+
+def test_no_held_finding_moves_the_baseline_as_before(monkeypatch):
+    import adapters.install_store as store
+
+    monkeypatch.delenv("GRUG_COMMENT_BUDGET", raising=False)
+    stored: list = []
+    monkeypatch.setattr(
+        store, "put_elder_last_reviewed", lambda **kw: stored.append(kw),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_current_review_snapshot",
+        lambda *a, **kw: ("s", "abcd1234", "b", "t"),
+    )
+
+    _review_with_eight_blocking(monkeypatch)
+
+    assert len(stored) == 1
+
+
+def test_a_late_finding_stays_in_the_check(monkeypatch):
+    monkeypatch.setenv("GRUG_COMMENT_BUDGET", "1")
+    monkeypatch.setattr(
+        cr_dispatch, "_round_changed_lines", lambda *a, **kw: frozenset(),
+    )
+
+    posted, checks = _review_with_eight_blocking(monkeypatch, action="synchronize")
+
+    assert posted == []
+    assert checks[-1].conclusion == "failure"
 
 
 def test_eight_blocking_findings_post_five_and_still_fail_the_check(monkeypatch):

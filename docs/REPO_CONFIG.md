@@ -20,7 +20,7 @@ All keys are optional.
 | `skip_prs` | `{authors, labels, title_patterns}`, each a list of strings | A matching pull request is not reviewed. See below. |
 | `security_review_paths` | list of path globs | Replaces the default sensitive-path list of the code-only security pass. An empty list turns the pass off for this repo. See below. |
 | `elder_blocking_cap` | integer, default `5` | Blocking model findings per PR that get an inline comment; `0` means no cap. The rest appear ranked on the board and still fail the check. See below. |
-| `elder_drip_feed` | boolean, default `true` | On a second or later round, drop a new model finding below critical on an unchanged line. See below. |
+| `elder_drip_feed` | boolean, default `true` | On a second or later round, hold a new model finding below critical on an unchanged line. See below. |
 | `elder_mute_min_labeled` | integer, default `20` | Labeled ledger rows a finding class needs before it can be muted. |
 | `elder_mute_below_precision` | number 0 to 1, default `0.2` | A class with at least `elder_mute_min_labeled` labeled rows and a lower fixed-rate is muted: no inline comment, only the board and check summary, marked "muted: fixed in N of M past findings". A high or critical finding still posts inline and blocks. |
 | `elder_mute_locked_classes` | list of class names | These classes keep their inline comments whatever their precision. |
@@ -68,7 +68,7 @@ When `GRUG_QUARANTINED_SECURITY_PASS` is set on the deployment, a pull request t
 
 ## Comment budget
 
-The budget applies only when `GRUG_COMMENT_BUDGET` is set on the deployment. Deterministic scanner findings are never capped or dropped. A held finding has no inline comment, is listed on the board by severity and judge confidence, and still counts toward the check. A non-blocking finding the judge called not real is held too.
+The budget applies only when `GRUG_COMMENT_BUDGET` is set on the deployment. Deterministic scanner findings are never capped or dropped. A held finding has no inline comment, is listed on the board by severity and judge confidence, and still counts toward the check. A non-blocking finding the judge called not real, or graded below 0.7, is held too. When a blocking finding is held for the cap, the next push reviews that ground again.
 
 ## Example
 
