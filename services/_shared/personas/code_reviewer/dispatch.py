@@ -1916,7 +1916,7 @@ def _unwalked_ground_note(evaluation: CodeReviewEvaluation) -> str:
 
 
 def _stack_closing_note(
-    evaluation: CodeReviewEvaluation, *, has_committable: bool = False,
+    evaluation: CodeReviewEvaluation, *, has_committable: bool,
 ) -> list[str]:
     """The board section's tail: what to do next, or why there is nothing.
 
@@ -1924,8 +1924,9 @@ def _stack_closing_note(
     it used to get "No agent prompt - nothing to remediate.", the fifth
     separate way one body said "no findings".
 
-    `has_committable` means a suggestion passed `checked_suggestion`, the same
-    check `/grug fix` runs, so the command is named only when it can commit."""
+    `has_committable` means a finding's own suggestion passed
+    `checked_suggestion`, the same check `/grug fix` runs, so the command is
+    named only when it can commit."""
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         # Only when there is something to fix - empty "Address each finding"
@@ -2059,9 +2060,12 @@ def _review_stack_body(
         rows.append(f"| +{n - _STACK_TABLE_ROWS} more | | | |")
     table = "\n".join(rows) if findings else ""
 
+    # `/grug fix` reads the stored `suggestion` field only, so a fix promoted
+    # from the message's prose is offered inline and never counted here.
     committable = [
         f for f in findings
-        if checked_suggestion(f, f.line, (file_contents or {}).get(f.file, ""))
+        if f.suggestion
+        and checked_suggestion(f, f.line, (file_contents or {}).get(f.file, ""))
         is not None
     ]
 
