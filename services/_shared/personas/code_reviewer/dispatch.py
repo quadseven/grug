@@ -2767,6 +2767,18 @@ def _note_deferred_lint(
         pr_context["deferred_lint_unfinished"] = tuple(dict.fromkeys(unfinished))
 
 
+def _log_omit_markings(
+    evaluation: CodeReviewEvaluation, *, pr: str, head_sha: str,
+) -> None:
+    """One line per marking whose own text says to omit it (grug#1529), to
+    measure how often the model skips the structured verdict."""
+    for rule in evaluation.omit_flagged_rules:
+        log.info(
+            "code_review_omit_marking_flagged",
+            extra={"pr": pr, "head_sha": head_sha[:8], "rule": rule},
+        )
+
+
 def _attach_linked_issue_context(
     pr_context: PrContext, *, installation_id: int, owner: str, repo_name: str,
 ) -> None:
@@ -3815,6 +3827,9 @@ def dispatch_code_review(
     evaluation = evaluate_diff(
         hunks, llm_response, cross_file_contents=evidence.cross_file_contents,
     )
+    _log_omit_markings(
+        evaluation, pr=f"{owner}/{repo_name}#{pull_number}", head_sha=head_sha,
+    )
     correctness_only = bool(pr_context.get("review_scope"))
     if correctness_only:
         evaluation = _drop_non_correctness_findings(evaluation)
@@ -4776,6 +4791,9 @@ def _grade_deep_response(
 ) -> tuple[CodeReviewEvaluation, tuple[Finding, ...], tuple[Any, ...], int]:
     deep_eval = evaluate_diff(
         hunks, deep_llm, cross_file_contents=evidence.cross_file_contents,
+    )
+    _log_omit_markings(
+        deep_eval, pr=f"{owner}/{repo_name}#{pull_number}", head_sha=head_sha,
     )
     # The reasoner reads the same linked criteria, so its intent-mismatch
     # findings get the same evidence filter and box scope (#1170, #1218).

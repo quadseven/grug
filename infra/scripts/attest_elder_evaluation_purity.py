@@ -69,6 +69,7 @@ ALLOWED_IN_EVALUATE_DIFF: frozenset[str] = frozenset({
     # grug#1397: reads the finding's own `withdrawn` flag and runs one regex
     # over its message; an in-memory check, not IO.
     "is_withdrawn_finding",
+    "concludes_omit",
     # grug#813/#707: the conclusion-derivation rule, single-sourced so
     # evaluate_diff/with_extra_findings/with_findings cannot drift into
     # three different answers (severity in -> conclusion out; no IO).

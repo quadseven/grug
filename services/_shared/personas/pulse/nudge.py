@@ -8,6 +8,12 @@ check is green, and mark them idle (or post a legacy comment when configured)
 per `_NUDGE_TTL_DAYS` (idempotent via a store claim). Hard-capped per
 install per run so a backlog can't blow the CronJob budget.
 
+Label mode judges idleness by an activity clock (#1556): the newest of the
+head commit date, the last review and the last non-bot comment. GitHub bumps
+`updated_at` on every label add or remove, so `updated_at` is only the cheap
+prefilter; a PR that already carries the label is re-judged every pass by the
+activity clock, never by its own label write.
+
 Default OFF per repo (`pulse_enabled`). Best-effort everywhere: one
 repo's failure logs and continues.
 """
@@ -197,57 +203,256 @@ def _set_idle_label(token: str, owner: str, repo: str, pr_number: int) -> None:
     resp.raise_for_status()
 
 
-def _update_idle_board(token: str, owner: str, repo: str, pr: dict[str, Any]) -> None:
-    updated = datetime.fromisoformat(pr["updated_at"].replace("Z", "+00:00"))
-    days = max(0, (datetime.now(timezone.utc) - updated).days)
+def _update_idle_board(
+    token: str, owner: str, repo: str, pr_number: int, idle_since: datetime,
+) -> None:
+    days = max(0, (datetime.now(timezone.utc) - idle_since).days)
     board_client.upsert_board_section(
-        token, owner, repo, int(pr["number"]), key="pulse",
-        section=f"Idle since {updated.date().isoformat()}, {days} days",
+        token, owner, repo, pr_number, key="pulse",
+        section=f"Idle since {idle_since.date().isoformat()}, {days} days",
         app_id=get_app_id(), create_if_absent=False,
     )
 
 
-def _cleanup_idle_labels(
-    token: str, owner: str, repo: str, delivery: str,
-    stale_prs: list[dict[str, Any]], labeled: list[dict[str, Any]],
-) -> None:
-    stale_numbers = {int(pr["number"]) for pr in stale_prs}
-    for pr in labeled:
-        number = int(pr["number"])
-        if delivery != "label" or number not in stale_numbers:
+_MAX_ACTIVITY_PAGES = 5
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _repo_url(owner: str, repo: str) -> str:
+    return f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+
+
+def _get_pages(token: str, url: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for page in range(1, _MAX_ACTIVITY_PAGES + 1):
+        resp = httpx.get(
+            url, params={**params, "per_page": 100, "page": page},
+            headers=_headers(token), timeout=_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        batch = resp.json() or []
+        out.extend(batch)
+        if len(batch) < 100:
+            return out
+    log.info("pulse_activity_page_cap", extra={"url": url, "pages": _MAX_ACTIVITY_PAGES})
+    return out
+
+
+def _fetch_pull(token: str, owner: str, repo: str, pr_number: int) -> dict[str, Any]:
+    resp = httpx.get(
+        f"{_repo_url(owner, repo)}/pulls/{pr_number}",
+        headers=_headers(token), timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json() or {}
+
+
+def _head_commit_date(
+    token: str, owner: str, repo: str, pr: dict[str, Any],
+) -> datetime | None:
+    head_sha = ((pr.get("head") or {}).get("sha")) or ""
+    if not head_sha:
+        return None
+    resp = httpx.get(
+        f"{_repo_url(owner, repo)}/commits/{quote(head_sha, safe='')}",
+        headers=_headers(token), timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    commit = (resp.json() or {}).get("commit") or {}
+    return _parse_ts((commit.get("committer") or {}).get("date"))
+
+
+def _newest_human_comment(
+    token: str, owner: str, repo: str, pr_number: int, after: datetime | None,
+) -> datetime | None:
+    """Newest non-bot comment created after `after`. Only comments touched
+    after it are fetched (`since`), so this is usually one short page."""
+    params = {"since": after.strftime("%Y-%m-%dT%H:%M:%SZ")} if after else {}
+    url = f"{_repo_url(owner, repo)}/issues/{pr_number}/comments"
+    created = [
+        _parse_ts(c.get("created_at"))
+        for c in _get_pages(token, url, params)
+        if (c.get("user") or {}).get("type") != "Bot"
+    ]
+    return max((t for t in created if t and (after is None or t > after)), default=None)
+
+
+def _last_activity(
+    token: str, owner: str, repo: str, pr: dict[str, Any],
+) -> datetime | None:
+    """The idle clock (#1556): the newest of the PR's creation, its head
+    commit date, its last review and its last non-bot comment. A label add
+    or remove moves none of these, unlike `updated_at`. None when no date
+    can be read at all (the caller then leaves the PR alone)."""
+    pr_number = int(pr["number"])
+    reviews = _get_pages(token, f"{_repo_url(owner, repo)}/pulls/{pr_number}/reviews", {})
+    times = [
+        _parse_ts(pr.get("created_at")),
+        _head_commit_date(token, owner, repo, pr),
+        *(_parse_ts(r.get("submitted_at")) for r in reviews),
+    ]
+    newest = max((t for t in times if t), default=None)
+    comment = _newest_human_comment(token, owner, repo, pr_number, newest)
+    return comment or newest
+
+
+def _mark_idle(
+    token: str, install_id: int, full: str, owner: str, repo: str,
+    pr: dict[str, Any], *, add_label: bool, idle_since: datetime,
+) -> bool:
+    """Label mode for one idle, Chief-green PR. Writes the label only when it
+    is missing, so a still-idle PR costs no label write per pass. The weekly
+    claim keeps one neutral verdict row per idle week. Returns whether any
+    GitHub write happened, which is what the per-install cap counts."""
+    pr_number = int(pr["number"])
+    if add_label:
+        _set_idle_label(token, owner, repo, pr_number)
+    claimed = claim_pulse_nudge(install_id, full, pr_number)
+    if add_label or claimed:
+        _update_idle_board(token, owner, repo, pr_number, idle_since)
+    if claimed:
+        log.info("pulse_nudged", extra={"install_id": install_id, "repo": full, "pr": pr_number})
+        record_check_verdict(
+            install_id=install_id, persona_key="pulse", repo=full,
+            pr_number=pr_number, head_sha=((pr.get("head") or {}).get("sha")) or "",
+            conclusion="neutral",
+            summary=f"Drum nudge - PR quiet {_STALE_DAYS}+ days",
+            findings_count=0, blocking=False, degraded_reason=None,
+        )
+    return add_label or claimed
+
+
+class _WriteBudget:
+    """Per-install count of PRs Pulse wrote to this pass. Mutable so writes
+    made before a later repo-level API failure still count against the cap."""
+
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        self.used = 0
+
+    @property
+    def spent(self) -> bool:
+        return self.used >= self.cap
+
+
+def _open_labeled_numbers(token: str, owner: str, repo: str) -> set[int]:
+    """Numbers of open PRs carrying the idle label. A closed PR loses the
+    label here, with no further reads."""
+    labeled: set[int] = set()
+    for item in _idle_labeled_prs(token, owner, repo):
+        number = int(item["number"])
+        if item.get("state", "open") != "open":
             _remove_idle_label(token, owner, repo, number)
+        else:
+            labeled.add(number)
+    return labeled
+
+
+def _label_candidates(
+    token: str, owner: str, repo: str,
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """The `updated_at` prefilter plus every open labeled PR (our own label
+    write makes `updated_at` fresh), labeled ones first."""
+    stale = _stale_prs(token, owner, repo)
+    labeled = _open_labeled_numbers(token, owner, repo)
+    by_number = {int(pr["number"]): pr for pr in stale}
+    for number in sorted(labeled - by_number.keys()):
+        by_number[number] = _fetch_pull(token, owner, repo, number)
+    ordered = [by_number[n] for n in sorted(labeled)] + [
+        pr for pr in stale if int(pr["number"]) not in labeled
+    ]
+    return ordered, labeled
+
+
+def _plan_ready(token: str, owner: str, repo: str, pr: dict[str, Any]) -> bool:
+    head_sha = ((pr.get("head") or {}).get("sha")) or ""
+    return bool(head_sha) and _dor_green(token, owner, repo, head_sha)
+
+
+def _judge_label_pr(
+    token: str, install_id: int, full: str, owner: str, repo: str,
+    pr: dict[str, Any], *, is_labeled: bool, cutoff: datetime,
+    budget: _WriteBudget,
+) -> None:
+    """One label-mode candidate, judged by the activity clock. Real
+    activity removes the label (corrective, not capped); an idle,
+    Chief-green PR is marked while the budget lasts. An unlabeled PR is
+    DoR-checked before the activity reads, a labeled one only if a write
+    could follow."""
+    if not is_labeled and not _plan_ready(token, owner, repo, pr):
+        return
+    idle_since = _last_activity(token, owner, repo, pr)
+    if idle_since is None:
+        return
+    if idle_since >= cutoff:
+        if is_labeled:
+            _remove_idle_label(token, owner, repo, int(pr["number"]))
+        return
+    if budget.spent:
+        return
+    if is_labeled and not _plan_ready(token, owner, repo, pr):
+        return
+    budget.used += _mark_idle(
+        token, install_id, full, owner, repo, pr,
+        add_label=not is_labeled, idle_since=idle_since,
+    )
+
+
+def _run_label_mode(
+    token: str, install_id: int, full: str, owner: str, repo: str,
+    budget: _WriteBudget,
+) -> None:
+    """One repo in label mode (#1556). Labeled PRs are judged first, so a
+    label always comes off after real activity. New labels (and their board
+    writes) stop at `budget`, and an unlabeled PR costs no activity reads
+    once it is spent."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_STALE_DAYS)
+    ordered, labeled = _label_candidates(token, owner, repo)
+    for pr in ordered:
+        is_labeled = int(pr["number"]) in labeled
+        if not is_labeled and budget.spent:
+            break
+        _judge_label_pr(
+            token, install_id, full, owner, repo, pr,
+            is_labeled=is_labeled, cutoff=cutoff, budget=budget,
+        )
 
 
 def _process_stale_pr(
     token: str, install_id: int, full: str, owner: str, repo: str,
-    delivery: str, pr: dict[str, Any],
+    pr: dict[str, Any],
 ) -> bool:
+    """Comment mode for one stale PR."""
     pr_number = int(pr["number"])
     head_sha = ((pr.get("head") or {}).get("sha")) or ""
     if not head_sha or not _dor_green(token, owner, repo, head_sha):
         return False
-    if delivery == "label":
-        _set_idle_label(token, owner, repo, pr_number)
-        _update_idle_board(token, owner, repo, pr)
-    if delivery == "comment" and _recent_nudge_exists(token, owner, repo, pr_number):
+    if _recent_nudge_exists(token, owner, repo, pr_number):
         return False
     if not claim_pulse_nudge(install_id, full, pr_number):
         return False
     try:
-        if delivery == "comment":
-            resp = httpx.post(
-                f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
-                f"/issues/{pr_number}/comments",
-                json={"body": _NUDGE_BODY.format(days=_STALE_DAYS)},
-                headers=_headers(token), timeout=_FETCH_TIMEOUT,
-            )
-            resp.raise_for_status()
+        resp = httpx.post(
+            f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+            f"/issues/{pr_number}/comments",
+            json={"body": _NUDGE_BODY.format(days=_STALE_DAYS)},
+            headers=_headers(token), timeout=_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
     except httpx.HTTPStatusError as e:
         if 400 <= e.response.status_code < 500:
             release_pulse_nudge(install_id, full, pr_number)
         raise
-    # Ambiguous transport and 5xx outcomes keep the weekly claim. A label write
-    # has already succeeded in label mode, and comment mode verifies markers.
+    # Ambiguous transport and 5xx outcomes keep the weekly claim; the marker
+    # pre-check above makes the retry safe.
     except httpx.RequestError:
         raise
     log.info("pulse_nudged", extra={"install_id": install_id, "repo": full, "pr": pr_number})
@@ -279,10 +484,11 @@ def run_pulse_for_install(
 ) -> int:
     """One Pulse pass for one install. `repos` = the install's repo list
     (id + full_name), fetched by the caller (the poller already holds a
-    token). Returns nudges posted. Never raises past a repo."""
-    nudged = 0
+    token). Returns the PRs written to: comments posted, or in label
+    mode idle labels added and weekly verdicts. Never raises past a repo."""
+    budget = _WriteBudget(_MAX_NUDGES_PER_INSTALL_RUN)
     for repo in repos[:_MAX_REPOS_PER_INSTALL]:
-        if nudged >= _MAX_NUDGES_PER_INSTALL_RUN:
+        if budget.spent:
             break
         repo_id = repo.get("id")
         full = repo.get("full_name", "")
@@ -294,14 +500,18 @@ def run_pulse_for_install(
             if not config.get("pulse_enabled", False):
                 continue
             delivery = config.get("pulse_delivery", "label")
+            if delivery == "label":
+                _run_label_mode(token, install_id, full, owner, name, budget)
+                continue
             stale_prs = _stale_prs(token, owner, name)
-            labeled = _idle_labeled_prs(token, owner, name)
-            _cleanup_idle_labels(token, owner, name, delivery, stale_prs, labeled)
+            # Comment mode carries no label: clear any left from label mode.
+            for item in _idle_labeled_prs(token, owner, name):
+                _remove_idle_label(token, owner, name, int(item["number"]))
             for pr in stale_prs:
-                if nudged >= _MAX_NUDGES_PER_INSTALL_RUN:
+                if budget.spent:
                     break
-                nudged += _process_stale_pr(
-                    token, install_id, full, owner, name, delivery, pr,
+                budget.used += _process_stale_pr(
+                    token, install_id, full, owner, name, pr,
                 )
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             # One repo's API failure must not stop the pass.
@@ -309,4 +519,4 @@ def run_pulse_for_install(
                 "pulse_repo_failed",
                 extra={"install_id": install_id, "repo": full, "kind": type(e).__name__},
             )
-    return nudged
+    return budget.used
