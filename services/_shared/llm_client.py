@@ -7503,15 +7503,24 @@ def review_second_lineage(
 ) -> LlmReviewResponse:
     """One review on the operator's subscription lane (#1573): no paid API
     spend, and no other backend. The lane serves two families and picks one,
-    so it hears the primary pass's family the way it hears an author's. The
-    caller compares the family that answered. A missing or spent lane is a
+    so it hears the family to avoid the way it hears an author's. The caller
+    compares the family that answered. A missing or spent lane is a
     failed pass, never a fallback. `cancel_event` is checked before the call."""
     if cancel_event is not None and cancel_event.is_set():
         return LlmReviewResponse(kind="all_failed", error="cancelled")
-    known = [family for family in map(model_family, primary_models) if family]
+    # Half the daily cap stays for the last resort the primary pass may need.
+    if _subscription_calls_today() * 2 >= _subscription_daily_cap():
+        return LlmReviewResponse(kind="all_failed", error="second-lineage share spent")
+    # One call has no cohort planner, so a diff past one cohort cannot fit.
+    if sum(len(hunk.body) for hunk in evidence.hunks) > review_cohort_char_budget():
+        return LlmReviewResponse(kind="all_failed", error="diff too large for one call")
     pr_context = evidence.pr_context
+    # The header carries one family, so the author's comes first. The caller
+    # checks the reply against every family to avoid.
+    known = [family for family in map(model_family, primary_models) if family]
+    avoid = (pr_context or {}).get("author_family") or (known[0] if known else "")
     messages = _build_messages(evidence, "v2")
-    token = _FAMILY_GATE.set((known[0], False)) if known else None
+    token = _FAMILY_GATE.set((avoid, False)) if avoid else None
     try:
         response = _run_subscription_fallback(
             messages, "v2", _llmobs_tags(pr_context), list(evidence.hunks),

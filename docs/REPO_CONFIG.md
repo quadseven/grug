@@ -68,7 +68,7 @@ When `GRUG_QUARANTINED_SECURITY_PASS` is set on the deployment, a pull request t
 
 ## Second-lineage review
 
-When `GRUG_SECOND_LINEAGE_REVIEW` is set on the deployment, a pull request touching a path in the same sensitive list gets a second review of those paths from a different model family, on the subscription lane, with code-only evidence. Findings merge into the one review, and a finding only this pass raised reads `[Second lineage]`. If no different family answered, the summary says `Single-lineage review`.
+When `GRUG_SECOND_LINEAGE_REVIEW` is set on the deployment, a pull request touching a path in the same sensitive list, or a migration path while the default list applies, gets a second review of those paths from a different model family, on the subscription lane, with code-only evidence. Findings merge into the one review, and a finding only this pass raised reads `[Second lineage]`. If no provably different family answered, its findings are dropped and the summary says `Single-lineage review`.
 
 ## Comment budget
 

@@ -71,7 +71,7 @@ from llm_client import (
     review_second_lineage,
 )
 from ledger import SECOND_LINEAGE_REVIEWER
-from model_family import model_family
+from redact import redact_secrets
 from voice_pack import VoiceSelection, entitled_voice
 from review_evidence import ElderEvidence, assemble_evidence
 from review_types import EFFORTS, SEVERITIES
@@ -166,6 +166,7 @@ from personas.code_reviewer.quarantine import (
     merge_by_fingerprint,
     quarantined_evidence,
     quarantined_pass_enabled,
+    high_risk_paths,
     second_lineage_enabled,
     sensitive_paths,
 )
@@ -4053,7 +4054,10 @@ def dispatch_code_review(
         repo_config=repo_config, started=run_started_monotonic,
         cancel_event=cancel_event, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,
-        skip=llm_response.kind != "reviewed",
+        skip=(
+            llm_response.kind != "reviewed"
+            or (cancel_event is not None and cancel_event.is_set())
+        ),
     )
     if lineage_gap:
         config_note = f"{config_note}\n\n{lineage_gap}".strip()
@@ -4776,13 +4780,20 @@ def _run_quarantined_pass(
     return evaluation, "" if outcome == "reviewed" else QUARANTINE_UNAVAILABLE_NOTE
 
 
-def _is_second_lineage(response: LlmReviewResponse, primary_models: tuple[str, ...]) -> bool:
-    """A finished reply from a known family the primary pass did not use."""
+def _is_second_lineage(
+    response: LlmReviewResponse, primary_models: tuple[str, ...],
+    author_family: str | None,
+) -> bool:
+    """A finished reply from a family named in neither the primary pass nor
+    the PR's author. Fails closed: an unknown family on either side is not
+    proof of a second lineage."""
     primary = {model_family(model) for model in primary_models}
     answered = {model_family(model) for model in response.models_used}
+    if not primary or not answered or None in primary or None in answered:
+        return False
     return (
         response.kind == "reviewed" and not response.error
-        and bool(answered) and None not in answered and not answered & primary
+        and not answered & primary and author_family not in answered
     )
 
 
@@ -4799,14 +4810,19 @@ def _second_lineage_rows(
     rows = [
         {
             **base, "severity": f.severity, "class": f.rule_name,
-            "category": f.category, "finding": f.message, "verdict": "second-only",
-            "evidence": f"second-lineage:{head_sha}:{f.file}:{f.line}",
+            "category": f.category,
+            "finding": redact_secrets(f.message.removeprefix(SECOND_LINEAGE_MARK)),
+            "verdict": "second-only",
+            # No head here: one finding is one row across pushes.
+            "evidence": f"second-lineage:{f.file}:{f.line}:{f.rule_name}",
         }
         for f in findings if f.severity in ("high", "critical")
     ]
     rows.append({
         **base, "severity": "", "class": "second-lineage", "finding": "run",
         "verdict": outcome, "evidence": f"second-lineage:{head_sha}",
+        # A real time: the row key includes it, so a rerun adds its own row.
+        "ts": datetime.now(timezone.utc).isoformat(),
         "model_calls": model_calls,
     })
     return rows
@@ -4840,40 +4856,48 @@ def _run_second_lineage_pass(
     answered, so the gap is never silent."""
     if skip or not second_lineage_enabled():
         return evaluation, ""
-    paths = sensitive_paths(
+    paths = high_risk_paths(
         dict.fromkeys(h.path for h in evidence.hunks), repo_config,
     )
     if not paths:
         return evaluation, ""
     fresh = quarantined_evidence(evidence, paths)
     pr = f"{owner}/{repo_name}#{pull_number}"
+    author_family = (fresh.pr_context or {}).get("author_family")
     merged = None
-    response: LlmReviewResponse | None = None
-    model_calls = 1
+    outcome = "single-lineage"
+    model_calls = 0
     try:
         with _review_deadline(started + _staged_review_budget_s()):
             response = review_second_lineage(
                 fresh, installation_id, primary_models, cancel_event=cancel_event,
             )
-            if response.kind == "reviewed":
-                graded, _, _, _ = _grade_deep_response(
+            # A lane call happened only if the lane tier answered.
+            model_calls = 1 if response.tier_served == "subscription" else 0
+            if _is_second_lineage(response, primary_models, author_family):
+                graded, judged, verdicts, _ = _grade_deep_response(
                     response, hunks, fresh, installation_id,
                     pr_context=fresh.pr_context or {}, owner=owner,
                     repo_name=repo_name, pull_number=pull_number,
                     head_sha=head_sha, arm="second-lineage",
                 )
                 model_calls += _adjudication_calls(response)
+                submit_evals(
+                    judged, verdicts,
+                    review_span_context=response.review_span_context,
+                )
                 merged = merge_by_fingerprint(
                     evaluation.findings, graded.findings,
-                    mark=SECOND_LINEAGE_MARK,
+                    mark=SECOND_LINEAGE_MARK, second_opinion=True,
                 )
+                outcome = "second-lineage-run"
     except Exception as e:  # noqa: BLE001 - additive; the normal review stands
+        merged = None
+        outcome = "single-lineage"
         log.warning(
             "elder_second_lineage_failed",
             extra={"pr": pr, "kind": type(e).__name__}, exc_info=True,
         )
-    two_lineages = response is not None and _is_second_lineage(response, primary_models)
-    outcome = "second-lineage-run" if two_lineages else "single-lineage"
     second_only = merged.added_findings if merged else ()
     put_second_lineage_rows(_second_lineage_rows(
         outcome, second_only, repo=f"{owner}/{repo_name}",
@@ -4885,12 +4909,11 @@ def _run_second_lineage_pass(
             "installation_id": installation_id, "pr": pr, "outcome": outcome,
             "sensitive_paths": len(paths), "model_calls": model_calls,
             "added": merged.added if merged else 0,
-            "raised": merged.raised if merged else 0,
         },
     )
     if merged is not None and merged.findings != evaluation.findings:
         evaluation = with_findings(evaluation, merged.findings)
-    return evaluation, "" if two_lineages else SINGLE_LINEAGE_NOTE
+    return evaluation, "" if merged is not None else SINGLE_LINEAGE_NOTE
 
 
 def _adjudication_calls(response: LlmReviewResponse) -> int:
