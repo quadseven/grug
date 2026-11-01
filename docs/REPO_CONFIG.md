@@ -57,7 +57,7 @@ Elder also reads the repo's agent-guideline files (`CLAUDE.md`, `AGENTS.md`, `.c
 2. The agent-guideline files.
 3. Taught rules (learnings).
 
-Path instructions come first because `.grug.yaml` is read from the base commit, while the guideline files are read from the PR head. A PR cannot use its own `CLAUDE.md` to overrule a maintainer's instruction. Both prompt blocks state this order to the model.
+Path instructions come first because they name specific files. `.grug.yaml` and the guideline files are all read from the base commit, so a PR cannot use its own `CLAUDE.md` to steer its own review; a change to one takes effect once it merges. Both prompt blocks state this order to the model.
 
 ## Example
 

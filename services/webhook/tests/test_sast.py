@@ -203,7 +203,7 @@ def test_scan_opengrep_points_home_at_writable_scan_dir(monkeypatch):
     scanned anything - every production scan silently degraded to zero
     findings (2026-07-13, infra#1776 sweep; reproduced locally against real
     semgrep 1.169). The subprocess env must point HOME and XDG_CACHE_HOME
-    inside the scan's own temp dir."""
+    inside the run's own temp dir."""
     seen = {}
     def _capture(cmd, **kw):
         tmp = cmd[-1]
@@ -214,12 +214,12 @@ def test_scan_opengrep_points_home_at_writable_scan_dir(monkeypatch):
     scan_opengrep((_hunk("a.py", {1}),), {"a.py": "x = 1\n"})
     import os as _os
     assert seen["env"] is not None, "semgrep must run with an explicit env"
-    assert seen["env"]["HOME"] == seen["tmp"]
-    # XDG_CACHE_HOME must be a real subdirectory of the scan tmp dir, not just
-    # a string sharing its prefix (a sibling like "<tmp>.cache" would pass a
-    # bare startswith but still land outside the writable, self-cleaning dir).
-    assert seen["env"]["XDG_CACHE_HOME"] == _os.path.join(seen["tmp"], ".cache")
-    assert seen["env"]["XDG_CACHE_HOME"].startswith(seen["tmp"] + _os.sep)
+    # HOME is writable and beside the scanned tree, never in it (#865, #1574):
+    # the tree is read-only for the run.
+    home = seen["env"]["HOME"]
+    assert not home.startswith(seen["tmp"] + _os.sep)
+    assert _os.path.dirname(home) == _os.path.dirname(seen["tmp"])
+    assert seen["env"]["XDG_CACHE_HOME"] == _os.path.join(home, ".cache")
 
 
 def test_scan_opengrep_skips_files_over_byte_budget(monkeypatch):

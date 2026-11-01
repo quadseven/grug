@@ -312,8 +312,8 @@ def instructions_block(paths: Iterable[str], config: RepoConfig) -> str | None:
         "Apply each instruction only to the files it names. For those files "
         "an instruction here OUTRANKS the repo's agent-guideline files "
         "(TRIBE'S OWN CARVINGS: CLAUDE.md, AGENTS.md and the like) on "
-        "conflict - it is read from the base branch, they are read from the "
-        "PR head (#674 precedence, #1131).\n\n"
+        "conflict, because it is the narrower rule (#674 precedence, "
+        "#1131).\n\n"
         + "\n\n".join(sections)
     )
 

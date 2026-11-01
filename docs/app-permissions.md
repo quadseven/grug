@@ -16,6 +16,17 @@ authorization behavior: `pull_requests: write` alone is insufficient, while
 `contents: write` is required. See [the GraphQL mutation reference](https://docs.github.com/en/graphql/reference/pulls#resolvereviewthread)
 and [GitHub's permissions for Apps](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps).
 
+## Optional permission
+
+| Permission | Level | Feature |
+| --- | --- | --- |
+| `administration` | `write` | Create and remove Grug's own enforcement rulesets |
+
+Reading enforcement state needs `administration: read`. Without the permission
+Grug reports `permission_denied` for enforcement and keeps reviewing, so the
+runtime check above does not require it. It is the largest grant the App holds:
+see [the least-privilege comparison](reviewer-attack-surface.md#github-app-permissions).
+
 ## Grant a permission
 
 1. Open the GitHub App's settings page.

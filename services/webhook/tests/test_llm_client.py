@@ -3603,7 +3603,7 @@ def test_repo_guidelines_block_end_to_end(monkeypatch) -> None:
 
     with patch.object(httpx, "get", side_effect=_fake_get):
         block = lc._repo_guidelines_block(
-            {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123"}
+            {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123", "base_sha": "def456"}
         )
     assert "never use bare except" in block
 
@@ -3658,7 +3658,7 @@ def test_claude_md_rule_reaches_system_prompt_end_to_end(monkeypatch) -> None:
             return _gh_raw_response(200, "never use bare except")
         return _gh_raw_response(404)
 
-    pr_context = {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123"}
+    pr_context = {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123", "base_sha": "def456"}
     with patch.object(httpx, "get", side_effect=_fake_get):
         block = lc._repo_guidelines_block(pr_context)
     assert "never use bare except" in block

@@ -482,6 +482,25 @@ def _load_repo_config(
     return parse_repo_config((fetched or {}).get(_REPO_CONFIG_PATH))
 
 
+def _load_repo_docs(
+    token: str, owner: str, repo_name: str, base_ref: str, hunks,
+) -> str | None:
+    """CONTEXT.md and the relevant ADRs at the PR BASE. The model reads these
+    as the repo's source of truth, so a PR must not be able to write them
+    (#1574). The diff still shows the model any change a PR makes to them."""
+    if not base_ref:
+        return None
+    return build_repo_docs_context(
+        fetch_file=lambda path: fetch_file_contents(
+            token, owner, repo_name, (path,), base_ref,
+        ).get(path),
+        list_dir=lambda path: _list_dir_contents(
+            token, owner, repo_name, path, base_ref,
+        ),
+        hunks=hunks,
+    )
+
+
 _RUFF_POLICY_PATHS = ("ruff.toml", ".ruff.toml", "pyproject.toml")
 
 
@@ -3820,14 +3839,8 @@ def dispatch_code_review(
     try:
         repo_docs_context = with_install_token_retry(
             installation_id,
-            lambda token: build_repo_docs_context(
-                fetch_file=lambda path: fetch_file_contents(
-                    token, owner, repo_name, (path,), head_sha,
-                ).get(path),
-                list_dir=lambda path: _list_dir_contents(
-                    token, owner, repo_name, path, head_sha,
-                ),
-                hunks=hunks,
+            lambda token: _load_repo_docs(
+                token, owner, repo_name, str(pr_context.get("base_sha") or ""), hunks,
             ),
         )
     except Exception as e:  # noqa: BLE001 — repo docs are additive; never break the review

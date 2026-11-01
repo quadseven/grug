@@ -2606,9 +2606,9 @@ def _review_system_prompt(
     is therefore stated in words, in BOTH blocks (#1131): the guidelines
     block names a path instruction as the one thing that outranks a carving,
     and `repo_config.instructions_block` says it outranks the agent-guideline
-    files for the files it names. The reason is trust, not taste: `.grug.yaml`
-    is read from the base branch, the guideline files from the PR head, so a
-    PR cannot use its own CLAUDE.md to overrule a maintainer's instruction.
+    files for the files it names. Both are read from the base commit
+    (#1574), so a PR cannot use its own CLAUDE.md to steer its own review;
+    the order is the narrower rule winning over the general one.
     Pinned by `test_path_instructions_outrank_guidelines_in_both_blocks`.
     """
     # Per-repo team-learned practices (#527) append to the system prompt at
@@ -4212,7 +4212,9 @@ def _repo_guidelines_block(pr_context: Optional[PrContext]) -> str:
     if "/" not in repo:
         return ""
     owner, repo_name = repo.split("/", 1)
-    ref = str(pr_context.get("head_sha", ""))
+    # The base commit, never the head (#1574): this text steers the review
+    # from the system prompt, so a PR must not be able to write it.
+    ref = str(pr_context.get("base_sha", ""))
     if not ref:
         return ""
     try:
@@ -4237,7 +4239,7 @@ _GUIDELINE_CANDIDATES = (
     ".github/copilot-instructions.md", ".windsurfrules",
 )
 _GUIDELINE_FETCH_TIMEOUT = 10.0
-# Enough for the reviews in flight on one consumer; each entry is one head.
+# Enough for the reviews in flight on one consumer; each entry is one base commit.
 _GUIDELINE_CACHE_HEADS = 32
 # Only the first `_MAX_GUIDELINES_CHARS` reach the prompt. Keeping more than
 # that leaves room for redaction, and the limit stops a huge file in a pull
@@ -4331,10 +4333,10 @@ def _render_guidelines_block(files: dict[str, str]) -> str:
         "TRIBE'S OWN CARVINGS (this repo's own agent-guideline files - "
         "versioned, team-authored standards; if one of these conflicts with "
         "a taught preference above, follow the carving - it is the current, "
-        "official word. One thing outranks a carving: a `.grug.yaml` review "
-        "instruction in the REPO DOCS block, for the files it names, because "
-        "it is read from the base branch and these files from the PR "
-        "head):\n\n" + body
+        "official word. Read from the base branch, so a change to one in this "
+        "PR is not yet in force. One thing outranks a carving: a `.grug.yaml` "
+        "review instruction in the REPO DOCS block, for the files it "
+        "names):\n\n" + body
     )
 
 
