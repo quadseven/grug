@@ -247,6 +247,8 @@ class PrContext(TypedDict, total=False):
     sensitive_review: bool
     # A quarantined pass reads no text the PR's author could write (grug#1569).
     code_only: bool
+    # The falsification verifier's fresh context (grug#1567).
+    fresh_verifier: bool
     # The webhook's `repository.private` (grug#1269). Unset means unknown,
     # which every reader treats as private.
     repo_private: bool
@@ -7840,7 +7842,7 @@ def _build_judge_messages(
         f"Diff under review:\n{diff_block}\n\nFindings to grade:\n{finding_lines}",
         redact=redact,
     )
-    fresh = bool((evidence.pr_context or {}).get("code_only"))
+    fresh = bool((evidence.pr_context or {}).get("fresh_verifier"))
     if refute:
         system = _FALSIFY_SYSTEM_PROMPT if fresh else _REFUTE_SYSTEM_PROMPT
     else:
@@ -8047,7 +8049,7 @@ def judge_findings(
     pr_context = evidence.pr_context
     # A fresh context carries no prior frame: no practices, examples, or
     # learnings that could argue for or against the finding (#1567).
-    fresh = bool((pr_context or {}).get("code_only"))
+    fresh = bool((pr_context or {}).get("fresh_verifier"))
     messages = _build_judge_messages(
         findings_repr,
         evidence,

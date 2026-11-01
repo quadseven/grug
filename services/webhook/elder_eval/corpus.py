@@ -24,7 +24,7 @@ from typing import Iterable
 # taxonomy, not a copy that drifts (same rationale as the SAST runner
 # importing _build_messages - measuring Elder means using Elder's own parts).
 from code_review_prompt import _BUG_CLASSES
-from ledger import LedgerRow, parse_row
+from ledger import VERIFIER_REVIEWER, LedgerRow, parse_row
 
 log = logging.getLogger("grug.elder_eval")
 
@@ -229,6 +229,8 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
     grouped: dict[tuple[str, int], list[LedgerRow]] = {}
     dropped = 0
     for r in rows:
+        if r.reviewer == VERIFIER_REVIEWER:
+            continue
         if r.pr is None:
             dropped += 1
             continue

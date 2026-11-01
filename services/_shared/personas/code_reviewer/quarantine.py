@@ -51,11 +51,13 @@ _BLOCKING = frozenset({"high", "critical"})
 _FALSE_VALUES = frozenset({"", "0", "false", "off", "no"})
 
 
+def switch_on(name: str) -> bool:
+    """A review switch that spends model calls: off unless set."""
+    return os.getenv(name, "").strip().lower() not in _FALSE_VALUES
+
+
 def quarantined_pass_enabled() -> bool:
-    """`GRUG_QUARANTINED_SECURITY_PASS`, off unless set: the pass spends
-    model calls on every PR touching a sensitive path."""
-    raw = os.getenv("GRUG_QUARANTINED_SECURITY_PASS", "")
-    return raw.strip().lower() not in _FALSE_VALUES
+    return switch_on("GRUG_QUARANTINED_SECURITY_PASS")
 
 
 def _is_default_sensitive(path: str) -> bool:

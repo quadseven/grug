@@ -4716,15 +4716,15 @@ def _adjudication_calls(response: LlmReviewResponse) -> int:
 
 
 def put_verifier_verdicts(rows: list[dict]) -> None:
-    """Store verifier verdicts in the findings ledger. Best-effort: a store
-    failure never changes what publishes."""
-    try:
-        from adapters.install_store import put_ledger_row
+    """Store verifier verdicts in the findings ledger. Best-effort per row: a
+    store failure never changes what publishes."""
+    from adapters.install_store import put_ledger_row
 
-        for row in rows:
+    for row in rows:
+        try:
             put_ledger_row(row)
-    except Exception as e:  # noqa: BLE001 - telemetry never breaks the review
-        log.warning("elder_verifier_ledger_failed", extra={"kind": type(e).__name__})
+        except Exception as e:  # noqa: BLE001 - telemetry never breaks the review
+            log.warning("elder_verifier_ledger_failed", extra={"kind": type(e).__name__})
 
 
 def _apply_refute_gate(
@@ -4747,18 +4747,18 @@ def _apply_refute_gate(
     high = tuple(f for f in findings if f.severity in ("high", "critical"))
     if not high:
         return findings
-    verifying = falsification_verifier_enabled()
-    if verifying:
+    cost = None
+    if falsification_verifier_enabled():
         outcome, cost = falsify_with_outcome(high, evidence, installation_id)
     else:
-        outcome, cost = refute_with_outcome(high, evidence, installation_id), None
+        outcome = refute_with_outcome(high, evidence, installation_id)
     verdicts = outcome.verdicts
     _, refuted = partition_refuted(high, verdicts) if verdicts else ((), ())
-    if verifying and cost is not None:
+    if cost is not None:
         head_sha = str((evidence.pr_context or {}).get("head_sha") or "")
         put_verifier_verdicts(verifier_rows(
             high, outcome, refuted, repo=f"{owner}/{repo_name}",
-            pull_number=pull_number, head_sha=head_sha,
+            pull_number=pull_number, head_sha=head_sha, arm=arm,
         ))
         log.info(
             "elder_verifier",
