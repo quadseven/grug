@@ -413,6 +413,31 @@ def test_pulse_removes_idle_label_when_pr_is_no_longer_stale(monkeypatch):
     assert deletes == ["https://api.github.com/repos/o/r/issues/8/labels/grug%3Aidle"]
 
 
+def test_cleanup_keeps_idle_label_on_pr_that_is_still_stale(monkeypatch):
+    """A labeled PR that is still idle by the activity clock keeps its label
+    after a pass, while a labeled PR with recent activity loses it."""
+    deletes, writes = [], []
+    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    still_idle = _pr(8, "2020-01-01T00:00:00Z")
+    monkeypatch.setattr(pulse, "_stale_prs", lambda *args: [still_idle])
+    monkeypatch.setattr(pulse, "_idle_labeled_prs",
+                        lambda *args: [still_idle, _pr(9, "2026-10-30T00:00:00Z")])
+    monkeypatch.setattr(pulse, "_fetch_pull", lambda t, o, r, n: _pr(n, "2026-10-30T00:00:00Z"))
+    recent = pulse.datetime.now(pulse.timezone.utc)
+    monkeypatch.setattr(
+        pulse, "_last_activity",
+        lambda t, o, r, pr: pulse._parse_ts("2020-01-01T00:00:00Z") if pr["number"] == 8 else recent,
+    )
+    monkeypatch.setattr(pulse, "_dor_green", lambda *args: True)
+    monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda *args: False)
+    monkeypatch.setattr(pulse, "_remove_idle_label", lambda *args: deletes.append(args[3]))
+    monkeypatch.setattr(pulse, "_set_idle_label", lambda *args: writes.append(args[3]))
+
+    pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+    assert deletes == [9]
+    assert writes == []  # still labeled: no rewrite, no updated_at bump
+
+
 def test_pulse_removes_idle_label_from_closed_pr(monkeypatch):
     deletes = []
     monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
@@ -696,42 +721,64 @@ class _FakeGitHub:
         out["labels"] = [{"name": name} for name in sorted(pr["labels"])]
         return out
 
+    # GET routes: path pattern under /repos/o/r -> handler(match, params).
+    _GET_ROUTES = (
+        (r"pulls", "_get_pull_list"),
+        (r"issues", "_get_labeled_issues"),
+        (r"pulls/(\d+)", "_get_pull"),
+        (r"pulls/(\d+)/reviews", "_get_reviews"),
+        (r"issues/(\d+)/comments", "_get_comments"),
+        (r"commits/([^/]+)/check-runs", "_get_check_runs"),
+        (r"commits/([^/]+)", "_get_commit"),
+        (r"labels/.+", "_get_label"),
+    )
+
+    def _get_pull_list(self, match, params):
+        if params.get("page", 1) != 1:
+            return []
+        open_prs = [p for p in self.prs.values() if p["state"] == "open"]
+        open_prs.sort(key=lambda p: p["updated_at"])
+        return [self._pull(p) for p in open_prs]
+
+    def _get_labeled_issues(self, match, params):
+        if params.get("page", 1) != 1:
+            return []
+        items = [
+            {**self._pull(p), "pull_request": {}}
+            for p in self.prs.values() if pulse._IDLE_LABEL in p["labels"]
+        ]
+        items.sort(key=lambda p: p["updated_at"], reverse=True)
+        return items
+
+    def _get_pull(self, match, params):
+        return self._pull(self.prs[int(match.group(1))])
+
+    def _get_reviews(self, match, params):
+        return []
+
+    def _get_comments(self, match, params):
+        since = params.get("since", "")
+        return [c for c in self.comments[int(match.group(1))] if c["updated_at"] >= since]
+
+    def _get_check_runs(self, match, params):
+        return {"check_runs": [{"name": pulse._DOR_CHECK_NAME, "conclusion": "success"}]}
+
+    def _get_commit(self, match, params):
+        sha = match.group(1)
+        return {"sha": sha, "commit": {"committer": {"date": self.commit_dates[sha]}}}
+
+    def _get_label(self, match, params):
+        return {"name": pulse._IDLE_LABEL}
+
     def get(self, url, params=None, **kw):
-        path = url.split("https://api.github.com/repos/o/r", 1)[1]
-        params = params or {}
-        parts = path.strip("/").split("/")
+        import re
 
-        def ok(body):
-            return httpx.Response(200, json=body, request=httpx.Request("GET", url))
-
-        if parts == ["pulls"]:
-            if params.get("page", 1) != 1:
-                return ok([])
-            open_prs = [p for p in self.prs.values() if p["state"] == "open"]
-            open_prs.sort(key=lambda p: p["updated_at"])
-            return ok([self._pull(p) for p in open_prs])
-        if parts == ["issues"]:
-            if params.get("page", 1) != 1:
-                return ok([])
-            items = [
-                {**self._pull(p), "pull_request": {}}
-                for p in self.prs.values() if pulse._IDLE_LABEL in p["labels"]
-            ]
-            items.sort(key=lambda p: p["updated_at"], reverse=True)
-            return ok(items)
-        if parts[0] == "pulls" and len(parts) == 2:
-            return ok(self._pull(self.prs[int(parts[1])]))
-        if parts[0] == "pulls" and parts[2:] == ["reviews"]:
-            return ok([])
-        if parts[0] == "issues" and parts[2:] == ["comments"]:
-            since = params.get("since", "")
-            return ok([c for c in self.comments[int(parts[1])] if c["updated_at"] >= since])
-        if parts[0] == "commits" and parts[2:] == ["check-runs"]:
-            return ok({"check_runs": [{"name": pulse._DOR_CHECK_NAME, "conclusion": "success"}]})
-        if parts[0] == "commits" and len(parts) == 2:
-            return ok({"sha": parts[1], "commit": {"committer": {"date": self.commit_dates[parts[1]]}}})
-        if parts[0] == "labels":
-            return ok({"name": pulse._IDLE_LABEL})
+        path = url.split("https://api.github.com/repos/o/r/", 1)[1]
+        for pattern, handler in self._GET_ROUTES:
+            match = re.fullmatch(pattern, path)
+            if match:
+                body = getattr(self, handler)(match, params or {})
+                return httpx.Response(200, json=body, request=httpx.Request("GET", url))
         raise AssertionError(f"unexpected GET {path}")
 
     def post(self, url, json=None, **kw):

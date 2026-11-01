@@ -255,6 +255,36 @@ def _fetch_pull(token: str, owner: str, repo: str, pr_number: int) -> dict[str, 
     return resp.json() or {}
 
 
+def _head_commit_date(
+    token: str, owner: str, repo: str, pr: dict[str, Any],
+) -> datetime | None:
+    head_sha = ((pr.get("head") or {}).get("sha")) or ""
+    if not head_sha:
+        return None
+    resp = httpx.get(
+        f"{_repo_url(owner, repo)}/commits/{quote(head_sha, safe='')}",
+        headers=_headers(token), timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    commit = (resp.json() or {}).get("commit") or {}
+    return _parse_ts((commit.get("committer") or {}).get("date"))
+
+
+def _newest_human_comment(
+    token: str, owner: str, repo: str, pr_number: int, after: datetime | None,
+) -> datetime | None:
+    """Newest non-bot comment created after `after`. Only comments touched
+    after it are fetched (`since`), so this is usually one short page."""
+    params = {"since": after.strftime("%Y-%m-%dT%H:%M:%SZ")} if after else {}
+    url = f"{_repo_url(owner, repo)}/issues/{pr_number}/comments"
+    created = [
+        _parse_ts(c.get("created_at"))
+        for c in _get_pages(token, url, params)
+        if (c.get("user") or {}).get("type") != "Bot"
+    ]
+    return max((t for t in created if t and (after is None or t > after)), default=None)
+
+
 def _last_activity(
     token: str, owner: str, repo: str, pr: dict[str, Any],
 ) -> datetime | None:
@@ -262,30 +292,16 @@ def _last_activity(
     commit date, its last review and its last non-bot comment. A label add
     or remove moves none of these, unlike `updated_at`. None when no date
     can be read at all (the caller then leaves the PR alone)."""
-    base = _repo_url(owner, repo)
     pr_number = int(pr["number"])
-    head_sha = ((pr.get("head") or {}).get("sha")) or ""
-    times = [_parse_ts(pr.get("created_at"))]
-    if head_sha:
-        resp = httpx.get(
-            f"{base}/commits/{quote(head_sha, safe='')}",
-            headers=_headers(token), timeout=_FETCH_TIMEOUT,
-        )
-        resp.raise_for_status()
-        commit = (resp.json() or {}).get("commit") or {}
-        times.append(_parse_ts((commit.get("committer") or {}).get("date")))
-    for review in _get_pages(token, f"{base}/pulls/{pr_number}/reviews", {}):
-        times.append(_parse_ts(review.get("submitted_at")))
+    reviews = _get_pages(token, f"{_repo_url(owner, repo)}/pulls/{pr_number}/reviews", {})
+    times = [
+        _parse_ts(pr.get("created_at")),
+        _head_commit_date(token, owner, repo, pr),
+        *(_parse_ts(r.get("submitted_at")) for r in reviews),
+    ]
     newest = max((t for t in times if t), default=None)
-    # Only comments touched after the newest known event can move the clock.
-    params = {"since": newest.strftime("%Y-%m-%dT%H:%M:%SZ")} if newest else {}
-    for comment in _get_pages(token, f"{base}/issues/{pr_number}/comments", params):
-        if (comment.get("user") or {}).get("type") == "Bot":
-            continue
-        created = _parse_ts(comment.get("created_at"))
-        if created and (newest is None or created > newest):
-            newest = created
-    return newest
+    comment = _newest_human_comment(token, owner, repo, pr_number, newest)
+    return comment or newest
 
 
 def _mark_idle(
@@ -327,18 +343,9 @@ class _WriteBudget:
         return self.used >= self.cap
 
 
-def _run_label_mode(
-    token: str, install_id: int, full: str, owner: str, repo: str,
-    budget: _WriteBudget,
-) -> None:
-    """One repo in label mode. Candidates are the `updated_at` prefilter
-    plus every open PR that already carries the label, since our own label
-    write makes `updated_at` fresh. Each is judged by `_last_activity`.
-    Labeled PRs are judged first: removing a label after real activity is
-    corrective and not capped. New labels (and their board writes) stop at
-    `budget`, and an unlabeled PR costs no activity reads once it is spent."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=_STALE_DAYS)
-    stale = _stale_prs(token, owner, repo)
+def _open_labeled_numbers(token: str, owner: str, repo: str) -> set[int]:
+    """Numbers of open PRs carrying the idle label. A closed PR loses the
+    label here, with no further reads."""
     labeled: set[int] = set()
     for item in _idle_labeled_prs(token, owner, repo):
         number = int(item["number"])
@@ -346,35 +353,76 @@ def _run_label_mode(
             _remove_idle_label(token, owner, repo, number)
         else:
             labeled.add(number)
+    return labeled
+
+
+def _label_candidates(
+    token: str, owner: str, repo: str,
+) -> tuple[list[dict[str, Any]], set[int]]:
+    """The `updated_at` prefilter plus every open labeled PR (our own label
+    write makes `updated_at` fresh), labeled ones first."""
+    stale = _stale_prs(token, owner, repo)
+    labeled = _open_labeled_numbers(token, owner, repo)
     by_number = {int(pr["number"]): pr for pr in stale}
     for number in sorted(labeled - by_number.keys()):
         by_number[number] = _fetch_pull(token, owner, repo, number)
     ordered = [by_number[n] for n in sorted(labeled)] + [
         pr for pr in stale if int(pr["number"]) not in labeled
     ]
+    return ordered, labeled
+
+
+def _plan_ready(token: str, owner: str, repo: str, pr: dict[str, Any]) -> bool:
+    head_sha = ((pr.get("head") or {}).get("sha")) or ""
+    return bool(head_sha) and _dor_green(token, owner, repo, head_sha)
+
+
+def _judge_label_pr(
+    token: str, install_id: int, full: str, owner: str, repo: str,
+    pr: dict[str, Any], *, is_labeled: bool, cutoff: datetime,
+    budget: _WriteBudget,
+) -> None:
+    """One label-mode candidate, judged by the activity clock. Real
+    activity removes the label (corrective, not capped); an idle,
+    Chief-green PR is marked while the budget lasts. An unlabeled PR is
+    DoR-checked before the activity reads, a labeled one only if a write
+    could follow."""
+    if not is_labeled and not _plan_ready(token, owner, repo, pr):
+        return
+    idle_since = _last_activity(token, owner, repo, pr)
+    if idle_since is None:
+        return
+    if idle_since >= cutoff:
+        if is_labeled:
+            _remove_idle_label(token, owner, repo, int(pr["number"]))
+        return
+    if budget.spent:
+        return
+    if is_labeled and not _plan_ready(token, owner, repo, pr):
+        return
+    budget.used += _mark_idle(
+        token, install_id, full, owner, repo, pr,
+        add_label=not is_labeled, idle_since=idle_since,
+    )
+
+
+def _run_label_mode(
+    token: str, install_id: int, full: str, owner: str, repo: str,
+    budget: _WriteBudget,
+) -> None:
+    """One repo in label mode (#1556). Labeled PRs are judged first, so a
+    label always comes off after real activity. New labels (and their board
+    writes) stop at `budget`, and an unlabeled PR costs no activity reads
+    once it is spent."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_STALE_DAYS)
+    ordered, labeled = _label_candidates(token, owner, repo)
     for pr in ordered:
-        number = int(pr["number"])
-        is_labeled = number in labeled
-        head_sha = ((pr.get("head") or {}).get("sha")) or ""
-        if not is_labeled:
-            if budget.spent:
-                break
-            if not head_sha or not _dor_green(token, owner, repo, head_sha):
-                continue
-        idle_since = _last_activity(token, owner, repo, pr)
-        if idle_since is None:
-            continue
-        if idle_since >= cutoff:
-            if is_labeled:
-                _remove_idle_label(token, owner, repo, number)
-            continue
-        if budget.spent:
-            continue
-        if is_labeled and (not head_sha or not _dor_green(token, owner, repo, head_sha)):
-            continue
-        budget.used += _mark_idle(
+        is_labeled = int(pr["number"]) in labeled
+        if not is_labeled and budget.spent:
+            break
+        _judge_label_pr(
             token, install_id, full, owner, repo, pr,
-            add_label=not is_labeled, idle_since=idle_since,
+            is_labeled=is_labeled, cutoff=cutoff, budget=budget,
         )
 
 
