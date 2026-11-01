@@ -19,6 +19,8 @@ All keys are optional.
 | `min_inline_severity` | `low`, `medium`, `high`, or `critical` | Findings below this level appear in the check summary but get no inline comment. |
 | `skip_prs` | `{authors, labels, title_patterns}`, each a list of strings | A matching pull request is not reviewed. See below. |
 | `security_review_paths` | list of path globs | Replaces the default sensitive-path list of the code-only security pass. An empty list turns the pass off for this repo. See below. |
+| `elder_blocking_cap` | integer, default `5` | Blocking model findings per PR that get an inline comment; `0` means no cap. The rest appear ranked on the board and still fail the check. See below. |
+| `elder_drip_feed` | boolean, default `true` | On a second or later round, drop a new model finding below critical on an unchanged line. See below. |
 | `elder_mute_min_labeled` | integer, default `20` | Labeled ledger rows a finding class needs before it can be muted. |
 | `elder_mute_below_precision` | number 0 to 1, default `0.2` | A class with at least `elder_mute_min_labeled` labeled rows and a lower fixed-rate is muted: no inline comment, only the board and check summary, marked "muted: fixed in N of M past findings". A high or critical finding still posts inline and blocks. |
 | `elder_mute_locked_classes` | list of class names | These classes keep their inline comments whatever their precision. |
@@ -63,6 +65,10 @@ Path instructions come first because `.grug.yaml` is read from the base commit, 
 ## Code-only security pass
 
 When `GRUG_QUARANTINED_SECURITY_PASS` is set on the deployment, a pull request touching a sensitive path gets a second security review of those paths. That pass, its judge, and its refute gate read the diff and code context only: no title, body, linked issue, repo docs, or agent guideline files. Its findings merge with the normal review by file, line, and rule at the stricter severity, and it can never remove a finding. The default list is auth, crypto, payment, secret, and credential paths plus `.github/workflows/`, `.github/actions/`, and `.grug.yaml`.
+
+## Comment budget
+
+The budget applies only when `GRUG_COMMENT_BUDGET` is set on the deployment. Deterministic scanner findings are never capped or dropped. A held finding has no inline comment, is listed on the board by severity and judge confidence, and still counts toward the check. A non-blocking finding the judge called not real is held too.
 
 ## Example
 

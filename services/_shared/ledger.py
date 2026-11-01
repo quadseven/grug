@@ -280,6 +280,18 @@ def learning_metrics(rows: list[LedgerRow]) -> dict[str, object]:
     }
 
 
+def tier_rates(rows: list[LedgerRow]) -> dict[str, tuple[int, int]]:
+    """{severity: (addressed, labeled)}: the data for tuning the comment
+    budget and checking that the top tier earns its place (#1570)."""
+    cells: dict[str, list[int]] = {}
+    for r in rows:
+        if r.accepted or r.false_positive:
+            cell = cells.setdefault(r.severity, [0, 0])
+            cell[0] += int(r.accepted)
+            cell[1] += 1
+    return {tier: (a, n) for tier, (a, n) in cells.items()}
+
+
 def format_metrics(rows: list[LedgerRow]) -> str:
     """Human-readable string representation of the ledger metrics (#539)."""
     m = learning_metrics(rows)
@@ -294,6 +306,11 @@ def format_metrics(rows: list[LedgerRow]) -> str:
     classes = m["classes"]  # type: ignore[assignment]
     for cls, c in sorted(classes.items()):
         lines.append(f"  {cls}: {c['accepted']}/{c['total']} accepted (precision {c['precision']:.2f})")
+    lines.append("tiers:")
+    rates = tier_rates(rows)
+    for tier in sorted(rates, key=lambda t: SEVERITY_ORDER.get(t, 4)):
+        addressed, labeled = rates[tier]
+        lines.append(f"  {tier}: {addressed}/{labeled} addressed")
     return "\n".join(lines)
 
 
