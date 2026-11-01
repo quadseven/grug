@@ -1915,12 +1915,17 @@ def _unwalked_ground_note(evaluation: CodeReviewEvaluation) -> str:
     )
 
 
-def _stack_closing_note(evaluation: CodeReviewEvaluation) -> list[str]:
+def _stack_closing_note(
+    evaluation: CodeReviewEvaluation, *, has_committable: bool = False,
+) -> list[str]:
     """The board section's tail: what to do next, or why there is nothing.
 
     Exactly one of these applies, and a clean non-degraded pass gets NOTHING -
     it used to get "No agent prompt - nothing to remediate.", the fifth
-    separate way one body said "no findings"."""
+    separate way one body said "no findings".
+
+    `has_committable` means a suggestion passed `checked_suggestion`, the same
+    check `/grug fix` runs, so the command is named only when it can commit."""
     agent = _consolidated_agent_prompt(evaluation)
     if agent:
         # Only when there is something to fix - empty "Address each finding"
@@ -1932,8 +1937,12 @@ def _stack_closing_note(evaluation: CodeReviewEvaluation) -> list[str]:
             "---",
             "",
             "Inline comments carry Fix + agent prompt on each marking. "
-            "Autofix push is not enabled - apply suggestions or hand the agent "
-            "prompt to your coding agent.",
+            + (
+                "Comment `/grug fix` to commit the open suggestions, or hand "
+                "the agent prompt to your coding agent."
+                if has_committable
+                else "Hand the agent prompt to your coding agent."
+            ),
             "",
         ]
     if is_partial_coverage(evaluation.degraded_reason):
@@ -2103,7 +2112,7 @@ def _review_stack_body(
     # No detail at all (a clean pass with no scope or suppression note) gets no
     # fold. An empty <details> renders as a disclosure triangle hiding nothing,
     # which reads as a bug in the tool.
-    parts.extend(_stack_closing_note(evaluation))
+    parts.extend(_stack_closing_note(evaluation, has_committable=bool(committable)))
 
     # Assemble a REAL board: marker, a delimited header, and Elder's content
     # inside its own `grug-sec:elder` region.

@@ -3160,6 +3160,42 @@ def test_stack_offers_bulk_fix_for_checked_suggestion():
     assert "/grug fix" in body
 
 
+def _closing_line(body: str) -> str:
+    """The stack's closing line, which sits under the agent prompt."""
+    return next(l for l in body.splitlines() if "Inline comments carry" in l)
+
+
+def _stack_with_suggestion(suggestion, file_text="x = 1\n"):
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    finding = Finding(
+        file="a.py", line=1, severity="low", rule_name="r",
+        message="fix value", suggestion=suggestion,
+    )
+    return cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+        conclusion="success", file_contents={"a.py": file_text},
+    )
+
+
+def test_stack_closing_line_names_grug_fix_for_a_checked_suggestion():
+    closing = _closing_line(_stack_with_suggestion("x = 2"))
+    assert "/grug fix" in closing
+    assert "not enabled" not in closing
+
+
+def test_stack_closing_line_names_no_command_without_a_suggestion():
+    body = _stack_with_suggestion(None)
+    assert "/grug" not in _closing_line(body)
+    assert "not enabled" not in body
+
+
+def test_stack_closing_line_names_no_command_for_a_suggestion_fix_would_refuse():
+    # `/grug fix` runs the same check and skips this one, so naming it would
+    # send the reader to a command that commits nothing.
+    closing = _closing_line(_stack_with_suggestion("x = ("))
+    assert "/grug" not in closing
+
+
 def test_stack_offers_docstrings_for_changed_undocumented_public_function():
     from personas.code_reviewer.persona import CodeReviewEvaluation
     body = cr_dispatch._review_stack_body(
