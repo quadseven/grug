@@ -84,6 +84,7 @@ class RepoConfigPayload(BaseModel):
     warder_gate_blocking: bool | None = Field(default=None)
     sentinel_enabled: bool | None = Field(default=None)
     pulse_enabled: bool | None = Field(default=None)
+    pulse_delivery: str | None = Field(default=None)
     pulse_comment_nudge_enabled: bool | None = Field(default=None)
     smasher_enabled: bool | None = Field(default=None)
     walkthrough_enabled: bool | None = Field(default=None)
@@ -331,6 +332,8 @@ def list_activity(
             "summary": r["summary"],
             "findings_count": r["findings_count"],
             "created_at": r["created_at"],
+            # Elder rows of a footer-named author only (grug#1437).
+            **{k: r[k] for k in ("author_family", "reviewer_family") if k in r},
         })
         if len(out) >= limit:
             break
@@ -546,6 +549,7 @@ def update_repo_config(
         warder_gate_blocking=body.warder_gate_blocking,
         sentinel_enabled=body.sentinel_enabled,
         pulse_enabled=body.pulse_enabled,
+        pulse_delivery=body.pulse_delivery,
         pulse_comment_nudge_enabled=body.pulse_comment_nudge_enabled,
         smasher_enabled=body.smasher_enabled,
         walkthrough_enabled=body.walkthrough_enabled,

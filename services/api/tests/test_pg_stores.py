@@ -814,6 +814,25 @@ def test_re_auth_with_new_refresh_replaces(pg, fake_kms):
     assert got.oauth_refresh_token == "r2"
 
 
+def test_check_verdict_families_round_trip_and_stay_sparse(pg):
+    from adapters import pg_install_store as store
+
+    common = dict(
+        install_id=778, persona="elder", repo="o/r", pr_number=1,
+        conclusion="success", summary="s", findings_count=0, blocking=False,
+        created_at="2026-05-16T00:00:00+00:00",
+    )
+    store.put_check_verdict(
+        head_sha="a" * 40, author_family="claude", reviewer_family="laguna", **common,
+    )
+    store.put_check_verdict(head_sha="b" * 40, **common)
+    rows = {row["head_sha"][0]: row for row in store.list_check_verdicts(778)}
+    assert rows["a"]["author_family"] == "claude"
+    assert rows["a"]["reviewer_family"] == "laguna"
+    assert "author_family" not in rows["b"]
+    assert "reviewer_family" not in rows["b"]
+
+
 def test_check_verdict_degraded_reason_round_trips_as_errored(pg):
     """/activity's errored filter depends on the degraded write arm; the
     sparse-when-absent arm alone leaves it unexecuted."""
@@ -996,12 +1015,15 @@ def test_warder_pulse_flags_flow_through_config(pg):
 
     cfg = store.get_repo_config(1, 55)
     assert cfg["warder_enabled"] is False and cfg["pulse_enabled"] is False
+    assert cfg["pulse_delivery"] == "label"
     store.set_repo_config(
         install_id=1, repo_id=55, repo_full_name="o/r",
         updated_by_user_id="9", warder_enabled=True, pulse_enabled=True,
+        pulse_delivery="comment",
     )
     cfg = store.get_repo_config(1, 55)
     assert cfg["warder_enabled"] is True and cfg["pulse_enabled"] is True
+    assert cfg["pulse_delivery"] == "comment"
     assert store.is_persona_enabled(1, 55, "warder") is True
     assert store.is_persona_enabled(1, 55, "pulse") is True
 

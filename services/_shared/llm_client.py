@@ -50,12 +50,13 @@ from typing import Any, Callable, Iterator, Literal, Optional, Sequence, TypedDi
 
 import httpx
 
-from code_review_prompt import PromptVariant, build_system_prompt
+from code_review_prompt import _RULE_NAME_RE, PromptVariant, build_system_prompt
 from openrouter_free_limiter import (
     RateLimitTimeoutError,
     acquire_free_tier_slot,
     is_free_tier_model,
 )
+from repo_file_cache import RepoFileCache
 from voice_pack import VoiceSelection, apply_voice
 from review_types import (
     CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, Severity,
@@ -77,6 +78,7 @@ from reviewability import (
     dimension_score,
 )
 from review_evidence import Hunk, ElderEvidence, seal
+from model_family import ReviewFamilies, model_family, review_families
 from datadog_switch import datadog_enabled
 import call_report
 import shared_benches
@@ -85,6 +87,7 @@ from secrets_loader import (
     get_opencode_go_api_key,
     get_openrouter_api_key,
     get_poolside_api_key,
+    get_subscription_lane_token,
     get_prompt_experiment_mode,
 )
 
@@ -236,11 +239,18 @@ class PrContext(TypedDict, total=False):
     cohort_count: int
     # Pre-rendered, already-sanitized linked-issue criteria block (#904).
     linked_issue_context: str
+    # `deferred_ruff.DeferredLint` rows of the tickets this PR settles (#1477).
+    deferred_lint: tuple[Any, ...]
+    # Why that list is incomplete; any entry degrades the review.
+    deferred_lint_unfinished: tuple[str, ...]
     review_scope: str
     sensitive_review: bool
     # The webhook's `repository.private` (grug#1269). Unset means unknown,
     # which every reader treats as private.
     repo_private: bool
+    # The model family that wrote this pull request, read from its footer
+    # (grug#1437). Unset means unknown, which keeps today's arm order.
+    author_family: str
 
 
 def _elapsed_ms(start_ns: int) -> int:
@@ -747,6 +757,9 @@ _WITHDRAWN_TAIL = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+# grug#1529: a hint, never a verdict. It decides nothing but a note and a log
+# line; only the structured verdict removes a candidate.
+_OMIT_HINT = re.compile(r"^omit(?: [-\u2013\u2014] not a secret)?\.?$", re.IGNORECASE)
 
 
 def is_withdrawn_finding(finding: "Finding") -> bool:
@@ -758,6 +771,12 @@ def is_withdrawn_finding(finding: "Finding") -> bool:
         return True
     sentences = [s for s in _SENTENCE_SPLIT.split(finding.message.strip()) if s]
     return bool(sentences) and bool(_WITHDRAWN_TAIL.match(sentences[-1].strip()))
+
+
+def concludes_omit(finding: "Finding") -> bool:
+    """Whether the message's final sentence says to omit it (grug#1529)."""
+    sentences = [s for s in _SENTENCE_SPLIT.split(finding.message.strip()) if s]
+    return bool(sentences) and bool(_OMIT_HINT.match(sentences[-1].strip()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -883,6 +902,9 @@ class LlmReviewResponse:
     tier_served: Optional[str] = None
     reviewability_note: str = ""
     reviewability_blocking: bool = False
+    # grug#1437: author and reviewer families of a finished review of a pull
+    # request whose footer names a known family. None otherwise.
+    families: ReviewFamilies | None = None
 
 
 # grug#1196: one failed model call inside a chunk's ladder walk.
@@ -895,10 +917,83 @@ class _LadderAttempt:
     # that a wait can clear. 0 means the failure is final for this chunk
     # (grug#1494).
     retry_after: float = 0.0
+    through_gateway: bool = False
+    outage_failure: bool = False
 
     @property
     def label(self) -> str:
         return f"{self.model} ({self.reason})"
+
+
+_GATEWAY_OUTAGE_REASON = "inference gateway outage"
+# A gateway call the review deadline cut short failed neither way: it does not
+# show the gateway down, and it does not show it up.
+_NEUTRAL_GATEWAY_REASONS = frozenset({ReviewDeadlineReached.__name__})
+
+
+def _with_gateway_outage_named(trail: list[_LadderAttempt]) -> list[_LadderAttempt]:
+    """Name the outage on one failed walk's gateway attempts (grug#1467).
+
+    Only when every gateway attempt failed that way: one arm timing out while
+    the other answers is a slow model. The labels reach the check title and
+    summary through coverage, and `tried` keeps them past the chunk retry,
+    whose skipped calls reach no model and could not name the outage."""
+    gateway = [
+        attempt for attempt in trail
+        if attempt.through_gateway and attempt.reason not in _NEUTRAL_GATEWAY_REASONS
+    ]
+    if not gateway or not all(attempt.outage_failure for attempt in gateway):
+        return trail
+    return [
+        replace(attempt, reason=f"{_GATEWAY_OUTAGE_REASON}: {attempt.reason}")
+        if attempt.through_gateway and attempt.outage_failure else attempt
+        for attempt in trail
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class _GatewayCall:
+    """One model call through the inference gateway in a ladder walk
+    (grug#1467). `neutral` marks a call the review deadline cut short, which
+    says nothing about whether the gateway is up."""
+
+    backend: str
+    model: str
+    outage: bool
+    neutral: bool
+
+
+# Every gateway call of the current ladder walk, the cloud chain and the Cave
+# arms alike. Set per walk by `_walk_review_ladder` (and by the Cave path for
+# a direct caller); None elsewhere, so the judge and the deep append are
+# untouched. A deep-mode arm thread gets the same list through its context
+# copy.
+_WALK_GATEWAY_CALLS: contextvars.ContextVar[list[_GatewayCall] | None] = (
+    contextvars.ContextVar("grug_walk_gateway_calls", default=None)
+)
+
+
+def _gateway_down(calls: Sequence[_GatewayCall]) -> bool:
+    """True when the walk reached the gateway and every call that ran to an
+    answer failed the way a down or load-shedding gateway fails. One arm
+    answering, or failing any other way, means the gateway is up."""
+    counted = [call for call in calls if not call.neutral]
+    return bool(counted) and all(call.outage for call in counted)
+
+
+def _record_gateway_call(
+    backend: str, model: str, config: BackendConfig, outcome: AttemptOutcome,
+) -> None:
+    calls = _WALK_GATEWAY_CALLS.get()
+    if calls is None or not _routes_through_gateway(config.url):
+        return
+    reason = _ladder_failure_reason(outcome)
+    calls.append(_GatewayCall(
+        backend=backend,
+        model=model,
+        outage=reason is not None and _is_outage_failure(outcome, reason),
+        neutral=reason in _NEUTRAL_GATEWAY_REASONS,
+    ))
 
 
 # Set by `_ChunkLadder.run` around one chunk's dispatch. `_run_llm_attempt` is
@@ -912,6 +1007,22 @@ _LADDER_TRAIL: contextvars.ContextVar[list[_LadderAttempt] | None] = (
 _LADDER_SKIP: contextvars.ContextVar[frozenset[tuple[str, str]]] = (
     contextvars.ContextVar("grug_ladder_skip", default=frozenset())
 )
+# Set by `_review_diff_dispatch` for a pull request with a known author family
+# (grug#1437): (author family, same_family_only). The first walk runs with
+# False and skips the author's family; the walk back runs with True and asks
+# only that family, so no other model is asked twice.
+_FAMILY_GATE: contextvars.ContextVar[tuple[str, bool] | None] = (
+    contextvars.ContextVar("grug_family_gate", default=None)
+)
+
+
+def _family_gated(model: str) -> bool:
+    """True when the current walk must not ask `model`."""
+    gate = _FAMILY_GATE.get()
+    if gate is None:
+        return False
+    author_family, same_family_only = gate
+    return (model_family(model) == author_family) != same_family_only
 
 
 # Test hook — replaced with a no-op in unit tests to avoid real sleeps.
@@ -967,7 +1078,9 @@ def _opencode_go_extra_body(model: str, wire: str) -> dict:
 
 
 # Operator subscription fallback (grug#1276)
-_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS = 40.0
+# Room for a chunk at its largest (46k chars took 25s of Haiku alone) plus the
+# wait for a slot on a lane that serves one or two calls at a time.
+_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS = 120.0
 _subscription_cap_lock = threading.Lock()
 _subscription_daily_calls: dict[str, int] = {}
 
@@ -978,6 +1091,15 @@ def _subscription_daily_cap() -> int:
         return max(0, val)
     except (ValueError, TypeError):
         return 50
+
+
+def _subscription_timeout_s() -> float:
+    raw = os.getenv("GRUG_SUBSCRIPTION_TIMEOUT_S", "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return _SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS
+    return value if math.isfinite(value) and value > 0 else _SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS
 
 
 def _subscription_today_key() -> str:
@@ -1030,6 +1152,17 @@ def _validate_subscription_key(key: str) -> None:
         )
 
 
+def _load_subscription_key() -> str:
+    return get_subscription_lane_token() or "in-cluster"
+
+
+def _review_author_family() -> str | None:
+    """The author's family for this walk, so a lane that serves two families
+    can keep a model off its own family's work (#1437)."""
+    gate = _FAMILY_GATE.get()
+    return gate[0] if gate else None
+
+
 def _subscription_fallback_config() -> BackendConfig | None:
     """Operator's subscription plan run headless as the last resort."""
     if not _subscription_fallback_enabled():
@@ -1042,14 +1175,15 @@ def _subscription_fallback_config() -> BackendConfig | None:
         backend=Backend.SUBSCRIPTION,
         url=url,
         model=model,
-        key_loader=lambda: "in-cluster",
+        key_loader=_load_subscription_key,
+        dynamic_headers={"X-Review-Author-Family": _review_author_family},
         extra_headers={
             "User-Agent": "grug/1.0 (+https://grug.lol)",
             "X-Spark-Priority": "interactive",
             "X-Spark-Caller": "grug-elder-subscription",
             "X-Loom-Lane-Type": "subscription-headless",
         },
-        timeout_seconds=_SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS,
+        timeout_seconds=_subscription_timeout_s(),
         retry_attempts=1,
         transport_retry_attempts=1,
     )
@@ -1293,6 +1427,7 @@ _BENCH_WINDOW_SECONDS = 600.0
 _BENCH_BASE_SECONDS = 3600.0
 _BENCH_MAX_SECONDS = 12 * 3600.0
 _BENCH_CLOUD_BACKENDS = frozenset({Backend.OPENCODE_GO, Backend.OPENROUTER, Backend.POOLSIDE})
+_LIMIT_HOLD_BACKENDS = _BENCH_CLOUD_BACKENDS | {Backend.FREE_POOL}
 # Statuses that are never withdrawal: timeout, too-large, rate limit.
 _BENCH_IGNORED_STATUSES = frozenset({408, 413, 425, 429})
 _BENCH_QUOTA_MARKERS = ("usage limit", "rate limit", "quota", "insufficient credit", "key limit")
@@ -1420,6 +1555,16 @@ _SPENT_LIMIT_MARKERS = (
 _SPENT_RATE_MARKERS = ("per-day", "per day", "daily", "monthly", "gousagelimiterror")
 _provider_breaker_lock = threading.Lock()
 _provider_blocked_until: dict[tuple[str, str], float] = {}
+# A limit that outlasts a throttle reads the same on one response, so the count
+# decides: a second limit refusal within five minutes skips the provider for
+# five minutes, then it is asked again. On 2026-10-31 Poolside answered 1,892 of
+# these in nine hours and the free pool 57, each costing a chunk its retry and
+# its wait before the subscription tier could run.
+_LIMIT_REFUSAL_THRESHOLD = 2
+_LIMIT_REFUSAL_WINDOW_SECONDS = 300.0
+_LIMIT_HOLD_SECONDS = 300.0
+_LIMIT_REFUSAL_MARKERS = ("usage limit", "capacity is reserved")
+_limit_refusals: dict[tuple[str, str], list[float]] = {}
 _warned_disabled_entries: set[str] = set()
 
 
@@ -1492,19 +1637,46 @@ def _is_spent_quota_refusal(resp: httpx.Response) -> bool:
     return any(m in text for m in markers)
 
 
+def _limit_refusals_repeated(config: BackendConfig, resp: httpx.Response) -> bool:
+    """Count one usage-limit 429; True when the count reaches the hold. Any
+    other answer from the provider starts the count over."""
+    key = (config.backend.value, _backend_pool(config.backend, config.model))
+    text = (resp.text or "").lower()
+    limited = resp.status_code == 429 and any(m in text for m in _LIMIT_REFUSAL_MARKERS)
+    now = time.time()
+    with _provider_breaker_lock:
+        if not limited:
+            _limit_refusals.pop(key, None)
+            return False
+        recent = [t for t in _limit_refusals.get(key, []) if now - t < _LIMIT_REFUSAL_WINDOW_SECONDS]
+        recent.append(now)
+        if len(recent) < _LIMIT_REFUSAL_THRESHOLD:
+            _limit_refusals[key] = recent
+            return False
+        _limit_refusals.pop(key, None)
+        return True
+
+
 def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None:
-    """Open the provider breaker on a 401, a 402 or a spent-limit refusal."""
-    if config.backend not in _BENCH_CLOUD_BACKENDS:
-        return
-    if resp.status_code == 401:
-        pools: tuple[str, ...] = _PROVIDER_POOLS
-    elif _is_spent_quota_refusal(resp):
-        pools = (_backend_pool(config.backend, config.model),)
-    else:
-        return
-    # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
-    seconds = _retry_after_seconds(resp)
-    until = time.time() + seconds
+    """Open the provider breaker on a 401, a 402, a spent-limit refusal, or
+    repeated limit refusals."""
+    pool = _backend_pool(config.backend, config.model)
+    if config.backend in _BENCH_CLOUD_BACKENDS:
+        # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
+        if resp.status_code == 401:
+            _open_provider_breaker(config, resp, _PROVIDER_POOLS, time.time() + _retry_after_seconds(resp))
+            return
+        if _is_spent_quota_refusal(resp):
+            _open_provider_breaker(config, resp, (pool,), time.time() + _retry_after_seconds(resp))
+            return
+    if config.backend in _LIMIT_HOLD_BACKENDS and _limit_refusals_repeated(config, resp):
+        _open_provider_breaker(config, resp, (pool,), time.time() + _LIMIT_HOLD_SECONDS)
+
+
+def _open_provider_breaker(
+    config: BackendConfig, resp: httpx.Response, pools: tuple[str, ...], until: float,
+) -> None:
+    seconds = until - time.time()
     with _provider_breaker_lock:
         for pool in pools:
             key = (config.backend.value, pool)
@@ -2901,6 +3073,12 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         return None, f"bad_type:{type(e).__name__}"
     if severity not in SEVERITIES:
         return None, f"invalid_severity:{severity[:32]}"
+    # The rule reaches log lines and comment markers. Model output that is not
+    # a rule name degrades to a placeholder, and the finding still lands. The
+    # digest keeps two distinct rules apart in merge and dedupe.
+    if not _RULE_NAME_RE.fullmatch(rule):
+        digest = hashlib.sha256(rule.encode("utf-8", "surrogatepass")).hexdigest()[:12]
+        rule = f"unknown-rule-{digest}"
     # #553 optional fields: malformed values DEGRADE (finding still lands),
     # never reject - a hostile model must not be able to drop a real
     # finding by attaching a bad suggestion.
@@ -4059,6 +4237,13 @@ _GUIDELINE_CANDIDATES = (
     ".github/copilot-instructions.md", ".windsurfrules",
 )
 _GUIDELINE_FETCH_TIMEOUT = 10.0
+# Enough for the reviews in flight on one consumer; each entry is one head.
+_GUIDELINE_CACHE_HEADS = 32
+# Only the first `_MAX_GUIDELINES_CHARS` reach the prompt. Keeping more than
+# that leaves room for redaction, and the limit stops a huge file in a pull
+# request from pinning its size in memory for every cached head.
+_GUIDELINE_CACHE_CHARS = 64_000
+_guideline_cache = RepoFileCache(_GUIDELINE_CACHE_HEADS)
 
 
 def _fetch_guideline_files(
@@ -4068,14 +4253,22 @@ def _fetch_guideline_files(
     best-effort (mirrors `dispatch.fetch_file_contents`'s contract, not
     imported from it - llm_client must not import the persona layer): a
     404/binary/timeout on one candidate is skipped, never raised, so one
-    unreadable file cannot cost the others."""
+    unreadable file cannot cost the others.
+
+    Every cohort, chunk and retry of a review lands here, so each file is
+    read once per head (grug#1535). A 404 is remembered too, since most repos
+    carry few of these files. Any other failure is not, so it is retried."""
     from urllib.parse import quote
 
     from github_app_auth import with_install_token_retry  # type: ignore
 
-    def _do(token: str) -> dict[str, str]:
-        found: dict[str, str] = {}
-        for path in _GUIDELINE_CANDIDATES:
+    head = (installation_id, owner, repo, ref)
+    known = _guideline_cache.known(head)
+    missing = [path for path in _GUIDELINE_CANDIDATES if path not in known]
+
+    def _do(token: str) -> dict[str, str | None]:
+        answered: dict[str, str | None] = {}
+        for path in missing:
             try:
                 resp = httpx.get(
                     f"https://api.github.com/repos/{owner}/{repo}/contents/"
@@ -4088,13 +4281,19 @@ def _fetch_guideline_files(
                     },
                     timeout=_GUIDELINE_FETCH_TIMEOUT,
                 )
-                resp.raise_for_status()
-                found[path] = resp.text
+                text = None
+                if resp.status_code != 404:
+                    resp.raise_for_status()
+                    text = resp.text[:_GUIDELINE_CACHE_CHARS]
             except (httpx.HTTPStatusError, httpx.RequestError):
                 continue
-        return found
+            answered[path] = text
+            _guideline_cache.remember(head, path, text)
+        return answered
 
-    return with_install_token_retry(installation_id, _do) or {}
+    if missing:
+        known.update(with_install_token_retry(installation_id, _do) or {})
+    return {path: text for path, text in known.items() if text is not None}
 
 
 # Bounded like the diff cap (#609): a guideline file can be arbitrarily long,
@@ -4196,6 +4395,8 @@ class _SuccessfulReview:
     # includes a truncated review must fold this into the final `error` via
     # `_truncation_error`/`_partial_review_reason` -- never publish it clean.
     truncated: bool = False
+    # Same meaning as `_ArmOutcome.model_unconfirmed`.
+    model_unconfirmed: bool = False
 
 
 _SEVERITY_RANK = {
@@ -4259,6 +4460,9 @@ def _merge_review_findings(
             other = current if preferred is finding else finding
             merged[key] = replace(
                 current,
+                # Both sides are out here. A preferred message need not carry
+                # the withdrawal, so the flag must.
+                withdrawn=current_out,
                 severity=severity,
                 # Prefer the explanation from the model that assigned the
                 # stronger severity; use length only as a same-severity
@@ -4440,6 +4644,16 @@ def _unwalked_paths(plan: ReviewPlan, failed_indexes: Sequence[int]) -> tuple[st
         if 1 <= index <= len(plan.cohorts):
             paths.update(plan.cohorts[index - 1].paths)
     return tuple(sorted(paths))
+
+
+def _served_models(model: str | None) -> tuple[str, ...]:
+    """`models_used` for one answer: the model its reply named, or nothing.
+
+    A reply with no `model` falls back to the configured name for logs and
+    `model_name`. That name is what was requested, and on a lane that picks
+    its own model it is not a model at all, so a report of who served the
+    review must not repeat it."""
+    return (model,) if model else ()
 
 
 def _cohort_attribution(
@@ -4966,7 +5180,7 @@ def _deep_response(
             model_name=outcome.model,
             review_span_context=outcome.span_context,
             backends_used=(Backend.CAVE_REASONER,),
-            models_used=(outcome.model,),
+            models_used=outcome.served_models,
             error=_truncation_error(
                 (Backend.CAVE_REASONER,) if outcome.truncated else (),
             ),
@@ -5135,7 +5349,9 @@ class _ChunkLadder:
                     "kind": response.kind,
                 },
             )
-        tried.extend(trail)
+        tried.extend(
+            trail if response.kind == "reviewed" else _with_gateway_outage_named(trail)
+        )
         waits = [attempt.retry_after for attempt in trail if attempt.retry_after]
         if waits and response.kind != "reviewed":
             self._wait[key] = max(waits)
@@ -5567,6 +5783,15 @@ def review_diff(
         result,
         reviewability_note=note,
         reviewability_blocking=assessment.decision == "block",
+        families=(
+            review_families(
+                ctx.get("author_family"),
+                # A silent reply still names a family through its request: a
+                # same-family warning errs safe where a served name must not.
+                result.models_used or ((result.model_name,) if result.model_name else ()),
+            )
+            if result.kind == "reviewed" else None
+        ),
     )
 
 
@@ -5606,6 +5831,9 @@ class _ArmOutcome:
     kind: Literal["config_error", "transport_error", "success", "parse_failed", "http_failed"]
     error_text: str = ""
     model: str | None = None
+    # The reply named no model, so `model` is only the configured request
+    # name. It stays usable as a label but never counts as the served model.
+    model_unconfirmed: bool = False
     findings: tuple["Finding", ...] = ()
     span_context: dict | None = None
     # Raw `_parse_response` error string (distinct from `error_text`, the
@@ -5627,6 +5855,10 @@ class _ArmOutcome:
     # completion over a large prompt (`_is_degenerate_empty_review`). The
     # cloud chain treats it as a miss and moves to the next tier.
     degenerate: bool = False
+
+    @property
+    def served_models(self) -> tuple[str, ...]:
+        return () if self.model_unconfirmed else _served_models(self.model)
 
 
 # A model that answers a 10-20k-token diff with `{"findings": []}` in 7
@@ -5860,6 +6092,34 @@ def _extract_attempt_content(body: dict) -> tuple[str, str]:
     return content, finish_reason
 
 
+_GATEWAY_OUTAGE_STATUSES = frozenset({503, 504})
+# By name, because `AttemptOutcome` keeps only the class name. Not the base
+# `httpx.RequestError`: a cancelled call, a passed deadline and a disabled
+# backend all raise a subclass of it and none of them is an outage.
+_GATEWAY_OUTAGE_TRANSPORT_ERRORS = frozenset(
+    error.__name__
+    for error in (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ReadError,
+        httpx.ReadTimeout,
+        httpx.RemoteProtocolError,
+    )
+)
+
+
+def _routes_through_gateway(url: str) -> bool:
+    base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
+    return bool(base) and url.startswith(f"{base}/")
+
+
+def _is_outage_failure(outcome: AttemptOutcome, reason: str) -> bool:
+    """Is this failure what a down or load-shedding gateway produces?"""
+    if outcome.error_kind == "transport":
+        return reason in _GATEWAY_OUTAGE_TRANSPORT_ERRORS
+    return outcome.status_code in _GATEWAY_OUTAGE_STATUSES
+
+
 def _ladder_failure_reason(outcome: AttemptOutcome) -> str | None:
     """Short reason for a failed attempt, or None when it answered usably."""
     if outcome.error_kind is None:
@@ -5936,13 +6196,22 @@ def _run_llm_attempt(
 
     Inside `_ChunkLadder.run`, a model that already failed on this chunk is
     skipped without a network call, so a retry moves on to the next model in
-    the ladder instead of re-asking the one that just failed. The skip reads
-    as a config miss, which every caller already steps past. Each real
-    failure is appended to the chunk's trail so the neutral check can name
+    the ladder instead of re-asking the one that just failed. A model the
+    family gate rules out for this walk is skipped the same way (grug#1437).
+    The skip reads as a config miss, which every caller already steps past.
+    Each real failure is appended to the chunk's trail so the neutral check can name
     it. Outside a chunk both context variables are empty and this is a plain
     pass-through. Interactive callers supply a response parser and span name;
     they skip review-specific direct-call reporting."""
     key = (backend.value, config.model)
+    if _family_gated(config.model):
+        return AttemptOutcome(
+            backend=backend, model=None, findings=(), content="",
+            error_kind="config",
+            error_text=f"{backend.value}: {config.model} is gated out by model family",
+            status_code=None, finish_reason="", usage_metrics={},
+            span_context=None, raw_response=None,
+        )
     if key in _LADDER_SKIP.get():
         return AttemptOutcome(
             backend=backend, model=None, findings=(), content="",
@@ -5965,12 +6234,15 @@ def _run_llm_attempt(
         call_report.end(running)
     if report_direct_call:
         _report_direct_call(backend, config, outcome, time.monotonic() - started)
+    _record_gateway_call(key[0], key[1], config, outcome)
     trail = _LADDER_TRAIL.get()
     reason = _ladder_failure_reason(outcome)
     if trail is not None and reason is not None:
         trail.append(_LadderAttempt(
             backend=key[0], model=key[1], reason=reason,
             retry_after=_rate_limit_wait(outcome),
+            through_gateway=_routes_through_gateway(config.url),
+            outage_failure=_is_outage_failure(outcome, reason),
         ))
     return outcome
 
@@ -6240,6 +6512,7 @@ def _run_review_arm(
                 backend=backend,
                 kind="success",
                 model=resolved_model,
+                model_unconfirmed=not model,
                 findings=findings,
                 span_context=attempt.span_context,
                 truncated=attempt.truncated,
@@ -6249,6 +6522,7 @@ def _run_review_arm(
             backend=backend,
             kind="success",
             model=resolved_model,
+            model_unconfirmed=not model,
             findings=findings,
             span_context=attempt.span_context,
             truncated=attempt.truncated,
@@ -6530,7 +6804,7 @@ def _cloud_tier_success(
         model_name=outcome.model,
         review_span_context=outcome.span_context,
         backends_used=(backend,),
-        models_used=(outcome.model,),
+        models_used=outcome.served_models,
         error=_truncation_error((backend,) if outcome.truncated else ()),
         tier_served="free-pool",
     )
@@ -6747,8 +7021,47 @@ def _review_diff_dispatch(
     cancel_event: threading.Event | None,
     review_map: str = "",
 ) -> "LlmReviewResponse":
-    """Dispatch one (unstaged or single-cohort) review, per
-    `GRUG_REVIEW_BACKEND_PRIORITY` (grug#906).
+    """Dispatch one review chunk, keeping the author's model family off it
+    while any other family can answer (grug#1437).
+
+    With no known author family this is the plain ladder walk. Otherwise the
+    whole ladder runs once without that family, in its usual order, so a
+    failed arm hands on to the next one as it always does. Only when nothing
+    answered does a second walk ask the author's family, and only that family:
+    a same-family review beats no review, and the check says which it was. A
+    second walk with nothing to ask leaves the first walk's failure standing.
+    """
+    author_family = (evidence.pr_context or {}).get("author_family")
+
+    def walk(gate: tuple[str, bool] | None) -> "LlmReviewResponse":
+        token = _FAMILY_GATE.set(gate)
+        calls_token = _WALK_GATEWAY_CALLS.set([])
+        try:
+            return _walk_review_ladder(
+                evidence, installation_id, voice, cancel_event, review_map,
+            )
+        finally:
+            _WALK_GATEWAY_CALLS.reset(calls_token)
+            _FAMILY_GATE.reset(token)
+
+    if not author_family:
+        return walk(None)
+    response = walk((author_family, False))
+    if response.kind == "reviewed" or (cancel_event and cancel_event.is_set()):
+        return response
+    same_family = walk((author_family, True))
+    return same_family if same_family.kind == "reviewed" else response
+
+
+def _walk_review_ladder(
+    evidence: ElderEvidence,
+    installation_id: int,
+    voice: VoiceSelection,
+    cancel_event: threading.Event | None,
+    review_map: str = "",
+) -> "LlmReviewResponse":
+    """Walk the review ladder once, per `GRUG_REVIEW_BACKEND_PRIORITY`
+    (grug#906).
 
     "cave" (default): delegates straight to
     `_review_diff_dispatch_cave_primary`, UNCHANGED - every deployment
@@ -6812,6 +7125,35 @@ def _review_diff_dispatch(
     return response
 
 
+def _gateway_outage_order(configs: list[BackendConfig]) -> list[BackendConfig]:
+    """Tier 2's order for this walk (grug#1467).
+
+    Unchanged unless the gateway is down. Then the off-gateway backends come
+    first, so the review's one retry outside the gateway runs before the
+    deadline is spent on a gateway that is not answering, and a gateway arm
+    this walk already saw fail is dropped. A gateway arm not yet tried stays
+    last: the gateway may still serve it."""
+    calls = _WALK_GATEWAY_CALLS.get()
+    if not calls or not _gateway_down(calls):
+        return configs
+    failed = {(call.backend, call.model) for call in calls}
+    off_gateway = [c for c in configs if not _routes_through_gateway(c.url)]
+    untried_gateway = [
+        c for c in configs
+        if _routes_through_gateway(c.url) and (c.backend.value, c.model) not in failed
+    ]
+    ordered = off_gateway + untried_gateway
+    log.warning(
+        "llm_gateway_outage_fallback",
+        extra={
+            "gateway_calls": len(calls),
+            "order": [f"{c.backend.value}/{c.model}" for c in ordered],
+            "off_gateway": len(off_gateway),
+        },
+    )
+    return ordered
+
+
 def _run_free_provider_fallback(
     messages: list[dict[str, str]],
     variant: PromptVariant,
@@ -6820,10 +7162,14 @@ def _run_free_provider_fallback(
     pr_context: Optional[PrContext],
     installation_id: int,
 ) -> tuple[Optional[LlmReviewResponse], Optional[tuple[Backend, Optional[str], str]], str]:
-    """Tier 2: Try free provider pool in fixed order (gateway free pool, then free SaaS)."""
+    """Tier 2: Try free provider pool in fixed order (gateway free pool, then free SaaS).
+
+    When every gateway call of this walk failed the way an outage does, the
+    backends that do not route through the gateway go first and a gateway
+    arm that already failed is not asked again (grug#1467)."""
     first_parse_fail: Optional[tuple[Backend, Optional[str], str]] = None
     last_error = ""
-    for config in _free_provider_fallback_configs():
+    for config in _gateway_outage_order(_free_provider_fallback_configs()):
         backend = config.backend
         attempt = _run_llm_attempt(
             backend=backend,
@@ -6876,7 +7222,7 @@ def _run_free_provider_fallback(
                     model_name=resolved_model,
                     review_span_context=span_context,
                     backends_used=(backend,),
-                    models_used=(resolved_model,),
+                    models_used=_served_models(model),
                     error=_attempt_truncation_error(attempt),
                     tier_served="free-pool",
                 ),
@@ -7000,7 +7346,7 @@ def _run_subscription_fallback(
             model_name=resolved_model,
             review_span_context=span_context,
             backends_used=(Backend.SUBSCRIPTION,),
-            models_used=(resolved_model,),
+            models_used=_served_models(model),
             error=_attempt_truncation_error(attempt),
             tier_served="subscription",
         )
@@ -7162,6 +7508,7 @@ def _review_diff_dispatch_cave_primary(
                 ),
                 review_span_context=outcome.span_context,
                 truncated=outcome.truncated,
+                model_unconfirmed=outcome.model_unconfirmed,
             ))
             if early_exit:
                 _emit_tier_served_metric("self-hosted", backend.value, resolved_model)
@@ -7172,7 +7519,7 @@ def _review_diff_dispatch_cave_primary(
                     model_name=resolved_model,
                     review_span_context=outcome.span_context,
                     backends_used=(backend,),
-                    models_used=(resolved_model,),
+                    models_used=outcome.served_models,
                     error=_truncation_error((backend,) if outcome.truncated else ()),
                     tier_served="self-hosted",
                 )
@@ -7277,7 +7624,10 @@ def _review_diff_dispatch_cave_primary(
             model_name=first.model,
             review_span_context=first.review_span_context,
             backends_used=tuple(review.backend for review in successes),
-            models_used=tuple(review.model for review in successes),
+            models_used=tuple(
+                review.model for review in successes
+                if not review.model_unconfirmed
+            ),
             # Only the concurrent dual-arm (`run_both`) merge reaches here
             # with successes - `fast`/`tiered` early-exit on the first success
             # above - so `review_backends` is exactly the set of arms that
@@ -7313,15 +7663,22 @@ def route_elder_model_call(
     1. self-hosted (Cave coder/reasoner)
     2. free provider pool (gateway free pool + free SaaS)
     3. subscription (operator's headless subscription lanes: Claude Code / Codex)
-    Order is fixed: never reordered by load or latency.
+    Order is fixed: never reordered by load or latency, except that a down
+    inference gateway sends step 2 off the gateway first (grug#1467).
     """
-    return _review_diff_dispatch_cave_primary(
-        evidence=evidence,
-        installation_id=installation_id,
-        voice=voice,
-        cancel_event=cancel_event,
-        review_map=review_map,
-    )
+    # A walk already tracks its gateway calls; a direct caller gets its own.
+    token = _WALK_GATEWAY_CALLS.set([]) if _WALK_GATEWAY_CALLS.get() is None else None
+    try:
+        return _review_diff_dispatch_cave_primary(
+            evidence=evidence,
+            installation_id=installation_id,
+            voice=voice,
+            cancel_event=cancel_event,
+            review_map=review_map,
+        )
+    finally:
+        if token is not None:
+            _WALK_GATEWAY_CALLS.reset(token)
 
 
 # ---------------------------------------------------------------------------
