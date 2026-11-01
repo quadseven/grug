@@ -77,7 +77,8 @@ def test_validate_scope_path_accepts_valid_globs(scope):
 
 # --- lifecycle + prompt selection -----------------------------------------
 
-def _row(text, *, status=None, at=_ago(30), **kw):
+def _row(text, *, status=None, at=None, **kw):
+    at = at or _ago(30)
     row = {"text": text, "repo": "o/r", "reinforced_at": at, "created_at": at, **kw}
     if status is not None:
         row["status"] = status

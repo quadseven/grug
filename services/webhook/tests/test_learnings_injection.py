@@ -17,7 +17,8 @@ def _ago(days):
     return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
 
-def _row(text, *, status=None, at=_ago(30), **kw):
+def _row(text, *, status=None, at=None, **kw):
+    at = at or _ago(30)
     row = {"text": text, "repo": "o/r", "scope_path": "", "reinforced_at": at,
            "id": cd.learning_id(text), **kw}
     if status:

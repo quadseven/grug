@@ -15,6 +15,19 @@ log = logging.getLogger("grug.pr_commits")
 _PR_COMMITS_CAP = 250
 
 
+def _commit_logins(rows: list[dict]) -> set[str] | None:
+    """The authors and committers of one page, or None for an unlinked one."""
+    logins: set[str] = set()
+    for row in rows:
+        for role in ("author", "committer"):
+            who = str(((row or {}).get(role) or {}).get("login") or "").lower()
+            if not who:
+                return None
+            if who != "web-flow":
+                logins.add(who)
+    return logins
+
+
 def pr_commit_logins(
     installation_id: int, owner: str, repo_name: str, pr_number: int,
 ) -> frozenset[str] | None:
@@ -46,13 +59,10 @@ def pr_commit_logins(
             total += len(rows)
             if total >= _PR_COMMITS_CAP:
                 return None
-            for row in rows:
-                for role in ("author", "committer"):
-                    who = str(((row or {}).get(role) or {}).get("login") or "").lower()
-                    if not who:
-                        return None
-                    if who != "web-flow":
-                        logins.add(who)
+            page_logins = _commit_logins(rows)
+            if page_logins is None:
+                return None
+            logins |= page_logins
             if len(rows) < 100:
                 return frozenset(logins)
         return None
