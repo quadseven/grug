@@ -755,7 +755,11 @@ def _enrich_claim_check_sources(
     return merged
 
 
-_RE_REVIEW_ACTIONS = {"synchronize", "reopened", "review"}
+# "rerun" is a `/grug improve` re-review (rerun._dispatch_elder_rerun). It
+# re-reads a PR that already carries Elder threads, so it carries earlier
+# findings forward and withdraws a block it clears like any re-review
+# (grug#1581: without it a clean `/grug improve` left the block standing).
+_RE_REVIEW_ACTIONS = {"synchronize", "reopened", "review", "rerun"}
 
 
 def _carry_into_check(
@@ -818,8 +822,8 @@ def _tidy_fixed_threads(
     """
     # Any re-review of a PR that may already carry Elder threads. Production
     # reviews arrive through the durable queue as action="review"
-    # (rerun._review_payload), so "synchronize" alone never matched live.
-    # Same set the prior-finding dedup uses.
+    # (rerun._review_payload), so "synchronize" alone never matched live;
+    # a `/grug improve` re-review arrives as action="rerun".
     if (
         action not in _RE_REVIEW_ACTIONS
         or not review_published
@@ -4209,6 +4213,7 @@ def dispatch_code_review(
     )
     check_publish_failed = False
     check_run_id: int | None = None
+    check_run_url = ""
     try:
         check_resp = with_install_token_retry(
             installation_id,
@@ -4218,6 +4223,7 @@ def dispatch_code_review(
             ),
         )
         check_run_id = (check_resp or {}).get("id")
+        check_run_url = str((check_resp or {}).get("html_url") or "")
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.error(
             "code_review_check_run_publish_failed",
@@ -4291,20 +4297,23 @@ def dispatch_code_review(
 
     # A blocking review from an earlier commit stays GitHub's standing verdict
     # until it is dismissed; a clean re-review alone does not clear it.
-    # Withdraw it only when the FINAL verdict is clean: a degraded run read
-    # nothing, `conclusion` already folds in earlier findings still open
-    # (carry-forward), and `listed_threads is None` means that fold could not
-    # run, so a living-range review cannot vouch for the commits it skipped.
+    # Withdraw it when the published Elder CHECK concludes `success` on this
+    # head (grug#1581): the dismissal follows the check, so advisory findings
+    # that leave the check green never keep a block alive, while `failure`
+    # and `neutral` keep it. A degraded run read nothing, `conclusion`
+    # already folds in earlier findings still open (carry-forward), and
+    # `listed_threads is None` means that fold could not run, so a
+    # living-range review cannot vouch for the commits it skipped.
     if (
         not evaluation.degraded_reason
-        and evaluation.conclusion != "failure"
-        and conclusion != "failure"
+        and conclusion == "success"
         and listed_threads is not None
         and not check_publish_failed
     ):
         _dismiss_stale_blocks(
             installation_id, owner, repo_name, pull_number, head_sha,
             run_started_at,
+            clean_url=check_run_url or str((review_resp or {}).get("html_url") or ""),
         )
 
     # Capture inline-comment IDs for later reaction polling (#247). BEST-
@@ -5032,7 +5041,7 @@ def _submitted_before(review: dict[str, Any], moment: datetime) -> bool:
 
 def _dismiss_stale_blocks(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-    head_sha: str, run_started_at: datetime,
+    head_sha: str, run_started_at: datetime, *, clean_url: str = "",
 ) -> int:
     """Dismiss Elder's own REQUEST_CHANGES reviews this clean run supersedes.
 
@@ -5040,6 +5049,9 @@ def _dismiss_stale_blocks(
     head submitted before `run_started_at` (#1350): a same-head block that
     landed after this run began was never weighed by it and stays. A
     same-head block with no usable `submitted_at` stays too.
+
+    The dismissal message links `clean_url`, the clean check run (or the
+    clean review), so the PR timeline names what superseded the block.
 
     Best-effort: a failure is logged and never changes the review outcome.
     Matches only reviews by the Grug app itself that carry the
@@ -5050,6 +5062,11 @@ def _dismiss_stale_blocks(
     pr = f"{owner}/{repo_name}#{pull_number}"
     tag = _REVIEW_PERSONA_TAG.format("elder")
     dismissed = 0
+    message = (
+        f"Superseded: the Elder check on {head_sha[:7]} concluded success "
+        "with nothing blocking"
+        + (f": {clean_url}" if clean_url else ".")
+    )
     try:
         reviews = with_install_token_retry(
             installation_id,
@@ -5073,11 +5090,7 @@ def _dismiss_stale_blocks(
                 installation_id,
                 lambda token, rid=review_id: dismiss_review(
                     token, owner, repo_name, pull_number=pull_number,
-                    review_id=rid,
-                    message=(
-                        f"Superseded: a later Elder review of {head_sha[:7]} "
-                        "found nothing blocking."
-                    ),
+                    review_id=rid, message=message,
                 ),
             )
             dismissed += 1
