@@ -60,6 +60,16 @@ ALLOWED_IN_EVALUATE_DIFF: frozenset[str] = frozenset({
     # #1255: checks whether a line is present in an already-bounded snippet;
     # this is an in-memory string operation, not repository IO.
     "_snippet_has_line",
+    # grug#1398: rewrites a pre-change alias of the anchor line in the
+    # message from the hunks already in hand (regex + hunk walk; no IO).
+    "align_line_refs",
+    # grug#1398: repairs a model-written Where reference to the anchor
+    # (regex only; no IO).
+    "repair_where_refs",
+    # grug#1397: reads the finding's own `withdrawn` flag and runs one regex
+    # over its message; an in-memory check, not IO.
+    "is_withdrawn_finding",
+    "concludes_omit",
     # grug#813/#707: the conclusion-derivation rule, single-sourced so
     # evaluate_diff/with_extra_findings/with_findings cannot drift into
     # three different answers (severity in -> conclusion out; no IO).

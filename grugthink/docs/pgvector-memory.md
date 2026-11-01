@@ -65,10 +65,4 @@ boot-time SQLite reader is added, keeping the two backends decoupled.
 2. Wire `GRUGTHINK_DATABASE_URL` into the deployment from the existing
    `grug-secrets` (`GRUG_DATABASE_URL`).
 3. Re-seed the family facts, verify semantic recall.
-4. Follow-up (done in grug#1190): the local-path PVC is dropped. Bot
-   configuration moved into Postgres too (the `grugthink_config` single-row
-   table, seeded from the YAML file on first boot), so `/data` in the
-   deployment is now an `emptyDir` for ephemeral per-bot runtime scratch only
-   and the pod reschedules onto any arm64 node. The SQLite+FAISS backend and
-   the `faiss-cpu`/`libgomp1` dependencies are deliberately **retained** for
-   the no-database local-dev/test fallback (out of scope for #1190).
+4. Follow-up: drop the local-path PVC and the FAISS/`libgomp` dependency.

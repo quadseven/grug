@@ -1,8 +1,10 @@
 {
   "backends": {
     "cave": {
+      "carried_prompt_sha": "fd698008772e7f844a1f238f81ca162631b7e69cbed07b606de67706e4aba575",
       "cases_scored": 17,
       "errored_cases": [],
+      "measured_prompt_sha": "7e5e81ea45396acf6845302fed521d58b1ad7d7603700f313dd57fc69008f09d",
       "model": "qwen3-coder-next:q8_0",
       "noise_rate": 0.0,
       "overall_catch": 0.1746031746031746,
@@ -22,5 +24,5 @@
       ]
     }
   },
-  "prompt_sha": "4a5f3f91c5ef65f7e00803c74a10540aaa0b7f09a78e1b3a62c6141051341293"
+  "prompt_sha": "fd698008772e7f844a1f238f81ca162631b7e69cbed07b606de67706e4aba575"
 }

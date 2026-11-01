@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from llm_client import Backend, FindingJudgement, Hunk
 from personas.code_reviewer import judge
+from review_evidence import assemble_evidence
 
 
 _FINDINGS = [{"rule_name": "r", "file": "src/x.py", "line": 1,
@@ -28,9 +29,9 @@ def _run(monkeypatch, answers: dict) -> list:
 
     monkeypatch.setattr(judge, "judge_findings", fake_judge)
     judge._judge_evidence_packet(
-        _FINDINGS, [Hunk(path="src/x.py", body="@@ -1 +1 @@\n+x")], 1,
-        pr_context=None, file_contents=None, cross_file_contents=None,
-        runtime_context=None,
+        _FINDINGS,
+        assemble_evidence([Hunk(path="src/x.py", body="@@ -1 +1 @@\n+x")]),
+        1,
     )
     return calls
 

@@ -2,7 +2,10 @@
 
 The operator's pipeline emits one row per review finding into
 `logs/review-ledger.jsonl`: {ts, repo, pr, reviewer, severity, class,
-finding, verdict, commit, evidence, head_sha}. `verdict` is the
+category, finding, verdict, commit, evidence, head_sha}. `category`
+(#683, optional) is the finding's taxonomy category
+(`review_types.CATEGORIES`); rows without it parse as "general".
+`verdict` is the
 ground-truth label - `fixed` / `declined` (a real finding acted on or
 consciously kept) vs `false-positive` (the reviewer was wrong).
 
@@ -33,7 +36,10 @@ Elder reuse it without a database.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
+
+from review_types import DEFAULT_CATEGORY, category_or_default
 
 # Verdicts that mean "the finding was REAL" (the reviewer earned the row),
 # vs the one verdict that means the reviewer was wrong.
@@ -68,6 +74,9 @@ class LedgerRow:
     # #545: the reviewed PR-head SHA, when the writer captured it directly
     # (see module docstring). Optional - most historical rows predate it.
     head_sha: str | None = None
+    # #683: taxonomy category (review_types.CATEGORIES) so precedent and
+    # precision can be sliced per category. Absent or invalid -> "general".
+    category: str = DEFAULT_CATEGORY
 
     @property
     def accepted(self) -> bool:
@@ -101,6 +110,7 @@ def parse_row(d: dict) -> LedgerRow | None:
             ts=str(d.get("ts", "")),
             commit=d.get("commit"),
             head_sha=d.get("head_sha"),
+            category=category_or_default(d.get("category")),
         )
     except (KeyError, ValueError, TypeError):
         return None
@@ -120,6 +130,47 @@ def parse_jsonl(text: str) -> list[LedgerRow]:
         row = parse_row(d)
         if row is not None:
             rows.append(row)
+    return rows
+
+
+# Column order of the Findings Ledger table the operator's pipeline posts on a
+# PR (#361): the same fields as a JSONL row, minus repo/pr (the comment's own
+# coordinates supply those).
+_TABLE_COLUMNS = ("reviewer", "severity", "class", "finding", "verdict", "evidence")
+
+
+def _split_table_row(line: str) -> list[str]:
+    """Split one markdown table line on unescaped pipes; `\\|` is a literal."""
+    body = line.strip().strip("|")
+    cells = re.split(r"(?<!\\)\|", body)
+    return [c.replace("\\|", "|").strip() for c in cells]
+
+
+def parse_comment_table(text: str, repo: str, pr: int | None) -> list[dict]:
+    """Findings Ledger markdown table (a PR comment body) -> raw row dicts
+    in the JSONL shape, stamped with the comment's `repo` and `pr`.
+
+    Rows start after a header whose first cells are `reviewer | severity |
+    class | finding | verdict`; a line with fewer cells than the required
+    five is skipped, and text without that header yields []. Output feeds
+    the same `parse_row` gate and `put_ledger_row` store as the JSONL source."""
+    rows: list[dict] = []
+    in_table = False
+    for line in text.splitlines():
+        if not line.strip().startswith("|"):
+            in_table = False
+            continue
+        cells = _split_table_row(line)
+        if [c.lower() for c in cells[:5]] == list(_TABLE_COLUMNS[:5]):
+            in_table = True
+            continue
+        if not in_table or set(line.strip()) <= set("|-: "):
+            continue
+        if len(cells) < 5:
+            continue
+        cells = (cells + [""] * len(_TABLE_COLUMNS))[: len(_TABLE_COLUMNS)]
+        fields = dict(zip(_TABLE_COLUMNS, cells, strict=True))
+        rows.append({"repo": repo, "pr": pr, **fields})
     return rows
 
 
@@ -174,3 +225,87 @@ def reviewer_precision(rows: list[LedgerRow]) -> dict[str, ReviewerScore]:
         rev: ReviewerScore(reviewer=rev, accepted=a, false_positives=fp)
         for rev, (a, fp) in acc.items()
     }
+
+
+def learning_metrics(rows: list[LedgerRow]) -> dict[str, object]:
+    """Calculate corpus metrics: total, accepted, false-positive, precision,
+    per-reviewer scores, and per-class precision breakdown (#539)."""
+    scores = reviewer_precision(rows)
+    accepted = sum(s.accepted for s in scores.values())
+    fps = sum(s.false_positives for s in scores.values())
+    total = accepted + fps
+    overall_precision = accepted / total if total else 1.0
+
+    class_counts: dict[str, list[int]] = {}
+    for r in rows:
+        cell = class_counts.setdefault(r.finding_class, [0, 0])
+        if r.accepted:
+            cell[0] += 1
+        elif r.false_positive:
+            cell[1] += 1
+    class_precision = {
+        cls: (a / (a + fp) if (a + fp) > 0 else 1.0)
+        for cls, (a, fp) in class_counts.items()
+    }
+
+    return {
+        "total_rows": len(rows),
+        "labeled_rows": total,
+        "accepted": accepted,
+        "false_positives": fps,
+        "precision": overall_precision,
+        "reviewers": {
+            rev: {
+                "accepted": s.accepted,
+                "false_positives": s.false_positives,
+                "total": s.total,
+                "precision": s.precision,
+            }
+            for rev, s in scores.items()
+        },
+        "classes": {
+            cls: {
+                "accepted": a,
+                "false_positives": fp,
+                "total": a + fp,
+                "precision": class_precision[cls],
+            }
+            for cls, (a, fp) in class_counts.items()
+        },
+    }
+
+
+def format_metrics(rows: list[LedgerRow]) -> str:
+    """Human-readable string representation of the ledger metrics (#539)."""
+    m = learning_metrics(rows)
+    lines = [
+        f"ledger: {m['total_rows']} rows, {m['accepted']} accepted, {m['false_positives']} false positives (precision {m['precision']:.2f})",
+        "reviewers:",
+    ]
+    reviewers = m["reviewers"]  # type: ignore[assignment]
+    for rev, s in sorted(reviewers.items()):
+        lines.append(f"  {rev}: {s['accepted']}/{s['total']} accepted (precision {s['precision']:.2f})")
+    lines.append("classes:")
+    classes = m["classes"]  # type: ignore[assignment]
+    for cls, c in sorted(classes.items()):
+        lines.append(f"  {cls}: {c['accepted']}/{c['total']} accepted (precision {c['precision']:.2f})")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import sys
+    args = sys.argv[1:] if argv is None else argv
+    path = args[0] if args else "logs/review-ledger.jsonl"
+    try:
+        with open(path, encoding="utf-8") as f:
+            rows = parse_jsonl(f.read())
+    except FileNotFoundError:
+        print(f"ledger: file not found: {path}")
+        return 1
+    print(format_metrics(rows))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(main(sys.argv[1:]))

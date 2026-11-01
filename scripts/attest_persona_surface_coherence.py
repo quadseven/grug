@@ -44,7 +44,6 @@ OPERATOR_ONLY: dict[str, str] = {
     # these via the API.
     "sentinel_enabled": "persona master switch; operator manages via API",
     "pulse_enabled": "persona master switch; operator manages via API",
-    "pulse_comment_nudge_enabled": "persona master switch; operator manages via API",
     "walkthrough_enabled": "persona master switch; operator manages via API",
     "issue_dor_enabled": "Chief issue-time advisory; operator manages via API",
     "check_run_reconcile_enabled": "periodic sweep opt-in; operator manages via API",

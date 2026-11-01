@@ -315,6 +315,7 @@ def _opengrep_finding(path: str, line: int, rule_id: str, message: str,
             f"and a reason if it is wrong here."
         ),
         suggestion=None,
+        check_output=f"{path}:{line}: {rule_id} {message}",
     )
 
 

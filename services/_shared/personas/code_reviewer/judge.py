@@ -21,26 +21,24 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from llm_client import (
     BackendConfig,
     FindingJudgement,
     FindingOrigin,
-    Hunk,
     JUDGE_BATCH_SIZE,
     JUDGE_MAX_FINDINGS,
     JudgeFindingRepr,
-    PrContext,
     _cave_judge_config,
     cloud_judge_configs,
     judge_findings,
     submit_finding_evaluation,
 )
-from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 from personas.code_reviewer.sast import EXPOSED_SECRET
+from review_evidence import ElderEvidence
 from review_types import Severity
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.judge")
@@ -55,36 +53,24 @@ _JUDGE_CONFIDENCE_FLOOR = 0.7
 _SUPPRESSIBLE_SEVERITIES: frozenset[Severity] = frozenset(("low", "medium"))
 
 
-def _scope_evidence(
-    findings: list[JudgeFindingRepr],
-    hunks: list[Hunk],
-    file_contents: Optional[dict[str, str]],
-) -> tuple[list[Hunk], Optional[dict[str, str]]]:
-    """Build the smallest evidence packet that can prove this batch.
+def _batch_evidence(
+    findings: list[JudgeFindingRepr], evidence: ElderEvidence,
+) -> ElderEvidence:
+    """The smallest evidence packet that can prove this batch: the review's
+    assembled evidence narrowed to the batch's files.
 
     Discovery may inspect an entire review cohort, but adjudication should not
     recreate a whole-PR prompt. Cross-file snippets stay available because
     they were selected upstream as bounded dependency evidence.
     """
-    paths = {finding["file"] for finding in findings}
-    scoped_hunks = [hunk for hunk in hunks if hunk.path in paths]
-    scoped_files = (
-        {path: body for path, body in file_contents.items() if path in paths}
-        if file_contents is not None
-        else None
-    )
-    return scoped_hunks, scoped_files
+    return evidence.scoped_to(finding["file"] for finding in findings)
 
 
 def _judge_evidence_packet(
     findings: list[JudgeFindingRepr],
-    hunks: list[Hunk],
+    evidence: ElderEvidence,
     installation_id: int,
     *,
-    pr_context: Optional[PrContext],
-    file_contents: Optional[dict[str, str]],
-    cross_file_contents: Optional[dict[str, str]],
-    runtime_context: str | None,
     refute: bool = False,
 ) -> tuple[FindingJudgement, ...]:
     """Grade one evidence packet, trying backends in order until one returns
@@ -102,12 +88,8 @@ def _judge_evidence_packet(
         try:
             verdicts = judge_findings(
                 findings,
-                hunks,
+                evidence,
                 installation_id=installation_id,
-                pr_context=pr_context,
-                file_contents=file_contents,
-                cross_file_contents=cross_file_contents,
-                runtime_context=runtime_context,
                 config=config,
                 redact=redact,
                 refute=refute,
@@ -151,12 +133,8 @@ def _judge_evidence_packet(
             return verdicts
     return judge_findings(
         findings,
-        hunks,
+        evidence,
         installation_id=installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
         config=None,
         redact=True,
         refute=refute,
@@ -189,6 +167,9 @@ def eval_tags(
         "file": f.file,
         "line": str(f.line),
         "severity": f.severity,
+        # #683: the taxonomy category rides the finding identity so the
+        # reaction-time ledger row can carry it (reactions reads it back).
+        "category": f.category,
     }
     if origin is not None:
         tags["source_backend"] = origin.backend.value
@@ -223,13 +204,8 @@ def _eval_targets(
 
 def grade_findings(
     evaluation: CodeReviewEvaluation,
-    hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
     installation_id: int,
-    *,
-    pr_context: Optional[PrContext] = None,
-    file_contents: Optional[dict[str, str]] = None,
-    cross_file_contents: Optional[dict[str, str]] = None,
-    runtime_context: str | None = None,
 ) -> tuple[FindingJudgement, ...]:
     """Run the judge LLM over the evaluation's findings and return its
     verdicts (#467). Fail-OPEN: an empty finding set or an LLM/parse error
@@ -238,12 +214,10 @@ def grade_findings(
     is the ONLY function that makes the judge LLM call; both the
     publication gate (`partition_findings`) and the DD evals (`submit_evals`)
     consume its result. Large ensemble outputs are split into bounded batches;
-    one failed batch does not discard verdicts for the others."""
+    one failed batch does not discard verdicts for the others. `evidence` is
+    the review's own assembled evidence, never re-collected here."""
     if not evaluation.findings:
         return ()
-    # Convert parser DiffHunks -> wire `Hunk`s (path/body) the same way the
-    # review path does. Passing raw DiffHunks once crashed every judge call.
-    wire_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
     finding_reprs = [_finding_to_repr(f) for f in evaluation.findings]
     verdicts: list[FindingJudgement] = []
     failed_batches = 0
@@ -260,18 +234,11 @@ def grade_findings(
         )
     for start in range(0, len(graded_reprs), JUDGE_BATCH_SIZE):
         batch = graded_reprs[start:start + JUDGE_BATCH_SIZE]
-        scoped_hunks, scoped_files = _scope_evidence(
-            batch, wire_hunks, file_contents,
-        )
         try:
             batch_verdicts = _judge_evidence_packet(
                 batch,
-                scoped_hunks,
+                _batch_evidence(batch, evidence),
                 installation_id=installation_id,
-                pr_context=pr_context,
-                file_contents=scoped_files,
-                cross_file_contents=cross_file_contents,
-                runtime_context=runtime_context,
             )
         except Exception as e:  # noqa: BLE001 - fail-open per bounded batch
             failed_batches += 1
@@ -407,20 +374,20 @@ def submit_evals(
 
 def run_judge(
     evaluation: CodeReviewEvaluation,
-    hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
     installation_id: int,
     *,
     review_span_context: Optional[dict],
-    pr_context: Optional[PrContext] = None,
-    file_contents: Optional[dict[str, str]] = None,
-    cross_file_contents: Optional[dict[str, str]] = None,
-    runtime_context: str | None = None,
 ) -> None:
     """Grade the evaluation's findings and submit DD LLM Obs evals - the
     eval-only compose (`grade_findings` + `submit_evals`), NO publication
-    filtering. Retained for callers/tests that only want to record evals;
-    the judge-gated publish path (dispatch, #467) calls the primitives
-    directly so it can filter between them. Best-effort - never raises."""
+    filtering. No production code calls it; only the judge test suites do.
+    The judge-gated publish path (dispatch, #467) calls `grade_findings`
+    directly so it can filter between grading and submission, and sast
+    calls `judge_findings`. Each of those callers passes an `ElderEvidence`
+    from `assemble_evidence`, and dispatch reuses the one it built for the
+    reviewer (#1189).
+    Best-effort - never raises."""
     if not any(
         _eval_targets(finding, review_span_context)
         for finding in evaluation.findings
@@ -431,13 +398,7 @@ def run_judge(
                 extra={"findings": len(evaluation.findings)},
             )
         return
-    verdicts = grade_findings(
-        evaluation, hunks, installation_id,
-        pr_context=pr_context,
-        file_contents=file_contents,
-        cross_file_contents=cross_file_contents,
-        runtime_context=runtime_context,
-    )
+    verdicts = grade_findings(evaluation, evidence, installation_id)
     submit_evals(
         evaluation.findings, verdicts, review_span_context=review_span_context,
     )
@@ -453,50 +414,78 @@ def run_judge(
 _REFUTE_CONFIDENCE_FLOOR = 0.9
 
 
-def refute_findings(
+@dataclass(frozen=True)
+class RefuteOutcome:
+    """The refute gate's answer (#714, #1400). `verdicts` index into the
+    findings the gate was asked about. `unavailable` holds the indices whose
+    batch got no answer from any backend (every backend errored, timed out,
+    or answered unparseably). A finding a backend answered for but whose
+    index is missing from the answer is NOT unavailable."""
+
+    verdicts: tuple[FindingJudgement, ...]
+    unavailable: frozenset[int]
+
+
+def refute_with_outcome(
     findings: tuple[Finding, ...],
-    hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
     installation_id: int,
-    *,
-    pr_context: Optional[PrContext] = None,
-    file_contents: Optional[dict[str, str]] = None,
-    cross_file_contents: Optional[dict[str, str]] = None,
-    runtime_context: str | None = None,
-) -> tuple[FindingJudgement, ...]:
+) -> RefuteOutcome:
     """Adversarial evidence-check (#714) for the HIGH/CRITICAL findings
     that survived the deterministic verification pass. One refute-framed
-    judge call (the burden inverts: the adjudicator must ground the claim
-    in quoted code or refute it); the semantic-misreading class - two
-    same-day production instances (grug PR #710, a private repo) -
-    passed the plausibility judge because nothing forced a line-level
-    check of the claim itself. Fail-OPEN like grade_findings: any error
-    returns () and everything publishes. Callers pass ONLY the
+    judge call per batch of `JUDGE_BATCH_SIZE` (the burden inverts: the
+    adjudicator must ground the claim in quoted code or refute it); the
+    semantic-misreading class - two same-day production instances (grug PR
+    #710, a private repo) - passed the plausibility judge because nothing
+    forced a line-level check of the claim itself. Every finding is refuted:
+    there is no cap, so a finding never lacks a verdict just for being
+    late in the list. Fail-open per batch: a batch no backend answered is
+    recorded in `unavailable` and grades nothing. Callers pass ONLY the
     high/critical subset (cost bound: typically 0-2 findings)."""
+    verdicts: list[FindingJudgement] = []
+    unavailable: set[int] = set()
+    for start in range(0, len(findings), JUDGE_BATCH_SIZE):
+        reprs = [
+            _finding_to_repr(f) for f in findings[start:start + JUDGE_BATCH_SIZE]
+        ]
+        try:
+            answered = _judge_evidence_packet(
+                reprs,
+                _batch_evidence(reprs, evidence),
+                installation_id=installation_id,
+                refute=True,
+            )
+        except Exception as e:  # noqa: BLE001 - fail-open, mirror grade_findings
+            log.error(
+                "refute_gate_failed",
+                extra={"kind": type(e).__name__, "count": len(reprs)},
+                exc_info=True,
+            )
+            answered = ()
+        if not answered:
+            unavailable.update(range(start, start + len(reprs)))
+            log.warning(
+                "refute_gate_unavailable",
+                extra={"batch_start": start, "count": len(reprs)},
+            )
+            continue
+        verdicts.extend(
+            replace(v, finding_index=v.finding_index + start)
+            for v in answered
+            if 0 <= v.finding_index < len(reprs)
+        )
+    return RefuteOutcome(tuple(verdicts), frozenset(unavailable))
+
+
+def refute_findings(
+    findings: tuple[Finding, ...],
+    evidence: ElderEvidence,
+    installation_id: int,
+) -> tuple[FindingJudgement, ...]:
+    """The refute gate's verdicts alone; see `refute_with_outcome`."""
     if not findings:
         return ()
-    wire_hunks = [Hunk(path=h.file_path, body=h.body) for h in hunks]
-    reprs = [_finding_to_repr(f) for f in findings[:JUDGE_BATCH_SIZE]]
-    scoped_hunks, scoped_files = _scope_evidence(
-        reprs, wire_hunks, file_contents,
-    )
-    try:
-        return _judge_evidence_packet(
-            reprs,
-            scoped_hunks,
-            installation_id=installation_id,
-            pr_context=pr_context,
-            file_contents=scoped_files,
-            cross_file_contents=cross_file_contents,
-            runtime_context=runtime_context,
-            refute=True,
-        )
-    except Exception as e:  # noqa: BLE001 - fail-open, mirror grade_findings
-        log.error(
-            "refute_gate_failed",
-            extra={"kind": type(e).__name__, "count": len(reprs)},
-            exc_info=True,
-        )
-        return ()
+    return refute_with_outcome(findings, evidence, installation_id).verdicts
 
 
 def partition_refuted(
@@ -522,3 +511,60 @@ def partition_refuted(
         else:
             kept.append(f)
     return tuple(kept), tuple(refuted)
+
+
+# Severity an unrefuted HIGH drops to when the plain judge called it not real
+# (#1400): medium still posts inline but never blocks a merge.
+_ADVISORY_SEVERITY: Severity = "medium"
+
+_ADVISORY_NOTE = (
+    " [Downgraded to advisory: the refute gate was unavailable and the plain "
+    "judge rated this not real (confidence {confidence:.2f}). Not blocking; "
+    "confirm by hand.]"
+)
+
+
+def _finding_identity(f: Finding) -> tuple[str, int, str, str]:
+    return (f.file, f.line, f.rule_name, f.message)
+
+
+def advisory_when_unrefuted(
+    findings: tuple[Finding, ...],
+    unavailable: frozenset[int],
+    *,
+    plain_findings: tuple[Finding, ...],
+    plain_verdicts: tuple[FindingJudgement, ...],
+    confidence_floor: float = _REFUTE_CONFIDENCE_FLOOR,
+) -> tuple[tuple[Finding, ...], tuple[tuple[Finding, FindingJudgement], ...]]:
+    """Soften the refute gate's fail-open (#1400). Returns (findings,
+    downgraded) where `downgraded` pairs each original finding with the
+    plain verdict that softened it.
+
+    `findings` is the list the refute gate was asked about, and
+    `unavailable` the indices no refute backend answered for (see
+    `RefuteOutcome`). Only a HIGH finding in `unavailable` whose plain judge
+    verdict (`plain_verdicts`, indexed into `plain_findings`) is not-real at
+    `confidence_floor` or above becomes an advisory medium carrying a
+    marker note. It still publishes: nothing is hidden. A critical always
+    keeps blocking, and so does any finding the refute gate answered for.
+    Pure - no IO."""
+    plain: dict[tuple[str, int, str, str], FindingJudgement] = {}
+    for v in plain_verdicts:
+        if 0 <= v.finding_index < len(plain_findings):
+            plain.setdefault(_finding_identity(plain_findings[v.finding_index]), v)
+    out: list[Finding] = []
+    downgraded: list[tuple[Finding, FindingJudgement]] = []
+    for i, f in enumerate(findings):
+        v = plain.get(_finding_identity(f)) if i in unavailable else None
+        if (
+            v is None
+            or v.is_real_bug
+            or v.confidence < confidence_floor
+            or f.severity != "high"
+        ):
+            out.append(f)
+            continue
+        note = _ADVISORY_NOTE.format(confidence=v.confidence)
+        out.append(replace(f, severity=_ADVISORY_SEVERITY, message=f.message + note))
+        downgraded.append((f, v))
+    return tuple(out), tuple(downgraded)

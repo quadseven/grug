@@ -396,6 +396,47 @@ def added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
     return out
 
 
+def pre_change_aliases(hunk: DiffHunk, new_line: int) -> frozenset[int]:
+    """Pre-change numbers a model may have written for head line `new_line`.
+
+    grug#1398: the model sees the raw hunk (`@@ -a,b +c,d @@`) and sometimes
+    quotes a line by its OLD-side number instead of the head-commit number
+    the finding is anchored to. This walks the hunk's old-to-new line map
+    and returns, for `new_line`:
+
+      - its old-side number (a context line), or the old line an added
+        line was inserted before (the old cursor at that point);
+      - the header-offset number `new_line - c + a`, the number a model
+        gets when it counts down from the old start over every shown line.
+
+    Empty when `new_line` is not a new-side line of this hunk, or when the
+    header does not parse. Each alias differs from `new_line` (a number
+    equal to the head line needs no rewrite)."""
+    lines = hunk.body.splitlines()
+    m = _OLD_SIDE_RE.match(lines[0]) if lines else None
+    if m is None:
+        return frozenset()
+    old_start = int(m.group(1))
+    old_cursor, new_cursor = old_start, hunk.new_start
+    found: set[int] = set()
+    for raw in lines[1:]:
+        if raw.startswith(chr(92)):
+            continue
+        if raw.startswith("-"):
+            old_cursor += 1
+            continue
+        if new_cursor == new_line:
+            found.add(old_cursor)
+            found.add(new_line - hunk.new_start + old_start)
+            break
+        if not raw.startswith("+"):
+            old_cursor += 1
+        new_cursor += 1
+    found.discard(new_line)
+    found.discard(0)
+    return frozenset(found)
+
+
 def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
     """Parse a unified diff into structured hunks.
 
@@ -538,3 +579,71 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
         i += 1
 
     return tuple(hunks)
+
+
+@dataclass(frozen=True, slots=True)
+class FileChange:
+    """One file's place in a diff: its status and how many lines moved.
+
+    `status` is "added", "removed", "renamed" or "modified". `similarity`
+    is git's rename similarity (0-100), None when the diff gives none.
+    `added`/`removed` count content lines, not headers."""
+
+    path: str
+    status: str
+    previous_path: str | None
+    similarity: int | None
+    added: int
+    removed: int
+
+
+_SIMILARITY_RE = re.compile(r"^similarity index (\d+)%$")
+
+
+def _first(lines: list[str], prefix: str) -> str | None:
+    """The rest of the first line starting with `prefix`, or None."""
+    return next((ln[len(prefix):] for ln in lines if ln.startswith(prefix)), None)
+
+
+def _block_header(
+    lines: list[str], old: str, new: str,
+) -> tuple[str, str | None, int | None, str, int]:
+    """(status, previous path, similarity, new path, index of the first
+    hunk line) from one file block's extended header."""
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("@@")), len(lines))
+    header = lines[:start]
+    previous = _first(header, "rename from ")
+    status = (
+        "added" if _first(header, "new file mode") is not None
+        else "removed" if _first(header, "deleted file mode") is not None
+        else "renamed" if previous is not None
+        else "modified"
+    )
+    sim = next((m for m in map(_SIMILARITY_RE.match, header) if m), None)
+    target = _NEW_FILE_RE.match("+++ " + (_first(header, "+++ ") or "/dev/null"))
+    if target and target.group(1) != "/dev/null":
+        new = target.group(1)
+    return status, previous, int(sim.group(1)) if sim else None, new, start
+
+
+def file_changes(unified_diff: str) -> tuple[FileChange, ...]:
+    """Per-file status and line counts, in diff order.
+
+    Unlike `parse_diff`, deleted files and pure renames are kept: a check
+    that asks what a diff removed has to see them. Pure; a block without a
+    `diff --git` header is skipped, never raised on, since `parse_diff`
+    already refuses malformed input on the same text."""
+    out: list[FileChange] = []
+    for block in re.split(r"(?m)^(?=diff --git )", unified_diff or ""):
+        lines = block.splitlines()
+        m = _DIFF_GIT_RE.match(lines[0]) if lines else None
+        if not m:
+            continue
+        old = m.group(1)
+        status, previous, similarity, new, start = _block_header(lines[1:], old, m.group(2))
+        body = lines[1 + start:]
+        added = sum(1 for line in body if line.startswith("+"))
+        removed = sum(1 for line in body if line.startswith("-"))
+        path = old if status == "removed" else new
+        out.append(FileChange(path, status, previous, similarity, added, removed))
+    return tuple(out)

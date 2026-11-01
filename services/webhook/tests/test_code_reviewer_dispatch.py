@@ -19,7 +19,9 @@ from llm_client import (
 )
 from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
+from personas.code_reviewer.judge import RefuteOutcome
 from personas.review_publish import plan_publish
+from review_evidence import ElderEvidence
 from review_pipeline import ReviewCoverage, ReviewabilityConcern
 
 
@@ -97,7 +99,7 @@ def test_dispatch_advisory_mode_posts_neutral_check_and_comment_review(monkeypat
     posted_check = []
     posted_review = []
 
-    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None, ci_context=None, repo_docs_context=None, voice="caveman", cancel_event=None):
+    def _fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
         return llm
 
     def _fake_post_check_run(install_token, owner, repo, result, external_id=None):
@@ -1127,12 +1129,49 @@ def test_dispatch_judge_failure_does_not_change_result(monkeypatch):
     assert out["result"] == "pass"
 
 
+def test_dispatch_judge_grades_against_the_reviewers_own_evidence(monkeypatch):
+    """The production judge caller is migrated to the evidence seam (#1189):
+    `grade_findings` receives the very `ElderEvidence` object the reviewer
+    read, never hunks plus loose kwargs and never a second assembly."""
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="r", severity="medium", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "rs1"},
+    )
+    reviewed: list = []
+    graded: list = []
+
+    def _fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
+        reviewed.append(evidence)
+        return llm
+
+    def _fake_grade(evaluation, evidence, installation_id, *a, **kw):
+        graded.append(evidence)
+        return (FindingJudgement(0, True, "real", 0.9),)
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", _fake_review_diff)
+    monkeypatch.setattr(cr_dispatch, "grade_findings", _fake_grade)
+    monkeypatch.setattr(cr_dispatch, "submit_evals", lambda *a, **kw: None)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert len(reviewed) == 1 and len(graded) == 1
+    assert isinstance(graded[0], ElderEvidence)
+    assert graded[0] is reviewed[0]
+
+
 def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
     """The review receives both trace coordinates and author intent."""
     captured = []
 
-    def _fake_review_diff(hunks, installation_id, pr_context=None, file_contents=None, cross_file_contents=None, runtime_context=None, ci_context=None, repo_docs_context=None, voice="caveman", cancel_event=None):
-        captured.append(pr_context)
+    def _fake_review_diff(evidence, installation_id, voice="caveman", cancel_event=None):
+        captured.append(evidence.pr_context)
         return LlmReviewResponse(kind="no_diff")
 
     monkeypatch.setattr(cr_dispatch, "review_diff", _fake_review_diff)
@@ -1173,11 +1212,16 @@ def test_dispatch_fetches_immutable_base_head_diff(monkeypatch):
     with patch("httpx.get", side_effect=capture_get):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
-    # First GET is the unified diff (diff Accept header).
-    assert captured[0]["headers"]["Accept"] == "application/vnd.github.diff"
-    assert "myorg/myrepo" in captured[0]["url"]
-    assert "/compare/base5678ijkl...abcd1234efgh" in captured[0]["url"]
-    assert captured[0]["timeout"] == review_publish.DIFF_FETCH_TIMEOUT
+    # The unified diff GET (diff Accept header). The base-ref `.grug.yaml`
+    # read comes first since grug#1439 (skip_prs is checked before the diff).
+    diff_gets = [
+        c for c in captured
+        if c["headers"].get("Accept") == "application/vnd.github.diff"
+    ]
+    assert diff_gets, "expected a unified diff fetch"
+    assert "myorg/myrepo" in diff_gets[0]["url"]
+    assert "/compare/base5678ijkl...abcd1234efgh" in diff_gets[0]["url"]
+    assert diff_gets[0]["timeout"] == review_publish.DIFF_FETCH_TIMEOUT
     # #336: subsequent GET(s) fetch full file content with the `.raw` Accept
     # header so the Elder sees mitigations outside the diff hunk.
     raw_gets = [c for c in captured if c["headers"].get("Accept") == "application/vnd.github.raw"]
@@ -2094,8 +2138,9 @@ def test_inline_comment_body_effort_chip_and_agent_prompt():
     assert "Grug see unused path" in body
     assert "Why it matters" in body
     assert "Verify each finding against the current code" in body
-    # dead-code rule maps to maintainability in RULES
-    assert "maintainability" in body
+    # #683: the chip carries the finding's taxonomy category ("general"
+    # when unset); the rule-derived class still keys why-it-matters.
+    assert "_general_" in body.split("\n", 1)[0]
     assert cr_dispatch._category_for_rule("dead-code") == "maintainability"
 
 
@@ -2679,9 +2724,12 @@ def test_dispatch_refute_gate_kills_confidently_refuted_high_finding(monkeypatch
 
     def _fake_refute(findings, hunks, installation_id, **kw):
         refute_calls.append(findings)
-        return (FJ(0, False, "quoted code shows the opposite of the claim", 0.95),)
+        return RefuteOutcome(
+            (FJ(0, False, "quoted code shows the opposite of the claim", 0.95),),
+            frozenset(),
+        )
 
-    monkeypatch.setattr(cr_dispatch, "refute_findings", _fake_refute)
+    monkeypatch.setattr(cr_dispatch, "refute_with_outcome", _fake_refute)
     posted_reviews: list = []
     monkeypatch.setattr(
         cr_dispatch, "post_review",
@@ -2703,6 +2751,111 @@ def test_dispatch_refute_gate_kills_confidently_refuted_high_finding(monkeypatch
     )
     assert row.rule == "inverted-logic"
     assert out["result"] == "pass"
+
+
+def _run_refute_outage_review(monkeypatch, caplog, *, plain_confidence):
+    """One blocking Tier-1 review with a single HIGH finding, every refute
+    backend failing (no verdict), and the plain judge calling the finding
+    not real at `plain_confidence`. Returns (check conclusions, reviews)."""
+    import logging
+
+    from llm_client import FindingJudgement as FJ
+
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="null-deref",
+            severity="high", message="value may be None here",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+        review_span_context={"span_id": "rs1"},
+    )
+    conclusions: list = []
+    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run",
+        lambda token, owner, repo, result, **kw: conclusions.append(
+            result.conclusion) or {},
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "grade_findings",
+        lambda *a, **kw: (FJ(0, False, "guarded above", plain_confidence),),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "fetch_file_contents",
+        lambda token, owner, repo, paths, sha: {"src/x.py": "x = 1\ny = 2\nz = 3\n"},
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "refute_with_outcome",
+        lambda findings, *a, **kw: RefuteOutcome(
+            (), frozenset(range(len(findings))),
+        ),
+    )
+    posted_reviews: list = []
+    monkeypatch.setattr(
+        cr_dispatch, "post_review",
+        lambda *a, **kw: posted_reviews.append(kw["result"]) or {},
+    )
+    with patch("httpx.get", return_value=_diff_response()), \
+         caplog.at_level(logging.INFO):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=True)
+    return conclusions, posted_reviews
+
+
+def test_refute_outage_publishes_a_judged_not_real_high_as_advisory(monkeypatch, caplog):
+    """#1400, live 2026-10-24: every refute backend failed and the plain
+    judge had called the high null-deref not real at 0.92. The finding
+    still posts, but as a non-blocking advisory: the check does not fail
+    and the review does not request changes."""
+    conclusions, reviews = _run_refute_outage_review(
+        monkeypatch, caplog, plain_confidence=0.92,
+    )
+
+    assert conclusions and conclusions[0] != "failure"
+    assert reviews, "the finding must still publish"
+    assert all(r.event != "REQUEST_CHANGES" for r in reviews)
+    assert any("0.92" in c.body for r in reviews for c in r.comments)
+    row = next(
+        r for r in caplog.records
+        if r.getMessage() == "code_review_refute_unverified_downgraded"
+    )
+    assert (row.rule, row.arm, row.confidence) == ("null-deref", "tier1", 0.92)
+
+
+def test_refute_outage_keeps_a_high_blocking_below_the_floor(monkeypatch, caplog):
+    """The plain judge at 0.85 is not confident enough: the high still blocks."""
+    conclusions, reviews = _run_refute_outage_review(
+        monkeypatch, caplog, plain_confidence=0.85,
+    )
+
+    assert conclusions and conclusions[0] == "failure"
+    assert any(r.event == "REQUEST_CHANGES" for r in reviews)
+
+
+def test_deep_arm_refute_outage_downgrades_a_judged_not_real_high(monkeypatch):
+    """#1400: the deep arm grades with its own plain verdicts and gets the
+    same advisory treatment when its refute call returns nothing."""
+    from llm_client import FindingJudgement as FJ
+    from review_evidence import assemble_evidence
+
+    monkeypatch.setattr(
+        cr_dispatch, "grade_findings",
+        lambda *a, **kw: (FJ(0, False, "guarded above", 0.95),),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "refute_with_outcome",
+        lambda findings, *a, **kw: RefuteOutcome(
+            (), frozenset(range(len(findings))),
+        ),
+    )
+    hunks = tuple(cr_dispatch.parse_diff(_DIFF))
+    deep_eval, _, _, _ = cr_dispatch._grade_deep_response(
+        _deep_llm_with_finding(rule="null-deref", severity="high"),
+        hunks, assemble_evidence(()), 11,
+        pr_context={}, owner="o", repo_name="r", pull_number=1,
+    )
+
+    assert [f.severity for f in deep_eval.findings] == ["medium"]
 
 
 # --- #730: deep review capture + stack refresh --------------------------------
@@ -2942,6 +3095,20 @@ def test_stack_body_is_a_board_with_a_verdict_first():
     assert "_#1 thing_" in body
 
 
+def test_stack_offers_bulk_fix_for_checked_suggestion():
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    finding = Finding(
+        file="a.py", line=1, severity="low", rule_name="r",
+        message="fix value", suggestion="x = 2",
+    )
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+        conclusion="success", file_contents={"a.py": "x = 1\n"},
+    )
+    assert "Finishing touch" in body
+    assert "/grug fix" in body
+
+
 def test_worth_an_email_is_findings_or_degraded_only():
     """The gate on whether grug may CREATE a comment - i.e. whether it may
     mail the author. A clean review is not news; the green check-run already
@@ -3052,7 +3219,9 @@ def test_clean_review_body_is_three_lines_and_has_no_empty_fold():
     # and render as nothing.
     visible = [l for l in body.splitlines()
                if l.strip() and not l.strip().startswith("<!--")]
-    assert len(visible) == 2, visible                    # verdict + PR title
+    # verdict + PR title + the grug#1429 closure sentence, which is last.
+    assert len(visible) == 3, visible
+    assert visible[-1] == "Nothing needs to change on this head."
 
 
 def test_table_and_detail_bullets_are_blank_line_separated():
@@ -4077,8 +4246,8 @@ def test_dispatch_skips_a_byte_identical_copy_of_an_untouched_repo_file(monkeypa
     reviewed_paths: list[str] = []
     posted_check = []
 
-    def _fake_review_diff(hunks, installation_id, **kwargs):
-        reviewed_paths.extend(h.path for h in hunks)
+    def _fake_review_diff(evidence, installation_id, **kwargs):
+        reviewed_paths.extend(h.path for h in evidence.hunks)
         return LlmReviewResponse(
             kind="reviewed", findings=(),
             backend_used=Backend.POOLSIDE, model_name="laguna",
@@ -4132,8 +4301,8 @@ def test_dispatch_reviews_a_copy_when_the_head_tree_is_unreadable(monkeypatch):
     )
     reviewed_paths: list[str] = []
 
-    def _fake_review_diff(hunks, installation_id, **kwargs):
-        reviewed_paths.extend(h.path for h in hunks)
+    def _fake_review_diff(evidence, installation_id, **kwargs):
+        reviewed_paths.extend(h.path for h in evidence.hunks)
         return LlmReviewResponse(
             kind="reviewed", findings=(),
             backend_used=Backend.POOLSIDE, model_name="laguna",
@@ -4152,3 +4321,127 @@ def test_dispatch_reviews_a_copy_when_the_head_tree_is_unreadable(monkeypatch):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
     assert reviewed_paths == [copy_path]
+
+
+def test_model_set_category_renders_as_chip_and_beats_rule_category():
+    """The reviewer-set taxonomy category replaces the rule-derived one."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=3, severity="high", rule_name="dead-code",
+        message="m", suggestion=None, category="data-integrity",
+    )
+    head = cr_dispatch._inline_comment_body(f).split("\n", 1)[0]
+    assert "_data-integrity_" in head
+    assert "maintainability" not in head
+
+
+def test_unset_category_renders_as_general():
+    """#683 criterion 4: an unset category degrades to "general" on the
+    Marking too - the chip, the ledger row and the run store all carry the
+    finding's one category, never the rule-derived class."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=3, severity="high", rule_name="dead-code",
+        message="m", suggestion=None,
+    )
+    assert f.category == "general"
+    head = cr_dispatch._inline_comment_body(f).split("\n", 1)[0]
+    assert "_general_" in head
+    assert "maintainability" not in head
+
+
+
+# --- muting a rarely-fixed finding class (#1436) ----------------------------
+# Fixture rows are dicts in the shape ledger.parse_row reads (the writer is
+# services/_shared/ledger.py); no live read.
+
+def _mute_rows(cls, accepted, rejected):
+    def row(i, verdict):
+        return {"repo": "o/r", "pr": i, "reviewer": "claude/x",
+                "severity": "HIGH", "class": cls, "finding": "f",
+                "verdict": verdict, "ts": "2026-06-10T00:00:00Z"}
+    return ([row(i, "fixed") for i in range(accepted)]
+            + [row(100 + i, "false-positive") for i in range(rejected)])
+
+
+def _mute_eval(cls, severity="medium"):
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    f = Finding(file="src/x.py", line=2, severity=severity, rule_name=cls,
+                message="m", suggestion=None)
+    conclusion = "failure" if severity in ("high", "critical") else "success"
+    return CodeReviewEvaluation(findings=(f,), conclusion=conclusion)
+
+
+def _muted(monkeypatch, rows, config=None):
+    monkeypatch.setattr("adapters.install_store.list_ledger_rows",
+                        lambda repo, *a, **k: rows, raising=False)
+    return cr_dispatch._muted_classes_for("o/r", config)
+
+
+def test_rarely_fixed_class_posts_no_inline_and_one_board_line(monkeypatch):
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))  # 25 labeled, 0.08
+    evaluation = _mute_eval("noisy")
+
+    result, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT", muted=muted,
+    )
+
+    assert result is None and posted == ()
+    _, summary = cr_dispatch._summary_markdown(evaluation, muted=muted)
+    assert summary.count("muted: fixed in 2 of 25 past findings") == 1
+    board = cr_dispatch._review_stack_body(
+        evaluation, conclusion="success", muted=muted,
+    )
+    assert board.count("muted: fixed in 2 of 25 past findings") == 1
+
+
+def test_class_below_min_labeled_is_not_muted(monkeypatch):
+    assert _muted(monkeypatch, _mute_rows("noisy", 0, 19)) == {}
+
+
+def test_critical_finding_of_muted_class_still_posts_inline_and_blocks(monkeypatch):
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))
+    evaluation = _mute_eval("noisy", severity="critical")
+
+    result, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="REQUEST_CHANGES", muted=muted,
+    )
+
+    assert result is not None and len(result.comments) == 1
+    assert posted == evaluation.findings
+    outcome = plan_publish(evaluation, mode="blocking")
+    assert (outcome.conclusion, outcome.event) == ("failure", "REQUEST_CHANGES")
+
+
+def test_locked_class_posts_inline_at_zero_precision(monkeypatch):
+    from personas.code_reviewer.repo_config import parse_repo_config
+
+    config = parse_repo_config("elder_mute_locked_classes: [noisy]\n")
+    muted = _muted(monkeypatch, _mute_rows("noisy", 0, 25), config)
+    assert muted == {}
+
+    result, posted = cr_dispatch.build_review_result(
+        _mute_eval("noisy"), head_sha="a" * 40, event="COMMENT", muted=muted,
+    )
+
+    assert result is not None and len(result.comments) == 1
+
+
+def test_mute_thresholds_come_from_repo_config(monkeypatch):
+    from personas.code_reviewer.repo_config import parse_repo_config
+
+    config = parse_repo_config(
+        "elder_mute_min_labeled: 5\nelder_mute_below_precision: 0.5\n"
+    )
+    assert "noisy" in _muted(monkeypatch, _mute_rows("noisy", 2, 4), config)
+    assert _muted(monkeypatch, _mute_rows("noisy", 3, 3), config) == {}
+
+
+def test_high_finding_of_muted_class_keeps_its_inline_thread(monkeypatch):
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))
+    result, _ = cr_dispatch.build_review_result(
+        _mute_eval("noisy", severity="high"), head_sha="a" * 40,
+        event="REQUEST_CHANGES", muted=muted,
+    )
+    assert result is not None and len(result.comments) == 1

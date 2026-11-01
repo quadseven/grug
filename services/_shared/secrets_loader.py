@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from functools import lru_cache
 from typing import Literal, cast, get_args
 
@@ -83,6 +84,12 @@ def get_poolside_api_key() -> str:
     return _get_ssm_secure_string(name)
 
 
+def get_subscription_lane_token() -> str:
+    """Bearer for the subscription lane, or "" when no SSM path is set."""
+    name = os.getenv("GRUG_SUBSCRIPTION_TOKEN_SSM", "")
+    return _get_ssm_secure_string(name) if name else ""
+
+
 def get_opencode_go_api_key() -> str:
     """grug#910. SSM param `/infra/llm/opencode_go_api_key` per this repo's
     `/infra/llm/<provider>_api_key` convention."""
@@ -129,6 +136,39 @@ def get_prompt_experiment_mode() -> Mode:
         return "off"
     # Narrowed: `value` passed the `_EXPERIMENT_MODES` (== get_args(Mode)) gate.
     return cast("Mode", value)
+
+
+_ACCEPTOR_RE = re.compile(r"([A-Za-z0-9-]+):([A-Za-z0-9-]+)")
+
+
+@lru_cache(maxsize=1)
+def get_removal_acceptors() -> frozenset[tuple[str, str]]:
+    """The trusted operators who may accept a guarded removal (#1405) beside
+    an admin: (owner, login) pairs, lower case, from the plain String SSM
+    param that GRUG_REMOVAL_ACCEPTORS_SSM names, written `owner:login`
+    separated by commas or whitespace. A personal account's repos cannot
+    give a collaborator admin, so the owner lists them here, outside any
+    repo a pull request could edit.
+
+    FAILS CLOSED: an unset env, a missing or unreadable param, or a
+    malformed entry adds nobody, so only admins accept. Cached per warm
+    container, like the prompt experiment."""
+    name = os.getenv("GRUG_REMOVAL_ACCEPTORS_SSM", "")
+    if not name:
+        return frozenset()
+    try:
+        value = _ssm.get_parameter(Name=name)["Parameter"]["Value"]
+    except Exception as e:  # noqa: BLE001 - best-effort config; fail closed
+        log.warning("removal_acceptors_fetch_failed", extra={"param": name, "kind": type(e).__name__})
+        return frozenset()
+    pairs = set()
+    for word in re.split(r"[\s,]+", value.strip()):
+        found = _ACCEPTOR_RE.fullmatch(word)
+        if found:
+            pairs.add((found.group(1).lower(), found.group(2).lower()))
+        elif word:
+            log.warning("removal_acceptor_malformed", extra={"param": name, "entry": word[:64]})
+    return frozenset(pairs)
 
 
 def get_dd_api_key() -> str:

@@ -14,6 +14,7 @@ from personas.code_reviewer import judge as judge_mod
 from personas.code_reviewer.judge import partition_refuted, refute_findings
 from personas.code_reviewer.persona import Finding
 from llm_client import FindingJudgement
+from review_evidence import assemble_evidence
 
 
 def _finding(**kw) -> Finding:
@@ -95,7 +96,7 @@ def test_refute_findings_calls_judge_with_refute_flag(monkeypatch):
         return (FindingJudgement(0, False, "refuted", 0.95),)
 
     monkeypatch.setattr(judge_mod, "judge_findings", _fake_judge)
-    out = refute_findings((_finding(),), (), 42)
+    out = refute_findings((_finding(),), assemble_evidence(()), 42)
     assert captured["refute"] is True
     assert captured["redact"] is True
     assert captured["count"] == 1
@@ -107,11 +108,123 @@ def test_refute_findings_fail_open_on_judge_error(monkeypatch):
         raise RuntimeError("judge exploded")
 
     monkeypatch.setattr(judge_mod, "judge_findings", _boom)
-    assert refute_findings((_finding(),), (), 42) == ()
+    assert refute_findings((_finding(),), assemble_evidence(()), 42) == ()
 
 
 def test_refute_findings_empty_input_makes_no_call(monkeypatch):
     called = []
     monkeypatch.setattr(judge_mod, "judge_findings", lambda *a, **kw: called.append(1))
-    assert refute_findings((), (), 42) == ()
+    assert refute_findings((), assemble_evidence(()), 42) == ()
     assert called == []
+
+
+# --- refute fail-open with a confident plain not-real verdict (#1400) -----
+
+from llm_client import JUDGE_BATCH_SIZE  # noqa: E402
+from personas.code_reviewer.judge import (  # noqa: E402
+    advisory_when_unrefuted, refute_with_outcome,
+)
+
+
+def _fj(index, real, confidence):
+    return FindingJudgement(index, real, "reason", confidence)
+
+
+def _soften(f, *, unavailable=frozenset({0}), plain=None):
+    return advisory_when_unrefuted(
+        (f,), unavailable, plain_findings=(f,),
+        plain_verdicts=plain if plain is not None else (_fj(0, False, 0.92),),
+    )
+
+
+def test_refute_outage_with_plain_not_real_downgrades_a_high():
+    """#1400, the live case: every refute backend failed and the plain judge
+    had called the high finding not real at 0.92. It still publishes, as a
+    non-blocking medium whose marker says why, never hidden."""
+    f = _finding()
+    out, downgraded = _soften(f)
+    assert len(out) == 1
+    assert out[0].severity == "medium"
+    assert out[0].message.startswith(f.message)
+    assert "refute gate was unavailable" in out[0].message
+    assert "confidence 0.92" in out[0].message
+    assert [(d[0], d[1].confidence) for d in downgraded] == [(f, 0.92)]
+
+
+def test_refute_outage_at_exactly_the_floor_downgrades():
+    out, _ = _soften(_finding(), plain=(_fj(0, False, 0.9),))
+    assert out[0].severity == "medium"
+
+
+def test_refute_outage_below_the_floor_stays_blocking():
+    f = _finding()
+    for plain in ((_fj(0, False, 0.89),), (_fj(0, True, 0.99),), ()):
+        assert _soften(f, plain=plain) == ((f,), ())
+
+
+def test_critical_stays_blocking_on_a_refute_outage():
+    f = _finding(severity="critical")
+    assert _soften(f, plain=(_fj(0, False, 0.99),)) == ((f,), ())
+
+
+def test_answered_finding_stays_blocking():
+    """A finding the refute gate answered for is not unavailable: the plain
+    judge's not-real can never soften it."""
+    f = _finding()
+    assert _soften(f, unavailable=frozenset(), plain=(_fj(0, False, 0.99),)) == ((f,), ())
+
+
+def test_plain_verdict_must_match_the_same_finding():
+    f, other = _finding(line=5), _finding(line=7, message="other")
+    out, _ = advisory_when_unrefuted(
+        (f,), frozenset({0}), plain_findings=(other, f),
+        plain_verdicts=(_fj(0, False, 0.99), _fj(1, True, 0.99)),
+    )
+    assert out == (f,)
+
+
+def test_refute_gate_judges_every_high_past_the_batch_size(monkeypatch):
+    """No truncation: a finding after the first JUDGE_BATCH_SIZE gets its own
+    refute verdict, so it can never look unavailable for being late."""
+    monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL", raising=False)
+    calls = []
+
+    def _judge(reprs, evidence, **kw):
+        calls.append(len(reprs))
+        return tuple(_fj(i, True, 0.95) for i in range(len(reprs)))
+
+    monkeypatch.setattr(judge_mod, "judge_findings", _judge)
+    findings = tuple(_finding(line=i + 1) for i in range(JUDGE_BATCH_SIZE + 1))
+    outcome = refute_with_outcome(findings, assemble_evidence(()), 42)
+    assert calls == [JUDGE_BATCH_SIZE, 1]
+    assert {v.finding_index for v in outcome.verdicts} == set(range(len(findings)))
+    assert outcome.unavailable == frozenset()
+
+
+def test_index_missing_from_an_answer_is_not_an_outage(monkeypatch):
+    """A backend that answered but skipped an index did not fail: that
+    finding is not unavailable, so it stays blocking."""
+    monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL", raising=False)
+    monkeypatch.setattr(
+        judge_mod, "judge_findings", lambda reprs, ev, **kw: (_fj(0, True, 0.95),),
+    )
+    a, b = _finding(line=5), _finding(line=9)
+    outcome = refute_with_outcome((a, b), assemble_evidence(()), 42)
+    assert outcome.unavailable == frozenset()
+    out, downgraded = advisory_when_unrefuted(
+        (a, b), outcome.unavailable, plain_findings=(a, b),
+        plain_verdicts=(_fj(0, False, 0.99), _fj(1, False, 0.99)),
+    )
+    assert out == (a, b) and downgraded == ()
+
+
+def test_every_backend_failing_marks_the_batch_unavailable(monkeypatch):
+    monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL", raising=False)
+
+    def _boom(*a, **kw):
+        raise TimeoutError("cave timed out")
+
+    monkeypatch.setattr(judge_mod, "judge_findings", _boom)
+    outcome = refute_with_outcome((_finding(),), assemble_evidence(()), 42)
+    assert outcome.verdicts == ()
+    assert outcome.unavailable == frozenset({0})

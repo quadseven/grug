@@ -92,6 +92,27 @@ def mock_transport_client() -> Iterator[Callable[..., httpx.Client]]:
 
 
 @pytest.fixture(autouse=True)
+def _every_poller_pass_is_due(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Which run a pass lands on depends on the clock. A test of what a pass
+    DOES must not. test_reaction_cadence pins the real schedule."""
+    poller = sys.modules.get("poller_handler")
+    if poller is not None:
+        monkeypatch.setattr(poller, "_DAILY_TICKS", 1)
+        monkeypatch.setattr(poller, "_ENFORCEMENT_TICKS", 1)
+        monkeypatch.setattr(poller, "get_enforcement_checks", lambda _iid: {})
+        monkeypatch.setattr(poller, "put_enforcement_checks", lambda _iid, _c: None)
+
+
+@pytest.fixture(autouse=True)
+def _forget_guideline_files() -> Iterator[None]:
+    """The guideline cache outlives a test, and tests reuse one repo and head."""
+    lc = sys.modules.get("llm_client")
+    if lc is not None:
+        lc._guideline_cache.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     """grug#1225: the LLM provider breaker is module state, and a shell's
     GRUG_DISABLED_BACKENDS must not reach a test. Without the reset, one test
@@ -102,6 +123,7 @@ def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     lc = sys.modules.get("llm_client")
     if lc is not None:
         monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
+        monkeypatch.setattr(lc, "_limit_refusals", {}, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -153,3 +175,54 @@ def _mock_learn_living_review_sync(monkeypatch):
     import rerun
 
     monkeypatch.setattr(rerun, "_sync_living_review", MagicMock(return_value=0))
+
+
+class _LabelHttpResponse:
+    """Minimal httpx.Response stand-in for the label calls."""
+
+    def __init__(self, status_code: int, body: dict | None = None) -> None:
+        self.status_code = status_code
+        self._body = body or {}
+
+    def json(self) -> dict:
+        return self._body
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+class _LabelHttp:
+    """Records the `grug:reviewing` label calls instead of making them."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, object]] = []
+
+    def get(self, url: str, **kw: object) -> _LabelHttpResponse:
+        self.calls.append(("get", url, None))
+        return _LabelHttpResponse(200)
+
+    def post(self, url: str, **kw: object) -> _LabelHttpResponse:
+        self.calls.append(("post", url, kw.get("json")))
+        return _LabelHttpResponse(200)
+
+    def delete(self, url: str, **kw: object) -> _LabelHttpResponse:
+        self.calls.append(("delete", url, None))
+        return _LabelHttpResponse(204)
+
+
+@pytest.fixture(autouse=True)
+def _mock_review_label_http(monkeypatch):
+    """Keep the `grug:reviewing` label writes off the network by default.
+
+    The label is best-effort by design (a missing sign is never a failed
+    command), so its HTTP calls would otherwise be real api.github.com
+    requests from every test that touches a re-run - slow, flaky, and
+    meaningless. The fake is yielded so a test can assert on the calls it
+    recorded; tests that need different answers patch `review_label.httpx`
+    themselves (innermost patch wins).
+    """
+    import review_label
+
+    fake = _LabelHttp()
+    monkeypatch.setattr(review_label, "httpx", fake)
+    return fake

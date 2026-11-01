@@ -8,12 +8,14 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import get_args
 from unittest.mock import patch
 
 import httpx
 import llm_client as lc
 import pytest
 from llm_client import Backend, Hunk, review_diff
+from review_evidence import assemble_evidence
 
 _GO_URL = "opencode.ai"
 _OR_URL = "openrouter.ai"
@@ -146,6 +148,29 @@ def test_the_shipped_chain_is_free_cloud_tiers_only_then_the_cave(monkeypatch) -
     assert lc._backend_enabled(Backend.OPENROUTER, _FREE)
 
 
+def test_the_shipped_deep_escalation_is_a_mode_the_client_accepts(monkeypatch, caplog) -> None:
+    """grug#1487: GRUG_DEEP_ESCALATION ships as on_demand while the Sparks
+    are away. An unknown value falls back to auto with a warning, which
+    would silently undo the switch, so the shipped value must be a mode
+    `_deep_escalation_mode` takes as-is."""
+    root = Path(__file__).resolve().parents[3] / "k8s"
+    per_manifest = {
+        manifest: re.findall(
+            r'name: GRUG_DEEP_ESCALATION, value: "?([^"}\s]*)"?\}',
+            (root / manifest).read_text(),
+        )
+        for manifest in ("consumer-deployment.yaml", "webhook-deployment.yaml")
+    }
+    assert all(len(v) == 1 for v in per_manifest.values()), per_manifest
+    assert len({v[0] for v in per_manifest.values()}) == 1, per_manifest
+    shipped = _shipped_env("GRUG_DEEP_ESCALATION")
+    assert shipped in get_args(lc.DeepEscalationMode)
+    monkeypatch.setenv("GRUG_DEEP_ESCALATION", shipped)
+    with caplog.at_level("WARNING"):
+        assert lc._deep_escalation_mode() == shipped
+    assert not [r for r in caplog.records if r.getMessage() == "deep_escalation_mode_invalid"]
+
+
 def test_the_free_pool_tier_is_opt_in(monkeypatch) -> None:
     monkeypatch.delenv("GRUG_CLOUD_FREE_POOL", raising=False)
     assert lc._free_pool_chain_config() is None
@@ -174,7 +199,7 @@ def test_the_free_pool_answers_before_any_spark_is_asked(monkeypatch) -> None:
         "cave.test/free/": _finding_response(),
     })
     with patch.object(httpx, "post", side_effect=fake):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.FREE_POOL
     assert [u for u in fake.urls if "cave.test" in u] == [
@@ -208,7 +233,7 @@ def test_free_tier_empties_never_pass_a_pr_the_sparks_review_it(monkeypatch) -> 
         _CAVE_URL: _finding_response(),
     })
     with patch.object(httpx, "post", side_effect=fake):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
     assert len(out.findings) == 1
@@ -230,7 +255,7 @@ def test_cloud_review_never_calls_a_disabled_backend(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_DISABLED_BACKENDS", "opencode-go,openrouter")
     fake = _Recorder({_POOLSIDE_URL: _finding_response()})
     with patch.object(httpx, "post", side_effect=fake):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.POOLSIDE
     assert fake.hosts() == {_POOLSIDE_URL}
@@ -247,7 +272,7 @@ def test_saas_overload_fallback_never_calls_a_disabled_backend(monkeypatch) -> N
         _OR_URL: _finding_response(),
     })
     with patch.object(httpx, "post", side_effect=fake):
-        out = review_diff([_hunk()], installation_id=1)
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert out.kind == "all_failed"
     assert _OR_URL not in fake.hosts()
     assert _POOLSIDE_URL in fake.hosts()
@@ -262,7 +287,7 @@ def test_judge_moves_off_a_disabled_backend(monkeypatch) -> None:
     fake = _Recorder({_POOLSIDE_URL: verdicts})
     findings = [{"rule_name": "r", "file": "src/x.py", "line": 1, "message": "m"}]
     with patch.object(httpx, "post", side_effect=fake):
-        out = lc.judge_findings(findings, [_hunk()], installation_id=1)
+        out = lc.judge_findings(findings, assemble_evidence([_hunk()]), installation_id=1)
     assert len(out) == 1
     assert fake.hosts() == {_POOLSIDE_URL}
 
@@ -271,7 +296,7 @@ def test_judge_with_every_backend_disabled_makes_no_call(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_DISABLED_BACKENDS", "openrouter,poolside")
     findings = [{"rule_name": "r", "file": "src/x.py", "line": 1, "message": "m"}]
     with patch.object(httpx, "post") as post:
-        assert lc.judge_findings(findings, [_hunk()], installation_id=1) == ()
+        assert lc.judge_findings(findings, assemble_evidence([_hunk()]), installation_id=1) == ()
     post.assert_not_called()
 
 
@@ -378,7 +403,6 @@ def test_the_free_per_day_cap_blocks_the_free_tier_and_is_not_retried() -> None:
 
 @pytest.mark.parametrize("resp", [
     # Poolside's short-lived throttle (live 2026-10-17, no Retry-After).
-    _err(429, "usage limit exceeded"),
     _err(429, "quota exceeded, try again shortly"),
     _err(429, "Rate limit exceeded: free-models-per-min."),
     _err(429, "slow down"),
@@ -444,13 +468,13 @@ def test_a_review_skips_a_provider_after_its_first_auth_refusal(monkeypatch) -> 
         _POOLSIDE_URL: _finding_response(),
     })
     with patch.object(httpx, "post", side_effect=fake):
-        first = review_diff([_hunk()], installation_id=1)
+        first = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert first.backend_used == Backend.POOLSIDE
     assert sum(_GO_URL in u for u in fake.urls) == 1
     assert sum(_OR_URL in u for u in fake.urls) == 1
     fake.urls.clear()
     with patch.object(httpx, "post", side_effect=fake):
-        second = review_diff([_hunk()], installation_id=1)
+        second = review_diff(assemble_evidence([_hunk()]), installation_id=1)
     assert second.backend_used == Backend.POOLSIDE
     assert fake.hosts() == {_POOLSIDE_URL}
 
@@ -467,6 +491,57 @@ def test_a_poolside_usage_limit_429_keeps_poolside_in_the_chain() -> None:
     assert post.call_count == 2
     assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
     assert Backend.POOLSIDE in [t.backend for t in lc._cloud_chain_tiers()]
+
+
+def _poolside_call(resp: httpx.Response) -> None:
+    cfg = lc.replace(lc._BACKEND_CONFIGS[Backend.POOLSIDE], retry_attempts=1)
+    with patch.object(httpx, "post", return_value=resp):
+        lc._call_backend(cfg, _MESSAGES)
+
+
+def test_repeated_limit_refusals_skip_poolside_then_it_is_asked_again(monkeypatch) -> None:
+    """The second refusal in five minutes holds Poolside for five minutes
+    (#1546), so the review reaches a tier that can answer, and Poolside
+    comes back on its own."""
+    now = 1_000_000.0
+    monkeypatch.setattr(lc.time, "time", lambda: now)
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    _poolside_call(limited)
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert Backend.POOLSIDE not in lc._usable_saas_fallback_backends()
+    assert Backend.POOLSIDE not in [t.backend for t in lc._cloud_chain_tiers()]
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL, now + 301)
+
+
+def test_repeated_capacity_refusals_skip_the_free_pool(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
+    pool = lc._free_pool_chain_config()
+    limited = _err(429, "free pool capacity is reserved for higher-priority callers: openrouter (daily)")
+    with patch.object(httpx, "post", return_value=limited):
+        lc._call_backend(pool, _MESSAGES)
+        lc._call_backend(pool, _MESSAGES)
+    assert lc._free_provider_fallback_configs()[0].backend != Backend.FREE_POOL
+    assert Backend.FREE_POOL not in [t.backend for t in lc._cloud_chain_tiers()]
+
+
+def test_a_success_between_limit_refusals_starts_the_count_over() -> None:
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    _poolside_call(_ok())
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+
+
+def test_limit_refusals_spread_past_the_window_never_hold(monkeypatch) -> None:
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(lc.time, "time", lambda: now["t"])
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    now["t"] += 301
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
 
 
 def test_opencode_go_monthly_usage_limit_still_trips_the_breaker() -> None:

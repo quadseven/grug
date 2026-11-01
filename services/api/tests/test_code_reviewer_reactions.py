@@ -10,6 +10,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import httpx
+import psycopg
 import pytest
 
 from personas.code_reviewer import reactions as cr_reactions
@@ -207,18 +208,128 @@ def test_poll_and_annotate_submit_failure_does_not_abort_batch(monkeypatch, _pat
 
 
 def test_poll_and_annotate_baseline_write_failure_skips_count(monkeypatch):
-    """submit succeeds but the baseline DDB write fails → not counted as
+    """submit succeeds but the baseline store write fails -> not counted as
     submitted-and-recorded; re-submits next cycle (at-least-once)."""
     monkeypatch.setattr(cr_reactions, "submit_reaction_annotation", lambda **kw: None)
     monkeypatch.setattr(
         cr_reactions, "update_comment_record_reaction",
-        MagicMock(side_effect=RuntimeError("DDB throttle")),
+        MagicMock(side_effect=OSError("store transport error")),
     )
     with patch("httpx.get", return_value=_reactions_response(["-1"])):
         n = cr_reactions.poll_and_annotate(
             [_record(comment_id=1)], install_id=1, fetch_token=lambda: "tok",
         )
-    assert n == 0  # baseline never advanced → will retry next cycle
+    assert n == 0  # baseline never advanced -> will retry next cycle
+
+
+def test_poll_and_annotate_propagates_programmer_error(monkeypatch):
+    """Programmer bugs (KeyError, TypeError) must propagate instead of being
+    swallowed by the transport retry guard."""
+    monkeypatch.setattr(cr_reactions, "submit_reaction_annotation", lambda **kw: None)
+    monkeypatch.setattr(
+        cr_reactions, "update_comment_record_reaction",
+        MagicMock(side_effect=KeyError("bogus_key")),
+    )
+    with patch("httpx.get", return_value=_reactions_response(["-1"])), pytest.raises(KeyError):
+        cr_reactions.poll_and_annotate(
+            [_record(comment_id=1)], install_id=1, fetch_token=lambda: "tok",
+        )
+
+
+def _learning_record(comment_id=1):
+    record = _record(comment_id=comment_id)
+    record.update({
+        "finding_text": "Optional value is dereferenced without a guard.",
+        "head_sha": "abc123",
+        "author_login": "alice",
+        "trust_reactors": True,
+    })
+    record["finding_tags"]["severity"] = "high"
+    return record
+
+
+def _trusted_thumbs_up_response():
+    response = _reactions_response(["+1"])
+    response.json.return_value[0]["user"] = {"login": "alice"}
+    return response
+
+
+def _poll_two_learning_records(monkeypatch, *, put_ledger_row, update_baseline):
+    """Poll two trusted records against a stubbed store and return the count."""
+    from adapters import install_store
+
+    monkeypatch.setattr(install_store, "put_ledger_row", put_ledger_row)
+    monkeypatch.setattr(install_store, "list_ledger_rows", lambda repo: [])
+    monkeypatch.setattr(install_store, "put_repo_practices", lambda repo, data: None)
+    monkeypatch.setattr(install_store, "put_repo_exemplars", lambda repo, data: None)
+    monkeypatch.setattr(cr_reactions, "_has_write_permission", lambda *args: True)
+    monkeypatch.setattr(cr_reactions, "update_comment_record_reaction", update_baseline)
+    _patch_annotate(monkeypatch)
+    with patch("httpx.get", return_value=_trusted_thumbs_up_response()):
+        return cr_reactions.poll_and_annotate(
+            [_learning_record(comment_id=1), _learning_record(comment_id=2)],
+            install_id=1, fetch_token=lambda: "tok",
+        )
+
+
+def test_database_failure_on_learning_write_does_not_abort_batch(monkeypatch, caplog):
+    """#1491: psycopg.OperationalError is not an OSError. A database failure
+    on one record's learning write must leave the next record processed."""
+    put_ledger_row = MagicMock(
+        side_effect=[psycopg.OperationalError("connection lost"), None],
+    )
+    update_baseline = MagicMock()
+    with caplog.at_level("WARNING"):
+        n = _poll_two_learning_records(
+            monkeypatch,
+            put_ledger_row=put_ledger_row,
+            update_baseline=update_baseline,
+        )
+    assert n == 1
+    assert put_ledger_row.call_count == 2
+    # Record 1 never reaches the baseline write, so the next cycle retries it.
+    update_baseline.assert_called_once_with(
+        install_id=1, comment_id=2, verdict="confirmed",
+    )
+    failures = [
+        r for r in caplog.records if r.message == "reaction_submit_or_persist_failed"
+    ]
+    assert [r.comment_id for r in failures] == [1]
+    assert failures[0].kind == "OperationalError"
+
+
+def test_database_failure_on_baseline_write_does_not_abort_batch(monkeypatch, caplog):
+    """#1491: same boundary for the baseline write. Record 1 stays uncounted
+    and unadvanced; record 2 still advances."""
+    update_baseline = MagicMock(
+        side_effect=[psycopg.OperationalError("connection lost"), None],
+    )
+    with caplog.at_level("WARNING"):
+        n = _poll_two_learning_records(
+            monkeypatch,
+            put_ledger_row=MagicMock(),
+            update_baseline=update_baseline,
+        )
+    assert n == 1
+    assert [c.kwargs["comment_id"] for c in update_baseline.call_args_list] == [1, 2]
+    failures = [
+        r for r in caplog.records if r.message == "reaction_submit_or_persist_failed"
+    ]
+    assert [r.comment_id for r in failures] == [1]
+    assert failures[0].kind == "OperationalError"
+
+
+@pytest.mark.parametrize("error", [KeyError("bogus_key"), TypeError("bad row")])
+def test_programmer_error_on_learning_write_propagates(monkeypatch, error):
+    """#1491: the database catch stays narrow, so a bug still fails the poll."""
+    update_baseline = MagicMock()
+    with pytest.raises(type(error)):
+        _poll_two_learning_records(
+            monkeypatch,
+            put_ledger_row=MagicMock(side_effect=error),
+            update_baseline=update_baseline,
+        )
+    update_baseline.assert_not_called()
 
 
 def test_poll_and_annotate_logs_mixed_signal(monkeypatch, _patch_store, caplog):

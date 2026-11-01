@@ -596,6 +596,97 @@ def _telemetry_loop() -> None:
         _stop.wait(_TELEMETRY_INTERVAL_S)
 
 
+# --- the `grug:reviewing` label sweep (grug#1270) -------------------------
+# The `grug:reviewing` label is the visible sign that Elder is re-reviewing
+# a PR. Every write has a removal, but a removal CAN be missed: the run
+# crashed, the head moved, the pod was killed between the two calls. A
+# label that outlives its review tells every later reader - and the command
+# path - that Elder is busy, which is exactly what this ticket exists to
+# stop. The sweep is the backstop: it removes the labels whose head has no
+# in-progress Elder check. It costs one listing call per repo of the
+# installation per sweep, and nothing at all for a repo with no label on it.
+
+
+_LABEL_SWEEP_INTERVAL_S = 600.0
+
+# The sweep's work is bounded on purpose. A busy installation (many repos,
+# many labeled PRs) must not be able to make one pass grow without limit:
+# the sweep would then take longer than the interval between two sweeps and
+# the backstop would stop being one. The bounds are generous - they are a
+# runaway backstop, not a real ceiling - and the installations are walked
+# from a rotating cursor, so a capped pass still reaches every one of them.
+_LABEL_SWEEP_MAX_INSTALLS = 25
+_LABEL_SWEEP_MAX_REMOVALS_PER_INSTALL = 50
+
+# Where the next sweep starts. Module state on purpose: the sweep is the
+# only writer, and it runs in one thread.
+_label_sweep_cursor = 0
+
+
+def _sweep_window(installs: list[int]) -> list[int]:
+    """The installations this pass visits.
+
+    The list is walked from the rotating cursor, so a pass that is capped
+    by `_LABEL_SWEEP_MAX_INSTALLS` still reaches every installation over
+    successive passes - no installation is starved by the cap."""
+    global _label_sweep_cursor
+    if not installs:
+        return []
+    start = _label_sweep_cursor % len(installs)
+    _label_sweep_cursor = (start + _LABEL_SWEEP_MAX_INSTALLS) % len(installs)
+    rotated = installs[start:] + installs[:start]
+    return rotated[:_LABEL_SWEEP_MAX_INSTALLS]
+
+
+def _label_sweep_once() -> int:
+    """One sweep over the allowlisted installations. Returns the number of
+    stale labels removed.
+
+    Bounded on purpose: at most `_LABEL_SWEEP_MAX_INSTALLS` installations
+    are visited per pass and at most `_LABEL_SWEEP_MAX_REMOVALS_PER_INSTALL`
+    labels are removed per installation. What a cap leaves behind is swept
+    by the next pass (grug#1270)."""
+    from adapters.install_store import list_allowlisted_installs
+    from github_budget import budget_is_low
+    from review_label import sweep_stale_labels
+
+    try:
+        installs = list_allowlisted_installs()
+    except Exception as e:  # noqa: BLE001 - the store must not break the sweep
+        log.warning(
+            "reviewing_label_sweep_installs_failed",
+            extra={"kind": type(e).__name__},
+        )
+        return 0
+    removed = 0
+    for install_id in _sweep_window(list(installs)):
+        if budget_is_low(install_id):
+            continue
+        removed += sweep_stale_labels(
+            install_id=install_id,
+            max_removals=_LABEL_SWEEP_MAX_REMOVALS_PER_INSTALL,
+        )
+    return removed
+
+
+def _label_sweep_loop() -> None:
+    """Thread body: one sweep per interval until shutdown. Never raises -
+    a sweep failure must never take the consumer pod down (the watchdog
+    excludes this thread, exactly like the telemetry one)."""
+    log.info("reviewing_label_sweep_started", extra={"interval_s": _LABEL_SWEEP_INTERVAL_S})
+    while not _stop.is_set():
+        try:
+            removed = _label_sweep_once()
+        except Exception as e:  # noqa: BLE001 - belt-and-suspenders
+            log.warning(
+                "reviewing_label_sweep_failed", extra={"kind": type(e).__name__},
+            )
+            removed = 0
+        if removed:
+            log.info("reviewing_label_sweep_done", extra={"removed": removed})
+        _stop.wait(_LABEL_SWEEP_INTERVAL_S)
+
+
 def _poll_once(spec: QueueSpec, queue_url: str, arn: str) -> int:
     """One receive → dispatch → delete cycle. Returns the number of
     messages handled (0 or 1). Never raises: receive errors back off,
@@ -1009,6 +1100,13 @@ def main() -> None:
     # message flow.
     threading.Thread(
         target=_telemetry_loop, name="queue-telemetry", daemon=True,
+    ).start()
+    # The `grug:reviewing` label sweep (grug#1270). Daemon + OUTSIDE the
+    # watchdog list for the same reason as the telemetry thread: a stale
+    # label is a cosmetic problem, a consumer that stops draining its
+    # queue is not.
+    threading.Thread(
+        target=_label_sweep_loop, name="reviewing-label-sweep", daemon=True,
     ).start()
     # Watchdog: there is no HTTP probe on this pod, so a consumer thread
     # that dies (missing env, ARN resolve failure, anything escaping

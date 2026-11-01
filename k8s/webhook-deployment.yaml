@@ -133,6 +133,13 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.hostIP}}
             - {name: DD_LOGS_INJECTION, value: "true"}
             - {name: GRUG_ENV, value: prod}
+            # grug#1445: the App bot logins the owner allows to run Elder
+            # re-run commands (/grug improve / resume / review) on a PR they
+            # did not author. Read from GRUG_ALLOWED_APP_BOT_LOGINS. Empty =
+            # feature off; the operator lists the owner's App bots here so a
+            # /grug improve from loom-brain[bot] on a PR it did not open runs
+            # Elder like a write collaborator's instead of being dropped.
+            - {name: GRUG_ALLOWED_APP_BOT_LOGINS, value: "loom-brain[bot],loom-station[bot],loom-lanes[bot],agent-anthropic-claude-code[bot],agent-meta-muse[bot],agent-openai-dot[bot],agent-openai-codex-luna[bot],agent-google-gemini[bot]"}
             # Off-Lambda async path (#368). Elder's production hot path is
             # durable SQS below; this flag still enables the local worker used
             # by the other async personas and by Elder only if that lane is
@@ -159,6 +166,11 @@ spec:
             # their existing lower-cost OpenRouter model configuration.
             # Tiered Elder (#645): see consumer-deployment for full comments.
             - {name: GRUG_REVIEW_DEPTH, value: tiered}
+            # grug#1553: GitHub App logins whose PRs carry an author family, as
+            # `login:family` pairs split by `;` (e.g. `lane-app[bot]:claude`). Exact
+            # login match only; family must be in model_family.py's table. Empty =
+            # no App gets a family (Elder keeps its usual arm order for App PRs).
+            - {name: GRUG_APP_AUTHOR_FAMILIES, value: ""}
             # Deep escalation (#645). WAS 500 lines / 0.05 sample, tuned for
             # speed. Measured 2026-08-12: grug's own PRs run 18-260 added
             # lines, so 5 of 6 never escalated and only ever saw the tier-1
@@ -173,7 +185,13 @@ spec:
             # auto | on_demand. on_demand runs the deep pass only on a
             # "deep review" marker in the PR title or body. Full comments in
             # consumer-deployment.
-            - {name: GRUG_DEEP_ESCALATION, value: auto}
+            # TEMPORARY (2026-10-27): on_demand while both Spark machines are
+            # away for RMA (about a month from 2026-10-27). With the Sparks off
+            # and the free cloud tier exhausted the deep pass ended all_failed
+            # and Elder concluded failure, blocking merges. Revert to auto when
+            # the Spark reasoner returns or paid OpenRouter credits are enabled
+            # (grug#1487).
+            - {name: GRUG_DEEP_ESCALATION, value: "on_demand"}
             # Keep the compatibility worker's staging policy identical to the
             # durable consumer even though production uses the consumer path.
             - {name: GRUG_STAGED_REVIEW_BUDGET_S, value: "700"}
@@ -232,9 +250,21 @@ spec:
             - {name: GRUG_SHARED_BENCHES, value: "true"}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
+            # Trusted operators who may accept a guarded removal beside an admin
+            # (owner:login pairs, plain String; secrets_loader.get_removal_acceptors).
+            - {name: GRUG_REMOVAL_ACCEPTORS_SSM, value: /grug/removal-acceptors}
             # In-cluster spark-gateway for the evidence-scoped judge. Keep the
             # role assignment identical on both Elder-capable workloads.
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
+            # Elder's last resort (#1276, #1546): the operator's plans, Luna then
+            # Haiku, chosen by the serving side. The model name is deliberately no
+            # family: the reply names the model that ran, and the family gate must
+            # not rule out a lane that serves two families. The serving side keeps
+            # the real daily counts across all pods; this cap is per process.
+            - {name: GRUG_SUBSCRIPTION_URL, value: http://forward.subscription-lane.svc:8080/v1/chat/completions}
+            - {name: GRUG_SUBSCRIPTION_MODEL, value: subscription-lane}
+            - {name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "750"}
+            - {name: GRUG_SUBSCRIPTION_TOKEN_SSM, value: /grug/subscription-lane-token}
             # infra#2451/#2454 precedent: the second GPU host's vLLM resident is not a
             # fixed identity (infra#2452 swapped poolside/Laguna-S-2.1-NVFP4 ->
             # Qwen/Qwen3.8-27B-FP8 same-day). spark_gateway.py's `spark:warm-any`

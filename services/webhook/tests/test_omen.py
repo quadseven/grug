@@ -11,6 +11,7 @@ import pytest
 
 from personas.code_reviewer import omen
 from personas.code_reviewer.diff_parser import parse_diff
+from review_evidence import assemble_evidence
 
 _DIFF = """diff --git a/src/dispatcher.py b/src/dispatcher.py
 --- a/src/dispatcher.py
@@ -129,12 +130,17 @@ def test_prompt_renders_production_signal_block():
     from llm_client import Hunk, _build_messages
 
     msgs = _build_messages(
-        [Hunk(path="a.py", body="+x=1")], "v1", None, None,
-        "PRODUCTION SIGNAL test block - a.py: 47 errors",
+        assemble_evidence(
+            [Hunk(path="a.py", body="+x=1")],
+            runtime_context="PRODUCTION SIGNAL test block - a.py: 47 errors",
+        ),
+        "v1",
     )
     assert "### PRODUCTION SIGNAL" in msgs[1]["content"]
-    without = _build_messages([Hunk(path="a.py", body="+x=1")], "v1")
-    with_none = _build_messages([Hunk(path="a.py", body="+x=1")], "v1", None, None, None)
+    without = _build_messages(assemble_evidence([Hunk(path="a.py", body="+x=1")]), "v1")
+    with_none = _build_messages(
+        assemble_evidence([Hunk(path="a.py", body="+x=1")], runtime_context=None), "v1",
+    )
     assert without == with_none  # byte-identical when absent
 
 

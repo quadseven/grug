@@ -18,7 +18,7 @@ import logging
 import re
 import httpx
 import pytest
-from llm_client import Hunk, _build_messages, _build_review_parts
+from llm_client import Hunk, _build_messages
 from personas.code_reviewer import linked_issue
 from personas.code_reviewer.linked_issue import (
     build_linked_issue_context,
@@ -26,6 +26,7 @@ from personas.code_reviewer.linked_issue import (
     linked_issue_numbers,
     render_linked_issue_block,
 )
+from review_evidence import assemble_evidence
 
 ISSUE = """## Why
 
@@ -280,22 +281,32 @@ def _hunk():
 
 def test_block_reaches_user_prompt_via_pr_context():
     ctx = {"linked_issue_context": "### LINKED ISSUE ACCEPTANCE CRITERIA\nX"}
-    msgs = _build_messages([_hunk()], "v2", pr_context=ctx)  # type: ignore[arg-type]
+    msgs = _build_messages(assemble_evidence(
+        [_hunk()],
+        pr_context=ctx,
+    ), "v2")  # type: ignore[arg-type]
     user = next(m["content"] for m in msgs if m["role"] == "user")
     assert "### LINKED ISSUE ACCEPTANCE CRITERIA\nX" in user
 
 
 def test_no_block_means_unchanged_prompt():
-    with_ctx, _ = _build_review_parts([_hunk()], pr_context={"title": "t"})  # type: ignore[arg-type]
-    bare, _ = _build_review_parts([_hunk()], pr_context={"title": "t", "linked_issue_context": ""})  # type: ignore[arg-type]
+    with_ctx, _ = assemble_evidence(
+        [_hunk()],
+        pr_context={"title": "t"},
+    ).reviewer_view()  # type: ignore[arg-type]
+    bare, _ = assemble_evidence(
+        [_hunk()],
+        pr_context={"title": "t", "linked_issue_context": ""},
+    ).reviewer_view()  # type: ignore[arg-type]
     assert with_ctx == bare
     assert not any("LINKED ISSUE" in p for p in bare)
 
 
 def test_block_comes_after_the_diff():
-    parts, _ = _build_review_parts(
-        [_hunk()], pr_context={"linked_issue_context": "### LINKED ISSUE ACCEPTANCE CRITERIA\nX"},  # type: ignore[arg-type]
-    )
+    parts, _ = assemble_evidence(
+        [_hunk()],
+        pr_context={"linked_issue_context": "### LINKED ISSUE ACCEPTANCE CRITERIA\nX"},
+    ).reviewer_view()
     idx = next(i for i, p in enumerate(parts) if p.startswith("### LINKED ISSUE"))
     assert any(p.startswith("### src/a.py") for p in parts[:idx])
 
@@ -340,8 +351,8 @@ def test_dispatch_puts_block_in_pr_context_and_failure_degrades(monkeypatch):
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
     seen = []
 
-    def fake_review(hunks, installation_id, pr_context=None, **kw):
-        seen.append(dict(pr_context or {}))
+    def fake_review(evidence, installation_id, **kw):
+        seen.append(dict(evidence.pr_context or {}))
         return LlmReviewResponse(kind="no_diff")
 
     monkeypatch.setattr(cr_dispatch, "review_diff", fake_review)
@@ -382,8 +393,9 @@ def test_judge_and_refute_prompts_carry_the_linked_issue_criteria():
     }
     for refute in (False, True):
         msgs = lc._build_judge_messages(
-            [finding], [Hunk(path="a.py", body="+x = 1\n")],
-            pr_context=ctx, refute=refute,
+            [finding],
+            assemble_evidence([Hunk(path="a.py", body="+x = 1\n")], pr_context=ctx),
+            refute=refute,
         )
         text = "\n".join(m["content"] for m in msgs)
         assert "LINKED ISSUE ACCEPTANCE CRITERIA" in text
