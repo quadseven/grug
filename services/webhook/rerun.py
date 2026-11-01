@@ -990,7 +990,9 @@ def _run_learn(
     from llm_client import (  # type: ignore
         LearnClassifierUnavailable, LearnClassifierUnusable, classify_learning,
     )
+    from cave_drawings import MAX_TEXT_CHARS, touches_protected  # type: ignore
     from observability import emit_gauge  # type: ignore
+    from redact import redact_secrets  # type: ignore
 
     owner, _, repo_name = repo_full.partition("/")
     record = get_comment_record(install_id, parent_comment_id)
@@ -1072,18 +1074,34 @@ def _run_learn(
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
             "result": result})
         return result
-    if classification["durable"]:
-        # Org-configurable approval delay: default 0 = active immediately.
-        delay = _org_learning_approval_delay(install_id, repo_full)
-        put_learning(
-            repo=repo_full,
-            text=classification["learning"],
-            scope_path=classification["scope_path"],
-            source_pr=pr_number,
-            source_comment_id=comment_id,
-            author=author,  # the maintainer who TAUGHT it (reply sender)
-            approval_delay_seconds=delay,
-        )
+    finding_tags = dict(record.get("finding_tags", {}))
+    finding_class = str(finding_tags.get("rule_name", ""))
+    finding_category = str(finding_tags.get("category", ""))
+    # Refused before the store, so no later edit or status change can arm it;
+    # select_for_prompt checks again at read time for rows that predate this.
+    refused = bool(classification["durable"]) and touches_protected({
+        "text": classification["learning"],
+        "finding_class": finding_class, "finding_category": finding_category,
+    })
+    if refused:
+        ack = LEARN_REACTION_ONE_OFF
+        result = "learn_refused_protected"
+    elif classification["durable"]:
+        # A redelivery stores nothing: a re-stamp would restart the 90 days
+        # with no human act behind it.
+        if already is None:
+            put_learning(
+                repo=repo_full,
+                text=classification["learning"],
+                scope_path=classification["scope_path"],
+                source_pr=pr_number,
+                source_comment_id=comment_id,
+                author=author,  # the maintainer who TAUGHT it (reply sender)
+                approval_delay_seconds=_org_learning_approval_delay(install_id, repo_full),
+                reason=redact_secrets(reply_text)[:MAX_TEXT_CHARS],
+                finding_class=finding_class,
+                finding_category=finding_category,
+            )
         ack = LEARN_REACTION_LEARNED
         result = "learned"
     else:
@@ -1114,7 +1132,7 @@ def _run_learn(
     try:
         body = _learn_ack_body(
             repo_full, classification["learning"], classification["scope_path"],
-            author, pr_number, classification["durable"],
+            author, pr_number, classification["durable"], refused=refused,
         )
         _post_learn_reply(install_id, owner, repo_name, comment_id, body)
     except Exception as e:  # noqa: BLE001
@@ -1192,15 +1210,26 @@ def _post_learn_reply(
 
 def _learn_ack_body(
     repo_full: str, text: str, scope_path: str, author: str,
-    source_pr: int, durable: bool,
+    source_pr: int, durable: bool, refused: bool = False,
 ) -> str:
     """Collapsible acknowledgment for a reply-mined learning. `text`/`scope`/
     `author` are defused (classifier-/reply-produced, untrusted) so a hostile
-    reply can't break out of the <details> or inject mentions."""
+    reply can't break out of the <details> or inject mentions. `refused`
+    means a durable rule that touches a security or SAST class (#1571)."""
     text_d = _defuse_md(text)
     scope_d = _defuse_md(scope_path)
     author_d = _defuse_md(author)
     scope_line = f", scoped to `{scope_d}`" if scope_d else ""
+    if refused:
+        return (
+            "<details>\n"
+            "<summary>Not remembered (security rule)</summary>\n\n"
+            f"Grug read your reply but will NOT carry it into future reviews on "
+            f"`{repo_full}`: learned rules never touch security or SAST findings. "
+            "It applies to this PR only.\n\n"
+            f"Replied by `{author_d}` (PR #{source_pr}).\n"
+            "</details>"
+        )
     if durable:
         return (
             "<details>\n"

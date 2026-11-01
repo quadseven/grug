@@ -49,7 +49,7 @@ def _learning_record(comment_id=1):
     record.update({
         "finding_text": "Optional value is dereferenced without a guard.",
         "head_sha": "abc123",
-        "author_login": "alice",
+        "author_login": "pr-author",
         "trust_reactors": True,
     })
     record["finding_tags"]["severity"] = "high"
@@ -187,6 +187,123 @@ def test_poll_uses_write_collaborator_reaction_and_ignores_outsider(
     learned.assert_called_once_with(_learning_record(comment_id=5), "confirmed")
 
 
+def test_an_app_bot_reaction_is_not_trusted_even_with_write_access(
+    monkeypatch, _patch_store, dismissals,
+):
+    """#1571: an agent's App holds write access, so permission alone cannot
+    tell it from a maintainer."""
+    submitted = _patch_annotate(monkeypatch)
+    monkeypatch.setattr(
+        cr_reactions, "_has_write_permission", lambda *a: True,
+    )
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=[
+        {"content": "-1", "user": {"login": "lane-app[bot]", "type": "Bot"}},
+        {"content": "-1", "user": {"login": "other-app[bot]"}},
+    ])
+    with patch("httpx.get", return_value=response):
+        n = cr_reactions.poll_and_annotate(
+            [_learning_record(comment_id=5)], install_id=1, fetch_token=lambda: "tok",
+        )
+    assert n == 0 and submitted == [] and dismissals == []
+
+
+@pytest.fixture(autouse=True)
+def _no_commit_lookup(monkeypatch):
+    monkeypatch.setattr(cr_reactions, "pr_commit_logins", lambda *a: frozenset())
+
+
+def _one_reaction(login):
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=[
+        {"content": "-1", "user": {"login": login, "type": "User"}},
+    ])
+    return response
+
+
+def _poll_one(monkeypatch, record, login="maintainer"):
+    submitted = _patch_annotate(monkeypatch)
+    monkeypatch.setattr(cr_reactions, "_record_reaction_learning", lambda *a: True)
+    monkeypatch.setattr(cr_reactions, "_has_write_permission", lambda *a: True)
+    with patch("httpx.get", return_value=_one_reaction(login)):
+        n = cr_reactions.poll_and_annotate([record], install_id=1, fetch_token=lambda: "tok")
+    return n, submitted
+
+
+def test_a_pr_committer_cannot_label_the_finding(monkeypatch, _patch_store, dismissals):
+    monkeypatch.setattr(cr_reactions, "pr_commit_logins", lambda *a: frozenset({"pusher"}))
+    n, submitted = _poll_one(monkeypatch, _learning_record(comment_id=5), login="Pusher")
+    assert n == 0 and submitted == [] and dismissals == []
+
+
+def test_an_unreadable_commit_list_trusts_nobody(monkeypatch, _patch_store, dismissals):
+    monkeypatch.setattr(cr_reactions, "pr_commit_logins", lambda *a: None)
+    n, submitted = _poll_one(monkeypatch, _learning_record(comment_id=5))
+    assert n == 0 and submitted == [] and dismissals == []
+
+
+def test_a_record_with_no_known_author_trusts_nobody(monkeypatch, _patch_store, dismissals):
+    record = _learning_record(comment_id=5)
+    del record["author_login"]
+    n, submitted = _poll_one(monkeypatch, record)
+    assert n == 0 and submitted == [] and dismissals == []
+
+
+def test_a_maintainer_who_did_not_write_the_pr_is_trusted(
+    monkeypatch, _patch_store, dismissals,
+):
+    n, submitted = _poll_one(monkeypatch, _learning_record(comment_id=5))
+    assert n == 1 and submitted[0]["verdict"] == "false_positive"
+
+
+def test_the_commit_list_is_read_once_per_pr_in_a_cycle(monkeypatch, _patch_store, dismissals):
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        cr_reactions, "pr_commit_logins",
+        lambda *a: calls.append(a) or frozenset(),
+    )
+    _patch_annotate(monkeypatch)
+    monkeypatch.setattr(cr_reactions, "_record_reaction_learning", lambda *a: True)
+    monkeypatch.setattr(cr_reactions, "_has_write_permission", lambda *a: True)
+    records = [_learning_record(comment_id=5), _learning_record(comment_id=6)]
+    with patch("httpx.get", return_value=_one_reaction("maintainer")):
+        cr_reactions.poll_and_annotate(records, install_id=1, fetch_token=lambda: "tok")
+    assert len(calls) == 1
+
+
+def test_a_verdict_already_recorded_spends_no_commit_lookup(
+    monkeypatch, _patch_store, dismissals,
+):
+    """The poller re-reads every record each cycle, so the lookup waits for a
+    verdict that would change something."""
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        cr_reactions, "pr_commit_logins",
+        lambda *a: calls.append(a) or frozenset(),
+    )
+    record = {**_learning_record(comment_id=5), "last_verdict": "false_positive"}
+    _poll_one(monkeypatch, record)
+    assert calls == []
+
+
+def test_the_pr_author_cannot_label_its_own_finding(
+    monkeypatch, _patch_store, dismissals,
+):
+    submitted = _patch_annotate(monkeypatch)
+    monkeypatch.setattr(cr_reactions, "_has_write_permission", lambda *a: True)
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=[
+        {"content": "-1", "user": {"login": "PR-Author", "type": "User"}},
+    ])
+    record = {**_learning_record(comment_id=5), "author_login": "pr-author"}
+    with patch("httpx.get", return_value=response):
+        n = cr_reactions.poll_and_annotate([record], install_id=1, fetch_token=lambda: "tok")
+    assert n == 0 and submitted == [] and dismissals == []
+
+
 def test_trusted_reaction_refreshes_ledger_practices_and_examples(monkeypatch):
     from adapters import install_store
 
@@ -265,10 +382,9 @@ def test_ensemble_verdict_writes_one_ledger_row_per_model(monkeypatch):
     assert prec["grug-elder/poolside/laguna-m.1"].accepted == 1
 
 
-def test_false_positive_reaction_refreshes_negative_prompt_guidance(monkeypatch):
-    """A trusted thumbs-down must change later behavior, not only precision
-    telemetry. It creates an AVOID practice while remaining excluded from the
-    positive few-shot examples."""
+def test_a_thumbs_down_alone_creates_no_suppression(monkeypatch):
+    """#1571: a thumbs-down is precision telemetry and leaves positive
+    examples, but an emoji alone never teaches Elder to stay quiet."""
     from adapters import install_store
 
     rows: list[dict] = []
@@ -296,10 +412,7 @@ def test_false_positive_reaction_refreshes_negative_prompt_guidance(monkeypatch)
     ) is True
 
     assert rows[0]["verdict"] == "false-positive"
-    assert practices[0][0]["disposition"] == "avoid"
-    assert practices[0][0]["rule"] == (
-        "Optional value is dereferenced without a guard."
-    )
+    assert practices == [[]]
     assert exemplars == [[]]
 
 

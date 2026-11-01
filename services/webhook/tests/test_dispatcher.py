@@ -765,18 +765,78 @@ def _review_reply_payload(**over):
     return p
 
 
-def test_review_reply_enqueues_for_write_author():
-    # The PR author teaches, AND has write perm -> enqueued, author threaded.
+def _maintainer_reply(payload, commits=frozenset({"lane-app[bot]"})):
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher._actor_permission", return_value="admin"), \
+         patch("dispatcher._pr_commit_logins", return_value=commits), \
+         patch("rerun.enqueue_learn") as mock_enq:
+        out = dispatch("pull_request_review_comment", payload)
+    return out, mock_enq
+
+
+def test_review_reply_pr_author_cannot_teach_even_with_admin():
+    # #1571: the reviewed must not teach the reviewer, whatever their role.
+    out, mock_enq = _maintainer_reply(_review_reply_payload())
+    assert out["status"] == "no_op" and "wrote this PR" in out["reason"]
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_pr_author_check_ignores_login_case():
+    out, mock_enq = _maintainer_reply(_review_reply_payload(sender={"login": "DEV"}))
+    assert out["status"] == "no_op"
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_commit_author_cannot_teach():
+    out, mock_enq = _maintainer_reply(
+        _review_reply_payload(sender={"login": "pusher"}),
+        commits=frozenset({"pusher"}),
+    )
+    assert out["status"] == "no_op" and "wrote this PR" in out["reason"]
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_is_refused_when_the_commits_cannot_be_read():
+    out, mock_enq = _maintainer_reply(
+        _review_reply_payload(sender={"login": "teammate"}), commits=None,
+    )
+    assert out == {"status": "skip", "reason": "pr_commits_unreadable"}
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_app_sender_cannot_teach():
+    out, mock_enq = _maintainer_reply(
+        _review_reply_payload(sender={"login": "lane-app[bot]", "type": "Bot"}),
+    )
+    assert out == {"status": "no_op", "reason": "reply author is a bot"}
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_with_no_reason_cannot_teach():
+    out, mock_enq = _maintainer_reply(_review_reply_payload(
+        sender={"login": "teammate"}, comment={"body": "not a bug"},
+    ))
+    assert out == {"status": "no_op", "reason": "reply gives no reason"}
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_enqueues_for_a_maintainer_who_did_not_write_the_pr():
+    # A write collaborator on someone else's PR teaches: enqueued, teacher threaded.
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher._pr_commit_logins", return_value=frozenset({"lane-app[bot]"})), \
          patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "admin"), \
          patch("rerun.enqueue_learn") as mock_enq:
-        out = dispatch("pull_request_review_comment", _review_reply_payload())
+        out = dispatch(
+            "pull_request_review_comment",
+            _review_reply_payload(sender={"login": "teammate"}),
+        )
     assert out == {"status": "enqueued", "kind": "learn"}
     kw = mock_enq.call_args.kwargs
     assert kw["repo"] == "quadseven/infra" and kw["parent_comment_id"] == 4000
     assert kw["comment_id"] == 5001 and kw["pr_number"] == 42
-    assert kw["author"] == "dev"  # the reply sender is the teacher
+    assert kw["author"] == "teammate"  # the reply sender is the teacher
 
 
 def test_review_reply_fork_author_without_write_is_blocked():
@@ -837,6 +897,7 @@ def test_review_reply_write_collaborator_enqueues():
     payload = _review_reply_payload(sender={"login": "teammate"})
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher._pr_commit_logins", return_value=frozenset()), \
          patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "write"), \
          patch("rerun.enqueue_learn") as mock_enq:
         out = dispatch("pull_request_review_comment", payload)
@@ -852,9 +913,13 @@ def test_review_reply_enqueue_sqs_failure_is_skip_not_500():
         raise _Boom("sqs unavailable")
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher._pr_commit_logins", return_value=frozenset()), \
          patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "write"), \
          patch("rerun.enqueue_learn", side_effect=_raise_enqueue):
-        out = dispatch("pull_request_review_comment", _review_reply_payload())
+        out = dispatch(
+            "pull_request_review_comment",
+            _review_reply_payload(sender={"login": "teammate"}),
+        )
     assert out["status"] == "skip" and out["reason"] == "enqueue_failed"
 
 

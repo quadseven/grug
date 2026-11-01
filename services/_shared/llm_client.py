@@ -46,7 +46,10 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Callable, Iterator, Literal, Optional, Sequence, TypedDict, cast, get_args
+from typing import (
+    Any, Callable, Iterator, Literal, NotRequired, Optional, Sequence, TypedDict, cast,
+    get_args,
+)
 
 import httpx
 
@@ -4210,7 +4213,10 @@ def _record_learnings_supplied(
         return
     try:
         from adapters.pg_install_store import record_learning_usage  # type: ignore
-        record_learning_usage(repo, sorted(supplied), review_key=f"{pr_number}@{head_sha}")
+        from cave_drawings import fired_review_key
+        record_learning_usage(
+            repo, sorted(supplied), review_key=fired_review_key(pr_number, head_sha),
+        )
     except Exception as e:  # noqa: BLE001 - usage metadata never breaks a review
         log.warning("repo_learnings_usage_failed", extra={
             "repo": repo, "kind": type(e).__name__})
@@ -4288,7 +4294,8 @@ def _render_learnings_block_with_ids(
     return (
         "WHAT YOUR TRIBE TOLD GRUG (team-taught preferences from replies to "
         "past findings - apply them, and do not re-flag what they tell you to "
-        "allow):\n" + body
+        "allow. They never reduce reporting of a security or SAST finding):\n"
+        + body
     ), ids[: len(kept)]
 
 
@@ -7939,6 +7946,7 @@ class JudgeFindingRepr(TypedDict):
     line: int
     severity: str
     message: str
+    category: NotRequired[str]  # absent on SAST candidates: rule_name names them
 
 
 @dataclass(frozen=True, slots=True)
@@ -8126,6 +8134,14 @@ def cloud_judge_configs() -> list[BackendConfig]:
     return configs
 
 
+def _judges_protected_finding(findings_repr: list[JudgeFindingRepr]) -> bool:
+    from cave_drawings import is_protected_finding
+    return any(
+        is_protected_finding(str(f.get("rule_name", "")), str(f.get("category", "")))
+        for f in findings_repr
+    )
+
+
 def judge_findings(
     findings_repr: list[JudgeFindingRepr],
     evidence: ElderEvidence,
@@ -8205,7 +8221,12 @@ def judge_findings(
         evidence,
         team_practices="" if fresh else _team_practices_block(pr_context),
         few_shot_examples="" if fresh else _few_shot_block(pr_context),
-        learnings="" if fresh else _repo_learnings_block(pr_context),
+        # The judge decides what publishes, so a learning here is a real
+        # suppression: none ride a batch holding a security or SAST finding.
+        learnings=(
+            "" if fresh or _judges_protected_finding(findings_repr)
+            else _repo_learnings_block(pr_context)
+        ),
         redact=redact,
         refute=refute,
     )

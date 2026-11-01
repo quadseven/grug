@@ -161,3 +161,36 @@ class TestRenderNote:
             finding_class="brand-new", finding_path="x.py", ledger_rows=[],
         )
         assert render_precedent_note(m) == ""
+
+
+def test_a_class_with_a_security_category_row_is_never_muted():
+    """#1571: the category travels per finding, so a class name outside the
+    security vocabulary must not hide it."""
+    from ledger import parse_row
+    from personas.code_reviewer.precedent import class_precision, muted_classes
+
+    rows = [
+        parse_row({"repo": "o/r", "pr": i, "reviewer": "r", "severity": "HIGH",
+                   "class": "odd-class", "finding": "f", "verdict": "false-positive",
+                   "category": "security" if i == 0 else "general"})
+        for i in range(30)
+    ]
+    muted = muted_classes(
+        class_precision(rows), min_labeled=20, below_precision=0.2, locked=frozenset(),
+    )
+    assert muted == {}
+
+
+def test_a_security_or_sast_class_is_never_muted():
+    """#1571: reactions feed this precision, so a mute is a learned suppression
+    the protected classes must stay out of, even at zero precision."""
+    from personas.code_reviewer.precedent import ClassPrecision, muted_classes
+
+    precisions = {
+        name: ClassPrecision(finding_class=name, accepted=0, rejected=30)
+        for name in ("sql-injection", "missing-authz", "style-nit")
+    }
+    muted = muted_classes(
+        precisions, min_labeled=20, below_precision=0.2, locked=frozenset(),
+    )
+    assert set(muted) == {"style-nit"}
