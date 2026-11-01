@@ -336,10 +336,13 @@ def _run_ruff(
             _write(tmp, kept)
             # Read-only tree, scrubbed environment (#1254): ruff only parses
             # the copied files, and no pod secret reaches the child process.
+            # --isolated stops ruff's walk up the tree finding a config above
+            # the temp directory (#1574).
             with read_only_tree(tmp):
                 proc = subprocess.run(
-                    ["ruff", "check", "--select", _SELECT, "--ignore", _IGNORE,
-                     "--output-format", "json", "--no-cache", tmp],
+                    ["ruff", "check", "--isolated", "--select", _SELECT,
+                     "--ignore", _IGNORE, "--output-format", "json",
+                     "--no-cache", tmp],
                     capture_output=True, text=True, timeout=timeout,
                     check=False, env=sandbox_env(tmp),
                 )
