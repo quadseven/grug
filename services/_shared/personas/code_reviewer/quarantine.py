@@ -38,13 +38,14 @@ _SENSITIVE_WORDS = frozenset({
     "authorization", "authorize",
     "crypto", "cryptography", "encryption", "jwt", "kms",
     "payment", "payments", "billing",
-    "secret", "secrets", "credential", "credentials", "password", "passwords",
+    "secret", "secrets", "token", "tokens", "credential", "credentials", "password", "passwords",
 })
 _CONFIG_GLOBS = (
     ".github/workflows/**", ".github/actions/**", ".gitlab-ci.yml", ".grug.yaml",
 )
-# Splits `AuthService` and `oauth2`: words are runs of letters, camelCase too.
-_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+")
+# Splits before lowercasing, so `JWTAuth`, `authService`, and `oauth2` all
+# yield their words.
+_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 _BLOCKING = frozenset({"high", "critical"})
 _FALSE_VALUES = frozenset({"", "0", "false", "off", "no"})
 

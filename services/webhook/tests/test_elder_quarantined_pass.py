@@ -189,6 +189,27 @@ def test_sensitive_paths_use_whole_words_and_config_files():
     assert sensitive_paths(paths, RepoConfig()) == paths[:8]
 
 
+@pytest.mark.parametrize("path", [
+    "web/authService.ts",
+    "src/paymentGateway.py",
+    "src/JWTAuth.ts",
+    "src/OAuth2Client.java",
+    "src/oauth2.py",
+    "src/secrets.py",
+    "src/api_tokens.py",
+    "src/token.py",
+])
+def test_camel_case_plural_and_digit_forms_are_sensitive(path):
+    assert sensitive_paths((path,), RepoConfig()) == (path,)
+
+
+@pytest.mark.parametrize("path", [
+    "src/tokenizer.py", "docs/authors.md", "src/Authorship.ts", "src/secretary.py",
+])
+def test_lookalike_words_stay_ordinary(path):
+    assert sensitive_paths((path,), RepoConfig()) == ()
+
+
 def test_a_repo_list_replaces_the_default_list():
     config = parse_repo_config("security_review_paths:\n  - 'core/**'\n")
 
