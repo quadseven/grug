@@ -3160,6 +3160,49 @@ def test_stack_offers_bulk_fix_for_checked_suggestion():
     assert "/grug fix" in body
 
 
+def _closing_line(body: str) -> str:
+    """The stack's closing line, which sits under the agent prompt."""
+    return next(l for l in body.splitlines() if "Inline comments carry" in l)
+
+
+def _stack_with_suggestion(suggestion, message="fix value"):
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    finding = Finding(
+        file="a.py", line=1, severity="low", rule_name="r",
+        message=message, suggestion=suggestion,
+    )
+    return cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+        conclusion="success", file_contents={"a.py": "x = 1\n"},
+    )
+
+
+def test_stack_closing_line_names_grug_fix_for_a_checked_suggestion():
+    closing = _closing_line(_stack_with_suggestion("x = 2"))
+    assert "/grug fix" in closing
+    assert "not enabled" not in closing
+
+
+def test_stack_closing_line_names_no_command_without_a_suggestion():
+    body = _stack_with_suggestion(None)
+    assert "/grug" not in _closing_line(body)
+    assert "not enabled" not in body
+
+
+def test_stack_closing_line_names_no_command_for_a_suggestion_fix_would_refuse():
+    # `/grug fix` runs the same check and skips this one, so naming it would
+    # send the reader to a command that commits nothing.
+    closing = _closing_line(_stack_with_suggestion("x = ("))
+    assert "/grug" not in closing
+
+
+def test_stack_names_no_fix_command_for_a_fix_only_promoted_from_prose():
+    # The promoted span is a committable block on the inline comment, but the
+    # session keeps the empty field, so `/grug fix` has nothing to commit.
+    body = _stack_with_suggestion(None, message="Use `x = 2` here")
+    assert "/grug fix" not in body
+
+
 def test_stack_offers_docstrings_for_changed_undocumented_public_function():
     from personas.code_reviewer.persona import CodeReviewEvaluation
     body = cr_dispatch._review_stack_body(
