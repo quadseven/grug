@@ -103,6 +103,86 @@ def test_file_budget_applies_to_both_views():
     assert "FULL FILE" not in evidence.judge_view().text
 
 
+_COLUMN_FILE = '''\
+def list_posts(conn):
+    return conn.execute("SELECT id, created_at FROM posts").fetchall()
+
+
+def age_seconds(row):
+    return int(row["created_at"])
+
+
+def recent(conn, cutoff):
+    rows = list_posts(conn)
+    return [row for row in rows if row["created_at"] > cutoff]
+'''
+_COLUMN_HUNK = (
+    "@@ -10,2 +10,2 @@\n"
+    "     rows = list_posts(conn)\n"
+    '-    return rows\n'
+    '+    return [row for row in rows if row["created_at"] > cutoff]'
+)
+
+
+def _column_evidence(content: str = _COLUMN_FILE) -> ev.ElderEvidence:
+    return ev.assemble_evidence(
+        [Hunk(path="bridge/posts.py", body=_COLUMN_HUNK)],
+        file_contents={"bridge/posts.py": content},
+    )
+
+
+def test_column_reads_show_every_read_of_a_touched_column():
+    """The integer column is read as a SQL column and converted with int()
+    elsewhere; both readers must sit in the prompt beside the new datetime
+    comparison, in the reviewer AND judge views."""
+    evidence = _column_evidence()
+    for text in (evidence.reviewer_view().text, evidence.judge_view().text):
+        assert "SQL COLUMN READS" in text
+        assert "columns: created_at" in text
+        assert '2:     return conn.execute("SELECT id, created_at FROM posts")' in text
+        assert '6:     return int(row["created_at"])' in text
+        assert '11:     return [row for row in rows if row["created_at"] > cutoff]' in text
+
+
+def test_column_reads_are_size_independent():
+    """Above the full-file budget the old reader would leave the prompt;
+    the column block still carries it."""
+    filler = [f"# filler {i}" for i in range(ev.MAX_FILE_CONTEXT_LINES + 2)]
+    filler[1] = 'SQL = "SELECT id, created_at FROM posts"'
+    filler[2] = 'def age_seconds(row): return int(row["created_at"])'
+    changed = len(filler)
+    filler.append('def recent(row, cutoff): return row["created_at"] > cutoff')
+    content = "\n".join(filler) + "\n"
+    evidence = ev.assemble_evidence(
+        [Hunk(path="bridge/posts.py",
+              body=f"@@ -{changed},0 +{changed + 1} @@\n+{filler[-1]}")],
+        file_contents={"bridge/posts.py": content},
+    )
+    text = evidence.reviewer_view().text
+    assert "FULL FILE" not in text
+    assert "SQL COLUMN READS" in text
+    assert '2: SQL = "SELECT id, created_at FROM posts"' in text
+    assert '3: def age_seconds(row): return int(row["created_at"])' in text
+
+
+def test_column_reads_stay_out_when_the_touched_column_has_one_reader():
+    content = (
+        'def recent(conn):\n'
+        '    return [row for row in list_posts(conn) if row["created_at"] > 0]\n'
+    )
+    hunk = (
+        "@@ -1,2 +1,2 @@\n"
+        " def recent(conn):\n"
+        '-    return list_posts(conn)\n'
+        '+    return [row for row in list_posts(conn) if row["created_at"] > 0]'
+    )
+    evidence = ev.assemble_evidence(
+        [Hunk(path="bridge/posts.py", body=hunk)],
+        file_contents={"bridge/posts.py": content},
+    )
+    assert "SQL COLUMN READS" not in evidence.reviewer_view().text
+
+
 def test_scoped_to_keeps_only_the_named_paths():
     scoped = _evidence().scoped_to({"src/a.py"})
     assert [h.path for h in scoped.hunks] == ["src/a.py"]
