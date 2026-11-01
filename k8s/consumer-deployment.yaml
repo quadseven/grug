@@ -187,6 +187,11 @@ spec:
             # escalation / sample. Rollback to always-on dual-arm: deep.
             # Fast = coder-first with reasoner only if coder fails.
             - {name: GRUG_REVIEW_DEPTH, value: tiered}
+            # grug#1553: GitHub App logins whose PRs carry an author family, as
+            # `login:family` pairs split by `;` (e.g. `lane-app[bot]:claude`). Exact
+            # login match only; family must be in model_family.py's table. Empty =
+            # no App gets a family (Elder keeps its usual arm order for App PRs).
+            - {name: GRUG_APP_AUTHOR_FAMILIES, value: ""}
             # Escalation knobs (llm_client.decide_deep_escalation). Were
             # tuned for speed: 0.05 sample, auto-deep only above 500 added
             # lines (exclusive bound - 500 does NOT escalate).

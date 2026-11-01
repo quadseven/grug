@@ -166,6 +166,11 @@ spec:
             # their existing lower-cost OpenRouter model configuration.
             # Tiered Elder (#645): see consumer-deployment for full comments.
             - {name: GRUG_REVIEW_DEPTH, value: tiered}
+            # grug#1553: GitHub App logins whose PRs carry an author family, as
+            # `login:family` pairs split by `;` (e.g. `lane-app[bot]:claude`). Exact
+            # login match only; family must be in model_family.py's table. Empty =
+            # no App gets a family (Elder keeps its usual arm order for App PRs).
+            - {name: GRUG_APP_AUTHOR_FAMILIES, value: ""}
             # Deep escalation (#645). WAS 500 lines / 0.05 sample, tuned for
             # speed. Measured 2026-08-12: grug's own PRs run 18-260 added
             # lines, so 5 of 6 never escalated and only ever saw the tier-1
