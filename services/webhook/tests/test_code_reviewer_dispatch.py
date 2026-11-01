@@ -3077,6 +3077,57 @@ def test_deep_review_refreshes_stack_comment_with_tier1_findings(monkeypatch):
     assert "tier1-bug" in deep_body  # Tier-1 finding preserved via combined_eval
 
 
+@pytest.mark.parametrize("source, expected", [
+    ("def f():\n    pass\n", "1 changed public function(s) lack docstrings"),
+    ("def f(:\n", "`src/x.py`: Python file does not parse"),
+])
+def test_tier1_and_deep_stacks_both_carry_the_docstring_offer(
+    monkeypatch, source, expected,
+):
+    """Each stack build replaces the whole comment, so the deep refresh must
+    keep the offer and the skip reasons the Tier-1 build published."""
+    monkeypatch.setattr(
+        cr_dispatch, "review_diff",
+        lambda *a, **kw: LlmReviewResponse(
+            kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+            model_name="laguna",
+        ),
+    )
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", lambda *a, **kw: [])
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: None)
+    stack_bodies = []
+    monkeypatch.setattr(
+        cr_dispatch, "_upsert_review_stack_comment",
+        lambda token, owner, repo, pr, body, **kw: stack_bodies.append(body),
+    )
+    monkeypatch.setattr(cr_dispatch, "review_is_staged", lambda hunks: False)
+    monkeypatch.setattr(
+        cr_dispatch, "decide_deep_escalation",
+        lambda hunks, pr_context: MagicMock(escalate=True, reasons=["t"], added_lines=5),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "review_reasoner_diff",
+        lambda *a, **kw: _deep_llm_with_finding(),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "fetch_file_contents",
+        lambda token, owner, repo, paths, sha: {"src/x.py": source},
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_current_review_snapshot",
+        lambda *a: ("snap", "abcd1234efgh", "open", False),
+    )
+
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert len(stack_bodies) == 2
+    assert all(expected in body for body in stack_bodies)
+
+
 # --- the stack comment IS the board (#791) ----------------------------------
 
 def test_stack_body_is_a_board_with_a_verdict_first():
@@ -3107,6 +3158,27 @@ def test_stack_offers_bulk_fix_for_checked_suggestion():
     )
     assert "Finishing touch" in body
     assert "/grug fix" in body
+
+
+def test_stack_offers_docstrings_for_changed_undocumented_public_function():
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(), conclusion="success"),
+        conclusion="success", docstring_targets=("pkg/mod.py:1",),
+    )
+    assert "changed public function(s) lack docstrings" in body
+    assert "/grug docstrings" in body
+
+
+def test_stack_names_each_docstring_candidate_skipped_with_its_reason():
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(), conclusion="success"),
+        conclusion="success",
+        docstring_skips=(("pkg/`<b>.py", "Python file does not parse"),),
+    )
+    assert f"`{cr_dispatch._md_code_span('pkg/`<b>.py')}`: Python file" in body
+    assert "pkg/`<b>.py" not in body
 
 
 def test_worth_an_email_is_findings_or_degraded_only():
