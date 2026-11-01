@@ -198,6 +198,9 @@ def test_sensitive_paths_use_whole_words_and_config_files():
     "src/secrets.py",
     "src/api_tokens.py",
     "src/token.py",
+    "src/JWTVerifier.java",
+    "src/KMSClient.go",
+    "src/PassWord.py",
 ])
 def test_camel_case_plural_and_digit_forms_are_sensitive(path):
     assert sensitive_paths((path,), RepoConfig()) == (path,)

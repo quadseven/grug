@@ -46,6 +46,7 @@ _CONFIG_GLOBS = (
 # Splits before lowercasing, so `JWTAuth`, `authService`, and `oauth2` all
 # yield their words.
 _WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+_LOWERED_RUN_RE = re.compile(r"[a-z]+")
 _BLOCKING = frozenset({"high", "critical"})
 _FALSE_VALUES = frozenset({"", "0", "false", "off", "no"})
 
@@ -60,7 +61,9 @@ def quarantined_pass_enabled() -> bool:
 def _is_default_sensitive(path: str) -> bool:
     if any(path_matches(path, glob) for glob in _CONFIG_GLOBS):
         return True
+    # Both readings, so a split word like `PassWord` still matches.
     words = {word.lower() for word in _WORD_RE.findall(path)}
+    words.update(_LOWERED_RUN_RE.findall(path.lower()))
     return not _SENSITIVE_WORDS.isdisjoint(words)
 
 
