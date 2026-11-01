@@ -1,6 +1,6 @@
 """Optional in-repo `.grug.yaml` review configuration.
 
-Eight keys, all optional:
+Ten keys, all optional:
 
   ignore               list of path globs that are never reviewed
   path_instructions    list of {path: glob, instructions: text}; the text is
@@ -23,6 +23,10 @@ Eight keys, all optional:
                        critical finding still posts inline)
   elder_mute_locked_classes  list of finding classes that stay inline whatever
                        their precision
+  elder_blocking_cap   integer, default 5; blocking markings per PR with an
+                       inline comment, 0 for no cap
+  elder_drip_feed      boolean, default true; drop new findings below critical
+                       on unchanged lines in a second or later round
   security_review_paths  list of path globs that replaces the default
                        sensitive-path list of the quarantined security pass
 
@@ -49,10 +53,12 @@ _KNOWN_KEYS = frozenset(
         "ignore", "path_instructions", "min_inline_severity", "skip_prs",
         "elder_mute_min_labeled", "elder_mute_below_precision",
         "elder_mute_locked_classes", "security_review_paths",
+        "elder_blocking_cap", "elder_drip_feed",
     },
 )
 _SKIP_PRS_KEYS = ("authors", "labels", "title_patterns")
 DEFAULT_MUTE_MIN_LABELED = 20
+DEFAULT_BLOCKING_CAP = 5
 DEFAULT_MUTE_BELOW_PRECISION = 0.2
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 # Bounds so one file cannot blow the prompt budget.
@@ -85,6 +91,8 @@ class RepoConfig:
     elder_mute_locked_classes: tuple[str, ...] = ()
     # None keeps the default list; an empty list turns the pass off here.
     security_review_paths: tuple[str, ...] | None = None
+    elder_blocking_cap: int = DEFAULT_BLOCKING_CAP
+    elder_drip_feed: bool = True
 
 
 def _string_list(value: object, key: str, problems: list[str]) -> tuple[str, ...]:
@@ -175,6 +183,22 @@ def _mute_settings(
     return min_labeled, below, locked
 
 
+def _blocking_cap(data: dict, problems: list[str]) -> int:
+    raw = data.get("elder_blocking_cap", DEFAULT_BLOCKING_CAP)
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    problems.append("`elder_blocking_cap` must be a non-negative integer")
+    return DEFAULT_BLOCKING_CAP
+
+
+def _drip_feed(data: dict, problems: list[str]) -> bool:
+    raw = data.get("elder_drip_feed", True)
+    if isinstance(raw, bool):
+        return raw
+    problems.append("`elder_drip_feed` must be true or false")
+    return True
+
+
 def _security_paths(
     data: dict, problems: list[str],
 ) -> tuple[str, ...] | None:
@@ -227,9 +251,12 @@ def parse_repo_config(text: str | None) -> RepoConfig:
     skip = _skip_prs(data["skip_prs"], problems) if "skip_prs" in data else SkipPrs()
     min_labeled, below, locked = _mute_settings(data, problems)
     security_paths = _security_paths(data, problems)
+    blocking_cap = _blocking_cap(data, problems)
+    drip_feed = _drip_feed(data, problems)
     return RepoConfig(
         ignore, instructions, floor, tuple(problems), skip,
         min_labeled, below, locked, security_paths,
+        blocking_cap, drip_feed,
     )
 
 
