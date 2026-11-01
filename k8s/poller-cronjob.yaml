@@ -102,6 +102,11 @@ spec:
                 - {name: GRUG_SHARED_BENCHES, value: "true"}
                 - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
                 - {name: GRUG_REVIEW_DEPTH, value: tiered}
+                # grug#1553: GitHub App logins whose PRs carry an author family, as
+                # `login:family` pairs split by `;` (e.g. `lane-app[bot]:claude`). Exact
+                # login match only; family must be in model_family.py's table. Empty =
+                # no App gets a family (Elder keeps its usual arm order for App PRs).
+                - {name: GRUG_APP_AUTHOR_FAMILIES, value: ""}
                 - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
                 - {name: GRUG_FALLBACK_ENABLED_SSM, value: /grug/elder-fallback-enabled}
                 - {name: DD_SITE, value: datadoghq.com}
