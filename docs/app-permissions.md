@@ -18,11 +18,8 @@ and [GitHub's permissions for Apps](https://docs.github.com/en/rest/authenticati
 
 ## Optional permission
 
-| Permission | Level | Feature |
-| --- | --- | --- |
-| `administration` | `write` | Create and remove Grug's own enforcement rulesets |
-
-Reading enforcement state needs `administration: read`. Without the permission
+`administration: write` lets Grug create and remove its own enforcement
+rulesets, and reading enforcement state needs `administration: read`. Without it
 Grug reports `permission_denied` for enforcement and keeps reviewing, so the
 runtime check above does not require it. It is the largest grant the App holds:
 see [the least-privilege comparison](reviewer-attack-surface.md#github-app-permissions).
