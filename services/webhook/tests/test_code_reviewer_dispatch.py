@@ -4670,3 +4670,39 @@ def test_high_finding_of_muted_class_keeps_its_inline_thread(monkeypatch):
         event="REQUEST_CHANGES", muted=muted,
     )
     assert result is not None and len(result.comments) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "expected"),
+    [
+        (403, {}, "forbidden"),
+        (403, {"X-RateLimit-Remaining": "0"}, "rate_limited"),
+        (502, {}, None),
+    ],
+)
+def test_freshness_failure_reports_how_github_refused_the_read(
+    monkeypatch, status, headers, expected,
+):
+    response = httpx.Response(
+        status,
+        headers=headers,
+        request=httpx.Request("GET", "https://api.github.com/repos/o/r/pulls/7"),
+    )
+
+    def refused(installation_id, fn):
+        raise httpx.HTTPStatusError("refused", request=response.request, response=response)
+
+    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", refused)
+
+    out = cr_dispatch._review_snapshot_freshness_failure(
+        installation_id=1,
+        owner="o",
+        repo_name="r",
+        pull_number=7,
+        expected_snapshot_id="snapshot",
+        expected_head_sha="head",
+    )
+
+    assert out["degraded_reason"] == "freshness_check_failed"
+    assert out.get("github_refusal") == expected
+

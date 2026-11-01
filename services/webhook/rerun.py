@@ -37,7 +37,7 @@ import boto3
 import httpx
 
 from adapters.install_store import get_repo_config, is_elder_paused  # type: ignore
-from github_app_auth import get_app_id, with_install_token_retry
+from github_app_auth import get_app_id, github_refusal, with_install_token_retry
 from github_budget import count_review_calls
 from check_run_reconciler import _STUCK_IN_PROGRESS_MAX_AGE_MINUTES
 from github_checks_client import (
@@ -1844,6 +1844,38 @@ def _dispatch_elder_rerun(
         )
 
 
+_PR_READ_FORBIDDEN_TITLE = "Grug cannot read this pull request: 403 from GitHub"
+_PR_READ_FORBIDDEN_SUMMARY = (
+    "GitHub denied Elder's pull request read with HTTP 403. "
+    "Review the GitHub App installation's repository access, "
+    "token permissions, and repository rules before re-running Elder."
+)
+
+
+def _freshness_outage_wording(refusal: str | None) -> tuple[str, str, str]:
+    """Title, cause and remedy for a freshness re-fetch that failed, named
+    from how GitHub answered so a refusal never reads like an outage."""
+    if refusal == "forbidden":
+        return (
+            _PR_READ_FORBIDDEN_TITLE,
+            _PR_READ_FORBIDDEN_SUMMARY,
+            "Re-run Elder once access is fixed.",
+        )
+    if refusal == "rate_limited":
+        return (
+            "Elder eyes clouded - GitHub rate limit",
+            "GitHub's rate limit refused the re-fetch of the PR that confirms "
+            "snapshot freshness.",
+            "Re-run Elder once the limit resets.",
+        )
+    return (
+        "Elder eyes clouded - GitHub unavailable",
+        "Could not re-fetch the PR to confirm snapshot freshness "
+        "(GitHub 5xx / transport).",
+        "Push again or re-run Elder when GitHub is healthy.",
+    )
+
+
 def _fetch_current_pr(
     install_id: int, owner: str, repo_name: str, pr_number: int,
 ) -> dict[str, Any]:
@@ -2554,7 +2586,8 @@ def _run_hot_review(
     try:
         before = _fetch_current_pr(install_id, owner, repo_name, pr_number)
     except httpx.HTTPStatusError as error:
-        if error.response.status_code != 403:
+        # A rate-limited 403 clears when the window resets, so it redrives.
+        if github_refusal(error.response) != "forbidden":
             raise
         queued_head_sha = str(job.get("requested_head_sha") or "")
         log.error(
@@ -2573,12 +2606,8 @@ def _run_hot_review(
             repo_name=repo_name,
             pr_number=pr_number,
             head_sha=queued_head_sha,
-            title="Grug cannot read this pull request: 403 from GitHub",
-            summary=(
-                "GitHub denied Elder's pull request read with HTTP 403. "
-                "Review the GitHub App installation's repository access, "
-                "token permissions, and repository rules before re-running Elder."
-            ),
+            title=_PR_READ_FORBIDDEN_TITLE,
+            summary=_PR_READ_FORBIDDEN_SUMMARY,
             conclusion="failure",
         )
         if not posted:
@@ -2903,18 +2932,18 @@ def _run_hot_review(
             # `elder_blocking` the review itself ran under. Real model
             # findings still use pass/fail.
             if result_status == "skipped" and degraded_reason == "freshness_check_failed":
+                title, cause, remedy = _freshness_outage_wording(
+                    result.get("github_refusal"),
+                )
                 posted = _complete_elder_check_open(
                     install_id=install_id,
                     owner=owner,
                     repo_name=repo_name,
                     pr_number=pr_number,
                     head_sha=head_sha,
-                    title="Elder eyes clouded - GitHub unavailable",
+                    title=title,
                     summary=lead_with_degraded_line(
-                        "Could not re-fetch the PR to confirm snapshot freshness "
-                        "(GitHub 5xx / transport). "
-                        + gate_sentence(elder_blocking)
-                        + " Push again or re-run Elder when GitHub is healthy.",
+                        f"{cause} {gate_sentence(elder_blocking)} {remedy}",
                         degraded_reason,
                     ),
                     conclusion=degraded_conclusion(elder_blocking),

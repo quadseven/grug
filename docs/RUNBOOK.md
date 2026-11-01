@@ -184,6 +184,40 @@ Triage:
 3. After the cause is fixed, re-run the affected PRs' checks (the
    `grug-poller` replay or a push) so the missing required checks land.
 
+### Elder cannot read a pull request
+
+Grug's own read of a pull request can be refused in two ways, and both can
+be a 403. `github_refusal` tells them apart from the response headers and body.
+
+| Check title | Meaning | Clears by itself |
+|---|---|---|
+| `Grug cannot read this pull request: 403 from GitHub` | A real denial, after one retry on a fresh token | No |
+| `Elder eyes clouded - GitHub rate limit` | The primary or secondary limit refused the read | Yes |
+| `Elder eyes clouded - GitHub unavailable` | GitHub 5xx or a transport failure | Yes |
+
+A rate-limited read before the review starts writes no title of its own: the
+job redrives, and the dead-letter path completes the check if it runs out.
+
+Before 2026-11-01 a refused read could not be told from an outage: the first
+two titles did not exist, and the rate-limit case either read as "GitHub
+unavailable" or gave up with a bare 403. To classify an old incident, or to
+act on a new `403 from GitHub`:
+
+1. Search consumer logs around the failed run for
+   `github_primary_rate_limit_exhausted` and `github_api_retry` with status
+   403. Either one means a rate limit: nothing to fix on the repo. Re-run with
+   `/grug improve` after the reset, and read `github_budget_low` for how the
+   budget went. The window is one hour.
+2. `elder_pr_read_forbidden`, or `code_review_freshness_check_failed` with
+   `github_refusal` set to `forbidden`, means a real denial. Open the
+   installation with `gh api /app/installations/<id>` using an App JWT, and
+   check `suspended_at`, `repository_selection` and that `permissions` has
+   `pull_requests: read`. For `selected`, confirm the repo is in the App's
+   repository list. For an organization, also check the IP allow list, which
+   refuses App tokens on private repos.
+3. Fix the access in the installation's settings on GitHub, then run
+   `/grug improve`.
+
 ### Elder review failure rate
 
 `[grug-elder] Reviews failing to parse or partial (>25% over 2h)` (digest tier)

@@ -715,6 +715,99 @@ def test_hot_review_pr_read_403_completes_check_without_redrive(monkeypatch):
     assert len(attempts) == 2
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1800000000"},
+        {"Retry-After": "60"},
+    ],
+    ids=["primary", "secondary"],
+)
+def test_hot_review_pr_read_rate_limit_403_redrives_without_a_permission_title(
+    monkeypatch, headers,
+):
+    """A rate-limited 403 clears on its own: a terminal "cannot read" check
+    would send the operator to the App's permissions over nothing."""
+    response = httpx.Response(
+        403,
+        headers=headers,
+        request=httpx.Request(
+            "GET", "https://api.github.com/repos/myorg/myrepo/pulls/7",
+        ),
+    )
+
+    def limited(iid, fn):
+        raise httpx.HTTPStatusError(
+            "Forbidden", request=response.request, response=response,
+        )
+
+    posted = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", limited)
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        rerun._run_one(_job(kind="review", requested_head_sha="head-that-was-queued"))
+
+    assert posted == []
+
+
+@pytest.mark.parametrize(
+    ("refusal", "title", "cause"),
+    [
+        (
+            "forbidden",
+            "Grug cannot read this pull request: 403 from GitHub",
+            "HTTP 403",
+        ),
+        (
+            "rate_limited",
+            "Elder eyes clouded - GitHub rate limit",
+            "rate limit",
+        ),
+        (None, "Elder eyes clouded - GitHub unavailable", "5xx / transport"),
+    ],
+)
+def test_hot_review_freshness_refusal_names_what_github_said(
+    monkeypatch, refusal, title, cause,
+):
+    """The second case on the ticket: a read that GitHub refused mid-review
+    read as "GitHub unavailable" whatever the refusal actually was."""
+    pr = _pr_data(head_sha="fresh-head")
+    fetches = iter((pr, pr))
+
+    def _fake_token_retry(iid, fn):
+        try:
+            return next(fetches)
+        except StopIteration:
+            return fn("tok")
+
+    posted: list = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", _fake_token_retry)
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
+    )
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    _patch_hot_claims(monkeypatch)
+    dispatched = {
+        "persona": "code_reviewer",
+        "result": "skipped",
+        "degraded_reason": "freshness_check_failed",
+    }
+    if refusal:
+        dispatched["github_refusal"] = refusal
+    monkeypatch.setattr(rerun, "dispatch_code_review", MagicMock(return_value=dispatched))
+
+    status = rerun._run_one(_job(kind="review", settle_seconds=0))
+
+    assert status == "fail_open_freshness"
+    assert posted[0].title == title
+    assert cause in posted[0].summary
+
+
 def test_hot_review_gives_up_mid_flight_once_the_redrive_cap_is_exhausted(monkeypatch):
     """grug#773 AC3's other call site: the EXPENSIVE mid-flight staleness
     path (a real dispatch already ran) must also stop redriving once the

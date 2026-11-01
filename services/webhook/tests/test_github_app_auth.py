@@ -319,3 +319,24 @@ def test_app_id_strips_whitespace_from_the_raw_ssm_value(monkeypatch):
         "secrets_loader._get_ssm_secure_string", lambda name: "12345\n"
     )
     assert gh.get_app_id() == "12345"
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "body", "expected"),
+    [
+        (403, {}, "Resource not accessible by integration", "forbidden"),
+        (403, {"X-RateLimit-Remaining": "0"}, "API rate limit exceeded", "rate_limited"),
+        (403, {"Retry-After": "60"}, "", "rate_limited"),
+        (403, {}, "You have exceeded a secondary rate limit", "rate_limited"),
+        (429, {}, "", "rate_limited"),
+        (404, {}, "Not Found", None),
+        (502, {}, "Bad Gateway", None),
+    ],
+)
+def test_github_refusal_tells_a_denial_from_a_rate_limit(status, headers, body, expected):
+    response = httpx.Response(status, headers=headers, text=body)
+
+    from github_app_auth import github_refusal
+
+    assert github_refusal(response) == expected
+

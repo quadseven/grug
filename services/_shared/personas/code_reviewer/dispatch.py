@@ -43,7 +43,10 @@ from activity_log import record_check_verdict
 from model_family import ReviewFamilies, app_author_family, model_family
 from code_review_prompt import RULES
 from github_app_auth import (
-    get_app_id, installation_permission_summary_note, with_install_token_retry,
+    get_app_id,
+    github_refusal,
+    installation_permission_summary_note,
+    with_install_token_retry,
 )
 from github_checks_client import (
     CheckConclusion,
@@ -287,19 +290,26 @@ def _review_snapshot_freshness_failure(
             ),
         )
     except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+        refusal = (
+            github_refusal(e.response)
+            if isinstance(e, httpx.HTTPStatusError)
+            else None
+        )
         log.warning(
             "code_review_freshness_check_failed",
             extra={
                 "installation_id": installation_id,
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "kind": type(e).__name__,
+                "github_refusal": refusal,
             },
         )
-        return {
+        skipped = {
             "persona": "code_reviewer",
             "result": "skipped",
             "degraded_reason": "freshness_check_failed",
         }
+        return {**skipped, "github_refusal": refusal} if refusal else skipped
     if current_state != "open" or current_draft:
         log.info(
             "code_review_ineligible_before_publish",

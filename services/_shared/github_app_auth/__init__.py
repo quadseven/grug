@@ -246,6 +246,23 @@ def _is_secondary_rate_limit(response: httpx.Response) -> bool:
     return "secondary rate limit" in text or "abuse detection" in text
 
 
+def github_refusal(response: httpx.Response) -> str | None:
+    """Name how GitHub refused a call: `rate_limited` clears when the window
+    resets, `forbidden` needs a person to fix access, and None is any other
+    answer. Both of the first two can be a 403, so a caller that reads only
+    the status tells an operator to chase permissions over a busy hour."""
+    status = response.status_code
+    if status not in _RATE_LIMIT_STATUS:
+        return None
+    if (
+        status == 429
+        or response.headers.get("X-RateLimit-Remaining") == "0"
+        or _is_secondary_rate_limit(response)
+    ):
+        return "rate_limited"
+    return "forbidden"
+
+
 def _is_retryable_github_error(response: httpx.Response) -> bool:
     status = response.status_code
     if status in _RETRYABLE_STATUS:
