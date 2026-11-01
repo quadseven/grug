@@ -10,7 +10,12 @@ import httpx
 import llm_client as lc
 import pytest
 from llm_client import Backend, BackendConfig, Hunk, review_diff
-from model_family import ReviewFamilies, model_family, review_families
+from model_family import (
+    ReviewFamilies,
+    app_author_family,
+    model_family,
+    review_families,
+)
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer import persona as cr_persona
 from personas.tpm.dor_checks import loom_footer_model
@@ -192,7 +197,7 @@ def test_families_survive_the_evaluation_rewrites() -> None:
 def test_app_author_family_uses_trusted_source() -> None:
     """Test that App authors use the trusted source for author family (grug#1553)."""
     # Mock the app_author_family function to test the integration
-    with patch('model_family.app_author_family') as mock_app_family:
+    with patch.object(cr_dispatch, 'app_author_family') as mock_app_family:
         mock_app_family.return_value = "claude"
 
         # Create a PR with a Bot user (App author)
@@ -208,7 +213,7 @@ def test_app_author_family_uses_trusted_source() -> None:
 def test_app_author_family_not_listed_gets_none() -> None:
     """Test that unlisted App authors get None from the trusted source (grug#1553)."""
     # Mock the app_author_family function to test the integration
-    with patch('model_family.app_author_family') as mock_app_family:
+    with patch.object(cr_dispatch, 'app_author_family') as mock_app_family:
         mock_app_family.return_value = None
 
         # Create a PR with a Bot user (App author)
@@ -224,7 +229,7 @@ def test_app_author_family_not_listed_gets_none() -> None:
 def test_app_author_family_case_insensitive() -> None:
     """Test that App author family lookup is case insensitive (grug#1553)."""
     # Mock the app_author_family function to test the integration
-    with patch('model_family.app_author_family') as mock_app_family:
+    with patch.object(cr_dispatch, 'app_author_family') as mock_app_family:
         mock_app_family.return_value = "gpt"
 
         # Create a PR with a Bot user (App author) with different case
@@ -240,7 +245,7 @@ def test_app_author_family_case_insensitive() -> None:
 def test_app_author_family_not_used_for_human_authors() -> None:
     """Test that App author family is not used for human authors (grug#1553)."""
     # Mock the app_author_family function to verify it's not called
-    with patch('model_family.app_author_family') as mock_app_family:
+    with patch.object(cr_dispatch, 'app_author_family') as mock_app_family:
         # Create a PR with a User (human) author
         pr = _pr("Loom ticket #7, lane fix, model claude-opus-5-5.", user_type="User")
 
@@ -254,7 +259,7 @@ def test_app_author_family_not_used_for_human_authors() -> None:
 def test_app_author_family_overrides_trusted_operator_check() -> None:
     """Test that App authors bypass the trusted_operator check (grug#1553)."""
     # Mock the app_author_family function to test the integration
-    with patch('model_family.app_author_family') as mock_app_family:
+    with patch.object(cr_dispatch, 'app_author_family') as mock_app_family:
         mock_app_family.return_value = "gpt"
 
         # Create a PR with a Bot user (App author)
@@ -270,7 +275,7 @@ def test_app_author_family_overrides_trusted_operator_check() -> None:
 def test_app_author_family_authorization_association_ignored() -> None:
     """Test that App author family lookup ignores author_association (grug#1553)."""
     # Mock the app_author_family function to test the integration
-    with patch('model_family.app_author_family') as mock_app_family:
+    with patch.object(cr_dispatch, 'app_author_family') as mock_app_family:
         mock_app_family.return_value = "gemini"
 
         # Create a PR with a Bot user (App author) and untrusted association
@@ -344,3 +349,51 @@ def test_mixed_cohorts_with_a_same_family_arm_count_as_same_family() -> None:
 )
 def test_loom_footer_model(body: str, model: str | None) -> None:
     assert loom_footer_model(body) == model
+
+
+@pytest.mark.parametrize(
+    ("model", "family"),
+    [("glm-4.6", "glm"), ("z-ai/glm-5", "glm"),
+     ("longcat-flash-chat", "longcat"), ("meituan/longcat-2", "longcat")],
+)
+def test_glm_and_longcat_families_still_resolve(model: str, family: str) -> None:
+    assert model_family(model) == family
+
+
+def test_app_author_family_reads_the_env_table(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "GRUG_APP_AUTHOR_FAMILIES", "lane-app[bot]:claude;\nOther-App[bot]:GPT\n",
+    )
+    assert app_author_family("lane-app[bot]") == "claude"
+    assert app_author_family("LANE-APP[BOT]") == "claude"
+    assert app_author_family("other-app[bot]") == "gpt"
+
+
+def test_app_author_family_matches_only_exact_logins(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_APP_AUTHOR_FAMILIES", "lane-app[bot]:claude")
+    assert app_author_family("lane-app") is None
+    assert app_author_family("my-lane-app[bot]") is None
+    assert app_author_family("claude[bot]") is None
+    assert app_author_family("") is None
+    assert app_author_family(None) is None
+
+
+def test_app_author_family_ignores_unknown_families_and_bad_pairs(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "GRUG_APP_AUTHOR_FAMILIES", "a[bot]:not-a-family;b[bot];:claude;c[bot]:",
+    )
+    for login in ("a[bot]", "b[bot]", "c[bot]", ""):
+        assert app_author_family(login) is None
+
+
+def test_app_author_family_unset_gives_no_family(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_APP_AUTHOR_FAMILIES", raising=False)
+    assert app_author_family("lane-app[bot]") is None
+
+
+def test_bot_author_family_flows_from_the_env_table(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_APP_AUTHOR_FAMILIES", "lane-app[bot]:gpt")
+    pr = _pr("Some PR body", user_type="Bot", login="lane-app[bot]", association="NONE")
+    assert cr_dispatch._author_family(pr) == "gpt"
+    human = _pr("Some PR body", user_type="User", login="lane-app[bot]", association="NONE")
+    assert cr_dispatch._author_family(human) is None

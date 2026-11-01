@@ -38,7 +38,7 @@ from urllib.parse import quote
 import httpx
 
 from activity_log import record_check_verdict
-from model_family import ReviewFamilies, model_family
+from model_family import ReviewFamilies, app_author_family, model_family
 from code_review_prompt import RULES
 from github_app_auth import (
     get_app_id, installation_permission_summary_note, with_install_token_retry,
@@ -1160,7 +1160,6 @@ def _author_family(pr: Mapping[str, Any]) -> str | None:
     user = pr.get("user")
     if isinstance(user, Mapping) and user.get("type") == "Bot":
         app_login = user.get("login")
-        from model_family import app_author_family
         return app_author_family(str(app_login) if app_login else None)
 
     return None
