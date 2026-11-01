@@ -57,6 +57,7 @@ def table(monkeypatch):
     monkeypatch.setattr(lc, "_bench_state", {})
     monkeypatch.setattr(lc, "_slow_bench_state", {})
     monkeypatch.setattr(lc, "_provider_blocked_until", {})
+    monkeypatch.setattr(lc, "_poolside_hold_stage", {})
     monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0)
     yield t
     shared_benches._queue.clear()
@@ -68,6 +69,7 @@ def _other_pod(monkeypatch) -> None:
     monkeypatch.setattr(lc, "_bench_state", {})
     monkeypatch.setattr(lc, "_slow_bench_state", {})
     monkeypatch.setattr(lc, "_provider_blocked_until", {})
+    monkeypatch.setattr(lc, "_poolside_hold_stage", {})
     monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0)
     monkeypatch.setattr(shared_benches, "_snapshot", {})
     shared_benches.sync()
@@ -127,6 +129,21 @@ def test_a_provider_breaker_is_shared(table, monkeypatch):
     assert not lc._provider_available(Backend.POOLSIDE, _MODEL)
     with pytest.raises(lc.BackendDisabledError):
         lc._refuse_unusable_backend(_POOLSIDE)
+
+
+def test_poolside_usage_hold_escalation_is_shared_between_pods(table, monkeypatch):
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(lc.time, "time", lambda: now["t"])
+    limited = _resp(429, {"error": {"message": "usage limit exceeded"}})
+    lc._note_provider_response(_POOLSIDE, limited)
+    assert not lc._provider_available(Backend.POOLSIDE, _MODEL)
+    shared_benches.sync()
+
+    now["t"] += 121
+    _other_pod(monkeypatch)
+    lc._note_provider_response(_POOLSIDE, limited)
+    assert not lc._provider_available(Backend.POOLSIDE, _MODEL)
+    assert lc._provider_available(Backend.POOLSIDE, _MODEL, now["t"] + 241)
 
 
 def test_the_opencode_go_usage_breaker_is_shared(table, monkeypatch):

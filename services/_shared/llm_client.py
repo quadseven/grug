@@ -1548,11 +1548,17 @@ _SPENT_LIMIT_MARKERS = (
     "usage limit", "quota", "credit", "key limit", "total limit", "spend limit",
 )
 # A 429 trips it only when the body names a daily or monthly allowance.
-# Poolside answers short-lived throttling with `429 usage limit exceeded` and
-# no Retry-After; reading that as spent blocked the one working cloud tier
-# for an hour (live, 2026-10-17). OpenCode Go's monthly 429 carries the
-# `GoUsageLimitError` type, and its own breaker above honours Retry-After.
+# Poolside answered `429 usage limit exceeded` for 75 minutes on 2026-10-31,
+# with 1,473 rate-limited calls in 75 minutes across both consumer pods. The
+# repeated short hold below avoids an hour-long block while stopping a known
+# refusal from being retried in the same call. OpenCode Go's monthly 429
+# carries the `GoUsageLimitError` type, and its breaker honours Retry-After.
 _SPENT_RATE_MARKERS = ("per-day", "per day", "daily", "monthly", "gousagelimiterror")
+_POOLSIDE_USAGE_MARKER = "usage limit exceeded"
+_POOLSIDE_HOLD_BASE_SECONDS = 120.0
+_POOLSIDE_HOLD_MAX_SECONDS = 1800.0
+_POOLSIDE_STAGE_TTL_SECONDS = 604800.0
+_poolside_hold_stage: dict[tuple[str, str], int] = {}
 _provider_breaker_lock = threading.Lock()
 _provider_blocked_until: dict[tuple[str, str], float] = {}
 # A limit that outlasts a throttle reads the same on one response, so the count
@@ -1637,6 +1643,37 @@ def _is_spent_quota_refusal(resp: httpx.Response) -> bool:
     return any(m in text for m in markers)
 
 
+def _poolside_usage_refusal(resp: httpx.Response, backend: Backend | None) -> bool:
+    return (
+        backend == Backend.POOLSIDE
+        and resp.status_code == 429
+        and _POOLSIDE_USAGE_MARKER in (resp.text or "").lower()
+    )
+
+
+def _poolside_usage_hold(config: BackendConfig, resp: httpx.Response) -> None:
+    key = (config.backend.value, _backend_pool(config.backend, config.model))
+    stage = max(
+        (_poolside_hold_stage.get(key, 0),
+         *(_shared_poolside_hold_stage(key, candidate) for candidate in range(1, 6))),
+    )
+    seconds = min(_POOLSIDE_HOLD_BASE_SECONDS * (2 ** stage), _POOLSIDE_HOLD_MAX_SECONDS)
+    next_stage = min(stage + 1, 4)
+    _poolside_hold_stage[key] = next_stage
+    shared_benches.publish(
+        "provider_escalation", key[0], f"{key[1]}-{next_stage}",
+        time.time() + _POOLSIDE_STAGE_TTL_SECONDS,
+    )
+    _open_provider_breaker(config, resp, (key[1],), time.time() + seconds)
+
+
+def _shared_poolside_hold_stage(key: tuple[str, str], stage: int) -> int:
+    marker = f"{key[1]}-{stage}"
+    if shared_benches.blocked_until("provider_escalation", key[0], marker) > time.time():
+        return stage
+    return 0
+
+
 def _limit_refusals_repeated(config: BackendConfig, resp: httpx.Response) -> bool:
     """Count one usage-limit 429; True when the count reaches the hold. Any
     other answer from the provider starts the count over."""
@@ -1661,6 +1698,17 @@ def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None
     """Open the provider breaker on a 401, a 402, a spent-limit refusal, or
     repeated limit refusals."""
     pool = _backend_pool(config.backend, config.model)
+    if _poolside_usage_refusal(resp, config.backend):
+        _poolside_usage_hold(config, resp)
+        return
+    if resp.status_code < 400 and config.backend == Backend.POOLSIDE:
+        key = (config.backend.value, pool)
+        _poolside_hold_stage.pop(key, None)
+        with _provider_breaker_lock:
+            _provider_blocked_until.pop(key, None)
+        shared_benches.clear("provider", *key)
+        for stage in range(1, 6):
+            shared_benches.clear("provider_escalation", key[0], f"{pool}-{stage}")
     if config.backend in _BENCH_CLOUD_BACKENDS:
         # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
         if resp.status_code == 401:
@@ -2692,7 +2740,7 @@ class _BackendConfigError(Exception):
 def _post_with_retries(
     url: str, body: dict[str, Any], headers: dict[str, str],
     timeout_seconds: float, retry_attempts: int, transport_attempts: int,
-    deadline: float | None = None,
+    deadline: float | None = None, backend: Backend | None = None,
 ) -> httpx.Response:
     """The actual 429/503-retrying HTTP call, shared by both `_call_backend`
     paths below. Always goes through the bare `httpx.post()` convenience
@@ -2721,6 +2769,7 @@ def _post_with_retries(
             and attempt < retry_attempts - 1
             # A spent daily or monthly allowance does not clear in a backoff.
             and not _is_spent_quota_refusal(resp)
+            and not _poolside_usage_refusal(resp, backend)
         ):
             _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
             continue
@@ -2893,7 +2942,7 @@ def _call_backend(
     if cancel_event is None:
         resp = _post_with_retries(
             config.url, body, headers, config.timeout_seconds,
-            config.retry_attempts, transport_attempts, deadline,
+            config.retry_attempts, transport_attempts, deadline, config.backend,
         )
     else:
         resp = _post_with_retries_cancellable(
@@ -3015,6 +3064,7 @@ def _post_with_retries_cancellable(
             resp = _post_with_retries(
                 config.url, body, headers, config.timeout_seconds,
                 config.retry_attempts, transport_attempts, deadline,
+                config.backend,
             )
             result_q.put(("ok", resp))
         except Exception as e:  # noqa: BLE001 - re-raised on the waiting side
