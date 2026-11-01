@@ -1965,6 +1965,37 @@ def _stack_closing_note(evaluation: CodeReviewEvaluation) -> list[str]:
     return []
 
 
+def _docstring_offer(
+    diff_text: str, file_contents: dict[str, str] | None,
+) -> dict[str, tuple[Any, ...]]:
+    """`_review_stack_body` keywords for the docstring offer. Every build of
+    the stack goes through here: each one replaces the whole comment, so a
+    build without them would erase the offer and its skip reasons."""
+    targets, skips = find_docstring_targets(diff_text, file_contents or {})
+    return {
+        "docstring_targets": tuple(f"{t.path}:{t.line}" for t in targets),
+        "docstring_skips": tuple(skips),
+    }
+
+
+def _docstring_offer_lines(
+    targets: tuple[str, ...], skips: tuple[tuple[str, str], ...],
+) -> list[str]:
+    """The stack's docstring offer and every candidate skipped with its reason."""
+    lines: list[str] = []
+    if targets:
+        lines.append(
+            f"**Finishing touch:** {len(targets)} changed public "
+            "function(s) lack docstrings. Run `/grug docstrings` to generate them."
+        )
+    if skips:
+        skipped = "; ".join(
+            f"`{_md_code_span(path)}`: {reason}" for path, reason in skips
+        )
+        lines.append(f"**Docstring candidates skipped:** {skipped}.")
+    return lines
+
+
 def _review_stack_body(
     evaluation: CodeReviewEvaluation,
     *,
@@ -2038,14 +2069,7 @@ def _review_stack_body(
             f"**Finishing touch:** {len(committable)} unresolved suggestion(s) "
             "can be applied together with `/grug fix`."
         )
-    if docstring_targets:
-        parts.append(
-            f"**Finishing touch:** {len(docstring_targets)} changed public "
-            "function(s) lack docstrings. Run `/grug docstrings` to generate them."
-        )
-    if docstring_skips:
-        skipped = "; ".join(f"{path}: {reason}" for path, reason in docstring_skips)
-        parts.append(f"**Docstring candidates skipped:** {skipped}.")
+    parts.extend(_docstring_offer_lines(docstring_targets, docstring_skips))
     # Phase, Status and Check-run used to live in the fold. All three were cut:
     # Status restated the summary line verbatim, Phase ("Tier-1 coder arm") is
     # internal vocabulary that means nothing to the author, and the check-run
@@ -4244,9 +4268,6 @@ def dispatch_code_review(
     # that already published. Skipped when the check never landed.
     if not check_publish_failed:
         try:
-            docstring_targets, docstring_skips = find_docstring_targets(
-                diff_text, file_contents,
-            )
             stack_body = _review_stack_body(
                 evaluation,
                 conclusion=conclusion,
@@ -4257,11 +4278,7 @@ def dispatch_code_review(
                 head_sha=head_sha,
                 base_sha=str(pr_context.get("base_sha") or ""),
                 file_contents=file_contents,
-                docstring_targets=tuple(
-                    f"{target.path}:{target.line}"
-                    for target in docstring_targets
-                ),
-                docstring_skips=tuple(docstring_skips),
+                **_docstring_offer(diff_text, file_contents),
                 linked_issues=pinned_issues,
                 muted=muted,
             )
@@ -4419,6 +4436,7 @@ def dispatch_code_review(
             mode=mode,
             blocking=blocking,
             hunks=hunks,
+            diff_text=diff_text,
             evidence=evidence,
             pr_context=pr_context,
             voice=voice,
@@ -5127,6 +5145,7 @@ def _publish_deep_review(
     file_contents: dict[str, str] | None = None,
     action: str = "review",
     linked_issues: tuple[int, ...] = (),
+    diff_text: str = "",
 ) -> None:
     """Publish the async deep review's novel findings as a GitHub review.
 
@@ -5179,7 +5198,7 @@ def _publish_deep_review(
             deep_suppressed_count=deep_suppressed_count, pr_title=pr_title,
             head_sha=head_sha, base_sha=base_sha, pr=f"{owner}/{repo_name}#{pull_number}",
             file_contents=file_contents, linked_issues=linked_issues,
-            muted=muted,
+            muted=muted, diff_text=diff_text,
         ),
         stack_create_if_absent=worth_an_email(combined_eval),
     )
@@ -5241,6 +5260,7 @@ def _deep_stack_body(
     file_contents: dict[str, str] | None,
     linked_issues: tuple[int, ...],
     muted: dict[str, ClassPrecision] | None = None,
+    diff_text: str = "",
 ) -> str | None:
     """The stack comment body for a deep publish, built before the POST so a
     queued retry can refresh the stack without the evaluation. None (logged)
@@ -5259,6 +5279,7 @@ def _deep_stack_body(
             head_sha=head_sha,
             base_sha=base_sha,
             file_contents=file_contents or {},
+            **_docstring_offer(diff_text, file_contents),
             linked_issues=linked_issues,
             muted=muted,
         )
@@ -5423,6 +5444,7 @@ def _async_deep_append_if_needed(
     mode: ReviewMode,
     blocking: bool,
     hunks: tuple[DiffHunk, ...],
+    diff_text: str,
     evidence: ElderEvidence,
     pr_context: PrContext,
     voice: VoiceSelection,
@@ -5657,6 +5679,7 @@ def _async_deep_append_if_needed(
         file_contents=evidence.file_contents,
         action=action,
         linked_issues=pinned_issues,
+        diff_text=diff_text,
     )
     _submit_deep_evals(
         deep_graded,
