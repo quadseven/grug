@@ -288,6 +288,13 @@ def test_app_author_family_authorization_association_ignored() -> None:
         mock_app_family.assert_called_once_with("lane[bot]")
 
 
+def test_activity_row_records_both_families() -> None:
+    assert cr_dispatch._activity_families(None) == {}
+    assert cr_dispatch._activity_families(
+        ReviewFamilies(author="claude", reviewers=("glm", "laguna")),
+    ) == {"author_family": "claude", "reviewer_family": "glm, laguna"}
+
+
 def test_activity_log_hands_both_families_to_the_store(monkeypatch) -> None:
     stored: dict = {}
     monkeypatch.setattr(activity_log, "put_check_verdict", lambda **kw: stored.update(kw))
