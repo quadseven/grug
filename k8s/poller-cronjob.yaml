@@ -83,6 +83,8 @@ spec:
                 # reviews use, so these mirror consumer-deployment.yaml.
                 - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: cloud}
                 - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
+                # Published terms read 2026-11-01: prompts are not used for training, data is
+                # retained 30 days for safety. _OPENCODE_GO_PRIVATE_SAFE_MODELS gates private code.
                 - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "beam-free"}
                 - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
                 # grug#1225: a listed backend is never called. Re-enable one by deleting
@@ -90,8 +92,8 @@ spec:
                 # grug#1269: OpenRouter's paid pool stays off. grug#1575: OpenCode Go is back
                 # on 2026-11-01, its allowance renewed.
                 # The cap counts paid Go calls per UTC day across every pod. 200 calls at
-                # 40k tokens is about 78% of a 27-day plan at most, so the shared key cannot
-                # be drained from here. Identical on all three Elder workloads.
+                # 40k tokens is about 78% of the plan over 27 days (doc prices, 2026-11-01);
+                # the shared key keeps the rest. Identical on all three Elder workloads.
                 - {name: GRUG_OPENCODE_GO_DAILY_CAP, value: "200"}
                 - {name: GRUG_DISABLED_BACKENDS, value: "openrouter:paid"}
                 # grug#1269: the gateway's free provider pool is a cloud tier after

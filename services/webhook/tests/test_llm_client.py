@@ -28,6 +28,13 @@ def _patch_keys(monkeypatch):
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
     # Module-level breaker state must not leak between tests.
+    # Retired names stand in as chain tiers here; test_opencode_go_return.py
+    # covers the real data-terms gate.
+    monkeypatch.setattr(
+        lc, "_OPENCODE_GO_PRIVATE_SAFE_MODELS",
+        lc._OPENCODE_GO_PRIVATE_SAFE_MODELS
+        | {"space-bunny-free", "longcat-2.5-preview-free", "mimo-v2.5", "gpt-5.6-luna"},
+    )
     monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
     monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
@@ -5019,6 +5026,7 @@ def test_deep_append_under_cloud_priority_answers_from_cloud_not_cave(monkeypatc
     """Operator decision 2026-09-26: the deep pass moves to the cloud chain.
     A healthy OpenCode Go answers it; the Cave reasoner is never called."""
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    _pin_deepseek_primary(monkeypatch)
     response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", return_value=response) as post:
@@ -5366,7 +5374,8 @@ def test_two_models_agreeing_on_no_findings_is_a_clean_review(monkeypatch, caplo
     agreement: accept it instead of walking the rest of the chain, which
     burned the staged budget and starved later cohorts."""
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
-    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    _pin_deepseek_primary(monkeypatch)
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "mimo-v2.5")
     with caplog.at_level("INFO"), patch.object(
         httpx, "post", side_effect=[_degenerate_response(), _degenerate_response()],
     ) as post:
@@ -5375,7 +5384,7 @@ def test_two_models_agreeing_on_no_findings_is_a_clean_review(monkeypatch, caplo
     assert out.kind == "reviewed"
     assert out.findings == ()
     assert post.call_count == 2  # no Poolside, no Cave
-    assert post.call_args_list[1].kwargs["json"]["model"] == "longcat-2.5-preview-free"
+    assert post.call_args_list[1].kwargs["json"]["model"] == "mimo-v2.5"
     assert any(r.getMessage() == "llm_cloud_empty_consensus" for r in caplog.records)
 
 
@@ -5732,9 +5741,10 @@ def test_primary_parse_failure_is_still_the_answer_with_a_fallback(monkeypatch) 
     assert calls[:2] == ["space-bunny-free", "deepseek-v4.1-flash"]
 
 
-def test_fallback_empty_answer_agrees_with_a_free_empty_answer(monkeypatch) -> None:
+def test_fallback_empty_answer_agrees_with_a_paid_empty_answer(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
-    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    _pin_deepseek_primary(monkeypatch)
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "mimo-v2.5")
     with patch.object(
         httpx, "post", side_effect=[_degenerate_response(), _degenerate_response()],
     ) as post:

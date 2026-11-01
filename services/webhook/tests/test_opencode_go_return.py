@@ -1,9 +1,9 @@
 """grug#1575: Elder is back on OpenCode Go, and Go cannot drain the plan.
 
 Paid Go calls stop at a daily cap shared by every pod, a spent or capped Go
-falls to the next tier without failing the review, and a dead backend never
-passes a review. Every test drives `review_diff`, or reads what the manifests
-ship, with the HTTP boundary faked."""
+falls to the next tier without failing the review, a dead backend never passes
+a review, and private code reaches only models with verified data terms. The
+HTTP boundary and the cap's store are faked."""
 from __future__ import annotations
 
 import json
@@ -93,10 +93,12 @@ def _finding() -> httpx.Response:
     })
 
 
-def _review(http: _Http, reserve: object):
+def _review(http: _Http, reserve: object, pr_context: dict | None = None):
     with patch.object(httpx, "post", side_effect=http), patch(_RESERVE, side_effect=reserve):
         return review_diff(
-            assemble_evidence([Hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar")]),
+            assemble_evidence(
+                [Hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar")], pr_context=pr_context,
+            ),
             installation_id=1,
         )
 
@@ -120,7 +122,11 @@ def test_at_the_daily_cap_no_paid_call_is_made_and_the_free_tier_answers(caplog)
 
 
 def test_the_cap_holds_every_pod_off_until_the_next_utc_day() -> None:
-    _review(_Http({_FREE_GO: _finding()}), _Counter(used=2))
+    with patch.object(lc.shared_benches, "publish") as publish:
+        _review(_Http({_FREE_GO: _finding()}), _Counter(used=2))
+    publish.assert_called_once_with(
+        "go", Backend.OPENCODE_GO.value, "", lc._next_utc_midnight(),
+    )
     assert not lc._opencode_go_available()
     assert lc._opencode_go_available(now=lc._next_utc_midnight() + 1)
     assert [t.model for t in lc._cloud_chain_tiers()] == [_FREE_GO, lc._POOLSIDE_MODEL]
@@ -175,20 +181,30 @@ def test_every_backend_dead_does_not_pass_the_review() -> None:
     assert not out.findings
 
 
-def _empty_on_a_large_cohort() -> httpx.Response:
-    return httpx.Response(200, json={
-        "choices": [{"message": {"content": '{"findings": []}', "role": "assistant"}}],
-        "model": "m",
-        "usage": {"prompt_tokens": 15_000, "completion_tokens": 7},
-    })
-
-
-def test_a_free_go_model_cannot_vote_a_pr_clean() -> None:
+@pytest.mark.parametrize("usage", [
+    {"prompt_tokens": 15_000, "completion_tokens": 7},
+    {"prompt_tokens": 33_000, "completion_tokens": 1792},
+    None,
+], ids=["short", "all-reasoning", "no-usage"])
+def test_a_free_go_empty_answer_is_never_a_clean_pass(usage) -> None:
     """Live 2026-11-01: Beam Free answered empty on a 33k-token diff that
-    DeepSeek found faults in. Its empty answer must not agree anything clean."""
-    http = _Http({_PAID: _empty_on_a_large_cohort(), _FREE_GO: _empty_on_a_large_cohort()})
-    out = _review(http, _Counter())
-    assert http.models[:2] == [_PAID, _FREE_GO]
+    DeepSeek found faults in, in 1792 reasoning tokens."""
+    body = {"choices": [{"message": {"content": '{"findings": []}', "role": "assistant"}}]}
+    if usage is not None:
+        body["usage"] = usage
+    http = _Http({_FREE_GO: httpx.Response(200, json=body)})
+    out = _review(http, _Counter(used=2))
+    assert http.models[0] == _FREE_GO
+    assert (out.error or "").startswith(lc._LOW_CONFIDENCE_PREFIX)
+
+
+def test_a_free_go_empty_answer_cannot_agree_with_the_paid_model() -> None:
+    def empty() -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": '{"findings": []}', "role": "assistant"}}],
+            "usage": {"prompt_tokens": 15_000, "completion_tokens": 7},
+        })
+    out = _review(_Http({_PAID: empty(), _FREE_GO: empty()}), _Counter())
     assert (out.error or "").startswith(lc._LOW_CONFIDENCE_PREFIX)
 
 
@@ -234,13 +250,33 @@ def test_every_workload_ships_the_same_daily_cap() -> None:
     assert int(caps.pop()) > 0
 
 
-def test_every_shipped_go_model_is_cheap_and_does_not_train_on_the_code() -> None:
-    """Kimi spent a month's allowance in hours on 2026-10-23; Muse and Iceman
-    Contributor train on prompts and Elder reads private repos; Longcat left
-    the catalogue."""
+def test_every_shipped_go_model_has_verified_data_terms() -> None:
     shipped = {
         *_shipped("GRUG_OPENCODE_GO_FALLBACK_MODEL").values(),
         lc._OPENCODE_GO_DEFAULT_MODEL,
     }
-    assert not {m for m in shipped if re.search(r"kimi|muse|contributor|longcat", m)}
-    assert shipped == {_PAID, _FREE_GO}
+    assert shipped <= lc._OPENCODE_GO_PRIVATE_SAFE_MODELS
+
+
+_PRIVATE = {"repo": "o/r", "pr_number": 1, "repo_private": True}
+_PUBLIC = {"repo": "o/r", "pr_number": 1, "repo_private": False}
+
+
+@pytest.mark.parametrize("off_list", ["muse-spark-1.3-contributor", "iceman-contributor-free"])
+@pytest.mark.parametrize("pr_context", [_PRIVATE, {"repo": "o/r", "pr_number": 1}, None],
+                         ids=["private", "visibility-unknown", "no-context"])
+def test_a_model_off_the_list_never_receives_a_private_diff(
+    monkeypatch, off_list, pr_context,
+) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", off_list)
+    http = _Http({_PAID: httpx.ConnectError("down"), _FREE_GO: _finding()})
+    _review(http, _Counter(), pr_context)
+    assert off_list not in http.models
+    assert http.models == [_PAID, _FREE_GO]
+
+
+def test_a_model_off_the_list_may_read_a_public_diff(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "kimi-k3")
+    http = _Http({_PAID: httpx.ConnectError("down"), "kimi-k3": _finding()})
+    _review(http, _Counter(), _PUBLIC)
+    assert http.models == [_PAID, "kimi-k3"]

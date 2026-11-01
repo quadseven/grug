@@ -1349,9 +1349,20 @@ _opencode_go_blocked_until = 0.0
 
 
 class OpencodeGoCircuitOpenError(httpx.RequestError):
-    """OpenCode Go is skipped: its usage-limit breaker is open. Subclasses
+    """OpenCode Go is skipped: its usage-limit breaker is open, its daily cap
+    is reached, or the cap's store cannot answer. Subclasses
     `httpx.RequestError` so every caller degrades exactly as it does for a
     transport failure."""
+
+
+# The Go models a private repo's code may reach, each read against OpenCode's
+# published terms on 2026-11-01. Check the terms before adding one. A model off
+# this list serves known-public repos only, so a training model can never see
+# private code. Unknown visibility counts as private.
+#   deepseek-v4.1-flash: not used for training, 0 days under a zero-retention
+#     agreement valid through 2026-11-30, renewed monthly.
+#   beam-free: not used for training, retained 30 days for safety.
+_OPENCODE_GO_PRIVATE_SAFE_MODELS = frozenset({"deepseek-v4.1-flash", "beam-free"})
 
 
 def _opencode_go_model_is_free(model: str) -> bool:
@@ -1776,6 +1787,14 @@ def _refuse_unusable_backend(config: BackendConfig) -> None:
     if not _backend_enabled(config.backend, config.model):
         raise BackendDisabledError(
             f"{config.backend.value} is switched off (GRUG_DISABLED_BACKENDS)"
+        )
+    if (
+        config.backend == Backend.OPENCODE_GO
+        and config.model not in _OPENCODE_GO_PRIVATE_SAFE_MODELS
+        and _spark_data_class_header() != "public"
+    ):
+        raise BackendDisabledError(
+            f"{config.model} has no verified data terms for private code"
         )
     if config.backend in _BENCH_CLOUD_BACKENDS and not _provider_available(
         config.backend, config.model,
@@ -6947,6 +6966,17 @@ def _empty_confirms_nothing(key: "tuple[Backend, str]") -> bool:
     return backend == Backend.FREE_POOL
 
 
+def _free_go_found_nothing(tier: BackendConfig, outcome: _ArmOutcome) -> bool:
+    """An empty answer from a free Go model is never a clean pass. The short-
+    answer check misses it: Beam Free spent 1792 output tokens, all reasoning,
+    on the empty answer above, and an answer with no usage is never flagged."""
+    return (
+        tier.backend == Backend.OPENCODE_GO
+        and _opencode_go_model_is_free(tier.model)
+        and not outcome.findings
+    )
+
+
 def _empty_answers_agree(
     first_empty: "tuple[Backend, str] | None",
     current: "tuple[Backend, str]",
@@ -7051,7 +7081,9 @@ def _try_cloud_primary(
         outcome = _run_review_arm(
             backend, messages, variant, pr_tags, cancel_event, config_override=tier,
         )
-        if outcome.kind == "success" and outcome.degenerate:
+        if outcome.kind == "success" and (
+            outcome.degenerate or _free_go_found_nothing(tier, outcome)
+        ):
             last_error = f"{backend.value}: degenerate empty review"
             key = (backend, tier.model)
             if _empty_answers_agree(first_empty, key, pr_context):

@@ -30,6 +30,13 @@ def _env(monkeypatch):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
+    # Retired names stand in as chain tiers here; test_opencode_go_return.py
+    # covers the real data-terms gate.
+    monkeypatch.setattr(
+        lc, "_OPENCODE_GO_PRIVATE_SAFE_MODELS",
+        lc._OPENCODE_GO_PRIVATE_SAFE_MODELS
+        | {"space-bunny-free", "longcat-2.5-preview-free", "mimo-v2.5"},
+    )
     monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
     monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
