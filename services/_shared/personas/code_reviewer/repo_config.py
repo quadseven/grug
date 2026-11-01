@@ -1,6 +1,6 @@
 """Optional in-repo `.grug.yaml` review configuration.
 
-Seven keys, all optional:
+Eight keys, all optional:
 
   ignore               list of path globs that are never reviewed
   path_instructions    list of {path: glob, instructions: text}; the text is
@@ -23,6 +23,8 @@ Seven keys, all optional:
                        critical finding still posts inline)
   elder_mute_locked_classes  list of finding classes that stay inline whatever
                        their precision
+  security_review_paths  list of path globs that replaces the default
+                       sensitive-path list of the quarantined security pass
 
 The caller reads the file from the PR BASE ref (never the head), so a PR
 cannot loosen its own review. This module is pure: it takes text and returns
@@ -46,7 +48,7 @@ _KNOWN_KEYS = frozenset(
     {
         "ignore", "path_instructions", "min_inline_severity", "skip_prs",
         "elder_mute_min_labeled", "elder_mute_below_precision",
-        "elder_mute_locked_classes",
+        "elder_mute_locked_classes", "security_review_paths",
     },
 )
 _SKIP_PRS_KEYS = ("authors", "labels", "title_patterns")
@@ -81,6 +83,8 @@ class RepoConfig:
     elder_mute_min_labeled: int = DEFAULT_MUTE_MIN_LABELED
     elder_mute_below_precision: float = DEFAULT_MUTE_BELOW_PRECISION
     elder_mute_locked_classes: tuple[str, ...] = ()
+    # None keeps the default list; an empty list turns the pass off here.
+    security_review_paths: tuple[str, ...] | None = None
 
 
 def _string_list(value: object, key: str, problems: list[str]) -> tuple[str, ...]:
@@ -171,6 +175,18 @@ def _mute_settings(
     return min_labeled, below, locked
 
 
+def _security_paths(
+    data: dict, problems: list[str],
+) -> tuple[str, ...] | None:
+    """A malformed list keeps the default list: a typo must not end a
+    security control the way a deliberate empty list does."""
+    if "security_review_paths" not in data:
+        return None
+    before = len(problems)
+    paths = _string_list(data["security_review_paths"], "security_review_paths", problems)
+    return None if len(problems) > before else paths
+
+
 def parse_repo_config(text: str | None) -> RepoConfig:
     """Parse `.grug.yaml` text. Never raises."""
     if text is None or not text.strip():
@@ -210,9 +226,10 @@ def parse_repo_config(text: str | None) -> RepoConfig:
             )
     skip = _skip_prs(data["skip_prs"], problems) if "skip_prs" in data else SkipPrs()
     min_labeled, below, locked = _mute_settings(data, problems)
+    security_paths = _security_paths(data, problems)
     return RepoConfig(
         ignore, instructions, floor, tuple(problems), skip,
-        min_labeled, below, locked,
+        min_labeled, below, locked, security_paths,
     )
 
 
