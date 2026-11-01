@@ -3034,6 +3034,14 @@ def _merge_lane_work(
     box the body claims (`lane_work.criteria_in_scope`). Dead-code findings
     follow the correctness-only scope the LLM's do."""
     body = str(pr_context.get("body") or "")
+    pr_title = pr_context.get("title")
+    if callable(pr_title):
+        pr_title = pr_title()
+    pr_title = str(pr_title or "")
+    linked_context = pr_context.get("linked_issue_context")
+    if callable(linked_context):
+        linked_context = linked_context()
+    linked_context = str(linked_context or "")
     found = lane_work_findings(
         diff_text=diff_text,
         hunks=hunks,
@@ -3041,14 +3049,10 @@ def _merge_lane_work(
         base_line_counts={
             path: len(text.splitlines()) for path, text in base_contents.items()
         },
-        boxes=rendered_criteria_with_state(
-            str(pr_context.get("linked_issue_context") or ""),
-        ),
-        pr_title=str(pr_context.get("title") or ""),
+        boxes=rendered_criteria_with_state(linked_context),
+        pr_title=pr_title,
         pr_body=body,
-        health_issues=rendered_health_issues(
-            str(pr_context.get("linked_issue_context") or ""),
-        ),
+        health_issues=rendered_health_issues(linked_context),
         criteria_judge=criteria_judge_for(pr_context),
     )
     if correctness_only:
@@ -3203,10 +3207,41 @@ def _full_pr_lane_work_inputs(
     return _LaneWorkInputs(diff_text, hunks, contents, base_contents)
 
 
+def _fetch_pr_title_and_body(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+) -> tuple[str, str] | None:
+    """Read PR title and body from GitHub at review time (#1457)."""
+    if not (installation_id and owner and repo_name and pull_number):
+        return None
+    try:
+        def _get(token: str) -> tuple[str, str]:
+            resp = httpx.get(
+                f"https://api.github.com/repos/{quote(owner, safe='')}/"
+                f"{quote(repo_name, safe='')}/pulls/{pull_number}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=DIFF_FETCH_TIMEOUT,
+            )
+            resp.raise_for_status()
+            body = resp.json() or {}
+            return str(body.get("title") or ""), str(body.get("body") or "")
+
+        return with_install_token_retry(installation_id, _get)
+    except Exception as e:  # noqa: BLE001 - review-time refresh never aborts review
+        log.info(
+            "code_review_pr_refresh_failed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        return None
+
+
 def _merge_lane_work_for_pass(
     evaluation: CodeReviewEvaluation, this_pass: _LaneWorkInputs,
     pr_context: PrContext, *, living_range: str, base_sha: str,
-    correctness_only: bool,
+    correctness_only: bool, action: str = "",
 ) -> CodeReviewEvaluation:
     """Merge the lane-work findings for one review pass. A full review
     judges the diff it reviewed; a living delta hides callers and the
@@ -3216,14 +3251,30 @@ def _merge_lane_work_for_pass(
     hunks, contents = this_pass.hunks, this_pass.file_contents
     owner, _, repo_name = str(pr_context.get("repo") or "").partition("/")
     pull_number = int(pr_context.get("pr_number") or 0)
+    installation_id = int(pr_context.get("installation_id") or 0)
     try:
         inputs: _LaneWorkInputs | None = this_pass
         if living_range:
             inputs = _full_pr_lane_work_inputs(
-                int(pr_context.get("installation_id") or 0), owner, repo_name,
+                installation_id, owner, repo_name,
                 pull_number, base_sha=base_sha,
                 head_sha=str(pr_context.get("head_sha") or ""),
                 known_contents=this_pass.file_contents,
+            )
+        if living_range or action in _RE_REVIEW_ACTIONS:
+            # Re-read PR title and linked issue criteria at review time (#1457):
+            # prevents carrying forward stale title or criteria from the first pass.
+            pr_details = _fetch_pr_title_and_body(
+                installation_id, owner, repo_name, pull_number,
+            )
+            if pr_details is not None:
+                cur_title, cur_body = pr_details
+                if cur_title:
+                    pr_context["title"] = cur_title
+                if cur_body:
+                    pr_context["body"] = cur_body
+            _attach_linked_issue_context(
+                pr_context, installation_id=installation_id, owner=owner, repo_name=repo_name,
             )
         if inputs is not None:
             hunks, contents = inputs.hunks, inputs.file_contents
@@ -4022,6 +4073,7 @@ def dispatch_code_review(
         _LaneWorkInputs(diff_text, parsed_hunks, file_contents, base_file_contents),
         pr_context, living_range=living_range, base_sha=base_sha,
         correctness_only=correctness_only,
+        action=action,
     )
 
     # Fetch review threads once for re-reviews (#1457): shared between the

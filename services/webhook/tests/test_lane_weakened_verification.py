@@ -239,6 +239,44 @@ def test_an_adjective_is_not_a_removal_ticket():
     assert f.severity == "high"
 
 
+def test_weakened_test_reads_pr_title_at_review_time_via_callable():
+    """#1457: scan_weakened_verification reads pr_title at review time via callable;
+    a removal it names is medium (not blocking)."""
+    (f_high,) = _scan(_DELETED_TWO, title=lambda: "Normal feature addition")
+    assert f_high.severity == "high"
+
+    (f_med,) = _scan(_DELETED_TWO, title=lambda: "Retire the reaction-only acknowledgment")
+    assert f_med.severity == "medium"
+
+
+def test_weakened_test_reads_criteria_at_review_time_via_callable():
+    """#1457: scan_weakened_verification reads criteria at review time via callable;
+    a removal they name is medium (not blocking)."""
+    crit_normal = (LinkedCriterion(9, 1, "Feature works normally"),)
+    (f_high,) = _scan(_DELETED_TWO, title="Feature title", criteria=lambda: crit_normal)
+    assert f_high.severity == "high"
+
+    crit_removal = (LinkedCriterion(9, 1, "Remove the reaction-only acknowledgment"),)
+    (f_med,) = _scan(_DELETED_TWO, title="Feature title", criteria=lambda: crit_removal)
+    assert f_med.severity == "medium"
+
+
+def test_lane_work_findings_evaluates_title_and_criteria_at_review_time():
+    """#1457: lane_work_findings evaluates review-time title and criteria callables."""
+    found = lane_work_findings(
+        diff_text=_DELETED_TWO,
+        hunks=parse_diff(_DELETED_TWO),
+        file_contents={},
+        base_line_counts={},
+        boxes=lambda: [(9, 1, "open", "Remove the reaction-only acknowledgment")],
+        pr_title=lambda: "Update tests",
+        pr_body="Closes #9",
+    )
+    wv_findings = [f for f in found if f.rule_name == "weakened-test"]
+    assert len(wv_findings) == 1
+    assert wv_findings[0].severity == "medium"
+
+
 def test_a_renamed_test_whose_body_stays_is_not_deleted():
     diff = _diff("tests/test_station.py", ("", [
         "-    def test_build_work_comes_first(self):",

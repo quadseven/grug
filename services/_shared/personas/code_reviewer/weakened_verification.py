@@ -45,7 +45,7 @@ Pure: file changes, hunks and PR text in; findings out.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from personas.code_reviewer.criteria_coverage import LinkedCriterion
@@ -658,12 +658,18 @@ def scan_weakened_verification(
     changes: Iterable[FileChange],
     hunks: tuple[DiffHunk, ...],
     *,
-    criteria: tuple[LinkedCriterion, ...],
-    pr_title: str,
+    criteria: tuple[LinkedCriterion, ...] | Callable[[], tuple[LinkedCriterion, ...]],
+    pr_title: str | Callable[[], str],
 ) -> tuple[Finding, ...]:
     """`weakened-test` and `removed-verification-layer` findings, or none
-    when the diff is past `MAX_DIFF_LINES` (not evaluated)."""
-    ticket = "\n".join([pr_title or "", *(c.text for c in criteria)])
+    when the diff is past `MAX_DIFF_LINES` (not evaluated).
+
+    Reads `pr_title` and `criteria` at review time (invoking callables if
+    provided) to avoid relying on stale cached values (#1457).
+    """
+    resolved_title = pr_title() if callable(pr_title) else pr_title
+    resolved_criteria = criteria() if callable(criteria) else criteria
+    ticket = "\n".join([resolved_title or "", *(c.text for c in resolved_criteria)])
     by_file: dict[str, list[DiffHunk]] = {}
     for hunk in hunks:
         by_file.setdefault(hunk.file_path, []).append(hunk)
