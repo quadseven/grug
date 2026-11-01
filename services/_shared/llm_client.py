@@ -317,10 +317,12 @@ _OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 # tokens, 0% timeouts, 3-4s median, about $0.0078 per 40k-token review. OpenCode
 # Go limits are monthly dollars per model ($60 on the $10 plan), so that is
 # ~7.7k reviews a month at 40k tokens and ~22k at 10k, against ~3k real ones.
-# Behind it: `GRUG_OPENCODE_GO_SECOND_MODEL=mimo-v2.5` (86% at 40k, no
-# timeouts, a different family for the second opinion) and the free
-# `GRUG_OPENCODE_GO_FALLBACK_MODEL=longcat-2.5-preview-free` (15-30%
-# timeouts). Kimi, Longcat-2.0, GLM-5.2 and Hy3 timed out or errored on 20-75%
+# Behind it: the free `GRUG_OPENCODE_GO_FALLBACK_MODEL=beam-free` (10s on 33k
+# tokens at low effort, unranked on quality). `mimo-v2.5` is retired (HTTP 410)
+# and `mimo-v2.6-flash` took 34s on 8k tokens and timed out at 70s on 33k
+# (2026-11-01), so `GRUG_OPENCODE_GO_SECOND_MODEL` stays unset. Muse and Iceman
+# Contributor train on prompts: never here, Elder reads private repos.
+# Kimi, Longcat-2.0, GLM-5.2 and Hy3 timed out or errored on 20-75%
 # of calls under the real prompt. History: space-bunny-free held the slot until
 # its promotion ended ~05:46 UTC 2026-10-06 (HTTP 400 "Model is unavailable");
 # its low-effort body stays in `_opencode_go_extra_body` in case it returns.
@@ -1069,7 +1071,7 @@ def _opencode_go_extra_body(model: str, wire: str) -> dict:
     """
     if wire != "chat":
         return {}
-    if model.startswith("space-bunny"):
+    if model.startswith(("space-bunny", "beam")):
         # Rejects reasoning_effort none and thinking.disabled (HTTP 400), so
         # low is the floor. Default effort reasons until max_tokens.
         effort = os.getenv("GRUG_OPENCODE_GO_REASONING_EFFORT", "low").strip().lower()
@@ -1288,8 +1290,7 @@ def _opencode_go_extra_model_config(model: str, timeout_seconds: float) -> Backe
 def _opencode_go_second_chain_config() -> "BackendConfig | None":
     """A second OpenCode Go model as tier 2, or None when unset.
 
-    `GRUG_OPENCODE_GO_SECOND_MODEL` names it (production: the free,
-    unlimited `longcat-2.5-preview-free`, 0-day retention). It is a
+    `GRUG_OPENCODE_GO_SECOND_MODEL` names it (unset in production). It is a
     different model on the same chat endpoint, so a short empty answer from
     the primary gets a real second opinion before the chain walks on to
     slower tiers. Measured 2026-10-05: 6/6 planted bugs caught, honest
@@ -1305,11 +1306,10 @@ def _opencode_go_second_chain_config() -> "BackendConfig | None":
 
 
 def _opencode_go_fallback_chain_config() -> "BackendConfig | None":
-    """A PAID OpenCode Go model right after the free tiers, or None when
-    `GRUG_OPENCODE_GO_FALLBACK_MODEL` is unset. The free promotions are
-    limited-time; when they end this tier keeps Elder on a cheap, reliable
-    model instead of walking on to slower tiers. Unlike the free tiers it is
-    gated by the usage-limit breaker."""
+    """The OpenCode Go model behind the primary, or None when
+    `GRUG_OPENCODE_GO_FALLBACK_MODEL` is unset. Production names a free model,
+    which keeps answering once the paid models are capped or spent. A paid
+    model here is gated by the daily cap and the usage-limit breaker."""
     model = os.getenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "").strip()
     if not model:
         return None
@@ -1395,9 +1395,24 @@ def _is_opencode_go_usage_limit(resp: httpx.Response) -> bool:
     )
 
 
+def _log_opencode_go_usage(model: str, resp: httpx.Response) -> None:
+    """What the call cost, from the `usage.opencode` block on each answer."""
+    try:
+        spent = resp.json()["usage"]["opencode"]
+        log.info(
+            "opencode_go_usage",
+            extra={
+                "model": model,
+                "allowance": spent["allowance"],
+                "billing_source": spent.get("billing_source", ""),
+            },
+        )
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return
+
+
 def _note_opencode_go_response(resp: httpx.Response) -> None:
     """Open the breaker on a usage-limit 429; ordinary overload 429s pass."""
-    global _opencode_go_blocked_until
     if not _is_opencode_go_usage_limit(resp):
         return
     seconds = _retry_after_seconds(resp)
@@ -1407,14 +1422,73 @@ def _note_opencode_go_response(resp: httpx.Response) -> None:
         limit_name = str(metadata.get("limitName", ""))
     except (ValueError, AttributeError, json.JSONDecodeError):
         pass
-    with _opencode_go_breaker_lock:
-        _opencode_go_blocked_until = max(_opencode_go_blocked_until, time.time() + seconds)
-        until = _opencode_go_blocked_until
-    shared_benches.publish("go", Backend.OPENCODE_GO.value, "", until)
+    _hold_opencode_go_until(time.time() + seconds)
     log.warning(
         "opencode_go_circuit_open",
         extra={"block_seconds": seconds, "limit_name": limit_name},
     )
+
+
+# OpenCode Go daily cap (grug#1575). The breaker above reacts only after the
+# plan is spent, and the key is shared with other work. The 5-hour, weekly and
+# monthly allowances are percentages of each model's monthly dollar limit, so
+# a fixed count of paid calls per UTC day bounds a month's spend.
+# `GRUG_OPENCODE_GO_DAILY_CAP` is that count, shared by every pod through
+# `pg_rate_limit_store`. Unset means no cap; a garbled value admits nothing.
+# At the cap the breaker holds Go until the next UTC day. A store error refuses
+# the call without a hold: no counter, no bound, but no lost day either. Free
+# models spend no allowance and are never counted.
+_OPENCODE_GO_CAP_LIMITER = "opencode_go_paid"
+
+
+def _opencode_go_daily_cap() -> int | None:
+    raw = os.getenv("GRUG_OPENCODE_GO_DAILY_CAP", "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        log.warning("grug_opencode_go_daily_cap_invalid", extra={"value": raw})
+        return 0
+
+
+def _next_utc_midnight() -> float:
+    return (math.floor(time.time() / 86400) + 1) * 86400.0
+
+
+def _hold_opencode_go_until(until: float) -> None:
+    global _opencode_go_blocked_until
+    with _opencode_go_breaker_lock:
+        _opencode_go_blocked_until = max(_opencode_go_blocked_until, until)
+    shared_benches.publish("go", Backend.OPENCODE_GO.value, "", until)
+
+
+def _reserve_opencode_go_call(config: BackendConfig) -> None:
+    """`_call_backend`'s daily cap: count one paid Go call, or raise before
+    any network call, so the caller moves to its next tier."""
+    if config.backend != Backend.OPENCODE_GO or _opencode_go_model_is_free(config.model):
+        return
+    cap = _opencode_go_daily_cap()
+    if cap is None:
+        return
+    try:
+        from adapters.pg_rate_limit_store import try_reserve_slot  # late: pg-backed
+
+        # The minute window never binds first: it fills only as the day does.
+        result = try_reserve_slot(
+            name=_OPENCODE_GO_CAP_LIMITER, minute_limit=max(cap, 1), day_limit=cap,
+        )
+    except Exception as e:  # noqa: BLE001 - fail CLOSED, see the comment above
+        log.warning("opencode_go_daily_cap_store_error", extra={"kind": type(e).__name__})
+        raise OpencodeGoCircuitOpenError("opencode Go daily cap: store unavailable") from e
+    if result.admitted:
+        return
+    _hold_opencode_go_until(_next_utc_midnight())
+    log.warning(
+        "opencode_go_daily_cap_reached",
+        extra={"cap": cap, "day_count": result.day_count},
+    )
+    raise OpencodeGoCircuitOpenError("opencode Go daily cap reached")
 
 
 # Per-model bench. A withdrawn model (an ended free promotion, a retired
@@ -2873,6 +2947,7 @@ def _call_backend(
                 f"{outcome.minute_limit}, day={outcome.day_count}/{outcome.day_limit}) "
                 f"for model {config.model!r}"
             )
+    _reserve_opencode_go_call(config)
     try:
         key = config.key_loader()
     except Exception as e:
@@ -2904,6 +2979,7 @@ def _call_backend(
             config, body, headers, transport_attempts, cancel_event, deadline,
         )
     if config.backend == Backend.OPENCODE_GO:
+        _log_opencode_go_usage(config.model, resp)
         _note_opencode_go_response(resp)
     _note_provider_response(config, resp)
     _note_model_response(config, resp)
@@ -6863,6 +6939,10 @@ def _empty_confirms_nothing(key: "tuple[Backend, str]") -> bool:
     only at the second, so two lazy answers passed PRs as clean."""
     backend, model = key
     if backend == Backend.OPENROUTER and is_free_tier_model(model):
+        return True
+    # Go's free models are unranked on review quality (grug#1561); Beam Free
+    # answered empty on a 33k-token diff DeepSeek found faults in (2026-11-01).
+    if backend == Backend.OPENCODE_GO and _opencode_go_model_is_free(model):
         return True
     return backend == Backend.FREE_POOL
 

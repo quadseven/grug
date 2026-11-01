@@ -131,19 +131,22 @@ def _shipped_env(name: str) -> str:
     return found.pop()
 
 
-def test_the_shipped_chain_is_free_cloud_tiers_only_then_the_cave(monkeypatch) -> None:
-    """grug#1269: the operator wants the free cloud models used first.
-    OpenRouter's free pool leads, then Poolside, then the gateway's free
-    provider pool, and only then the Cave. Nothing paid can be called:
-    OpenCode Go is off and OpenRouter's paid pool is off."""
+def test_the_shipped_chain_leads_with_go_then_the_free_cloud_tiers(monkeypatch) -> None:
+    """grug#1575: OpenCode Go leads again, then the free cloud tiers, and only
+    then the Cave. OpenRouter's paid pool stays off."""
     monkeypatch.setenv("GRUG_DISABLED_BACKENDS", _shipped_env("GRUG_DISABLED_BACKENDS"))
     monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", _shipped_env("GRUG_CLOUD_FREE_POOL"))
+    monkeypatch.setenv(
+        "GRUG_OPENCODE_GO_FALLBACK_MODEL", _shipped_env("GRUG_OPENCODE_GO_FALLBACK_MODEL"),
+    )
+    monkeypatch.delenv("GRUG_OPENCODE_GO_SECOND_MODEL")
     assert [(t.backend, t.model) for t in lc._cloud_chain_tiers()] == [
+        (Backend.OPENCODE_GO, "deepseek-v4.1-flash"),
+        (Backend.OPENCODE_GO, "beam-free"),
         (Backend.OPENROUTER, _FREE),
         (Backend.POOLSIDE, lc._POOLSIDE_MODEL),
         (Backend.FREE_POOL, "free-pool"),
     ]
-    assert not lc._backend_enabled(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
     assert not lc._backend_enabled(Backend.OPENROUTER, "anthropic/claude-opus-4.7")
     assert lc._backend_enabled(Backend.OPENROUTER, _FREE)
 

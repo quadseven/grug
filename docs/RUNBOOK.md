@@ -1029,9 +1029,16 @@ comma-separated names (`opencode-go`, `openrouter`, `poolside`), each
 optionally narrowed to one pool (`openrouter:free`, `openrouter:paid`). The
 review chain, the overload fallback, the judge and Teller / ask / learn all
 skip a listed backend. To re-enable one, delete its entry from that line and
-let the deploy roll it out. Since 2026-10-17 the deployed value is
-`opencode-go,openrouter` (grug#1225). An entry that names no known backend or
-pool logs `grug_disabled_backends_unknown_entry` and disables nothing.
+let the deploy roll it out. Since 2026-11-01 the deployed value is
+`openrouter:paid`; OpenCode Go is back on (grug#1575, after grug#1225). An
+entry that names no known backend or pool logs
+`grug_disabled_backends_unknown_entry` and disables nothing.
+
+`GRUG_OPENCODE_GO_DAILY_CAP` bounds paid OpenCode Go calls per UTC day across
+every pod, counted in `grug_kv`. At the cap grug logs
+`opencode_go_daily_cap_reached` and holds paid Go until the next UTC day, and
+the review moves to the next tier. Free Go models are not counted. Unset means
+no cap; a value that is not a number admits no paid call.
 
 Without the switch, the provider breaker limits the waste. A 401, a 402, or a
 refusal whose body says a limit is spent (`total limit`, credits,
