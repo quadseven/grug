@@ -4130,13 +4130,15 @@ def dispatch_code_review(
         )
 
     # Filter lane-work findings that match resolved or dismissed Elder threads
-    # (#1457): prevents re-raising weakened-test findings on re-reviews when
-    # the thread was already resolved by a human.
+    # (#1457, #1582): prevents re-raising weakened-test findings on re-reviews
+    # when the thread was resolved by another maintainer. A resolve by the PR
+    # author or an App must not hide the finding.
     if review_threads is not None:
         filtered = carry_forward.filter_findings_against_resolved_threads(
             evaluation.findings,
             installation_id, owner, repo_name, pull_number,
             threads=review_threads,
+            pr_author=author_login,
         )
         evaluation = with_findings(evaluation, filtered)
 

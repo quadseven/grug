@@ -161,14 +161,86 @@ def list_threads(
         return None
 
 
+_KNOWN_SECURITY_RULES = frozenset({
+    "cleartext-secret-log",
+    "exposed-secret",
+    "iac-misconfig",
+    "lint-security",
+})
+
+
+def _is_security_or_sast(finding: Finding) -> bool:
+    """True when the finding is in the security category or comes from a SAST rule."""
+    if getattr(finding, "category", None) == "security":
+        return True
+    rule = getattr(finding, "rule_name", "") or ""
+    if rule in _KNOWN_SECURITY_RULES:
+        return True
+    return bool(rule.startswith("grug-") or "security" in rule or "sast" in rule)
+
+
+def _normalize_login(login: str | None) -> str:
+    """Normalize a GitHub login for comparison by stripping [bot] and lowercasing."""
+    if not login:
+        return ""
+    return str(login).removesuffix("[bot]").strip().lower()
+
+
+def _is_app_actor(actor: dict | str | None) -> bool:
+    """True when the actor is a GitHub App or Bot."""
+    if not actor:
+        return False
+    if isinstance(actor, dict):
+        typename = str(actor.get("__typename") or actor.get("type") or "").strip().lower()
+        if typename == "bot":
+            return True
+        login = str(actor.get("login") or "")
+    else:
+        login = str(actor)
+    login_clean = login.strip().lower()
+    return bool(login_clean.endswith("[bot]") or is_grug(login))
+
+
+def _is_pr_author(actor: dict | str | None, pr_author: str | None) -> bool:
+    """True when the actor matches the PR author."""
+    if not pr_author or not actor:
+        return False
+    actor_login = actor.get("login") if isinstance(actor, dict) else actor
+    norm_actor = _normalize_login(str(actor_login or ""))
+    norm_author = _normalize_login(pr_author)
+    return bool(norm_actor and norm_actor == norm_author)
+
+
+def _thread_resolver_counts(thread: dict, pr_author: str | None = None) -> bool:
+    """True when the thread was resolved by a valid maintainer (not author, not App).
+
+    A resolve by the PR author or an App must never hide a finding on re-review (#1582).
+    If resolvedBy is not provided on a resolved thread, it is treated as a valid
+    maintainer resolve for backwards compatibility with test fixtures.
+    """
+    if not _thread_is_resolved(thread):
+        return False
+    resolver = thread.get("resolvedBy")
+    if not resolver:
+        return True
+    if _is_pr_author(resolver, pr_author):
+        return False
+    if _is_app_actor(resolver):
+        return False
+    return True
+
+
+def _thread_is_dismissed(thread: dict) -> bool:
+    """True when the first comment has been dismissed via living review."""
+    first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
+    return living_review.parse_state(first.get("body") or "") == living_review.DISMISSED
+
+
 def _thread_is_resolved_or_dismissed(thread: dict) -> bool:
     """True when the thread is resolved (by a person) or dismissed (living review)."""
     if _thread_is_resolved(thread):
         return True
-    first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
-    if living_review.parse_state(first.get("body") or "") == living_review.DISMISSED:
-        return True
-    return False
+    return _thread_is_dismissed(thread)
 
 
 def _elder_thread_rule_and_line(thread: dict) -> tuple[str, str, int] | None:
@@ -221,15 +293,21 @@ def filter_findings_against_resolved_threads(
     installation_id: int, owner: str, repo: str, pull_number: int,
     *,
     threads: list[dict] | None = None,
+    pr_author: str | None = None,
 ) -> tuple[Finding, ...]:
     """Remove findings that match resolved or dismissed Elder threads.
 
     A finding matches a thread when they share the same rule, file, and
     the finding's line is within `_NEARBY_LINES` of the thread's anchor line.
-    This prevents re-raising findings that a human has already addressed,
-    unless the code it points at changed (`thread.isOutdated`): then the
-    finding is re-raised and its message explains what changed since the
+    This prevents re-raising findings that a human maintainer has already
+    addressed, unless the code it points at changed (`thread.isOutdated`): then
+    the finding is re-raised and its message explains what changed since the
     earlier answer (#1457).
+
+    A thread resolved by the PR author or an App does not hide a matching
+    finding on re-review (#1582). A security or SAST finding is never dropped
+    by a thread resolve alone: only code changes or maintainer dismissal
+    (living review) can clear it.
 
     If `threads` is provided, it is used instead of fetching a new listing.
     """
@@ -237,33 +315,62 @@ def filter_findings_against_resolved_threads(
         threads = list_threads(installation_id, owner, repo, pull_number)
     if threads is None:
         return findings
+
+    dismissed_unchanged: list[tuple[str, str, int]] = []
     resolved_unchanged: list[tuple[str, str, int]] = []
     resolved_outdated: list[tuple[str, str, int, str | None]] = []
+
     for t in threads:
-        if not _thread_is_resolved_or_dismissed(t):
-            continue
         owned = _elder_thread_rule_and_line(t)
         if owned is None:
             continue
         rule, path, line = owned
+
+        if _thread_is_dismissed(t):
+            dismissed_unchanged.append((rule, path, line))
+            continue
+
+        if not _thread_resolver_counts(t, pr_author=pr_author):
+            continue
+
         if t.get("isOutdated"):
             resolved_outdated.append((rule, path, line, _earlier_answer(t)))
         else:
             resolved_unchanged.append((rule, path, line))
-    if not resolved_unchanged and not resolved_outdated:
+
+    if not dismissed_unchanged and not resolved_unchanged and not resolved_outdated:
         return findings
+
     out: list[Finding] = []
     for f in findings:
+        # A finding dismissed via living review was evaluated by a maintainer
+        # as a false positive (#1187).
+        if any(
+            f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
+            for rule, path, line in dismissed_unchanged
+        ):
+            continue
+
         # A deferred-ruff finding was measured at this head, and a resolved thread
         # is not evidence of a fix (#1477).
         if f.rule_name == deferred_ruff.RULE:
             out.append(f)
             continue
+
+        # A security or SAST finding was measured at this head; a thread resolve
+        # alone is not evidence of a fix and must never hide the finding on
+        # re-review (#1582). Only code changes or maintainer dismissal (living
+        # review) clear it.
+        if _is_security_or_sast(f):
+            out.append(f)
+            continue
+
         if any(
             f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
             for rule, path, line in resolved_unchanged
         ):
             continue
+
         matching_outdated = [
             ans for rule, path, line, ans in resolved_outdated
             if f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES

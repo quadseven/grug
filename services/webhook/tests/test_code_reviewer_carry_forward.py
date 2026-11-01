@@ -138,7 +138,7 @@ def test_reraised_finding_is_not_double_counted():
 
 def _thread_for_filter(*, resolved=False, dismissed=False, outdated=False,
                        rule="weakened-test", path="tests/test_foo.py", line=20,
-                       author="grug-tribe", reply=None):
+                       author="grug-tribe", reply=None, resolved_by=None):
     """Thread helper for filter tests."""
     from personas.code_reviewer import living_review as lr
     nodes = [_comment(severity="🔥 high", rule=rule, path=path, line=line, author=author)]
@@ -153,6 +153,8 @@ def _thread_for_filter(*, resolved=False, dismissed=False, outdated=False,
         "id": "T1", "isResolved": resolved, "isOutdated": outdated,
         "comments": {"totalCount": len(nodes), "nodes": nodes},
     }
+    if resolved_by is not None:
+        t["resolvedBy"] = resolved_by
     if dismissed:
         root = t["comments"]["nodes"][0]
         root["body"] = lr.render(root["body"], lr.DISMISSED)
@@ -280,6 +282,96 @@ def test_finding_resolved_with_reply_is_not_raised_unless_code_changed():
     )
     assert reraised.rule_name == "weakened-test"
     assert "changed since earlier answer" in reraised.message
+
+
+def test_thread_resolved_by_pr_author_does_not_hide_finding():
+    """#1582: A thread resolved by the PR author must not hide the matching finding."""
+    thread = _thread_for_filter(
+        resolved=True, resolved_by={"login": "alice"}, rule="weakened-test", line=20,
+    )
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
+    assert filtered == (finding,)
+
+
+@pytest.mark.parametrize("bot_resolver", [
+    {"login": "loom-lanes[bot]"},
+    {"login": "some-agent[bot]"},
+    {"login": "loom-brain", "__typename": "Bot"},
+    {"login": "grug-tribe"},
+])
+def test_thread_resolved_by_app_does_not_hide_finding(bot_resolver):
+    """#1582: A thread resolved by an App/Bot must not hide the matching finding."""
+    thread = _thread_for_filter(
+        resolved=True, resolved_by=bot_resolver, rule="weakened-test", line=20,
+    )
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
+    assert filtered == (finding,)
+
+
+def test_thread_resolved_by_another_maintainer_hides_finding():
+    """#1582: A thread resolved by another maintainer behaves as it does today (hidden)."""
+    thread = _thread_for_filter(
+        resolved=True, resolved_by={"login": "bob-maintainer"}, rule="weakened-test", line=20,
+    )
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
+    assert filtered == ()
+
+
+def test_seeded_security_finding_is_never_dropped_by_resolved_thread():
+    """#1582: A seeded security/SAST finding is never dropped by a thread resolve alone,
+    even if resolved by another maintainer. A thread resolve is not evidence of a fix."""
+    sec_finding = Finding(
+        file="services/auth.py", line=42, severity="high",
+        rule_name="cleartext-secret-log",
+        message="Logging plaintext token", suggestion=None,
+        category="security",
+    )
+    # Even if another maintainer resolved the thread:
+    thread_maintainer = _thread_for_filter(
+        resolved=True, resolved_by={"login": "bob-maintainer"},
+        rule="cleartext-secret-log", path="services/auth.py", line=42,
+    )
+    filtered = cf.filter_findings_against_resolved_threads(
+        (sec_finding,), 1, "o", "r", 2, threads=[thread_maintainer], pr_author="alice",
+    )
+    assert filtered == (sec_finding,)
+
+    # If resolved by PR author or App:
+    thread_author = _thread_for_filter(
+        resolved=True, resolved_by={"login": "alice"},
+        rule="cleartext-secret-log", path="services/auth.py", line=42,
+    )
+    filtered_author = cf.filter_findings_against_resolved_threads(
+        (sec_finding,), 1, "o", "r", 2, threads=[thread_author], pr_author="alice",
+    )
+    assert filtered_author == (sec_finding,)
+
+
+def test_seeded_security_finding_dismissed_via_living_review_is_dropped():
+    """#1582: A seeded security finding dismissed via living review (thumbs-down) is
+    dropped as a maintainer-confirmed false positive."""
+    sec_finding = Finding(
+        file="services/auth.py", line=42, severity="high",
+        rule_name="cleartext-secret-log",
+        message="Logging plaintext token", suggestion=None,
+        category="security",
+    )
+    thread_dismissed = _thread_for_filter(
+        dismissed=True, rule="cleartext-secret-log", path="services/auth.py", line=42,
+    )
+    filtered = cf.filter_findings_against_resolved_threads(
+        (sec_finding,), 1, "o", "r", 2, threads=[thread_dismissed], pr_author="alice",
+    )
+    assert filtered == ()
 
 
 # --- verdict plumbing -----------------------------------------------------
