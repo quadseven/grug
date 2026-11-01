@@ -82,6 +82,7 @@ from personas.code_reviewer.dedup import (
     dedup_findings, finding_key, parse_rule, rule_marker,
 )
 from personas.code_reviewer.diff_parser import (
+    added_lines,
     DiffHunk, DiffParseError, file_changes, is_tree_copy_candidate, new_file_blob_ids,
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
@@ -151,6 +152,9 @@ from personas.code_reviewer.judge import (
 )
 from personas.code_reviewer.intent_filter import (
     filter_intent_mismatch_findings, scope_intent_mismatch_to_claimed_boxes,
+)
+from personas.code_reviewer.comment_budget import (
+    budget_enabled, drip_fed, held_lines, is_model_blocking, split_for_budget,
 )
 from personas.code_reviewer.quarantine import (
     UNAVAILABLE_NOTE as QUARANTINE_UNAVAILABLE_NOTE,
@@ -2038,6 +2042,7 @@ def _review_stack_body(
     docstring_skips: tuple[tuple[str, str], ...] = (),
     linked_issues: tuple[int, ...] = (),
     muted: dict[str, ClassPrecision] | None = None,
+    held_note: str = "",
 ) -> str:
     """PR-timeline review stack comment (Markings v2 / FLINT-style shell).
 
@@ -2111,6 +2116,7 @@ def _review_stack_body(
     # line after a table row is swallowed into the table.
     detail = "\n\n".join(p for p in [
         table,
+        held_note,
         _muted_lines(findings, muted),
         _stack_detail_lines(
             review_phase, living_range, suppressed_count, head_sha, base_sha,
@@ -2400,6 +2406,7 @@ def build_review_result(
     file_contents: dict[str, str] | None = None,
     persona: str = "elder",
     muted: dict[str, ClassPrecision] | None = None,
+    held_back: frozenset[str] = frozenset(),
 ) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
     """Build the ReviewResult, or (None, ()) if nothing NEW to post.
 
@@ -2450,6 +2457,12 @@ def build_review_result(
         new_findings = tuple(
             f for f in new_findings
             if f.severity in ("high", "critical") or f.rule_name not in muted
+        )
+    if held_back:
+        # #1570: over-budget findings stay in the summary and on the board.
+        new_findings = tuple(
+            f for f in new_findings
+            if finding_key(f.file, f.line, f.rule_name) not in held_back
         )
     if not new_findings:
         return None, ()
@@ -3462,6 +3475,7 @@ def dispatch_code_review(
     # full PR base..head. Best-effort: store blips fall back to full review.
     living_prior_sha = ""
     living_range = ""
+    prior_review_head = ""
     # #845: set when the stored baseline turned out not to be an ancestor
     # of head (rewritten history) - the delta was rejected and the full PR
     # diff reviewed instead. Reported in the check-run summary, not silent.
@@ -3474,6 +3488,7 @@ def dispatch_code_review(
             repo=f"{owner}/{repo_name}",
             pr_number=pull_number,
         )
+        prior_review_head = prior or ""
         if prior and prior != head_sha:
             living_prior_sha = prior
             living_range = f"{prior[:8]}..{head_sha[:8]}"
@@ -4179,6 +4194,34 @@ def dispatch_code_review(
         _muted_classes_for(f"{owner}/{repo_name}", repo_config)
         if evaluation.findings else {}
     )
+    # On a re-review (synchronize/reopened), dedup findings already
+    # commented on unchanged lines so the PR isn't flooded with
+    # duplicate inline comments on every push (#189). On the first pass
+    # (opened/ready_for_review) there are no prior Grug comments, so
+    # skip the fetch entirely. The comment budget reads the same keys
+    # before publishing, and a rerun needs them too.
+    prior_keys: frozenset[str] = frozenset()
+    dedup_degraded = False
+    budget_on = budget_enabled() and bool(evaluation.findings)
+    prior_keys_read = False
+    if budget_on and action in {"synchronize", "reopened", "review", "rerun"}:
+        prior_keys, dedup_degraded = prior_finding_keys(
+            installation_id, owner, repo_name, pull_number,
+        )
+        prior_keys_read = not dedup_degraded
+    budget = _BudgetOutcome()
+    if budget_on:
+        budget = _plan_comment_budget(
+            evaluation, prior_keys=prior_keys,
+            changed_lines=_round_changed_lines(
+                hunks, prior_review_head=prior_review_head, head_sha=head_sha,
+                delta_reviewed=bool(living_range), keys_known=prior_keys_read,
+            ),
+            open_threads=review_threads or [],
+            repo_config=repo_config,
+            confidence=_judge_confidence(graded_findings, judge_verdicts),
+            pr=f"{owner}/{repo_name}#{pull_number}",
+        )
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
     outcome = plan_publish(
@@ -4211,6 +4254,7 @@ def dispatch_code_review(
             "ignores or explicitly selects those rules for the affected paths."
         )
     summary += _analyzer_skip_note(analyzer_skips)
+    summary += f"\n\n{budget.note}" if budget.note else ""
     summary += config_note
     summary += deletion_note
     summary += _linked_issue_summary_note(
@@ -4266,14 +4310,7 @@ def dispatch_code_review(
 
     review_publish_failed = False
     review_publish_rejected = False
-    # On a re-review (synchronize/reopened), dedup findings already
-    # commented on unchanged lines so the PR isn't flooded with
-    # duplicate inline comments on every push (#189). On the first pass
-    # (opened/ready_for_review) there are no prior Grug comments, so
-    # skip the fetch entirely.
-    prior_keys: frozenset[str] = frozenset()
-    dedup_degraded = False
-    if action in {"synchronize", "reopened", "review"}:
+    if not budget_on and action in {"synchronize", "reopened", "review"}:
         prior_keys, dedup_degraded = prior_finding_keys(
             installation_id, owner, repo_name, pull_number,
         )
@@ -4288,7 +4325,7 @@ def dispatch_code_review(
     review_result, posted_findings = build_review_result(
         evaluation, head_sha=head_sha, event=event, prior_keys=prior_keys,
         precedent_notes=precedent_notes, repo_config=repo_config,
-        file_contents=file_contents, muted=muted,
+        file_contents=file_contents, muted=muted, held_back=budget.held_keys,
     )
     review_resp: dict[str, Any] | None = None
     if review_result is not None:
@@ -4398,6 +4435,7 @@ def dispatch_code_review(
                 **_docstring_offer(diff_text, file_contents),
                 linked_issues=pinned_issues,
                 muted=muted,
+                held_note=budget.note,
             )
             with_install_token_retry(
                 installation_id,
@@ -4494,6 +4532,7 @@ def dispatch_code_review(
         result in {"pass", "fail", "skipped"}
         and not check_publish_failed
         and evaluation.degraded_reason in (None, "", "no_diff")
+        and not budget.keep_baseline
     ):
         try:
             from adapters.install_store import put_elder_last_reviewed
@@ -4712,6 +4751,112 @@ def _adjudication_calls(response: LlmReviewResponse) -> int:
     return (
         ceil(len(response.findings) / JUDGE_BATCH_SIZE)
         + ceil(blocking / JUDGE_BATCH_SIZE)
+    )
+
+
+@dataclass(frozen=True)
+class _BudgetOutcome:
+    held_keys: frozenset[str] = frozenset()
+    note: str = ""
+    # A held blocking finding has no thread, so the next push must see it.
+    keep_baseline: bool = False
+
+
+def _deep_held_keys(
+    novel: tuple[Finding, ...],
+    combined_eval: CodeReviewEvaluation,
+    prior_keys: frozenset[str],
+    repo_config: RepoConfig | None,
+) -> frozenset[str]:
+    """The deep arm's share of the budget: what tier-1 and earlier rounds
+    already spent comes off the cap (#1570). Its findings show on the board."""
+    if not budget_enabled():
+        return frozenset()
+    spent = sum(
+        1 for f in combined_eval.findings
+        if is_model_blocking(f)
+        and finding_key(f.file, f.line, f.rule_name) in prior_keys
+    )
+    split = split_for_budget(
+        novel, cap=(repo_config or RepoConfig()).elder_blocking_cap,
+        open_blocking=spent, confidence={},
+    )
+    return frozenset(finding_key(f.file, f.line, f.rule_name) for f in split.held)
+
+
+def _judge_confidence(
+    findings: tuple[Finding, ...], verdicts: tuple[Any, ...],
+) -> dict[str, tuple[bool, float]]:
+    """The plain judge's view of each graded finding, by finding key."""
+    return {
+        finding_key(findings[v.finding_index].file, findings[v.finding_index].line,
+                    findings[v.finding_index].rule_name): (v.is_real_bug, v.confidence)
+        for v in verdicts if 0 <= v.finding_index < len(findings)
+    }
+
+
+def _round_changed_lines(
+    hunks: tuple[DiffHunk, ...], *, prior_review_head: str, head_sha: str,
+    delta_reviewed: bool, keys_known: bool,
+) -> frozenset[tuple[str, int]] | None:
+    """The lines this round changed, for the drip-feed rule. None on a first
+    round, after rewritten history, and when the prior markings could not be
+    read: the rule then marks nothing late."""
+    if not prior_review_head or not keys_known:
+        return None
+    if prior_review_head == head_sha:
+        return frozenset()
+    if not delta_reviewed:
+        return None
+    return frozenset(
+        (hunk.file_path, line) for hunk in hunks for line, _ in added_lines(hunk)
+    )
+
+
+def _plan_comment_budget(
+    evaluation: CodeReviewEvaluation,
+    *,
+    prior_keys: frozenset[str],
+    changed_lines: frozenset[tuple[str, int]] | None,
+    open_threads: list[dict],
+    repo_config: RepoConfig | None,
+    confidence: dict[str, tuple[bool, float]],
+    pr: str,
+) -> _BudgetOutcome:
+    """Pick what stays off the inline surface (#1570). The evaluation is left
+    whole, so nothing here can turn a failing check green. One
+    `elder_comment_budget` row per review."""
+    config = repo_config or RepoConfig()
+    new: list[Finding] = []
+    posted: list[Finding] = []
+    for finding in evaluation.findings:
+        key = finding_key(finding.file, finding.line, finding.rule_name)
+        (posted if key in prior_keys else new).append(finding)
+    late: tuple[Finding, ...] = ()
+    fresh = tuple(new)
+    if config.elder_drip_feed:
+        fresh, late = drip_fed(
+            fresh, prior_keys=prior_keys, changed_lines=changed_lines,
+        )
+    split = split_for_budget(
+        tuple(f for f in fresh if f.outside_diff_reason is None),
+        cap=config.elder_blocking_cap,
+        open_blocking=max(
+            carry_forward.open_blocking_count(open_threads),
+            sum(1 for f in posted if is_model_blocking(f)),
+        ),
+        confidence=confidence,
+    )
+    held = split.held + late
+    log.info(
+        "elder_comment_budget",
+        extra={"pr": pr, "held": len(split.held), "late": len(late),
+               "inline": len(split.inline), "cap": config.elder_blocking_cap},
+    )
+    return _BudgetOutcome(
+        frozenset(finding_key(f.file, f.line, f.rule_name) for f in held),
+        held_lines(held, confidence),
+        any(is_model_blocking(f) for f in split.held),
     )
 
 
@@ -5423,6 +5568,7 @@ def _publish_deep_review(
         repo_config=repo_config,
         file_contents=file_contents,
         muted=muted,
+        held_back=_deep_held_keys(novel_deep, combined_eval, all_prior, repo_config),
     )
     if review_result is None:
         return
