@@ -219,10 +219,19 @@ def test_the_base_ignore_list_is_the_only_one_the_engine_sees(bench, monkeypatch
     assert seen == ["", "vendor/\n"]
 
 
-@pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff not on PATH")
+def _require(engine: str) -> None:
+    """A missing engine skips on a laptop and fails in CI: a skipped trial here
+    would read as a passed one."""
+    if shutil.which(engine) is None:
+        if os.getenv("CI"):
+            pytest.fail(f"{engine} must be on PATH in CI")
+        pytest.skip(f"{engine} not on PATH")
+
+
 def test_real_ruff_ignores_a_config_above_the_scan_directory(tmp_path, monkeypatch):
     """Ruff walks up from what it scans, so a config beside the temp directory
     would apply. The check is the real engine, on a real finding."""
+    _require("ruff")
     (tmp_path / "ruff.toml").write_text('[lint]\nper-file-ignores = {"*" = ["ALL"]}\n')
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
@@ -231,19 +240,56 @@ def test_real_ruff_ignores_a_config_above_the_scan_directory(tmp_path, monkeypat
     assert {hit.code for hit in hits} & {"S301", "S403"}
 
 
-@pytest.mark.skipif(shutil.which("opengrep") is None, reason="opengrep not on PATH")
-def test_real_opengrep_runs_scrubbed_and_still_finds(monkeypatch):
-    """The real engine starts on the scrubbed environment and read-only tree,
-    and a PR's own ignore list does not hide its finding."""
-    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", _CANARY)
+def _spy_on_child_environments(monkeypatch) -> list[dict[str, str]]:
+    envs: list[dict[str, str]] = []
+    real_run = an.subprocess.run
+
+    def spy(argv, **kwargs):
+        envs.append(dict(kwargs["env"]))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(an.subprocess, "run", spy)
+    return envs
+
+
+_REAL_SAST_RULES = sast._RULES_DIR
+
+
+def test_real_opengrep_on_a_hostile_tree_reaches_nothing_and_still_finds(bench, monkeypatch):
+    """The real engine, the whole hostile tree, the tripwire and the canary. It
+    must still report the finding, which proves the run was a real scan."""
+    _require("opengrep")
+    monkeypatch.setattr(sast, "_RULES_DIR", _REAL_SAST_RULES)
+    envs = _spy_on_child_environments(monkeypatch)
     source = "import subprocess\nsubprocess.call('x', shell=True)\n"
-    files = {"app.py": source, ".semgrepignore": "*\n"}
+    tree = {**_hostile_tree(bench.port, bench.sentinel), "app.py": source}
     hunk = DiffHunk(
         file_path="app.py", new_start=1, new_lines=frozenset({1, 2}),
         body="@@ -0,0 +1,2 @@\n",
     )
 
-    assert scan_opengrep((hunk,), files)
+    findings = scan_opengrep((hunk,), tree)
+
+    assert findings
+    assert envs and not any(_CANARY in value for env in envs for value in env.values())
+    assert bench.egress_attempts() == 0
+    assert not bench.sentinel.exists()
+
+
+def test_real_ruff_on_a_hostile_tree_reaches_nothing_and_still_finds(bench, monkeypatch):
+    """The real engine against the same tree. The finding proves the PR's own
+    configs did not silence it."""
+    _require("ruff")
+    envs = _spy_on_child_environments(monkeypatch)
+    source = "import pickle\npickle.loads(b'x')\n"
+    tree = {**_hostile_tree(bench.port, bench.sentinel), "app.py": source}
+
+    hits = ruff_hits(tree)
+
+    assert {hit.code for hit in hits} & {"S301", "S403"}
+    assert envs and not any(_CANARY in value for env in envs for value in env.values())
+    assert bench.egress_attempts() == 0
+    assert not bench.sentinel.exists()
 
 
 _HEAD, _BASE = "h" * 40, "b" * 40
