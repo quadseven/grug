@@ -1409,17 +1409,10 @@ def _is_opencode_go_usage_limit(resp: httpx.Response) -> bool:
 def _log_opencode_go_usage(model: str, resp: httpx.Response) -> None:
     """What the call cost, from the `usage.opencode` block on each answer."""
     try:
-        spent = resp.json()["usage"]["opencode"]
-        log.info(
-            "opencode_go_usage",
-            extra={
-                "model": model,
-                "allowance": spent["allowance"],
-                "billing_source": spent.get("billing_source", ""),
-            },
-        )
-    except (ValueError, KeyError, TypeError, AttributeError):
+        allowance = float(resp.json()["usage"]["opencode"]["allowance"])
+    except (ValueError, KeyError, TypeError):
         return
+    log.info("opencode_go_usage", extra={"model": model, "allowance": allowance})
 
 
 def _note_opencode_go_response(resp: httpx.Response) -> None:

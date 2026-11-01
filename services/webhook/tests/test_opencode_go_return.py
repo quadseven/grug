@@ -223,9 +223,7 @@ def test_each_go_answer_logs_what_it_cost_the_allowance(caplog) -> None:
     with caplog.at_level("INFO"):
         _review(http, _Counter())
     usage = [r for r in caplog.records if r.getMessage() == "opencode_go_usage"]
-    assert [(r.model, r.allowance, r.billing_source) for r in usage] == [
-        (_PAID, 0.00115, "go"),
-    ]
+    assert [(r.model, r.allowance) for r in usage] == [(_PAID, 0.00115)]
 
 
 def _shipped(name: str) -> dict[str, str]:
