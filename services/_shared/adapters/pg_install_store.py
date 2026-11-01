@@ -215,7 +215,7 @@ _EXTRA_REPO_FLAGS = frozenset(
 # Repo-level flags whose value is a STRING, not a bool (the persona flags and
 # _EXTRA_REPO_FLAGS are all bool). elder_voice (#288/#578) is "caveman" | "sage".
 # These are exempt from the bool-only value check and validated per-flag below.
-_STR_REPO_FLAGS = frozenset({"elder_voice"})
+_STR_REPO_FLAGS = frozenset({"elder_voice", "pulse_delivery"})
 
 # Repo-level flags whose value is a list of strings. guard_hygiene_dead_ref_
 # patterns (#778) is per-install infrastructure data (decommissioned host/
@@ -318,6 +318,7 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     # Elder voice pack (#288/#578): stored only for entitled installs that
     # opted in; every other repo reads the caveman free default.
     cfg["elder_voice"] = str(item.get("elder_voice") or "caveman")
+    cfg["pulse_delivery"] = str(item.get("pulse_delivery") or "label")
     # Guard hygiene-watch dead-ref patterns (#778): absent row/field reads
     # back as (), the same "unconfigured, not clean" shape scan_dead_refs
     # already treats as a no-op - the visibility fix is the caller logging
@@ -363,9 +364,7 @@ def _validate_str_repo_flags(persona_flags: dict[str, Any], install_id: int) -> 
     paid pack gated on the install allowlist. Runs AFTER the caller has
     already confirmed the flag is known (it is in _STR_REPO_FLAGS)."""
     voice = persona_flags.get("elder_voice")
-    if voice is None:
-        return
-    if voice not in ("caveman", "sage"):
+    if voice is not None and voice not in ("caveman", "sage"):
         raise ValueError(
             f"elder_voice must be one of ('caveman', 'sage'), got {voice!r}"
         )
@@ -374,6 +373,9 @@ def _validate_str_repo_flags(persona_flags: dict[str, Any], install_id: int) -> 
             f"elder_voice='sage' requires an allowlisted (paid) "
             f"installation; install {install_id} is not entitled"
         )
+    delivery = persona_flags.get("pulse_delivery")
+    if delivery is not None and delivery not in ("label", "comment"):
+        raise ValueError("pulse_delivery must be 'label' or 'comment'")
 
 
 def _validate_list_repo_flags(persona_flags: dict[str, Any]) -> None:

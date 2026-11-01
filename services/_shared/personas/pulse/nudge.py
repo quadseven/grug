@@ -4,8 +4,8 @@ the first SCHEDULED (non-webhook) persona.
 Runs inside the existing grug-poller CronJob cadence (its own pass,
 gated independently): for each pulse-enabled repo of an allowlisted
 install, find open PRs with no update for `_STALE_DAYS` whose Grug DoR
-check is green, and post ONE caveman-voiced nudge comment per PR per
-`_NUDGE_TTL_DAYS` (idempotent via a store claim). Hard-capped per
+check is green, and mark them idle (or post a legacy comment when configured)
+per `_NUDGE_TTL_DAYS` (idempotent via a store claim). Hard-capped per
 install per run so a backlog can't blow the CronJob budget.
 
 Default OFF per repo (`pulse_enabled`). Best-effort everywhere: one
@@ -21,9 +21,15 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-
 from activity_log import record_check_verdict
-from adapters.install_store import claim_pulse_nudge, get_repo_config, release_pulse_nudge
+from adapters.install_store import (
+    claim_pulse_nudge,
+    get_repo_config,
+    release_pulse_nudge,
+)
+from github_app_auth import get_app_id
+
+from personas import board_client
 from personas.tribe import CHECK_CHIEF, acceptable_check_names
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.pulse")
@@ -36,6 +42,7 @@ _MAX_PRS_PER_REPO = 30
 _FETCH_TIMEOUT = 10
 _DOR_CHECK_NAME = CHECK_CHIEF
 _DOR_CHECK_NAMES = frozenset(acceptable_check_names(CHECK_CHIEF))
+_IDLE_LABEL = "grug:idle"
 
 # "Grug Drum", not "Grug Pulse": the #798 rename changed the CHECK TITLE and
 # stopped there, so the persona's own voice kept the old name in the one place
@@ -60,6 +67,7 @@ def _headers(token: str) -> dict[str, str]:
 
 
 _MAX_PR_PAGES = 5
+_MAX_LABEL_PAGES = 50
 
 
 def _stale_prs(token: str, owner: str, repo: str) -> list[dict[str, Any]]:
@@ -117,6 +125,141 @@ def _recent_nudge_exists(token: str, owner: str, repo: str, pr_number: int) -> b
     return any("grug-pulse-nudge" in (c.get("body") or "") for c in resp.json() or [])
 
 
+def _idle_labeled_prs(token: str, owner: str, repo: str) -> list[dict[str, Any]]:
+    """Labeled pull requests, including closed ones, for label cleanup.
+
+    Newest-updated first: a PR that moved or closed sorts ahead of the
+    still-idle PRs that keep their labels, so the ones cleanup must act on
+    are read first and each removal shifts the next ones forward. Anyone
+    with triage rights can apply the label, plain issues included, so the
+    scan keeps a hard page cap as the backstop (logged, never silent)."""
+    out: list[dict[str, Any]] = []
+    for page in range(1, _MAX_LABEL_PAGES + 1):
+        resp = httpx.get(
+            f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/issues",
+            params={"state": "all", "labels": _IDLE_LABEL, "sort": "updated",
+                    "direction": "desc", "per_page": 100, "page": page},
+            headers=_headers(token), timeout=_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        batch = resp.json() or []
+        out.extend(item for item in batch if "pull_request" in item)
+        if len(batch) < 100:
+            return out
+    log.warning(
+        "pulse_idle_label_scan_page_cap",
+        extra={"repo": f"{owner}/{repo}", "pages": _MAX_LABEL_PAGES,
+               "labeled_found": len(out)},
+    )
+    return out
+
+
+def _label_url(owner: str, repo: str, pr_number: int) -> str:
+    return (
+        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+        f"/issues/{pr_number}/labels"
+    )
+
+
+def _remove_idle_label(token: str, owner: str, repo: str, pr_number: int) -> None:
+    resp = httpx.delete(
+        f"{_label_url(owner, repo, pr_number)}/{quote(_IDLE_LABEL, safe='')}",
+        headers=_headers(token), timeout=_FETCH_TIMEOUT,
+    )
+    if resp.status_code != 404:
+        resp.raise_for_status()
+
+
+def _set_idle_label(token: str, owner: str, repo: str, pr_number: int) -> None:
+    labels_url = f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/labels"
+    label_resp = httpx.get(
+        f"{labels_url}/{quote(_IDLE_LABEL, safe='')}",
+        headers=_headers(token), timeout=_FETCH_TIMEOUT,
+    )
+    if label_resp.status_code == 404:
+        created = httpx.post(
+            labels_url,
+            json={
+                "name": _IDLE_LABEL,
+                "color": "ededed",
+                "description": "Open pull request has been idle",
+            },
+            headers=_headers(token), timeout=_FETCH_TIMEOUT,
+        )
+        if created.status_code not in (201, 422):
+            created.raise_for_status()
+    else:
+        label_resp.raise_for_status()
+    resp = httpx.post(
+        _label_url(owner, repo, pr_number), json={"labels": [_IDLE_LABEL]},
+        headers=_headers(token), timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+
+def _update_idle_board(token: str, owner: str, repo: str, pr: dict[str, Any]) -> None:
+    updated = datetime.fromisoformat(pr["updated_at"].replace("Z", "+00:00"))
+    days = max(0, (datetime.now(timezone.utc) - updated).days)
+    board_client.upsert_board_section(
+        token, owner, repo, int(pr["number"]), key="pulse",
+        section=f"Idle since {updated.date().isoformat()}, {days} days",
+        app_id=get_app_id(), create_if_absent=False,
+    )
+
+
+def _cleanup_idle_labels(
+    token: str, owner: str, repo: str, delivery: str,
+    stale_prs: list[dict[str, Any]], labeled: list[dict[str, Any]],
+) -> None:
+    stale_numbers = {int(pr["number"]) for pr in stale_prs}
+    for pr in labeled:
+        number = int(pr["number"])
+        if delivery != "label" or number not in stale_numbers:
+            _remove_idle_label(token, owner, repo, number)
+
+
+def _process_stale_pr(
+    token: str, install_id: int, full: str, owner: str, repo: str,
+    delivery: str, pr: dict[str, Any],
+) -> bool:
+    pr_number = int(pr["number"])
+    head_sha = ((pr.get("head") or {}).get("sha")) or ""
+    if not head_sha or not _dor_green(token, owner, repo, head_sha):
+        return False
+    if delivery == "label":
+        _set_idle_label(token, owner, repo, pr_number)
+        _update_idle_board(token, owner, repo, pr)
+    if delivery == "comment" and _recent_nudge_exists(token, owner, repo, pr_number):
+        return False
+    if not claim_pulse_nudge(install_id, full, pr_number):
+        return False
+    try:
+        if delivery == "comment":
+            resp = httpx.post(
+                f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+                f"/issues/{pr_number}/comments",
+                json={"body": _NUDGE_BODY.format(days=_STALE_DAYS)},
+                headers=_headers(token), timeout=_FETCH_TIMEOUT,
+            )
+            resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        if 400 <= e.response.status_code < 500:
+            release_pulse_nudge(install_id, full, pr_number)
+        raise
+    # Ambiguous transport and 5xx outcomes keep the weekly claim. A label write
+    # has already succeeded in label mode, and comment mode verifies markers.
+    except httpx.RequestError:
+        raise
+    log.info("pulse_nudged", extra={"install_id": install_id, "repo": full, "pr": pr_number})
+    record_check_verdict(
+        install_id=install_id, persona_key="pulse", repo=full,
+        pr_number=pr_number, head_sha=head_sha, conclusion="neutral",
+        summary=f"Drum nudge - PR quiet {_STALE_DAYS}+ days",
+        findings_count=0, blocking=False, degraded_reason=None,
+    )
+    return True
+
+
 def _dor_green(token: str, owner: str, repo: str, head_sha: str) -> bool:
     """Only nudge PRs whose plan is READY (Chief's check green) - a
     failing-DoR PR has a different problem than staleness."""
@@ -147,70 +290,18 @@ def run_pulse_for_install(
         if not (repo_id and owner and name):
             continue
         try:
-            if not get_repo_config(install_id, int(repo_id)).get("pulse_enabled", False):
+            config = get_repo_config(install_id, int(repo_id))
+            if not config.get("pulse_enabled", False):
                 continue
-            for pr in _stale_prs(token, owner, name):
+            delivery = config.get("pulse_delivery", "label")
+            stale_prs = _stale_prs(token, owner, name)
+            labeled = _idle_labeled_prs(token, owner, name)
+            _cleanup_idle_labels(token, owner, name, delivery, stale_prs, labeled)
+            for pr in stale_prs:
                 if nudged >= _MAX_NUDGES_PER_INSTALL_RUN:
                     break
-                pr_number = int(pr["number"])
-                head_sha = ((pr.get("head") or {}).get("sha")) or ""
-                if not head_sha or not _dor_green(token, owner, name, head_sha):
-                    continue
-                # Win-once per (install, repo, pr) per TTL window - a
-                # lost claim means a nudge inside the window already
-                # happened (or a concurrent poller run won it).
-                # Write-verification BEFORE the claim (codex PR #489 r3:
-                # a verification-READ failure must not burn the weekly
-                # slot - before the claim exists there is nothing to
-                # release). A marker comment inside the window means a
-                # prior tick's ambiguous failure actually landed - never
-                # double-post. Racing runs then serialize on the claim's
-                # win-once semantics below.
-                if _recent_nudge_exists(token, owner, name, pr_number):
-                    continue
-                if not claim_pulse_nudge(install_id, full, pr_number):
-                    continue
-                try:
-                    resp = httpx.post(
-                        f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues/{pr_number}/comments",
-                        json={"body": _NUDGE_BODY.format(days=_STALE_DAYS)},
-                        headers=_headers(token), timeout=_FETCH_TIMEOUT,
-                    )
-                    resp.raise_for_status()
-                except httpx.HTTPStatusError as e:
-                    if 400 <= e.response.status_code < 500:
-                        # DEFINITE no-write (4xx): release so the next
-                        # tick retries - the claim represents a
-                        # COMPLETED nudge, never a failed attempt.
-                        release_pulse_nudge(install_id, full, pr_number)
-                    # 5xx = ambiguous (the write may have landed): keep
-                    # the claim; the marker pre-check above makes a
-                    # future retry safe either way.
-                    raise
-                except httpx.RequestError:
-                    # Ambiguous transport outcome (timeout after accept
-                    # is possible): keep the claim - a missed nudge
-                    # beats duplicate spam; the marker pre-check governs
-                    # any later retry.
-                    raise
-                nudged += 1
-                log.info(
-                    "pulse_nudged",
-                    extra={"install_id": install_id, "repo": full, "pr": pr_number},
-                )
-                # Honest Activity row (ADR-0003): a nudge is a completed
-                # advisory action, not a review - neutral, zero findings.
-                record_check_verdict(
-                    install_id=install_id,
-                    persona_key="pulse",
-                    repo=full,
-                    pr_number=pr_number,
-                    head_sha=head_sha,
-                    conclusion="neutral",
-                    summary=f"Drum nudge - PR quiet {_STALE_DAYS}+ days",
-                    findings_count=0,
-                    blocking=False,
-                    degraded_reason=None,
+                nudged += _process_stale_pr(
+                    token, install_id, full, owner, name, delivery, pr,
                 )
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             # One repo's API failure must not stop the pass.
