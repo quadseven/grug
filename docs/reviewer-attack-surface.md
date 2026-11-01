@@ -78,5 +78,7 @@ second App, which a person registers, and #1500 depends on that decision.
   obeys every file it can see and reports every secret in its environment to a
   local tripwire. The bar is zero tripwire connections, zero config files
   obeyed, and no repository code run.
-- A run through a live installation on a test repository is still to do. It
-  needs a test repository with the App installed.
+- Recorded result, CI on 2026-11-01 with opengrep 1.27.1 and ruff 0.16: egress
+  attempts 0, secret access attempts 0, configs obeyed 0, repository code run 0.
+- That run covers the analyzers on a CI runner. The run through a live
+  installation on a test repository, against a deployed build, is #1587.
