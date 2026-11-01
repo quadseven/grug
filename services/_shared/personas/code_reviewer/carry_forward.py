@@ -34,15 +34,17 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from github_app_auth import with_install_token_retry
 from personas.code_reviewer import deferred_ruff, living_review
+from personas.code_reviewer.dedup import parse_rule
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.thread_resolver import (
     _NEARBY_LINES,
     _fetch_threads,
     _owned_rule_and_line,
+    is_grug,
 )
 
 log = logging.getLogger(
@@ -169,6 +171,51 @@ def _thread_is_resolved_or_dismissed(thread: dict) -> bool:
     return False
 
 
+def _elder_thread_rule_and_line(thread: dict) -> tuple[str, str, int] | None:
+    """`(rule, path, line)` of an Elder-initiated thread, regardless of human replies."""
+    comments = thread.get("comments") or {}
+    nodes = comments.get("nodes") or []
+    if not nodes:
+        return None
+    first = nodes[0]
+    if not is_grug((first.get("author") or {}).get("login")):
+        return None
+    rule = parse_rule(first.get("body") or "")
+    path = first.get("path")
+    line = first.get("line") or first.get("originalLine")
+    if not rule or not path or not line:
+        return None
+    return rule, path, int(line)
+
+
+def _earlier_answer(thread: dict) -> str | None:
+    """The text of an earlier reply from a person on this thread, if any."""
+    nodes = ((thread.get("comments") or {}).get("nodes") or [])
+    for c in nodes[1:]:
+        login = (c.get("author") or {}).get("login")
+        if not is_grug(login) and c.get("body"):
+            return str(c["body"]).strip()
+    return None
+
+
+def _with_reraised_explanation(finding: Finding, earlier_answer: str | None) -> Finding:
+    """State what changed since the earlier answer (#1457)."""
+    if "changed since earlier answer" in finding.message or "changed since the earlier answer" in finding.message:
+        return finding
+    if earlier_answer:
+        first_line = earlier_answer.splitlines()[0][:100]
+        note = (
+            f"Re-raised: code changed since earlier answer ({first_line!r}). "
+            "The pointed-at code was modified in a later commit."
+        )
+    else:
+        note = (
+            "Re-raised: code changed since earlier answer. "
+            "The pointed-at code was modified in a later commit."
+        )
+    return replace(finding, message=f"{finding.message}\n\n{note}")
+
+
 def filter_findings_against_resolved_threads(
     findings: tuple[Finding, ...],
     installation_id: int, owner: str, repo: str, pull_number: int,
@@ -179,7 +226,10 @@ def filter_findings_against_resolved_threads(
 
     A finding matches a thread when they share the same rule, file, and
     the finding's line is within `_NEARBY_LINES` of the thread's anchor line.
-    This prevents re-raising findings that a human has already addressed.
+    This prevents re-raising findings that a human has already addressed,
+    unless the code it points at changed (`thread.isOutdated`): then the
+    finding is re-raised and its message explains what changed since the
+    earlier answer (#1457).
 
     If `threads` is provided, it is used instead of fetching a new listing.
     """
@@ -187,28 +237,42 @@ def filter_findings_against_resolved_threads(
         threads = list_threads(installation_id, owner, repo, pull_number)
     if threads is None:
         return findings
-    resolved_threads: list[tuple[str, str, int]] = []
+    resolved_unchanged: list[tuple[str, str, int]] = []
+    resolved_outdated: list[tuple[str, str, int, str | None]] = []
     for t in threads:
         if not _thread_is_resolved_or_dismissed(t):
             continue
-        owned = _owned_rule_and_line(t)
+        owned = _elder_thread_rule_and_line(t)
         if owned is None:
             continue
-        rule, path, original_line = owned
-        first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
-        line = int(first.get("line") or original_line)
-        resolved_threads.append((rule, path, line))
-    if not resolved_threads:
+        rule, path, line = owned
+        if t.get("isOutdated"):
+            resolved_outdated.append((rule, path, line, _earlier_answer(t)))
+        else:
+            resolved_unchanged.append((rule, path, line))
+    if not resolved_unchanged and not resolved_outdated:
         return findings
-    # A deferred-ruff finding was measured at this head, and a resolved thread
-    # is not evidence of a fix (#1477).
-    return tuple(
-        f for f in findings
-        if f.rule_name == deferred_ruff.RULE or not any(
+    out: list[Finding] = []
+    for f in findings:
+        # A deferred-ruff finding was measured at this head, and a resolved thread
+        # is not evidence of a fix (#1477).
+        if f.rule_name == deferred_ruff.RULE:
+            out.append(f)
+            continue
+        if any(
             f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
-            for rule, path, line in resolved_threads
-        )
-    )
+            for rule, path, line in resolved_unchanged
+        ):
+            continue
+        matching_outdated = [
+            ans for rule, path, line, ans in resolved_outdated
+            if f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
+        ]
+        if matching_outdated:
+            out.append(_with_reraised_explanation(f, matching_outdated[0]))
+        else:
+            out.append(f)
+    return tuple(out)
 
 
 def _summary_block(carried: tuple[CarriedFinding, ...]) -> str:

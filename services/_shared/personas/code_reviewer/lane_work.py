@@ -37,7 +37,7 @@ Pure: diff text, parsed hunks, file contents and PR text in; findings out.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from personas.code_reviewer.criteria_coverage import (
     LinkedCriterion,
@@ -110,8 +110,8 @@ def lane_work_findings(
     hunks: tuple[DiffHunk, ...],
     file_contents: dict[str, str],
     base_line_counts: dict[str, int],
-    boxes: Iterable[LinkedBox],
-    pr_title: str,
+    boxes: Iterable[LinkedBox] | Callable[[], Iterable[LinkedBox]],
+    pr_title: str | Callable[[], str],
     pr_body: str,
     changes: tuple[FileChange, ...] | None = None,
     health_issues: Iterable[int] = (),
@@ -129,7 +129,8 @@ def lane_work_findings(
     decides the criteria the partial-delivery mapping cannot (#1389)."""
     if changes is None:
         changes = file_changes(diff_text)
-    boxes = tuple(boxes)
+    boxes = tuple(boxes() if callable(boxes) else boxes)
+    pr_title = pr_title() if callable(pr_title) else pr_title
     criteria = criteria_in_scope(boxes, pr_body)
     findings = list(scan_criteria_coverage(
         hunks, file_contents, criteria=criteria,
