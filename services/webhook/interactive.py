@@ -15,10 +15,14 @@ comment_id so a re-delivered webhook doesn't double-act.
 - accept-removal <path>  -> record a trusted maintainer accepting one deleted
   guard path on the current head, then re-run Elder (grug#1405)
 
-grug#1270 - an Elder re-run now (a) is refused while one is already running
-on the same head, (b) puts the `grug:reviewing` label on the PR while it
-runs, and (c) is KEPT (deferred to the GitHub budget's reset) instead of
-being dropped when the installation's hourly budget is exhausted.
+grug#1270 - an Elder re-run (a) puts the `grug:reviewing` label on the PR
+while it runs and (b) is KEPT (deferred to the GitHub budget's reset)
+instead of being dropped when the installation's hourly budget is exhausted.
+
+grug#1430 - a comment-triggered Elder re-run is QUEUED per PR, never
+refused or dropped: while a review is in flight the job waits behind it
+(the rerun consumer holds it), every command gets its own queue
+deduplication id, and an enqueue that fails is answered on the PR.
 """
 
 from __future__ import annotations
@@ -46,6 +50,19 @@ def _post_reply(token: str, owner: str, repo: str, pr_number: int, body: str) ->
     ).raise_for_status()
 
 
+def _post_reaction(token: str, owner: str, repo: str, comment_id: int, content: str) -> None:
+    """Add a reaction to a PR conversation comment. A `/grug` command arrives
+    as `issue_comment`, so its reactions live under issues/comments: the
+    pulls/comments path is for review comments on a diff and answers 404 for
+    this id. GitHub de-duplicates repeated reactions."""
+    httpx.post(
+        f"{_API}/repos/{_q(owner, safe='')}/{_q(repo, safe='')}/issues/comments/{comment_id}/reactions",
+        json={"content": content},
+        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+        timeout=_TIMEOUT,
+    ).raise_for_status()
+
+
 def _escape_html(s: str) -> str:
     """Escape HTML-significant chars in a displayed learning so a taught
     rule can't break out of the comment markup or inject tags."""
@@ -63,6 +80,20 @@ def _reply(token_fn, owner: str, repo: str, pr_number: int, body: str) -> bool:
         token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.warning("interactive_reply_failed", extra={"kind": type(e).__name__})
+        return False
+    return True
+
+
+def _react(token_fn, owner: str, repo: str, comment_id: int, content: str) -> bool:
+    """Add a reaction to a comment. True when the reaction landed.
+
+    Best-effort: the command's effect (the enqueue) already happened, so a
+    reaction GitHub refuses must not raise out of the command. GitHub
+    de-duplicates repeated reactions, so a redelivery is harmless."""
+    try:
+        token_fn(lambda t: _post_reaction(t, owner, repo, comment_id, content))
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning("interactive_reaction_failed", extra={"kind": type(e).__name__})
         return False
     return True
 
@@ -140,6 +171,43 @@ def _mark_reviewing(*, token_fn, owner: str, repo: str, pr_number: int) -> bool:
     return attached
 
 
+def _command_job(comment_id: int) -> dict:
+    """The fields that make a re-run job a COMMAND job (grug#1430).
+
+    `comment_id` gives every command its own FIFO deduplication id, so two
+    different `/grug improve` comments are never collapsed into one by
+    SQS's 5-minute dedup window, and it tells the rerun consumer that this
+    job may wait behind a review in flight and may be coalesced. A comment
+    id of 0 (unknown) still queues, just without that identity."""
+    return {"comment_id": int(comment_id)} if comment_id else {}
+
+
+def _queued_note(head_sha: str, state: str) -> str:
+    """The reply for a command queued while a review may be in flight."""
+    if state == "running":
+        return (
+            f"Elder is already reviewing {head_sha[:8]}. Grug queued this "
+            "command: Elder will look again when that review ends."
+        )
+    return (
+        "Grug queued this command. Elder will review this PR once any "
+        "review already in flight ends."
+    )
+
+
+def _answer_enqueue_failed(
+    *, verb: str, token_fn, owner: str, repo: str, pr_number: int,
+) -> dict[str, str]:
+    """A command whose job could not be queued is ANSWERED, never dropped in
+    silence (grug#1430). The comment stays unclaimed, so a redelivery can
+    still queue it."""
+    _reply(
+        token_fn, owner, repo, pr_number,
+        f"Grug could not queue this command. Comment `/grug {verb}` again.",
+    )
+    return {"status": "skip", "reason": "enqueue_failed", "verb": verb}
+
+
 def _defer_elder_review(
     *, verb: str, install_id: int, owner: str, repo: str, pr_number: int,
     comment_id: int, token_fn, enqueue, claim, defer_until: float,
@@ -165,6 +233,7 @@ def _defer_elder_review(
         enqueue(
             install_id=install_id, repo=repo_full, pr_number=pr_number,
             persona="code_reviewer", not_before=float(defer_until),
+            **_command_job(comment_id),
         )
     except Exception as e:  # noqa: BLE001 - the queue is the keep-path
         log.error(
@@ -291,34 +360,46 @@ def _wake_elder(
             pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
             enqueue=enqueue, claim=claim, defer_until=defer_until,
         )
-    elder_state = _elder_review_state(
-        token_fn=token_fn, owner=owner, repo=repo, head_sha=head_sha,
-    )
-    if elder_state != "idle":
+    if not head_sha:
         return _already_reviewing(
             verb=verb, owner=owner, repo=repo, pr_number=pr_number,
             comment_id=comment_id, token_fn=token_fn, claim=claim,
-            head_sha=head_sha, state=elder_state,
+            head_sha=head_sha, state="unknown",
         )
+    elder_state = _elder_review_state(
+        token_fn=token_fn, owner=owner, repo=repo, head_sha=head_sha,
+    )
     try:
-        enqueue(**coords, persona="code_reviewer")
+        enqueue(**coords, persona="code_reviewer", **_command_job(comment_id))
     except Exception as e:  # noqa: BLE001 - enqueue best-effort; NOT claimed on failure
         log.warning("interactive_enqueue_failed", extra={"verb": verb, "kind": type(e).__name__})
-        return {"status": "skip", "reason": "enqueue_failed", "verb": verb}
+        return _answer_enqueue_failed(
+            verb=verb, token_fn=token_fn, owner=owner, repo=repo,
+            pr_number=pr_number,
+        )
     if not claim(f"grugcmd:{comment_id}"):
         return {"status": "no_op", "reason": "comment already handled", "verb": verb}
-    # The sign goes up only on the path that owns the command: a comment
-    # that was already handled must not leave a `grug:reviewing` label
-    # behind for a review this delivery did not start (grug#1270).
-    _mark_reviewing(
-        token_fn=token_fn, owner=owner, repo=repo, pr_number=pr_number,
-    )
+    queued = elder_state != "idle"
+    if not queued:
+        # The sign goes up only on the path that owns the command: a comment
+        # that was already handled must not leave a `grug:reviewing` label
+        # behind for a review this delivery did not start (grug#1270). A
+        # QUEUED command gets its sign from the consumer when it runs.
+        _mark_reviewing(
+            token_fn=token_fn, owner=owner, repo=repo, pr_number=pr_number,
+        )
     paused, note = _pause_after_wake(verb, coords, resume, is_paused)
+    if queued:
+        note = f"{_queued_note(head_sha, elder_state)} {note}"
     try:
         token_fn(lambda t: _post_reply(t, owner, repo, pr_number, f"{note} So speaks Grug."))
     except Exception as e:  # noqa: BLE001 - the review is enqueued; the ack reply is cosmetic
         log.warning("interactive_ack_failed", extra={"verb": verb, "kind": type(e).__name__})
-    return {"status": "dispatched", "verb": verb, "persona": "code_reviewer", "paused": paused}
+    result = {"status": "queued" if queued else "dispatched", "verb": verb,
+              "persona": "code_reviewer", "paused": paused}
+    if queued:
+        result["reason"] = "queued_behind_review"
+    return result
 
 
 def _run_persona_rerun(
@@ -337,6 +418,8 @@ def _run_persona_rerun(
         from rerun import enqueue_rerun  # type: ignore
         enqueue = enqueue_rerun
     repo_full = f"{owner}/{repo}"
+    elder_state = "idle"
+    extra: dict = {}
     if verb == "improve":
         if defer_until:
             return _defer_elder_review(
@@ -344,37 +427,87 @@ def _run_persona_rerun(
                 pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
                 enqueue=enqueue, claim=claim, defer_until=defer_until,
             )
-        elder_state = _elder_review_state(
-            token_fn=token_fn, owner=owner, repo=repo, head_sha=head_sha,
-        )
-        if elder_state != "idle":
+        if not head_sha:
             return _already_reviewing(
                 verb=verb, owner=owner, repo=repo, pr_number=pr_number,
                 comment_id=comment_id, token_fn=token_fn, claim=claim,
-                head_sha=head_sha, state=elder_state,
+                head_sha=head_sha, state="unknown",
             )
+        # grug#1430: a review in flight no longer REFUSES the command. The
+        # job is queued with its own identity and the rerun consumer holds
+        # it until that review ends, so nothing the commenter changed since
+        # goes unreviewed.
+        elder_state = _elder_review_state(
+            token_fn=token_fn, owner=owner, repo=repo, head_sha=head_sha,
+        )
+        extra = _command_job(comment_id)
     try:
-        enqueue(install_id=install_id, repo=repo_full, pr_number=pr_number, persona=persona)
+        enqueue(install_id=install_id, repo=repo_full, pr_number=pr_number,
+                persona=persona, **extra)
     except Exception as e:  # noqa: BLE001 - enqueue best-effort; NOT claimed on failure
         log.warning("interactive_enqueue_failed", extra={"verb": verb, "kind": type(e).__name__})
-        return {"status": "skip", "reason": "enqueue_failed", "verb": verb}
+        return _answer_enqueue_failed(
+            verb=verb, token_fn=token_fn, owner=owner, repo=repo,
+            pr_number=pr_number,
+        )
     if not claim(f"grugcmd:{comment_id}"):
         return {"status": "no_op", "reason": "comment already handled", "verb": verb}
-    if verb == "improve":
+    queued = elder_state != "idle"
+    if verb == "improve" and not queued:
         # The sign goes up only on the path that owns the command: a
         # comment that was already handled must not leave a
         # `grug:reviewing` label behind for a review this delivery did
-        # not start (grug#1270).
+        # not start (grug#1270). A QUEUED command gets its sign from the
+        # consumer when it runs.
         _mark_reviewing(
             token_fn=token_fn, owner=owner, repo=repo, pr_number=pr_number,
         )
-    note = ("Elder is re-reviewing this PR." if verb == "improve"
-            else "Smasher is checking for test gaps.")
-    try:
-        token_fn(lambda t: _post_reply(t, owner, repo, pr_number, f"{note} So speaks Grug."))
-    except Exception as e:  # noqa: BLE001 - the rerun is enqueued; the ack reply is cosmetic
-        log.warning("interactive_ack_failed", extra={"verb": verb, "kind": type(e).__name__})
+    if queued:
+        log.info(
+            "interactive_elder_rerun_queued_behind_review",
+            extra={"verb": verb, "repo": repo_full, "pr": pr_number,
+                   "head_sha": head_sha[:8], "state": elder_state},
+        )
+    # Post a reaction to the command comment as acknowledgement (no reply comment)
+    _react(token_fn, owner, repo, comment_id, "eyes")
+    if queued:
+        return {"status": "queued", "reason": "queued_behind_review",
+                "verb": verb, "persona": persona}
     return {"status": "dispatched", "verb": verb, "persona": persona}
+
+
+def _run_autofix(
+    *, install_id: int, owner: str, repo: str, pr_number: int,
+    comment_id: int, token_fn, claim, head_sha: str,
+) -> dict:
+    """`/grug fix` (#676): apply the open committable suggestions as one
+    bot commit.
+
+    The comment is claimed FIRST, since the command writes to the branch
+    and a redelivery must not commit twice. That claim means GitHub never
+    redelivers it, so any raise from the fix path is answered on the PR and
+    returned as a skip instead of becoming a webhook 500 that drops the
+    command in silence (grug#1430)."""
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": "fix"}
+    try:
+        from autofix import run_fix  # type: ignore
+        return run_fix(
+            install_id=install_id, owner=owner, repo=repo,
+            pr_number=pr_number, head_sha=head_sha, token_fn=token_fn,
+        )
+    except Exception as e:  # noqa: BLE001 - claimed: answer, never 500
+        log.warning(
+            "interactive_fix_failed",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number,
+                   "kind": type(e).__name__},
+        )
+        _reply(
+            token_fn, owner, repo, pr_number,
+            "Grug could not apply the suggestions. Nothing was committed. "
+            "Comment `/grug fix` again. So speaks Grug.",
+        )
+        return {"status": "skip", "reason": "fix_failed", "verb": "fix"}
 
 
 def run_command(
@@ -427,6 +560,13 @@ def run_command(
             pr_number=pr_number, comment_id=comment_id, token_fn=token_fn,
             enqueue=enqueue, claim=claim, head_sha=head_sha,
             defer_until=defer_until,
+        )
+
+    if verb == "fix":
+        return _run_autofix(
+            install_id=install_id, owner=owner, repo=repo, pr_number=pr_number,
+            comment_id=comment_id, token_fn=token_fn, claim=claim,
+            head_sha=head_sha,
         )
 
     if verb == "ask":

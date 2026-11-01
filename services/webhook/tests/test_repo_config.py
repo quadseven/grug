@@ -105,3 +105,63 @@ def test_inline_floor():
     assert rc.meets_inline_floor("high", cfg)
     assert rc.meets_inline_floor("critical", cfg)
     assert rc.meets_inline_floor("low", rc.RepoConfig())
+
+
+# --- skip_prs (grug#1439) ---------------------------------------------------
+
+SkipPrs, skip_pr_rule, parse_repo_config = rc.SkipPrs, rc.skip_pr_rule, rc.parse_repo_config
+
+
+def test_skip_prs_parses_all_three_lists():
+    cfg = parse_repo_config(
+        "skip_prs:\n  authors: [a]\n  labels: [l]\n  title_patterns: ['t*']\n"
+    )
+    assert cfg.skip_prs == SkipPrs(("a",), ("l",), ("t*",))
+    assert cfg.problems == ()
+
+
+def test_skip_prs_bad_shapes_are_problems_not_raises():
+    assert parse_repo_config("skip_prs: [a]\n").problems
+    cfg = parse_repo_config("skip_prs:\n  authors: a\n  bogus: [x]\n")
+    assert cfg.skip_prs == SkipPrs()
+    assert len(cfg.problems) == 2
+
+
+def test_skip_pr_rule_matches_and_misses():
+    cfg = parse_repo_config(
+        "skip_prs:\n  authors: ['Bot[bot]']\n  labels: [generated]\n"
+        "  title_patterns: ['chore(deps)*']\n"
+    )
+    assert skip_pr_rule(cfg, author="bot[bot]", labels=(), title="x") == "author `Bot[bot]`"
+    assert skip_pr_rule(cfg, author="h", labels=("GENERATED",), title="x") == "label `generated`"
+    assert skip_pr_rule(cfg, author="h", labels=(), title="Chore(deps): bump") == (
+        "title pattern `chore(deps)*`"
+    )
+    assert skip_pr_rule(cfg, author="h", labels=("other",), title="feat: x") is None
+    assert skip_pr_rule(parse_repo_config(None), author="bot[bot]", labels=(), title="x") is None
+
+
+# --- elder_mute_* (#1436) ---------------------------------------------------
+
+def test_mute_settings_default_and_parse():
+    cfg = rc.parse_repo_config(None)
+    assert (cfg.elder_mute_min_labeled, cfg.elder_mute_below_precision) == (20, 0.2)
+    assert cfg.elder_mute_locked_classes == ()
+    cfg = rc.parse_repo_config(
+        "elder_mute_min_labeled: 30\nelder_mute_below_precision: 0.1\n"
+        "elder_mute_locked_classes: [a, b]\n"
+    )
+    assert cfg.elder_mute_min_labeled == 30
+    assert cfg.elder_mute_below_precision == 0.1
+    assert cfg.elder_mute_locked_classes == ("a", "b")
+    assert cfg.problems == ()
+
+
+def test_bad_mute_settings_keep_defaults_and_report():
+    cfg = rc.parse_repo_config(
+        "elder_mute_min_labeled: lots\nelder_mute_below_precision: 2\n"
+        "elder_mute_locked_classes: nope\n"
+    )
+    assert (cfg.elder_mute_min_labeled, cfg.elder_mute_below_precision) == (20, 0.2)
+    assert cfg.elder_mute_locked_classes == ()
+    assert len(cfg.problems) == 3

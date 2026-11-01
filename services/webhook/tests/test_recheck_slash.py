@@ -18,13 +18,17 @@ Covers:
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
+import yaml
 
 import dispatcher as d
 import personas.tpm.persona as tpm_persona
+
+_K8S = Path(__file__).resolve().parents[3] / "k8s"
 
 
 def _comment_payload(
@@ -519,11 +523,13 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     seen = {}
     monkeypatch.setattr(fetchers, "build_issue_fetcher", lambda **kw: "F")
     monkeypatch.setattr(fetchers, "build_issue_facts_fetcher", lambda **kw: "FF")
+    monkeypatch.setattr(fetchers, "build_merged_siblings_fetcher", lambda **kw: "S")
 
     def _eval(body, fetch_issue=None, fetch_issue_facts=None, author_trusted=False,
-              fetch_changed_files=None, advisory_checks=None):
+              fetch_changed_files=None, advisory_checks=None, fetch_siblings=None):
         seen["eval"] = (body, fetch_issue, fetch_issue_facts, fetch_changed_files,
                         advisory_checks)
+        seen["siblings"] = fetch_siblings
         seen["trusted"] = author_trusted
         return "EVAL"
 
@@ -538,7 +544,7 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     )
     assert evaluation == "EVAL" and result_map["result"] == "pass"
     body, fi, ff, fcf, ac = seen["eval"]
-    assert body == "B" and fi == "F" and ff == "FF"
+    assert body == "B" and fi == "F" and ff == "FF" and seen["siblings"] == "S"
     assert callable(fcf)  # the shared changed-files fetcher is wired through
     assert "in-scope" in ac  # advisory set passed through
     assert seen["trusted"] is False  # default keeps the pre-#1251 skip
@@ -556,9 +562,11 @@ class _InteractiveHttp:
 
     def __init__(self) -> None:
         self.posts: list[dict] = []
+        self.urls: list[str] = []
 
     def post(self, url: str, **kw: object):
         self.posts.append(kw.get("json") or {})
+        self.urls.append(url)
         return _Ok()
 
     def get(self, url: str, **kw: object):
@@ -639,6 +647,64 @@ def test_grug_improve_that_is_not_rate_limited_still_runs(_no_install_lookups, m
     enq.assert_not_called()
 
 
+def _forbidden_get(*_a: object, **_kw: object):
+    request = httpx.Request("GET", "https://api.github.com/repos/myorg/myrepo/pulls/42")
+    response = httpx.Response(403, request=request)
+    raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+
+def _timeout_get(*_a: object, **_kw: object):
+    raise httpx.ReadTimeout("github.com slow")
+
+
+@pytest.mark.parametrize("verb", ["improve", "resume", "review"])
+@pytest.mark.parametrize("fetch,reason", [
+    (_forbidden_get, "pr_fetch_failed"),
+    (_timeout_get, "pr_fetch_transport_failed"),
+])
+def test_an_elder_command_whose_pr_fetch_fails_is_answered(
+    _no_install_lookups, monkeypatch, verb, fetch, reason,
+):
+    """grug#1430: a PR fetch that fails leaves no head to queue against, so
+    the command is ANSWERED ("comment again") instead of skipped in silence."""
+    import interactive
+
+    payload = _comment_payload(body=f"/grug {verb}", sender_login="alice", pr_author="alice")
+    http = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", http)
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=fetch), \
+         patch("rerun.enqueue_rerun") as enq:
+        out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "skip" and out["reason"] == reason
+    enq.assert_not_called()
+    bodies = [str(p.get("body", "")) for p in http.posts]
+    assert len(bodies) == 1
+    assert "could not read this PR" in bodies[0]
+    assert f"/grug {verb}` again" in bodies[0]
+
+
+def test_a_recheck_whose_pr_fetch_fails_keeps_its_own_handling(
+    _no_install_lookups, monkeypatch,
+):
+    """Only Elder re-run verbs get the new answer; Chief's recheck is not
+    changed by grug#1430."""
+    import interactive
+
+    payload = _comment_payload(body="/grug recheck", sender_login="alice", pr_author="alice")
+    http = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", http)
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=_forbidden_get):
+        out = d.dispatch("issue_comment", payload)
+
+    assert out["status"] == "skip"
+    assert http.posts == []
+
+
 def test_budget_reset_epoch_defers_when_the_budget_is_low(monkeypatch):
     """grug#1270: below the floor of the installation's hourly budget, a
     re-run waits for the reset instead of spending what is left."""
@@ -674,4 +740,133 @@ def test_budget_reset_epoch_is_zero_when_the_budget_cannot_be_read(monkeypatch):
         github_app_auth, "with_install_token_retry", lambda iid, fn: fn("tok"),
     )
     assert d._budget_reset_epoch(1) == 0.0
+
+
+# --- grug#1445: an allowed App Bot runs Elder re-runs like a collaborator ---
+
+_ALLOWED_BOTS = {"loom-brain[bot]", "loom-station[bot]"}
+
+
+def _improve_payload(
+    *,
+    sender_login: str = "loom-brain[bot]",
+    sender_type: str = "Bot",
+    pr_author: str = "alice",
+    install_id: int = 1,
+    repo_id: int = 100,
+    comment_id: int = 777,
+) -> dict:
+    return {
+        "action": "created",
+        "issue": {
+            "number": 42,
+            "user": {"login": pr_author},
+            "pull_request": {"url": "..."},
+        },
+        "comment": {"body": "/grug improve", "id": comment_id},
+        "repository": {
+            "id": repo_id, "name": "myrepo",
+            "owner": {"login": "myorg"}, "full_name": "myorg/myrepo",
+        },
+        "installation": {"id": install_id},
+        "sender": {"login": sender_login, "type": sender_type},
+    }
+
+
+def _pr_response(sha: str = "abc123"):
+    class _R:
+        def raise_for_status(self_inner):
+            pass
+
+        def json(self_inner):
+            return {"head": {"sha": sha}, "body": ""}
+
+    return _R()
+
+
+def test_allowed_app_bot_queues_improve_with_no_collaborator_record(
+    _no_install_lookups, monkeypatch,
+):
+    """An allowed App Bot (not the PR author, no collaborator record) queues
+    an Elder re-run on the head."""
+    import interactive
+    import review_label
+
+    monkeypatch.setenv("GRUG_ALLOWED_APP_BOT_LOGINS", "loom-brain[bot], loom-station[bot]")
+    monkeypatch.setattr(d, "_budget_reset_epoch", lambda _id: 0.0)
+    # No review is in flight on this head.
+    monkeypatch.setattr(review_label, "elder_check_state", lambda **k: "absent")
+    http = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", http)
+    monkeypatch.setattr("adapters.pg_install_store.claim_delivery", lambda key: True)
+
+    enqueued: list[dict] = []
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", return_value=_pr_response()), \
+         patch("rerun.enqueue_rerun", side_effect=lambda **kw: enqueued.append(kw)):
+        out = d.dispatch("issue_comment", _improve_payload())
+
+    assert out["status"] == "dispatched"
+    assert out["persona"] == "code_reviewer"
+    assert enqueued, "the allowed bot's improve must queue an Elder re-run"
+    assert enqueued[0]["persona"] == "code_reviewer"
+    assert enqueued[0]["repo"] == "myorg/myrepo"
+    # Only the PR fetch is made - the collaborator lookup is short circuited.
+    # The command is an `issue_comment`, so the reaction goes to issues/comments
+    # and is the only post: no reply comment (grug#1433).
+    assert http.urls == [
+        "https://api.github.com/repos/myorg/myrepo/issues/comments/777/reactions",
+    ]
+    assert http.posts == [{"content": "eyes"}]
+
+
+def test_unknown_app_bot_is_refused_with_a_reply(
+    _no_install_lookups, monkeypatch, mock_transport_client,
+):
+    """A Bot outside the allowed list is refused with a reply naming why,
+    and no Elder re-run is queued."""
+    import interactive
+
+    monkeypatch.setenv("GRUG_ALLOWED_APP_BOT_LOGINS", "loom-brain[bot], loom-station[bot]")
+    http = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", http)
+    monkeypatch.setattr("adapters.pg_install_store.claim_delivery", lambda key: True)
+
+    client = mock_transport_client(status_codes=[404], json_bodies=[{}])
+    enqueued: list[dict] = []
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)), \
+         patch("rerun.enqueue_rerun", side_effect=lambda **kw: enqueued.append(kw)):
+        out = d.dispatch(
+            "issue_comment",
+            _improve_payload(sender_login="random-bot[bot]", sender_type="Bot"),
+        )
+
+    assert out["status"] == "skip"
+    assert out["reason"] == "perm_lookup_failed"
+    assert not enqueued, "an unknown bot must not queue an Elder re-run"
+    assert len(http.posts) == 1
+    body = str(http.posts[0].get("body", ""))
+    assert "refused" in body and "/grug improve" in body
+
+
+# --- production wiring --------------------------------------------------------
+
+def test_deployed_allowed_app_bot_logins_is_not_empty():
+    """The webhook deployment must list at least one allowed App bot login,
+    else an allowed-App /grug improve is dropped exactly as the ticket's Why
+    describes (empty = feature off)."""
+    docs = [doc for doc in yaml.safe_load_all((_K8S / "webhook-deployment.yaml").read_text()) if doc]
+    (deploy,) = [doc for doc in docs if doc.get("kind") == "Deployment"]
+    (container,) = deploy["spec"]["template"]["spec"]["containers"]
+    env = {entry["name"]: entry.get("value") for entry in container.get("env", [])}
+    value = env.get("GRUG_ALLOWED_APP_BOT_LOGINS", "")
+    assert value, "GRUG_ALLOWED_APP_BOT_LOGINS must be set on the webhook container"
+    logins = {name.lower() for name in value.replace(",", " ").split()}
+    assert {"loom-brain[bot]", "loom-station[bot]", "loom-lanes[bot]",
+            "agent-anthropic-claude-code[bot]", "agent-meta-muse[bot]",
+            "agent-openai-dot[bot]", "agent-openai-codex-luna[bot]",
+            "agent-google-gemini[bot]"} <= logins
 

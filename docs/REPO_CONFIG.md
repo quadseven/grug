@@ -17,6 +17,27 @@ All keys are optional.
 | `ignore` | list of path globs | Matching files are never reviewed and never reach the model. The summary names them. |
 | `path_instructions` | list of `{path, instructions}` | `instructions` is added to the review prompt only when the diff touches a file matching `path`. |
 | `min_inline_severity` | `low`, `medium`, `high`, or `critical` | Findings below this level appear in the check summary but get no inline comment. |
+| `skip_prs` | `{authors, labels, title_patterns}`, each a list of strings | A matching pull request is not reviewed. See below. |
+| `elder_mute_min_labeled` | integer, default `20` | Labeled ledger rows a finding class needs before it can be muted. |
+| `elder_mute_below_precision` | number 0 to 1, default `0.2` | A class with at least `elder_mute_min_labeled` labeled rows and a lower fixed-rate is muted: no inline comment, only the board and check summary, marked "muted: fixed in N of M past findings". A high or critical finding still posts inline and blocks. |
+| `elder_mute_locked_classes` | list of class names | These classes keep their inline comments whatever their precision. |
+
+### Skipping a whole pull request
+
+`skip_prs` opts a pull request out of the Elder review and the Teller walkthrough, for example a dependency-bump app's pull requests or ones carrying a label that marks them as generated:
+
+```yaml
+skip_prs:
+  authors: ["dependabot[bot]"]
+  labels: ["generated"]
+  title_patterns: ["chore(deps)*"]
+```
+
+- `authors` and `labels` match exactly, ignoring case.
+- A title pattern matches the whole title, ignoring case. Only `*` (any text) and `?` (one character) are special, so `[deps] *` matches a literal `[deps]` prefix.
+- A matching pull request gets a `success` Elder check whose summary reads `skipped by .grug.yaml skip_prs (<which rule>)`, and no review, no inline comment, no board comment and no walkthrough.
+- Chief and Guard never read `skip_prs`: the definition-of-ready and secret checks run on every pull request.
+- Like every key, it is read from the base commit, so a pull request that adds itself to `skip_prs` is still reviewed.
 
 ### Glob rules
 

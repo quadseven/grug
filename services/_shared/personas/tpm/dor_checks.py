@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from personas.tpm.ticket_compliance import strip_code_spans
 from personas.tpm.in_scope import check_in_scope
+from personas.tpm.sibling_evidence import SiblingFetcher, delivered_criteria
 
 
 log = logging.getLogger("grug.persona.tpm.dor_checks")
@@ -115,6 +116,11 @@ _LOOM_FOOTER_PAT = re.compile(r"^Loom ticket ", re.MULTILINE)
 # from a fleet lane (#1318).
 _LOOM_FOOTER_LANE_PAT = re.compile(
     r"^Loom ticket [^\n]*?,\s*lane\s+([\w.-]+)", re.MULTILINE,
+)
+# The model the footer names (`..., model <name>`). Elder reads it to pick a
+# reviewer of another model family (#1437).
+_LOOM_FOOTER_MODEL_PAT = re.compile(
+    r"^Loom ticket [^\n]*?,\s*model\s+([\w.:/-]+)", re.MULTILINE,
 )
 _LOOM_TICKET_REF_PAT = re.compile(
     r"\b(?:refs|part\s+of|fixes|closes)\s+quadseven/loom#\d+",
@@ -311,6 +317,13 @@ def loom_footer_lane(body: str) -> str | None:
     return match.group(1).rstrip(".") if match else None
 
 
+def loom_footer_model(body: str) -> str | None:
+    """The model the Loom audit footer names, or None when there is no footer
+    or it names no model. Same parser home as `loom_footer_lane`."""
+    match = _LOOM_FOOTER_MODEL_PAT.search(body or "")
+    return match.group(1).rstrip(".") if match else None
+
+
 def check_loom_footer(body: str) -> CheckResult:
     if has_loom_footer(body):
         return CheckResult("loom-footer", True, "Loom audit footer present")
@@ -329,7 +342,9 @@ def check_loom_footer(body: str) -> CheckResult:
     )
 
 
-def _scan_checklist(issue_body: str) -> tuple[list[str], int]:
+def _scan_checklist(
+    issue_body: str, *, max_chars: int | None = 100,
+) -> tuple[list[str], int]:
     """Scan an issue body for checkbox criteria: (unchecked items, total items).
 
     Mirrors the algorithm in infra-public's check.issue-close-completeness.yml:
@@ -343,7 +358,7 @@ def _scan_checklist(issue_body: str) -> tuple[list[str], int]:
     criteria": with zero checkboxes nothing is unchecked either, and reading
     that as a pass is the vacuous-truth bug (zero of zero criteria met).
 
-    Unchecked item texts are stripped and truncated to 100 chars.
+    Unchecked item texts are stripped and truncated to `max_chars`.
     """
     skipping = False
     in_fence = False
@@ -366,7 +381,7 @@ def _scan_checklist(issue_body: str) -> tuple[list[str], int]:
         # Unchecked checkbox item.
         if re.match(r"^[-*]\s+\[\s\]\s+", line):
             item_text = re.sub(r"^[-*]\s+\[\s\]\s+", "", line)
-            open_items.append(item_text[:100])
+            open_items.append(item_text[:max_chars])
             total += 1
         elif re.match(r"^[-*]\s+\[[xX]\]\s+", line):
             total += 1
@@ -378,13 +393,34 @@ def _scan_unchecked_items(issue_body: str) -> list[str]:
     return _scan_checklist(issue_body)[0]
 
 
+def _met_by_siblings(
+    number: int, open_items: list[str], issue_body: str,
+    fetch_siblings: SiblingFetcher | None,
+) -> dict[str, int]:
+    """The open items a merged sibling PR delivered. A failed read is no
+    evidence, which leaves the plain check (grug#1530)."""
+    if fetch_siblings is None:
+        return {}
+    try:
+        siblings = fetch_siblings(number)
+    except Exception as exc:  # noqa: BLE001 - evidence must not change the check's fail-open
+        log.warning(
+            "linked_issue_siblings_fetch_failed",
+            extra={"issue_number": number, "kind": type(exc).__name__},
+        )
+        return {}
+    return delivered_criteria(open_items, siblings, issue_body)
+
+
 def check_linked_issue_completeness(
     body: str,
     *,
     fetch_issue: IssueFetcher | None = None,
+    fetch_siblings: SiblingFetcher | None = None,
 ) -> CheckResult:
     """Check that linked issues (via Closes/Fixes/Resolves #N) have all
-    non-exempt acceptance/test checkboxes ticked.
+    non-exempt acceptance/test checkboxes ticked, or the box's criterion
+    delivered by a merged PR on the same ticket (`sibling_evidence`).
 
     This is the only check that needs IO (fetching the issue body). The fetcher
     is injected as a keyword arg so the parsing/scan logic stays unit-testable
@@ -426,6 +462,7 @@ def check_linked_issue_completeness(
     failures: list[str] = []
     fetch_failures: list[int] = []
     no_criteria: list[int] = []
+    delivered: list[str] = []
     for num in issue_numbers:
         try:
             issue_body = fetch_issue(num)
@@ -437,9 +474,18 @@ def check_linked_issue_completeness(
             )
             fetch_failures.append(num)
             continue
-        open_items, total_items = _scan_checklist(issue_body)
-        if open_items:
-            items_str = "; ".join(open_items)
+        open_items, total_items = _scan_checklist(issue_body, max_chars=None)
+        met = _met_by_siblings(num, open_items, issue_body, fetch_siblings)
+        if met:
+            prs = sorted(set(met.values()))
+            log.info(
+                "linked_issue_criteria_met_by_siblings",
+                extra={"issue_number": num, "criteria": len(met), "prs": prs},
+            )
+            delivered.append(f"#{num}: {len(met)} by {', '.join(f'#{p}' for p in prs)}")
+        still_open = [item[:100] for item in open_items if item not in met]
+        if still_open:
+            items_str = "; ".join(still_open)
             failures.append(f"#{num}: {items_str}")
         elif total_items == 0:
             no_criteria.append(num)
@@ -447,6 +493,10 @@ def check_linked_issue_completeness(
     if failures:
         detail = "linked issue(s) have unchecked items: " + "; ".join(failures)
         return CheckResult("linked-issue-completeness", False, detail)
+
+    sibling_note = (
+        f"; criteria met by merged PRs ({'; '.join(delivered)})" if delivered else ""
+    )
 
     # No failures found. An issue with NO checkbox criteria was not evaluated
     # either: nothing was unchecked because nothing was there to check, and
@@ -464,7 +514,9 @@ def check_linked_issue_completeness(
             detail += f"; #{checked} all checkboxes ticked"
         if fetch_failures:
             detail += f"; fetch failed for #{fetch_failures} (fail-open)"
-        return CheckResult("linked-issue-completeness", True, detail, skipped=True)
+        return CheckResult(
+            "linked-issue-completeness", True, detail + sibling_note, skipped=True,
+        )
 
     # If any fetches failed, we fail open (pass) but
     # mark the check `skipped`: a partly-fetched issue list was not fully
@@ -473,13 +525,13 @@ def check_linked_issue_completeness(
         return CheckResult(
             "linked-issue-completeness", True,
             f"linked issues #{issue_numbers} checked; "
-            f"fetch failed for #{fetch_failures} (fail-open)",
+            f"fetch failed for #{fetch_failures} (fail-open){sibling_note}",
             skipped=True,
         )
 
     return CheckResult(
         "linked-issue-completeness", True,
-        f"linked issue(s) #{issue_numbers} all checkboxes ticked",
+        f"linked issue(s) #{issue_numbers} all checkboxes ticked{sibling_note}",
     )
 
 
@@ -632,11 +684,12 @@ def run_all(
     fetch_issue: IssueFetcher | None = None,
     fetch_issue_facts: IssueFactsFetcher | None = None,
     fetch_changed_files: Callable[[], list[str]] | None = None,
+    fetch_siblings: SiblingFetcher | None = None,
 ) -> list[CheckResult]:
     """Run all DoR checks over the PR body.
 
     `fetch_issue` is passed through to `check_linked_issue_completeness` and
-    `check_in_scope`; `fetch_issue_facts` to `check_linked_issue_in_epic`;
+    `check_in_scope`; `fetch_siblings` to the first; `fetch_issue_facts` to `check_linked_issue_in_epic`;
     `fetch_changed_files` to `check_in_scope`. When either IO fetcher is
     None, its check fails open (pass, marked `skipped`).
 
@@ -646,7 +699,9 @@ def run_all(
     # The first 5 checks are pure (body -> CheckResult); the last 3 need IO
     # through their injected fetchers.
     results = [check(body) for check in _PURE_CHECKS]
-    results.append(check_linked_issue_completeness(body, fetch_issue=fetch_issue))
+    results.append(check_linked_issue_completeness(
+        body, fetch_issue=fetch_issue, fetch_siblings=fetch_siblings,
+    ))
     results.append(check_linked_issue_in_epic(body, fetch_issue_facts=fetch_issue_facts))
     results.append(
         check_in_scope(body, fetch_issue=fetch_issue, fetch_changed_files=fetch_changed_files)

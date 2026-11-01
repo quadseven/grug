@@ -4,7 +4,12 @@ Elder posts inline threads but never closed them, so a PR author faced a
 wall of stale markings after fixing the code. After a new review, this
 module resolves each thread that is provably Elder's, whose anchored code a
 later commit changed or removed, and which the new review does not raise
-again, replying "fixed in <sha>" first.
+again, without posting an email-triggering reply (#1435).
+
+Where resolving is forbidden (the integration lacks thread-resolve scope),
+it edits Elder's root comment so its first line reads "Fixed in <sha>: ..."
+and collapses it as OUTDATED. In both cases, closed threads are recorded
+on the shared board's findings section with the short fixing sha.
 
 Ownership is conservative on every axis:
   - the thread's first comment must be authored by the grug app AND carry
@@ -14,7 +19,9 @@ Ownership is conservative on every axis:
   - a reply from the PR author that starts with "Fixed in" is treated as
     the author confirming the fix, so the thread may still be resolved;
   - "code changed" is GitHub's own `isOutdated`, which flips only when a
-    later commit changed or removed the anchored lines;
+    later commit changed or removed the anchored lines. A deferred-ruff
+    thread is the exception: its anchor can be a line the fix never touches,
+    so the review no longer raising it is what says it is fixed (#1477);
   - a thread whose original commit is gone (force-push) is skipped.
 
 Entry point: `resolve_fixed_threads`. It never raises; every failure is
@@ -28,6 +35,9 @@ from typing import Any
 
 import httpx
 from github_app_auth import with_install_token_retry
+
+from personas import board, board_client
+from personas.code_reviewer import deferred_ruff
 from personas.code_reviewer.dedup import parse_rule
 from personas.code_reviewer.persona import Finding
 
@@ -54,7 +64,7 @@ query($owner: String!, $repo: String!, $pr: Int!, $after: String,
       reviewThreads(first: 100, after: $after) {
         pageInfo { hasNextPage endCursor }
         nodes {
-          id isResolved isOutdated
+          id isResolved isOutdated resolvedBy { login }
           comments(first: $perThread) {
             totalCount
             nodes {
@@ -69,19 +79,19 @@ query($owner: String!, $repo: String!, $pr: Int!, $after: String,
   }
 }
 """
-_REPLY_MUTATION = """
-mutation($thread: ID!, $body: String!) {
-  addPullRequestReviewThreadReply(input: {
-    pullRequestReviewThreadId: $thread, body: $body
-  }) { comment { id } }
-}
-"""
 _RESOLVE_MUTATION = """
 mutation($thread: ID!) {
   resolveReviewThread(input: {threadId: $thread}) { thread { isResolved } }
 }
 """
 
+_EDIT_COMMENT_MUTATION = """
+mutation($comment: ID!, $body: String!) {
+  updatePullRequestReviewComment(input: {
+    pullRequestReviewCommentId: $comment, body: $body
+  }) { pullRequestReviewComment { id } }
+}
+"""
 
 _MINIMIZE_MUTATION = """
 mutation($subject: ID!) {
@@ -196,24 +206,10 @@ def _owned_rule_and_line(thread: dict, pr_author: str | None = None) -> tuple[st
 _FIXED_REPLY_PREFIX = "Fixed in "
 
 
-def _already_answered(thread: dict, head_sha: str) -> bool:
-    """An earlier pass (or the PR author) posted a "Fixed in" reply but
-    the resolve call failed or has not run yet.
-
-    Counting the author's reply here is deliberate (#1147): only threads
-    that passed `select_fixed_threads` reach this check, so every non-Elder
-    reply is the PR author's own "Fixed in". A second "Fixed in" from Elder
-    would add noise, and the resolve still requires GitHub's `isOutdated`
-    and no nearby re-raise, so the author's word alone never closes a thread.
-    Pinned by `test_author_fixed_in_reply_is_not_answered_twice`."""
-    nodes = (thread.get("comments") or {}).get("nodes") or []
-    prefix = _FIXED_REPLY_PREFIX.lower()
-    expected = head_sha[:7].lower()
-    expected_reply = f"{prefix}{expected}"
-    return any(
-        (body := (c.get("body") or "").lower()) == expected_reply
-        or body.startswith(f"{expected_reply}:")
-        for c in nodes[1:]
+def _fixed_prefix(head_sha: str) -> str:
+    return (
+        f"{_FIXED_REPLY_PREFIX}{head_sha[:7]}: the flagged code changed and "
+        "this review does not raise it again."
     )
 
 
@@ -238,17 +234,25 @@ def _blocked_by_person_reply(thread: dict, pr_author: str | None) -> bool:
     return False
 
 
+def _is_remeasured(thread: dict) -> bool:
+    nodes = (thread.get("comments") or {}).get("nodes") or []
+    return bool(nodes) and parse_rule(nodes[0].get("body") or "") == deferred_ruff.RULE
+
+
 def select_fixed_threads(
     threads: list[dict], findings: tuple[Finding, ...],
     *, pr_author: str | None = None,
 ) -> tuple[list[str], int, int]:
-    """Node ids of threads that are Elder's, outdated, and not re-raised,
-    plus skip counts for person replies and re-raised findings."""
+    """Node ids of threads that are Elder's, outdated (or re-measured on
+    every review), and not re-raised, plus skip counts for person replies
+    and re-raised findings."""
     picked: list[str] = []
     skipped_person = 0
     skipped_reraised = 0
     for t in threads:
-        if t.get("isResolved") or not t.get("isOutdated"):
+        if t.get("isResolved"):
+            continue
+        if not t.get("isOutdated") and not _is_remeasured(t):
             continue
         owned = _owned_rule_and_line(t, pr_author)
         if owned is None:
@@ -269,13 +273,16 @@ def select_fixed_threads(
 
 def _resolve_or_collapse(
     installation_id: int, thread_id: str, comment_id: str | None,
+    comment_body: str = "", head_sha: str = "",
 ) -> str:
-    """Resolve the thread; if GitHub forbids it, collapse Elder's comment.
+    """Resolve the thread; if GitHub forbids it, edit Elder's root comment
+    so its first line reads "Fixed in <sha>: ..." and collapse it.
 
     GitHub answers `FORBIDDEN: Resource not accessible by integration` when
     the app lacks the permission resolving needs (seen live 2026-10-05),
     but an app may always minimize its own comment. Collapsing it as
-    OUTDATED, under the "Fixed in" reply, is the same signal to the author.
+    OUTDATED with the edited first line signals to consumers that the
+    finding is fixed without posting an email-triggering reply.
 
     Returns ``resolved`` or ``collapsed``.
     """
@@ -288,6 +295,20 @@ def _resolve_or_collapse(
     except GraphQLError as e:
         if "FORBIDDEN" not in e.types or not comment_id:
             raise
+    fixed_line = _fixed_prefix(head_sha)
+    if not comment_body.startswith(_FIXED_REPLY_PREFIX):
+        new_body = f"{fixed_line}\n\n{comment_body}" if comment_body else fixed_line
+    elif not comment_body.startswith(f"{_FIXED_REPLY_PREFIX}{head_sha[:7]}"):
+        lines = comment_body.splitlines()
+        new_body = "\n".join([fixed_line] + lines[1:])
+    else:
+        new_body = comment_body
+    with_install_token_retry(
+        installation_id,
+        lambda tok: _graphql(
+            tok, _EDIT_COMMENT_MUTATION, {"comment": comment_id, "body": new_body},
+        ),
+    )
     with_install_token_retry(
         installation_id,
         lambda tok: _graphql(tok, _MINIMIZE_MUTATION, {"subject": comment_id}),
@@ -296,18 +317,60 @@ def _resolve_or_collapse(
     return "collapsed"
 
 
+def _format_closed_thread(head_sha: str, thread_id: str) -> str:
+    return f"- Fixed in {head_sha[:7]}: thread {thread_id}"
+
+
+def _update_board_closed_threads(
+    token: str,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    closed_thread_ids: list[str],
+    head_sha: str,
+) -> None:
+    found = board_client.find_board(token, owner, repo, pull_number)
+    if found is None:
+        return
+    _, existing = found
+    elder_section = board.extract_section(existing, "elder") or ""
+    lines_to_add = [
+        _format_closed_thread(head_sha, tid)
+        for tid in closed_thread_ids
+        if _format_closed_thread(head_sha, tid) not in elder_section
+    ]
+    if not lines_to_add:
+        return
+
+    closed_heading = "**Closed threads**"
+    if closed_heading in elder_section:
+        new_elder = f"{elder_section.rstrip()}\n" + "\n".join(lines_to_add)
+    else:
+        closed_block = f"{closed_heading}\n\n" + "\n".join(lines_to_add)
+        if elder_section.strip():
+            new_elder = f"{elder_section.rstrip()}\n\n{closed_block}"
+        else:
+            new_elder = closed_block
+
+    board_client.upsert_board_section(
+        token, owner, repo, pull_number,
+        key="elder", section=new_elder, create_if_absent=False,
+    )
+
+
 def resolve_fixed_threads(
     installation_id: int, owner: str, repo: str, pull_number: int,
     *, head_sha: str, findings: tuple[Finding, ...],
     threads: list[dict] | None = None,
     pr_author: str | None = None,
 ) -> int:
-    """Reply "fixed in <sha>" and resolve each qualifying Elder thread.
+    """Resolve each qualifying Elder thread without posting a reply comment.
 
     `threads` is an already-fetched listing (shared with the carry-forward
     pass so a review lists once); None fetches it here. `pr_author` lets
-    threads the PR author already answered "Fixed in" be closed without a
-    second reply. Returns the number of threads touched. Never raises.
+    threads the PR author already answered "Fixed in" be closed.
+    Closed threads are recorded on the board's findings section.
+    Returns the number of threads touched. Never raises.
     """
     pr_ref = f"{owner}/{repo}#{pull_number}"
     try:
@@ -319,49 +382,52 @@ def resolve_fixed_threads(
         targets, skipped_person, skipped_reraised = select_fixed_threads(
             threads, findings, pr_author=pr_author,
         )
-        answered = {
-            t["id"] for t in threads
-            if t.get("id") in targets and _already_answered(t, head_sha)
-        }
-        first_comment_ids = {
-            t["id"]: ((t.get("comments") or {}).get("nodes") or [{}])[0].get("id")
+        first_comments = {
+            t["id"]: ((t.get("comments") or {}).get("nodes") or [{}])[0]
             for t in threads if t.get("id") in targets
         }
     except Exception as e:  # noqa: BLE001 - never fail a review for tidying
         log.warning("elder_thread_list_failed",
                     extra={"pr": pr_ref, "kind": type(e).__name__})
         return 0
-    body = (
-        f"{_FIXED_REPLY_PREFIX}{head_sha[:7]}: the flagged code changed and "
-        "this review does not raise it again."
-    )
+
     resolved = 0
     collapsed = 0
     failed = 0
+    closed_thread_ids: list[str] = []
     for thread_id in targets:
+        first = first_comments.get(thread_id) or {}
+        comment_id = first.get("id")
+        comment_body = first.get("body") or ""
         try:
-            # Reply and resolve are separate calls, each retried on its own,
-            # so a token retry never re-posts the reply, and a thread whose
-            # earlier resolve failed is resolved without a second reply.
-            if thread_id not in answered:
-                with_install_token_retry(
-                    installation_id,
-                    lambda tok, tid=thread_id: _graphql(
-                        tok, _REPLY_MUTATION, {"thread": tid, "body": body},
-                    ),
-                )
             outcome = _resolve_or_collapse(
-                installation_id, thread_id, first_comment_ids.get(thread_id),
+                installation_id, thread_id, comment_id,
+                comment_body=comment_body, head_sha=head_sha,
             )
             if outcome == "resolved":
                 resolved += 1
+                closed_thread_ids.append(thread_id)
             else:
                 collapsed += 1
+                closed_thread_ids.append(thread_id)
         except Exception as e:  # noqa: BLE001 - one bad thread must not stop the rest
             failed += 1
             log.warning("elder_thread_resolve_failed",
                         extra={"pr": pr_ref, "thread_id": thread_id,
                                "kind": type(e).__name__})
+
+    if closed_thread_ids:
+        try:
+            with_install_token_retry(
+                installation_id,
+                lambda tok: _update_board_closed_threads(
+                    tok, owner, repo, pull_number, closed_thread_ids, head_sha,
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 - board update is best-effort
+            log.warning("elder_thread_board_update_failed",
+                        extra={"pr": pr_ref, "kind": type(e).__name__})
+
     log.info("elder_threads_resolved",
              extra={"pr": pr_ref, "resolved": resolved, "collapsed": collapsed,
                     "skipped_person": skipped_person,

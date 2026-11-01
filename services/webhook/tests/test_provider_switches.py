@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import get_args
 from unittest.mock import patch
 
 import httpx
@@ -145,6 +146,29 @@ def test_the_shipped_chain_is_free_cloud_tiers_only_then_the_cave(monkeypatch) -
     assert not lc._backend_enabled(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
     assert not lc._backend_enabled(Backend.OPENROUTER, "anthropic/claude-opus-4.7")
     assert lc._backend_enabled(Backend.OPENROUTER, _FREE)
+
+
+def test_the_shipped_deep_escalation_is_a_mode_the_client_accepts(monkeypatch, caplog) -> None:
+    """grug#1487: GRUG_DEEP_ESCALATION ships as on_demand while the Sparks
+    are away. An unknown value falls back to auto with a warning, which
+    would silently undo the switch, so the shipped value must be a mode
+    `_deep_escalation_mode` takes as-is."""
+    root = Path(__file__).resolve().parents[3] / "k8s"
+    per_manifest = {
+        manifest: re.findall(
+            r'name: GRUG_DEEP_ESCALATION, value: "?([^"}\s]*)"?\}',
+            (root / manifest).read_text(),
+        )
+        for manifest in ("consumer-deployment.yaml", "webhook-deployment.yaml")
+    }
+    assert all(len(v) == 1 for v in per_manifest.values()), per_manifest
+    assert len({v[0] for v in per_manifest.values()}) == 1, per_manifest
+    shipped = _shipped_env("GRUG_DEEP_ESCALATION")
+    assert shipped in get_args(lc.DeepEscalationMode)
+    monkeypatch.setenv("GRUG_DEEP_ESCALATION", shipped)
+    with caplog.at_level("WARNING"):
+        assert lc._deep_escalation_mode() == shipped
+    assert not [r for r in caplog.records if r.getMessage() == "deep_escalation_mode_invalid"]
 
 
 def test_the_free_pool_tier_is_opt_in(monkeypatch) -> None:
@@ -379,7 +403,6 @@ def test_the_free_per_day_cap_blocks_the_free_tier_and_is_not_retried() -> None:
 
 @pytest.mark.parametrize("resp", [
     # Poolside's short-lived throttle (live 2026-10-17, no Retry-After).
-    _err(429, "usage limit exceeded"),
     _err(429, "quota exceeded, try again shortly"),
     _err(429, "Rate limit exceeded: free-models-per-min."),
     _err(429, "slow down"),
@@ -468,6 +491,57 @@ def test_a_poolside_usage_limit_429_keeps_poolside_in_the_chain() -> None:
     assert post.call_count == 2
     assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
     assert Backend.POOLSIDE in [t.backend for t in lc._cloud_chain_tiers()]
+
+
+def _poolside_call(resp: httpx.Response) -> None:
+    cfg = lc.replace(lc._BACKEND_CONFIGS[Backend.POOLSIDE], retry_attempts=1)
+    with patch.object(httpx, "post", return_value=resp):
+        lc._call_backend(cfg, _MESSAGES)
+
+
+def test_repeated_limit_refusals_skip_poolside_then_it_is_asked_again(monkeypatch) -> None:
+    """The second refusal in five minutes holds Poolside for five minutes
+    (#1546), so the review reaches a tier that can answer, and Poolside
+    comes back on its own."""
+    now = 1_000_000.0
+    monkeypatch.setattr(lc.time, "time", lambda: now)
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    _poolside_call(limited)
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert Backend.POOLSIDE not in lc._usable_saas_fallback_backends()
+    assert Backend.POOLSIDE not in [t.backend for t in lc._cloud_chain_tiers()]
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL, now + 301)
+
+
+def test_repeated_capacity_refusals_skip_the_free_pool(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
+    pool = lc._free_pool_chain_config()
+    limited = _err(429, "free pool capacity is reserved for higher-priority callers: openrouter (daily)")
+    with patch.object(httpx, "post", return_value=limited):
+        lc._call_backend(pool, _MESSAGES)
+        lc._call_backend(pool, _MESSAGES)
+    assert lc._free_provider_fallback_configs()[0].backend != Backend.FREE_POOL
+    assert Backend.FREE_POOL not in [t.backend for t in lc._cloud_chain_tiers()]
+
+
+def test_a_success_between_limit_refusals_starts_the_count_over() -> None:
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    _poolside_call(_ok())
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+
+
+def test_limit_refusals_spread_past_the_window_never_hold(monkeypatch) -> None:
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(lc.time, "time", lambda: now["t"])
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    now["t"] += 301
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
 
 
 def test_opencode_go_monthly_usage_limit_still_trips_the_breaker() -> None:

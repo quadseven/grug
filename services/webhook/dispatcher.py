@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import importlib
 import logging
+import os
 from typing import Any
 
 from adapters.install_store import (
@@ -556,6 +557,20 @@ _AUTHORIZED_ROLES = {"admin", "maintain", "write"}
 # once - the commands after the wall were the ones that got dropped.
 _LOW_BUDGET_FRACTION = 0.10
 
+# grug#1445: the App bot logins the owner allows to run Elder re-run commands
+# (/grug improve / resume / review) on a PR they did not author. Read from the
+# GRUG_ALLOWED_APP_BOT_LOGINS env var (comma/whitespace separated, lower cased).
+# An App login has no collaborator permission record, so the lookup would fail;
+# an App the owner installed and listed here runs Elder re-runs like a write
+# collaborator. Empty = no bots allowed (feature off, safe to deploy).
+_ALLOWED_APP_BOT_LOGINS_ENV = "GRUG_ALLOWED_APP_BOT_LOGINS"
+
+
+def _allowed_app_bot_logins() -> frozenset[str]:
+    """The configured allowed App bot logins, lower cased."""
+    raw = os.getenv(_ALLOWED_APP_BOT_LOGINS_ENV, "")
+    return frozenset(name.lower() for name in raw.replace(",", " ").split())
+
 
 def _budget_reset_epoch(install_id: int) -> float:
     """The epoch second the installation's GitHub budget resets at, when
@@ -579,6 +594,19 @@ def _budget_reset_epoch(install_id: int) -> float:
     if limit <= 0 or remaining >= limit * _LOW_BUDGET_FRACTION:
         return 0.0
     return float(reset)
+
+
+def _sender_is_allowed_app_bot(sender_type: str, sender_login: str) -> bool:
+    """True when the commenter is a Bot from an allowed App on this owner.
+
+    An App login such as loom-brain[bot] is not a collaborator and has no
+    permission record, so the collaborator lookup fails for it. An App the
+    owner installed and listed here runs Elder re-run commands like a write
+    collaborator instead."""
+    return (
+        str(sender_type or "").lower() == "bot"
+        and sender_login.lower() in _allowed_app_bot_logins()
+    )
 
 
 def _actor_has_write(
@@ -647,6 +675,62 @@ def _actor_permission(
             "perm_lookup_failed",
             extra={"sender": sender_login, "status": e.response.status_code},
         )
+        return None
+
+
+# GitHub's pull request commits endpoint returns at most this many commits,
+# so a list this long may be cut short.
+_PR_COMMITS_CAP = 250
+
+
+def _pr_commit_logins(
+    installation_id: int, owner: str, repo_name: str, pr_number: int,
+) -> frozenset[str] | None:
+    """Lower-case logins that authored or committed any commit on the PR
+    (GitHub's web-flow committer excluded), or None, which refuses a trusted
+    operator: the list could not be read, it reached GitHub's 250-commit cap
+    on that endpoint (so it may be cut short), or a commit's author or
+    committer maps to no GitHub login (an unlinked identity could be anyone). Git metadata can still name another person's
+    linked address; push-actor proof is out of scope, since the owner
+    chooses whom to trust."""
+    from urllib.parse import quote as _q
+    from github_app_auth import with_install_token_retry  # type: ignore
+    import httpx  # type: ignore
+
+    def _read(token: str) -> frozenset[str] | None:
+        logins: set[str] = set()
+        total = 0
+        for page in (1, 2, 3):
+            r = httpx.get(
+                f"https://api.github.com/repos/{_q(owner, safe='')}/"
+                f"{_q(repo_name, safe='')}/pulls/{int(pr_number)}/commits"
+                f"?per_page=100&page={page}",
+                headers={
+                    "Authorization": f"token {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            rows = r.json() or []
+            total += len(rows)
+            if total >= _PR_COMMITS_CAP:
+                return None
+            for row in rows:
+                for role in ("author", "committer"):
+                    who = str(((row or {}).get(role) or {}).get("login") or "").lower()
+                    if not who:
+                        return None
+                    if who != "web-flow":
+                        logins.add(who)
+            if len(rows) < 100:
+                return frozenset(logins)
+        return None
+
+    try:
+        return with_install_token_retry(int(installation_id), _read)
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning("pr_commits_lookup_failed", extra={"pr_number": pr_number, "kind": type(e).__name__})
         return None
 
 
@@ -971,6 +1055,176 @@ def _defer_if_budget_spent(
     )
 
 
+def _enqueue_walkthrough_for_pr(
+    pr: dict[str, Any], *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, comment_id: int,
+) -> str:
+    """Enqueue one Teller walkthrough for the PR a `/grug walkthrough`
+    named. No `labeled` pull_request action is dispatched, so without this
+    the opt-in would wait for the next push. Returns `queued` or
+    `enqueue_failed`; a failed enqueue gets the same durable self-recover
+    the pull_request path uses."""
+    from async_dispatch import enqueue_walkthrough_review, self_recover_review  # lazy: webhook-only
+
+    base_repo = (pr.get("base") or {}).get("repo") or {}
+    payload = {
+        "action": "walkthrough_command",
+        "pull_request": {**pr, "number": int(pr_number)},
+        "repository": {
+            "owner": {"login": owner},
+            "name": repo_name,
+            "private": base_repo.get("private"),
+        },
+        "installation": {"id": int(installation_id)},
+    }
+    delivery_id = f"grug-walkthrough-{int(pr_number)}-{int(comment_id)}"
+    if enqueue_walkthrough_review(payload=payload, delivery_id=delivery_id, blocking=False):
+        return "queued"
+    self_recover_review(payload, delivery_id, persona="walkthrough")
+    log.error(
+        "walkthrough_command_enqueue_failed",
+        extra={
+            "installation_id": installation_id,
+            "owner": owner,
+            "repo": repo_name,
+            "pr_number": pr_number,
+            "delivery_id": delivery_id,
+        },
+    )
+    return "enqueue_failed"
+
+
+def _handle_grug_walkthrough(
+    pr: dict[str, Any], *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, comment_id: int, token_fn,
+) -> dict[str, str]:
+    """Handle `/grug walkthrough` - add the opt-in label, then enqueue the
+    walkthrough for the PR's current head.
+
+    The label `grug:walkthrough` keeps the walkthrough running on later
+    pushes. Idempotent - adding an existing label is a no-op. A label
+    failure enqueues nothing: the opt-in did not land.
+    """
+    import httpx  # type: ignore
+    from urllib.parse import quote as _q
+
+    def _add_label(token: str) -> dict[str, Any]:
+        r = httpx.post(
+            f"https://api.github.com/repos/{_q(owner, safe='')}/"
+            f"{_q(repo_name, safe='')}/issues/{int(pr_number)}/labels",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"labels": ["grug:walkthrough"]},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    try:
+        token_fn(_add_label)
+    except httpx.HTTPStatusError as e:
+        log.warning(
+            "grug_walkthrough_label_failed",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": pr_number,
+                "status": e.response.status_code,
+            },
+        )
+        return {"status": "skip", "reason": "label_add_failed"}
+    except httpx.RequestError as e:
+        log.warning(
+            "grug_walkthrough_label_transport_failed",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": pr_number,
+                "kind": type(e).__name__,
+            },
+        )
+        return {"status": "skip", "reason": "label_add_transport_failed"}
+
+    log.info(
+        "grug_walkthrough_opt_in",
+        extra={
+            "installation_id": installation_id,
+            "owner": owner,
+            "repo": repo_name,
+            "pr_number": pr_number,
+        },
+    )
+    result = _enqueue_walkthrough_for_pr(
+        pr, installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pr_number=pr_number, comment_id=comment_id,
+    )
+    return {"status": "ok", "trigger": "walkthrough", "result": result}
+
+
+def _answer_pr_fetch_failed(
+    cmd, *, installation_id: int, owner: str, repo_name: str, pr_number: int,
+) -> None:
+    """Answer an Elder re-run command whose PR could not be read (grug#1430).
+
+    Without the PR there is no head to queue against, so the command cannot
+    be kept; it is answered instead of vanishing, which is what made people
+    fire the same command again. Other verbs keep their own handling."""
+    from grug_commands import ELDER_RERUN_VERBS  # type: ignore
+
+    if cmd.verb not in ELDER_RERUN_VERBS:
+        return
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from interactive import _reply  # type: ignore
+
+    _reply(
+        lambda fn: with_install_token_retry(installation_id, fn),
+        owner, repo_name, pr_number,
+        f"Grug could not read this PR from GitHub, so the command was not "
+        f"queued. Comment `/grug {cmd.verb}` again.",
+    )
+
+
+def _refuse_accept(
+    reason: str, *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, comment_id: object, permission: str = "",
+    association: str = "",
+) -> None:
+    """Tell the commenter once why `/grug accept-removal` was refused."""
+    from accept_removal import refuse_removal  # type: ignore
+    from github_app_auth import with_install_token_retry  # type: ignore
+
+    refuse_removal(
+        reason, owner=owner, repo=repo_name, pr_number=pr_number,
+        comment_id=comment_id, permission=permission, association=association,  # type: ignore[arg-type]
+        token_fn=lambda fn: with_install_token_retry(installation_id, fn),
+    )
+
+
+def _refuse_rerun_command(
+    reason: str, *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, verb: str,
+) -> None:
+    """Tell the commenter once why an Elder re-run command was refused.
+
+    A refused command that vanishes looks like one that worked (grug#1270),
+    so the reader is told why and invited to comment again. Best-effort: a
+    reply GitHub refuses must not turn the refusal into a webhook 500."""
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from interactive import _reply  # type: ignore
+
+    _reply(
+        lambda fn: with_install_token_retry(int(installation_id), fn),
+        owner, repo_name, int(pr_number),
+        f"Grug refused `/grug {verb}`: {reason}. Only the PR author, a "
+        f"write collaborator, or an allowed App bot can re-run Elder here. "
+        f"Comment `/grug {verb}` again.",
+    )
+
+
 def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     action = payload.get("action", "")
     if action != "created":
@@ -983,7 +1237,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     comment = payload.get("comment") or {}
     body = comment.get("body") or ""
     comment_id = comment.get("id")
-    from grug_commands import parse_command  # type: ignore
+    from grug_commands import ELDER_RERUN_VERBS, parse_command  # type: ignore
     cmd = parse_command(body)
     if cmd is None:
         return {"status": "no_op", "reason": "no /grug command trigger"}
@@ -997,6 +1251,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     repo_name = repo.get("name")
     pr_number = issue.get("number")
     sender_login = sender.get("login", "")
+    sender_type = sender.get("type", "")
     pr_author_login = (issue.get("user") or {}).get("login", "")
 
     if not all([installation_id, owner, repo_name, pr_number]):
@@ -1028,6 +1283,15 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         from accept_removal import acceptor_from_payload  # type: ignore
         sender_login, refused = acceptor_from_payload(payload)
         if refused:
+            # A human commenter is told why (and what works); a Bot, an App
+            # or an unconfirmed author is not, so bots never answer bots.
+            if refused == "comment author is not an owner, member or collaborator":
+                _refuse_accept(
+                    "association", installation_id=int(installation_id),
+                    owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+                    comment_id=comment_id,
+                    association=str(comment.get("author_association") or ""),
+                )
             log.info(
                 "accept_removal_refused",
                 extra={"sender": sender.get("login", ""), "owner": owner,
@@ -1054,28 +1318,84 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
 
     try:
         if accepting:
-            # grug#1405: only an admin accepts a removal, whoever wrote
-            # the PR. No PR-author shortcut, and no write-level path.
-            from accept_removal import may_accept  # type: ignore
+            # #1405: an admin accepts a removal, whoever wrote the PR;
+            # a trusted operator the owner lists in SSM accepts with write,
+            # never on their own PR. No other write-level path.
+            import secrets_loader  # type: ignore
+            from accept_removal import is_trusted, may_accept  # type: ignore
             perm = _actor_permission(
                 int(installation_id), owner, repo_name, sender_login,
             )
             association = str(comment.get("author_association") or "")
-            has_write = None if perm is None else may_accept(association, perm)
-        else:
-            has_write = _actor_has_write(
-                int(installation_id), owner, repo_name, sender_login,
-                allow_author=True, pr_author_login=pr_author_login,
+            trusted = secrets_loader.get_removal_acceptors()
+            # A trusted operator's commits are read only for a listed login,
+            # so admins and everyone else cost no extra request.
+            commit_logins = (
+                _pr_commit_logins(int(installation_id), owner, repo_name, int(pr_number))
+                if perm not in (None, "admin") and association != "OWNER"
+                and is_trusted(owner, sender_login, trusted) else frozenset()
             )
+            has_write = None if perm is None else may_accept(
+                association, perm, owner=owner, login=sender_login,
+                pr_author=pr_author_login or "", trusted=trusted,
+                commit_logins=commit_logins,
+            )
+        else:
+            # grug#1445: an allowed App Bot runs Elder re-run commands like a
+            # write collaborator. It has no collaborator permission record, so
+            # the lookup would fail (404) - short circuit it instead. Only
+            # improve / resume / review are opened to bots; recheck and the
+            # other verbs keep the strict author-or-write gate.
+            if cmd.verb in ELDER_RERUN_VERBS and _sender_is_allowed_app_bot(
+                sender_type, sender_login
+            ):
+                has_write = True
+            else:
+                has_write = _actor_has_write(
+                    int(installation_id), owner, repo_name, sender_login,
+                    allow_author=True, pr_author_login=pr_author_login,
+                )
     except httpx.RequestError as e:
+        if accepting:
+            _refuse_accept(
+                "perm_lookup_failed", installation_id=int(installation_id),
+                owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+                comment_id=comment_id,
+            )
         log.warning(
             "perm_lookup_transport_failed",
             extra={"sender": sender_login, "kind": type(e).__name__},
         )
         return {"status": "skip", "reason": "perm_lookup_transport_failed"}
     if has_write is None:
+        if accepting:
+            _refuse_accept(
+                "perm_lookup_failed", installation_id=int(installation_id),
+                owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+                comment_id=comment_id,
+            )
+        elif cmd.verb in ELDER_RERUN_VERBS:
+            _refuse_rerun_command(
+                "the permission lookup failed", installation_id=int(installation_id),
+                owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+                verb=cmd.verb,
+            )
         return {"status": "skip", "reason": "perm_lookup_failed"}
     if not has_write:
+        if accepting:
+            _refuse_accept(
+                "not_admin", installation_id=int(installation_id), owner=owner,
+                repo_name=repo_name, pr_number=int(pr_number),
+                comment_id=comment_id, permission=perm,
+                association=str(comment.get("author_association") or ""),
+            )
+        elif cmd.verb in ELDER_RERUN_VERBS:
+            _refuse_rerun_command(
+                "the sender has no write role on this repo",
+                installation_id=int(installation_id), owner=owner,
+                repo_name=repo_name, pr_number=int(pr_number),
+                verb=cmd.verb,
+            )
         log.info(
             "recheck_unauthorized",
             extra={
@@ -1136,6 +1456,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             "recheck_pr_fetch_failed",
             extra={"pr_number": pr_number, "status": e.response.status_code},
         )
+        _answer_pr_fetch_failed(
+            cmd, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
+        )
         return {"status": "skip", "reason": "pr_fetch_failed"}
     except httpx.RequestError as e:
         # Transport-level failure (timeout, DNS, connection-reset).
@@ -1143,6 +1467,10 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         log.warning(
             "recheck_pr_fetch_transport_failed",
             extra={"pr_number": pr_number, "kind": type(e).__name__},
+        )
+        _answer_pr_fetch_failed(
+            cmd, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
         )
         return {"status": "skip", "reason": "pr_fetch_transport_failed"}
 
@@ -1154,6 +1482,13 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # Interactive commands (#528) reuse the SAME gating above (allowlist +
     # tpm + author-or-write-collaborator), then branch to their own actions.
     # recheck keeps the original DoR-re-evaluate path below.
+    if cmd.verb == "walkthrough":
+        return _handle_grug_walkthrough(
+            pr, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
+            comment_id=int(comment_id) if comment_id is not None else 0,
+            token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+        )
     if cmd.verb != "recheck":
         from interactive import run_command  # type: ignore
         return run_command(
@@ -1238,7 +1573,7 @@ def run_chief_recheck(
     Unexpected errors propagate; each caller owns its containment."""
     from personas.tpm.issue_fetcher import (  # type: ignore
         build_changed_files_fetcher, build_issue_facts_fetcher,
-        build_issue_fetcher,
+        build_issue_fetcher, build_merged_siblings_fetcher,
     )
     from personas.tpm.persona import (  # type: ignore
         _ADVISORY_CHECKS, evaluate_pull_request, publish_tpm_evaluation,
@@ -1271,6 +1606,10 @@ def run_chief_recheck(
         pr_body,
         fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
         fetch_changed_files=fetch_changed_files,
+        fetch_siblings=build_merged_siblings_fetcher(
+            installation_id=installation_id, owner=owner, repo=repo,
+            pr_number=pr_number,
+        ),
         author_trusted=author_trusted,
         advisory_checks=advisory_checks,
     )
@@ -1480,7 +1819,16 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
 
     comment = payload.get("comment") or {}
     in_reply_to = comment.get("in_reply_to_id")
-    if not in_reply_to:
+    body = (comment.get("body") or "").strip()
+
+    # #822: a /grug question inside a review thread - as a reply, or as the
+    # root comment of a new thread - is answered in that thread. Detect it
+    # before the learnings-only flow below, which requires a reply.
+    from grug_commands import parse_command  # type: ignore
+    cmd = parse_command(body) if body else None
+    thread_ask = cmd is not None and cmd.verb == "ask" and bool(cmd.arg)
+
+    if not in_reply_to and not thread_ask:
         # A NEW inline comment (a thread root), not a reply. Grug only learns
         # from replies to its findings; a root comment has nothing to join.
         return {"status": "no_op", "reason": "not a reply"}
@@ -1489,7 +1837,6 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
     if str((comment.get("user") or {}).get("type", "")) == "Bot":
         return {"status": "no_op", "reason": "reply author is a bot"}
 
-    body = (comment.get("body") or "").strip()
     if not body:
         return {"status": "no_op", "reason": "empty reply"}
 
@@ -1522,6 +1869,43 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
     from urllib.parse import quote as _q
     from github_app_auth import with_install_token_retry  # type: ignore
     import httpx  # type: ignore
+
+    if thread_ask:
+        # #822: an in-thread question takes the same gate as a /grug command
+        # on the PR conversation - the PR author or a write collaborator -
+        # NOT the stricter learnings gate below: asking about a finding is
+        # not teaching, and the author asking "why did you flag this?" in
+        # the finding's own thread is the feature's main case.
+        pr_author_login = str((pr.get("user") or {}).get("login") or "")
+        try:
+            may_ask = _actor_has_write(
+                int(installation_id), owner, repo_name, sender_login,
+                allow_author=True, pr_author_login=pr_author_login,
+            )
+        except httpx.RequestError as e:
+            log.warning(
+                "perm_lookup_transport_failed",
+                extra={"sender": sender_login, "kind": type(e).__name__},
+            )
+            return {"status": "skip", "reason": "perm_lookup_transport_failed"}
+        if may_ask is None:
+            return {"status": "skip", "reason": "perm_lookup_failed"}
+        if not may_ask:
+            return {"status": "no_op", "reason": "ask author lacks write perm"}
+        from rerun import enqueue_ask  # type: ignore
+        try:
+            enqueue_ask(
+                install_id=int(installation_id),
+                repo=f"{owner}/{repo_name}",
+                pr_number=int(pr_number),
+                comment_id=int(comment_id),
+                question=cmd.arg,
+                reply_to_comment_id=int(in_reply_to or comment_id),
+            )
+        except Exception as e:  # noqa: BLE001 - same containment as the learn enqueue
+            log.warning("ask_enqueue_failed", extra={"kind": type(e).__name__})
+            return {"status": "skip", "reason": "enqueue_failed"}
+        return {"status": "dispatched", "kind": "ask"}
 
     # Trust gate: ALWAYS require write-or-above, even for the PR author. Unlike
     # /grug recheck (an author re-running their own PR is harmless), a learning

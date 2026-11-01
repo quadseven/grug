@@ -66,6 +66,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from typing import NamedTuple
 
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import Finding
@@ -255,6 +256,15 @@ def _write(tmp: str, files: dict[str, str]) -> None:
             fh.write(text)
 
 
+class RuffHit(NamedTuple):
+    """One ruff violation, with no diff anchoring applied."""
+
+    path: str
+    row: int
+    code: str
+    message: str
+
+
 def scan_ruff(
     hunks: tuple[DiffHunk, ...], file_contents: dict[str, str],
     policy: RepoRuffPolicy | None = None,
@@ -287,6 +297,40 @@ def scan_ruff(
         return ()
 
     timeout = _TIMEOUT_S if timeout_s is None else min(_TIMEOUT_S, timeout_s)
+    ran = _run_ruff(kept, timeout, strict)
+    if ran is None:
+        return ()
+    results, prefix = ran
+    return _map_results(results, prefix, added, file_contents, policy, policy_dropped)
+
+
+def ruff_hits(file_contents: dict[str, str]) -> tuple[RuffHit, ...]:
+    """Every violation in the given Python files, whatever the diff touched.
+
+    The deferred-finding re-check (#1477) measures a named file at the head,
+    where the violation is on a line no PR added. Raises `AnalyzerSkip` when
+    ruff could not run: that caller must not read a failed run as a clean one.
+    A file over the byte budget is not scanned, so it raises the same way."""
+    kept = _budget(file_contents)
+    if len(kept) < len([p for p in file_contents if p.endswith(".py")]):
+        raise AnalyzerSkip("over-budget")
+    if not kept:
+        return ()
+    ran = _run_ruff(kept, _TIMEOUT_S, strict=True)
+    if ran is None:
+        raise AnalyzerSkip("error")
+    results, prefix = ran
+    if not isinstance(results, list):
+        raise AnalyzerSkip("unparseable")
+    parsed = (_parse_result(r, prefix) for r in results)
+    return tuple(RuffHit(*hit) for hit in parsed if hit is not None)
+
+
+def _run_ruff(
+    kept: dict[str, str], timeout: float, strict: bool,
+) -> tuple[object, str] | None:
+    """(parsed ruff JSON, temp dir prefix), or None when ruff did not finish.
+    `strict` raises `AnalyzerSkip` with the reason instead of returning None."""
     try:
         with tempfile.TemporaryDirectory(prefix="grug-lint-") as tmp:
             _write(tmp, kept)
@@ -310,8 +354,7 @@ def scan_ruff(
                     },
                 )
                 return _degrade(strict, "error")
-            results = json.loads(proc.stdout or "[]")
-            prefix = tmp.rstrip("/") + "/"
+            return json.loads(proc.stdout or "[]"), tmp.rstrip("/") + "/"
     except FileNotFoundError:
         # WARNING, not info: reaching here means someone set
         # GRUG_LINT_EVIDENCE=ruff and is getting silent nothing, because the
@@ -327,14 +370,11 @@ def scan_ruff(
         log.warning("lint_ruff_unparseable", extra={"kind": type(e).__name__})
         return _degrade(strict, "unparseable")
 
-    return _map_results(results, prefix, added, file_contents, policy, policy_dropped)
 
-
-def _degrade(strict: bool, reason: str) -> tuple[Finding, ...]:
-    """() for the best-effort caller; a recorded skip for the strict one."""
+def _degrade(strict: bool, reason: str) -> None:
+    """None for the best-effort caller; a recorded skip for the strict one."""
     if strict:
         raise AnalyzerSkip(reason)
-    return ()
 
 
 def _is_reportable(
@@ -433,6 +473,7 @@ def _finding(
         ),
         suggestion=_fix_suggestion(fix, row, (file_contents or {}).get(path)),
         effort=None,
+        check_output=f"{path}:{row}: {code} {msg}",
     )
 
 
@@ -458,8 +499,40 @@ def _s608_is_constant(source: str, row: int) -> bool:
                     if isinstance(target, ast.Name):
                         constants[target.id] = value
 
+    for name in _rebound_names(tree):
+        constants.pop(name, None)
+
     candidates = _s608_candidates(tree, row)
     return any(_literal_sql(candidate, constants) for candidate in candidates)
+
+
+def _binding_names(node: ast.AST) -> list[str]:
+    """Every name `node` itself binds, by any statement or pattern form."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        return [node.id]
+    if isinstance(node, (ast.arg, ast.alias)):
+        name = node.arg if isinstance(node, ast.arg) else (node.asname or node.name.split(".")[0])
+        return [name]
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler,
+                         ast.MatchAs, ast.MatchStar)):
+        return [node.name] if node.name else []
+    if isinstance(node, ast.MatchMapping):
+        return [node.rest] if node.rest else []
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return list(node.names)
+    return []
+
+
+def _rebound_names(tree: ast.Module) -> set[str]:
+    """Names bound more than once anywhere in the file (parameters, other
+    scopes, augmented assignment, imports, ...). A module constant sharing
+    such a name may be shadowed or rebound at the flagged row, so it is never
+    resolved as constant (conservative: high severity)."""
+    counts: dict[str, int] = {}
+    for node in ast.walk(tree):
+        for name in _binding_names(node):
+            counts[name] = counts.get(name, 0) + 1
+    return {name for name, n in counts.items() if n > 1}
 
 
 def _s608_candidates(tree: ast.Module, row: int) -> list[ast.expr]:
@@ -476,7 +549,7 @@ def _s608_candidates(tree: ast.Module, row: int) -> list[ast.expr]:
         on_row = isinstance(node, ast.expr) and node.lineno == row
         assigned = isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
         if on_row and not inside and not assigned and isinstance(
-            node, (ast.BinOp, ast.Constant, ast.Name)
+            node, (ast.BinOp, ast.Constant, ast.Name, ast.JoinedStr)
         ):
             candidates.append(node)
         for child in ast.iter_child_nodes(node):
@@ -490,7 +563,8 @@ def _literal_sql(
     node: ast.AST, constants: dict[str, ast.expr], seen: frozenset[str] = frozenset()
 ) -> bool:
     """True for literals, names in `constants` (module-level assignments)
-    whose value is itself constant, `+` of constants, and tuple, list, set or
+    whose value is itself constant, `+` of constants, f-strings whose
+    interpolated values are constant, and tuple, list, set or
     dict displays of constants. Calls never count, even with literal
     arguments: their return value is unknown."""
     if isinstance(node, ast.Constant):
@@ -501,6 +575,10 @@ def _literal_sql(
         )
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         return _literal_sql(node.left, constants, seen) and _literal_sql(node.right, constants, seen)
+    if isinstance(node, ast.JoinedStr):
+        return all(_literal_sql(part, constants, seen) for part in node.values)
+    if isinstance(node, ast.FormattedValue):
+        return node.format_spec is None and _literal_sql(node.value, constants, seen)
     if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
         return all(_literal_sql(item, constants, seen) for item in node.elts)
     if isinstance(node, ast.Dict):

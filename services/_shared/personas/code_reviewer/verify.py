@@ -74,6 +74,18 @@ evidence contradicts:
   passes. Kills only when the pattern re-matches the raw lines near the
   anchor and every value it would hide there is a name the module uses
   as code; a quoted literal is a real secret and keeps the finding.
+- ``covered_by_passing_check``: a ``caller-not-updated`` claim whose cited
+  file or symbol is covered by a check run that concluded ``success`` on
+  the REVIEWED head. Unlike the kills above, the evidence is the PR's own
+  CI, passed in by the dispatch, not the file snapshot. A check covers a
+  finding when its name or output names a cited file's stem as a phrase
+  (``attest_persona_purity.py`` -> "attest persona purity"), or its output
+  names a cited identifier. A failed, pending, neutral or skipped check, a
+  check on another head, and Grug's own check runs never count. Live
+  instance (#763): on PR #762 the persona-purity attester printed
+  ``OK: evaluate_pull_request is pure`` on the reviewed head while Elder
+  claimed its allowlist was stale. The kill records the covering check's
+  name as its ``detail``.
 
 Inconclusive is NOT a kill: a missing file, an unparseable module, a
 module-level line, or a suggestion with no code tokens all keep the
@@ -105,8 +117,38 @@ class KilledFinding:
     finding: "Finding"
     # "non_code_file" | "sync_context" | "fix_already_present" |
     # "fix_block_present" | "mitigation_present" | "collection_lockstep" |
-    # "return_value_used" | "callee_not_async" | "redaction_artifact"
+    # "return_value_used" | "callee_not_async" | "redaction_artifact" |
+    # "covered_by_passing_check"
     reason: str
+    # Free-text evidence for the kill; for covered_by_passing_check, the
+    # name of the covering check run (#763). Empty for the other reasons.
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CheckEvidence:
+    """One check run on a commit, reduced to what the coverage kill reads.
+
+    `text` is the check's output title, summary and text joined; GitHub
+    Actions jobs usually leave it empty, so for them only the name counts.
+    """
+    name: str
+    head_sha: str
+    status: str
+    conclusion: str
+    text: str = ""
+
+    @classmethod
+    def from_check_run(cls, run: dict) -> "CheckEvidence":
+        output = run.get("output") or {}
+        parts = (output.get("title"), output.get("summary"), output.get("text"))
+        return cls(
+            name=str(run.get("name") or ""),
+            head_sha=str(run.get("head_sha") or ""),
+            status=str(run.get("status") or "").lower(),
+            conclusion=str(run.get("conclusion") or "").lower(),
+            text="\n".join(str(p) for p in parts if p),
+        )
 
 
 # Prose file suffixes: findings about EXECUTING these are category errors.
@@ -259,6 +301,91 @@ def _kills_as_collection_lockstep(finding: "Finding", source: str) -> bool:
     if not 1 <= finding.line <= len(lines):
         return False  # anchor outside the snapshot - inconclusive, keep
     return not _SIGNATURE_LINE_RE.search(lines[finding.line - 1])
+
+
+# covered_by_passing_check (#763). Paths the message cites, by extension, so
+# a prose word with a dot ("e.g.") is never read as a file.
+_CITED_PATH_RE = re.compile(
+    r"(?<![\w/.-])([\w./-]*\w\.(?:py|pyi|ts|tsx|js|jsx|mjs|go|rs|rb|java|kt"
+    r"|cs|c|cc|cpp|h|hpp|sh|lua|sql))(?![\w])"
+)
+# Identifiers specific enough to name one thing: snake_case or camelCase,
+# eight characters or more. "list" or "run" would match any output.
+_CITED_SYMBOL_RE = re.compile(
+    r"(?<![\w])([A-Za-z_]\w*(?:_[A-Za-z0-9]\w*|[a-z0-9][A-Z]\w*))(?![\w])"
+)
+_MIN_SYMBOL_CHARS = 8
+# A file stem needs two words and ten characters before it can name a
+# check: "main.py" or "utils.py" would match half the checks on a PR.
+_MIN_STEM_WORDS = 2
+_MIN_STEM_CHARS = 10
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# Grug's own check runs judge the PR; they are not CI evidence about it.
+_OWN_CHECK_PREFIX = "grug"
+
+
+def _phrase(text: str) -> str:
+    """Lowercase words separated by single spaces, camelCase split."""
+    return " ".join(_NON_ALNUM_RE.sub(" ", _CAMEL_RE.sub(" ", text).lower()).split())
+
+
+def _cited_stems(finding: "Finding") -> tuple[str, ...]:
+    paths = [finding.file, *_CITED_PATH_RE.findall(finding.message)]
+    stems: list[str] = []
+    for path in paths:
+        base = path.replace("\\", "/").rsplit("/", 1)[-1]
+        stem = _phrase(base.rsplit(".", 1)[0] if "." in base else base)
+        if (
+            len(stem.split()) >= _MIN_STEM_WORDS
+            and len(stem) >= _MIN_STEM_CHARS
+            and stem not in stems
+        ):
+            stems.append(stem)
+    return tuple(stems)
+
+
+def _cited_symbols(finding: "Finding") -> tuple[str, ...]:
+    message = _CITED_PATH_RE.sub(" ", finding.message)
+    found = [
+        s for s in _CITED_SYMBOL_RE.findall(message)
+        if len(s) >= _MIN_SYMBOL_CHARS
+    ]
+    return tuple(dict.fromkeys(found))
+
+
+def _covering_check(
+    finding: "Finding", checks: tuple[CheckEvidence, ...], head_sha: str,
+) -> str | None:
+    """Name of a check that passed on `head_sha` and covers the finding.
+
+    None (keep) unless every condition holds: the rule is
+    caller-not-updated, the check completed with `success` on exactly the
+    reviewed head, it is not one of Grug's own checks, and its name or
+    output names a cited file stem, or its output names a cited symbol.
+    """
+    if finding.rule_name != _CALLER_NOT_UPDATED or not head_sha or not checks:
+        return None
+    stems = _cited_stems(finding)
+    symbols = _cited_symbols(finding)
+    if not stems and not symbols:
+        return None
+    for check in checks:
+        if check.head_sha != head_sha:
+            continue
+        if check.status != "completed" or check.conclusion != "success":
+            continue
+        if check.name.strip().lower().startswith(_OWN_CHECK_PREFIX):
+            continue
+        haystack = f" {_phrase(check.name + ' ' + check.text)} "
+        if any(f" {stem} " in haystack for stem in stems):
+            return check.name
+        if any(
+            re.search(rf"(?<![\w]){re.escape(sym)}(?![\w])", check.text)
+            for sym in symbols
+        ):
+            return check.name
+    return None
 
 
 # return_value_used. The claim family: the result of a call is thrown away.
@@ -829,8 +956,12 @@ def _verify_one(finding: "Finding", contents: dict[str, str]) -> str | None:
 
 def verify_findings(
     findings: tuple["Finding", ...], file_contents: dict[str, str],
+    *, checks: tuple[CheckEvidence, ...] = (), head_sha: str = "",
 ) -> tuple[tuple["Finding", ...], tuple[KilledFinding, ...]]:
     """Partition findings into (kept, killed-with-reasons). Order-preserving.
+
+    `checks` are the PR's check runs and `head_sha` the reviewed head; with
+    either empty the covered_by_passing_check kill never fires.
 
     Never raises on malformed inputs: any per-finding verification error
     keeps the finding (inconclusive-keeps bias, documented above).
@@ -838,14 +969,19 @@ def verify_findings(
     kept: list["Finding"] = []
     killed: list[KilledFinding] = []
     for f in findings:
+        detail = ""
         try:
             reason = _verify_one(f, file_contents)
+            if reason is None:
+                covering = _covering_check(f, checks, head_sha)
+                if covering is not None:
+                    reason, detail = "covered_by_passing_check", covering
         except Exception:  # noqa: BLE001 - verification must never abort a review
             reason = None
         if reason is None:
             kept.append(f)
         else:
-            killed.append(KilledFinding(finding=f, reason=reason))
+            killed.append(KilledFinding(finding=f, reason=reason, detail=detail))
     return tuple(kept), tuple(killed)
 
 

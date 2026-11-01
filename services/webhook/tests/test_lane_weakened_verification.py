@@ -10,8 +10,10 @@ reviewed each as a test edit.
 
 from __future__ import annotations
 
+import itertools
 import time
 
+import pytest
 from personas.code_reviewer import weakened_verification as wv
 from personas.code_reviewer.criteria_coverage import LinkedCriterion
 from personas.code_reviewer.diff_parser import file_changes, parse_diff
@@ -255,6 +257,629 @@ def test_a_close_rename_with_a_reworded_assertion_is_not_deleted():
         '+        self.assertEqual(used, routes - {"/api/frame", "/api/watch"})',
     ]))
     assert _scan(diff) == ()
+
+
+# Tests moved between files in one diff (#1496). A split test file removes
+# tests from one file and adds them to others; they are not deleted.
+_UNIT_BODY = {
+    "unittest": lambda n: [
+        f"    def test_{n}(self):",
+        f"        self.assertEqual(widget.{n}(), 1)",
+        f"        self.assertTrue(widget.{n}_ok())",
+    ],
+    "pytest": lambda n: [
+        f"def test_{n}():",
+        f"    assert widget.{n}() == 1",
+        f"    assert widget.{n}_ok()",
+    ],
+}
+_NAMES = ("alpha_is_stable", "beta_is_stable", "gamma_is_stable")
+
+
+def _split(kind, removed, added, *, added_path="tests/test_part.py"):
+    """`removed` tests leave tests/test_big.py; `added` tests join `added_path`."""
+    body = _UNIT_BODY[kind]
+    gone = [f"-{ln}" for n in removed for ln in body(n)]
+    came = [f"+{ln}" for n in added for ln in body(n)]
+    return _diff("tests/test_big.py", ("", gone)) + _diff(added_path, ("", came))
+
+
+def test_a_deleted_test_file_is_medium_even_when_tests_appear_elsewhere():
+    diff = (
+        "diff --git a/tests/test_old.py b/tests/test_old.py\ndeleted file mode 100644\n"
+        "index 1111111..0000000\n--- a/tests/test_old.py\n+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n-def test_x():\n-    assert x()\n"
+        + _diff("tests/test_new.py", ("", ["+def test_x():", "+    assert x()"]))
+    )
+    (f,) = _scan(diff)
+    assert f.severity == "medium"
+    assert "`tests/test_old.py`" in f.message
+
+
+@pytest.mark.parametrize("kind", ["unittest", "pytest"])
+def test_tests_moved_to_another_file_with_the_same_name_are_not_deleted(kind):
+    assert _scan(_split(kind, _NAMES, _NAMES)) == ()
+
+
+@pytest.mark.parametrize("kind", ["unittest", "pytest"])
+def test_tests_moved_under_new_names_with_the_same_body_are_not_deleted(kind):
+    body = _UNIT_BODY[kind]
+    gone = [f"-{ln}" for n in _NAMES[:2] for ln in body(n)]
+    came = [
+        f"+{ln}" for n in _NAMES[:2]
+        for ln in body(n)
+    ]
+    # Rename: keep the body (same normalized assertions), change the name.
+    came = [ln.replace("_is_stable", "_holds_up_under_load_xyz", 1) if "def " in ln else ln
+            for ln in came]
+    diff = _diff("tests/test_big.py", ("", gone)) + _diff("tests/test_part.py", ("", came))
+    assert _scan(diff) == ()
+
+
+@pytest.mark.parametrize("kind", ["unittest", "pytest"])
+def test_a_removed_test_with_no_counterpart_in_the_diff_is_still_marked(kind):
+    diff = _split(kind, _NAMES, _NAMES[:1])
+    (f,) = _scan(diff)
+    assert f.rule_name == "weakened-test"
+    assert "deletes 2 test(s)" in f.message
+    assert "`test_beta_is_stable`" in f.message
+    assert "`test_gamma_is_stable`" in f.message
+    assert "`test_alpha_is_stable`" not in f.message
+
+
+@pytest.mark.parametrize("kind", ["unittest", "pytest"])
+def test_a_move_that_weakens_the_test_is_still_marked(kind):
+    body = _UNIT_BODY[kind]
+    gone = [f"-{ln}" for n in _NAMES[:2] for ln in body(n)]
+    # The same names come back with the second assertion dropped.
+    came = [f"+{ln}" for n in _NAMES[:2] for ln in body(n)[:-1]]
+    diff = _diff("tests/test_big.py", ("", gone)) + _diff("tests/test_part.py", ("", came))
+    (f,) = _scan(diff)
+    assert "deletes 2 test(s)" in f.message
+
+
+def test_the_same_body_under_a_new_name_with_fewer_assertions_is_still_marked():
+    body = _UNIT_BODY["pytest"]
+    gone = [f"-{ln}" for ln in body("alpha_is_stable")]
+    came = ["+def test_something_else_entirely():", "+    assert widget.alpha_is_stable() == 1"]
+    diff = _diff("tests/test_big.py", ("", gone)) + _diff("tests/test_part.py", ("", came))
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_a_move_of_some_tests_marks_only_the_ones_left_behind():
+    (f,) = _scan(_split("pytest", _NAMES, _NAMES[:2]))
+    assert "deletes 1 test(s)" in f.message
+    assert "`test_gamma_is_stable`" in f.message
+
+
+def _pytest_test(name, *asserts, decorators=(), pre=()):
+    return [*decorators, f"def test_{name}():", *pre, *(f"    {a}" for a in asserts)]
+
+
+def _gone(*tests):
+    return [f"-{ln}" for t in tests for ln in t]
+
+
+def _came(*tests):
+    return [f"+{ln}" for t in tests for ln in t]
+
+
+_TWO = ("assert shared.check() == 1", "assert shared.ok()")
+
+
+def test_a_same_name_test_with_an_unrelated_body_elsewhere_does_not_excuse():
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("basic", *_TWO)))) + _diff(
+        "tests/test_part.py",
+        ("", _came(_pytest_test("basic", "assert other.thing() == 2", "assert other.more()"))),
+    )
+    (f,) = _scan(diff)
+    assert "`test_basic`" in f.message
+
+
+def test_a_reformatted_copy_in_the_same_file_does_not_excuse():
+    # Only another file's test counts as a counterpart; the in-file rules are
+    # unchanged. The copy differs in spacing, so the file still loses a line.
+    compact = ("assert shared.check()==1", "assert shared.ok()")
+    diff = _diff(
+        "tests/test_big.py",
+        ("", _gone(_pytest_test("alpha_is_stable", *_TWO))),
+        ("", _came(_pytest_test("unrelated_thing_entirely", *compact))),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_a_renamed_test_with_the_same_assertions_in_another_file_excuses():
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *_TWO)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("unrelated_thing_entirely", *_TWO))),
+    )
+    assert _scan(diff) == ()
+
+
+def test_one_counterpart_excuses_only_one_removed_test():
+    diff = _diff(
+        "tests/test_big.py",
+        ("", _gone(_pytest_test("alpha_is_stable", *_TWO), _pytest_test("beta_is_stable", *_TWO))),
+    ) + _diff("tests/test_part.py", ("", _came(_pytest_test("alpha_is_stable", *_TWO))))
+    (f,) = _scan(diff)
+    assert "deletes 1 test(s)" in f.message
+    assert "`test_beta_is_stable`" in f.message
+
+
+@pytest.mark.parametrize("variant", ["unittest", "mark_skip", "xfail", "call", "skipif"])
+def test_a_skipped_counterpart_does_not_excuse(variant):
+    decorators, pre = {
+        "unittest": (['@unittest.skip("later")'], []),
+        "mark_skip": (["@pytest.mark.skip"], []),
+        "xfail": (["@pytest.mark.xfail"], []),
+        "skipif": (['@pytest.mark.skipif(True, reason="x")'], []),
+        "call": ([], ['    pytest.skip("later")']),
+    }[variant]
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *_TWO)))) + _diff(
+        "tests/test_part.py",
+        ("", _came(_pytest_test("alpha_is_stable", *_TWO, decorators=decorators, pre=pre))),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_a_same_name_test_seen_only_as_context_does_not_excuse():
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *_TWO)))) + _diff(
+        "tests/test_part.py",
+        ("", [f" {ln}" for ln in _pytest_test("alpha_is_stable", *_TWO)] + ["+X = 1"]),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_a_single_assertion_needs_the_same_name_to_be_excused():
+    one = "assert widget.ready()"
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", one)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("unrelated_thing_entirely", one))),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+    same_name = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", one)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("alpha_is_stable", one))),
+    )
+    assert _scan(same_name) == ()
+
+
+def test_a_counterpart_that_only_verifies_mock_calls_does_not_excuse():
+    mock = ("fake.assert_called_once()", "fake.assert_not_called()")
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *_TWO)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("alpha_is_stable", *mock))),
+    )
+    assert _scan(diff)
+    both = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *mock)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("alpha_is_stable", *mock))),
+    )
+    assert _scan(both) == ()
+
+
+def test_a_mock_only_counterpart_does_not_excuse_a_test_with_real_assertions():
+    removed = _pytest_test("alpha_is_stable", "fake.assert_called_once()", "assert widget.ready()")
+    came = _pytest_test("alpha_is_stable", "fake.assert_called_once()", "fake.assert_not_called()")
+    diff = _diff("tests/test_big.py", ("", _gone(removed))) + _diff(
+        "tests/test_part.py", ("", _came(came)),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_a_same_name_test_sharing_under_half_the_assertions_does_not_excuse():
+    four = tuple(f"assert widget.f{i}() == {i}" for i in range(4))
+    other = (four[0], "assert q.a()", "assert q.b()", "assert q.c()")
+    diff = _diff("tests/test_big.py", ("", _gone(_pytest_test("alpha_is_stable", *four)))) + _diff(
+        "tests/test_part.py", ("", _came(_pytest_test("alpha_is_stable", *other))),
+    )
+    (f,) = _scan(diff)
+    assert "`test_alpha_is_stable`" in f.message
+
+
+def test_the_marking_does_not_depend_on_the_order_of_the_files():
+    parts = [
+        _diff("tests/test_a.py", ("", _gone(
+            _pytest_test("one_is_stable", *_TWO), _pytest_test("two_is_stable", *_TWO),
+            _pytest_test("three_is_stable", "assert z.a() == 1", "assert z.b()")))),
+        _diff("tests/test_b.py", ("", _came(_pytest_test("one_is_stable", *_TWO)))),
+        _diff("tests/test_c.py", ("", _came(_pytest_test("renamed_other_thing", *_TWO)))),
+    ]
+    seen = set()
+    for order in itertools.permutations(parts):
+        found = _scan("".join(order))
+        seen.add(tuple(sorted(f.message for f in found)))
+    assert len(seen) == 1
+    (messages,) = seen
+    assert len(messages) == 1
+    assert "`test_three_is_stable`" in messages[0]
+
+
+def test_the_move_check_stays_fast_on_a_large_diff():
+    n = 4000
+    gone = _gone(*(_pytest_test(f"case_{i}", f"assert w.f{i}() == 1", f"assert w.g{i}()") for i in range(n)))
+    unmatched = _came(*(_pytest_test(f"other_{i}", f"assert v.f{i}() == 2", f"assert v.h{i}()") for i in range(n)))
+    matched = _came(*(_pytest_test(f"case_{i}", f"assert w.f{i}() == 1", f"assert w.g{i}()") for i in range(n)))
+    start = time.monotonic()
+    assert _scan(_diff("tests/test_big.py", ("", gone)) + _diff("tests/test_part.py", ("", unmatched)))
+    assert _scan(_diff("tests/test_big.py", ("", gone)) + _diff("tests/test_part.py", ("", matched))) == ()
+    assert time.monotonic() - start < 5
+
+
+def _file(path, lines, prefix="+"):
+    return _diff(path, ("", [f"{prefix}{ln}" for ln in lines]))
+
+
+_ALPHA = _pytest_test("alpha_is_stable", *_TWO)
+_REMOVED_ALPHA = _file("tests/test_big.py", _ALPHA, "-")
+
+
+def _marked(counterpart_lines, *, removed=_REMOVED_ALPHA, name="`test_alpha_is_stable`"):
+    """True when the removed test is still marked with the counterpart file."""
+    found = _scan(removed + _file("tests/test_part.py", counterpart_lines))
+    if not found:
+        return False
+    assert name in found[0].message
+    return True
+
+
+def _share(n_total, n_shared, *, name="alpha_is_stable"):
+    base = [f"assert widget.f{i}() == {i}" for i in range(n_total)]
+    other = base[:n_shared] + [f"assert other.g{i}()" for i in range(n_total - n_shared)]
+    return base, other
+
+
+@pytest.mark.parametrize(
+    ("total", "shared", "marked"),
+    [(2, 2, False), (2, 1, True), (3, 2, False), (3, 1, True), (5, 3, False), (5, 2, True),
+     (1, 1, False), (4, 2, True), (4, 3, False)],
+)
+def test_the_same_name_route_needs_strictly_more_than_half_the_assertions(total, shared, marked):
+    removed, kept = _share(total, shared)
+    diff = _file("tests/test_big.py", _pytest_test("alpha_is_stable", *removed), "-")
+    diff += _file("tests/test_part.py", _pytest_test("alpha_is_stable", *kept))
+    assert bool(_scan(diff)) is marked
+
+
+def test_a_strong_assertion_is_not_excused_by_a_trivial_pair():
+    diff = _file(
+        "tests/test_big.py",
+        _pytest_test("alpha_is_stable", "assert engine.compute() == 42", "assert engine"), "-",
+    ) + _file("tests/test_part.py", _pytest_test("alpha_is_stable", "assert engine", "assert True"))
+    assert _scan(diff)
+
+
+_SKIP_FORMS = {
+    "multi_line_skipif": (
+        ["@pytest.mark.skipif(", "    sys.platform == 'win32',", "    reason='x',", ")"],
+        ["@pytest.mark.parametrize(", "    'x',", "    [1],", ")"],
+    ),
+    "comment_between": (["@pytest.mark.skip", "# why", ""], ["@pytest.mark.slow", "# why", ""]),
+    "unittest_skip": (['@unittest.skip("later")'], ['@unittest.mark("later")']),
+    "expected_failure": (["@unittest.expectedFailure"], ["@unittest.final"]),
+    "xfail": (["@pytest.mark.xfail"], ["@pytest.mark.slow"]),
+}
+
+
+@pytest.mark.parametrize("form", sorted(_SKIP_FORMS))
+def test_every_skip_decorator_form_makes_a_counterpart_not_count(form):
+    skipped, plain = _SKIP_FORMS[form]
+    assert _marked([*skipped, *_ALPHA])
+    assert not _marked([*plain, *_ALPHA])
+
+
+def test_a_skip_call_after_a_docstring_makes_a_counterpart_not_count():
+    body = ["def test_alpha_is_stable():", '    """A long', "    docstring.", '    """',
+            "    # a comment", '    pytest.skip("later")', *[f"    {a}" for a in _TWO]]
+    assert _marked(body)
+    live = [ln for ln in body if "pytest.skip" not in ln]
+    assert not _marked(live)
+    one_line = ["def test_alpha_is_stable():", '    """One line."""', "    self.skipTest('x')",
+                *[f"    {a}" for a in _TWO]]
+    assert _marked(one_line)
+
+
+def test_a_skip_call_that_is_not_the_first_statement_does_not_hide_the_test():
+    body = ["def test_alpha_is_stable():", *[f"    {a}" for a in _TWO], '    pytest.skip("x")']
+    assert not _marked(body)
+
+
+@pytest.mark.parametrize(
+    ("module_line", "marked"),
+    [
+        ("pytestmark = pytest.mark.skip(reason='x')", True),
+        ("pytestmark = [pytest.mark.xfail, pytest.mark.slow]", True),
+        ("pytestmark = pytest.mark.slow", False),
+        ("np = pytest.importorskip('numpy')", True),
+        ("import numpy as np", False),
+        ("pytest.skip('all', allow_module_level=True)", True),
+    ],
+)
+def test_a_module_level_skip_makes_every_counterpart_in_the_file_not_count(module_line, marked):
+    assert _marked([module_line, "", *_ALPHA]) is marked
+
+
+def test_a_counterpart_under_if_false_does_not_count():
+    dead = ["if False:", "    def test_alpha_is_stable():", *[f"        {a}" for a in _TWO]]
+    assert _marked(dead)
+    assert _marked([dead[0].replace("False", "0"), *dead[1:]])
+    live = ["if True:", *dead[1:]]
+    assert not _marked(live)
+    after = [*dead, "x = 1", *_ALPHA]
+    assert not _marked(after)
+
+
+def test_only_the_last_definition_of_a_test_name_counts():
+    other = _pytest_test("alpha_is_stable", "assert other.thing() == 2", "assert other.more()")
+    assert _marked([*_ALPHA, "", *other])
+    assert not _marked([*other, "", *_ALPHA])
+    in_classes = ["class TestA:", "    def test_alpha_is_stable(self):",
+                  *[f"        {a}" for a in _TWO], "class TestB:",
+                  "    def test_alpha_is_stable(self):", "        assert other.thing() == 2",
+                  "        assert other.more()"]
+    assert not _marked(in_classes)
+
+
+def test_a_skip_on_a_class_covers_its_nested_classes_but_not_a_sibling():
+    method = ["    def test_alpha_is_stable(self):", *[f"        {a}" for a in _TWO]]
+    skipped = ['@unittest.skip("x")', "class TestOuter:", *method]
+    assert _marked(skipped)
+    nested = ['@unittest.skip("x")', "class TestOuter:", "    class TestInner:",
+              *[f"    {ln}" for ln in method]]
+    assert _marked(nested)
+    sibling = ['@unittest.skip("x")', "class TestOne:", "    pass", "class TestTwo:", *method]
+    assert not _marked(sibling)
+    plain = ["class TestOuter:", *method]
+    assert not _marked(plain)
+    leaks_to_function = ['@unittest.skip("x")', "class TestOne:", "    pass", "", *_ALPHA]
+    assert not _marked(leaks_to_function)
+
+
+def test_a_helper_def_inside_a_test_does_not_end_the_test_body():
+    body = ["def test_alpha_is_stable():", "    def helper():", "        return 1",
+            *[f"    {a}" for a in _TWO]]
+    assert not _marked(body)
+    signature = ["def test_alpha_is_stable(", "    fixture,", "):", *[f"    {a}" for a in _TWO]]
+    assert not _marked(signature)
+    skipping = ["def test_alpha_is_stable(", "    fixture,", "):", '    pytest.skip("x")',
+                *[f"    {a}" for a in _TWO]]
+    assert _marked(skipping)
+
+
+def test_a_removed_async_test_is_not_excused_by_a_sync_one_or_the_reverse():
+    gone_async = _file("tests/test_big.py", ["async def test_alpha_is_stable():",
+                                            *[f"    {a}" for a in _TWO]], "-")
+    async_alpha = ["async def test_alpha_is_stable():", *[f"    {a}" for a in _TWO]]
+    assert _marked(_ALPHA, removed=gone_async)
+    assert not _marked(async_alpha, removed=gone_async)
+    assert _marked(async_alpha)
+
+
+def test_a_counterpart_in_a_cut_short_file_does_not_count():
+    cut = _file("tests/test_part.py", _ALPHA) + "\\ truncated: 29 more lines\n"
+    assert _scan(_REMOVED_ALPHA + cut)
+    assert _scan(_REMOVED_ALPHA + _file("tests/test_part.py", _ALPHA)) == ()
+
+
+def test_one_removed_test_takes_only_one_counterpart():
+    gone = _file("tests/test_big.py", [*_ALPHA, *_pytest_test("beta_is_stable", *_TWO)], "-")
+    diff = gone + _file("tests/test_p.py", _ALPHA) + _file("tests/test_q.py", _ALPHA)
+    assert _scan(diff) == ()
+    renamed = _file("tests/test_q.py", _pytest_test("gamma_is_stable", *_TWO))
+    assert _scan(gone + _file("tests/test_p.py", _ALPHA) + renamed) == ()
+
+
+def test_the_strongest_match_goes_first_whatever_the_path_order():
+    # Both removed tests match the one counterpart; the same-name one wins,
+    # although the renamed one sits in the file that sorts first.
+    diff = (
+        _file("tests/test_0.py", _pytest_test("beta_is_stable", *_TWO), "-")
+        + _file("tests/test_1.py", _ALPHA, "-")
+        + _file("tests/test_2.py", _ALPHA)
+    )
+    (f,) = _scan(diff)
+    assert "`test_beta_is_stable`" in f.message
+
+
+def test_an_equal_assertion_set_beats_a_partial_overlap_for_the_same_name():
+    four = ["assert w.a() == 1", "assert w.b() == 2", "assert w.c() == 3", "assert w.d() == 4"]
+    partial = [*four[:3], "assert w.x() == 9"]
+    diff = (
+        _file("tests/test_0.py", _pytest_test("alpha_is_stable", *partial), "-")
+        + _file("tests/test_1.py", _pytest_test("alpha_is_stable", *four), "-")
+        + _file("tests/test_2.py", _pytest_test("alpha_is_stable", *four))
+    )
+    (f,) = _scan(diff)
+    assert "`tests/test_0.py`" in f.message
+
+
+@pytest.mark.parametrize("position", [0, 31, 32, 39])
+def test_only_the_first_32_same_name_counterparts_are_scanned(position):
+    def decoy():
+        return _pytest_test("basic", "assert other.thing() == 2", "assert other.more()")
+
+    three = (*_TWO, "assert shared.third()")
+    near = (*_TWO, "assert other.fourth()")
+    removed = _file("tests/test_big.py", _pytest_test("basic", *three), "-")
+    parts = [
+        _file(f"tests/test_p{i:02d}.py", _pytest_test("basic", *near) if i == position else decoy())
+        for i in range(40)
+    ]
+    forward = bool(_scan(removed + "".join(parts)))
+    backward = bool(_scan(removed + "".join(reversed(parts))))
+    assert forward == backward == (position >= 32)
+
+
+def test_the_marking_with_competing_candidates_ignores_the_file_order():
+    parts = [
+        _file("tests/test_a.py", _pytest_test("one_is_stable", *_TWO), "-"),
+        _file("tests/test_b.py", _pytest_test("two_is_stable", *_TWO), "-"),
+        _file("tests/test_c.py", _pytest_test("three_is_stable", *_TWO)),
+    ]
+    seen = {
+        tuple(sorted(f.message for f in _scan("".join(order))))
+        for order in itertools.permutations(parts)
+    }
+    assert len(seen) == 1
+    ((message,),) = seen
+    assert "`test_two_is_stable`" in message
+
+
+def test_a_counterpart_with_fewer_assertion_lines_is_marked_even_when_it_shares_most():
+    three = ["assert w.a() == 1", "assert w.b() == 2", "assert w.c() == 3"]
+    removed = _file("tests/test_big.py", _pytest_test("alpha_is_stable", *three), "-")
+    two = _file("tests/test_part.py", _pytest_test("alpha_is_stable", *three[:2]))
+    assert _scan(removed + two)
+    full = _file("tests/test_part.py", _pytest_test("alpha_is_stable", *three))
+    assert _scan(removed + full) == ()
+    repeated = _file("tests/test_big.py", _pytest_test("alpha_is_stable", *([three[0]] * 3)), "-")
+    once = _file("tests/test_part.py", _pytest_test("alpha_is_stable", three[0]))
+    assert _scan(repeated + once)
+
+
+def test_mock_checks_only_excuse_a_removed_test_that_also_only_checked_mock_calls():
+    mocks = ["fake.assert_called_once()", "fake.assert_not_called()", "fake.assert_called()"]
+    removed = _file(
+        "tests/test_big.py",
+        _pytest_test("alpha_is_stable", mocks[0], mocks[1], "assert widget.ready()"), "-",
+    )
+    came = _file("tests/test_part.py", _pytest_test("alpha_is_stable", *mocks))
+    assert _scan(removed + came)
+    all_mocks = _file("tests/test_big.py", _pytest_test("alpha_is_stable", *mocks[:2]), "-")
+    assert _scan(all_mocks + came) == ()
+
+
+def test_an_assertion_after_the_test_at_a_lower_indent_is_not_the_tests():
+    body = ["def test_alpha_is_stable():", f"    {_TWO[0]}", "", _TWO[1]]
+    assert _marked(body)
+
+
+def test_a_skip_decorator_or_class_does_not_carry_across_hunks():
+    diff = _REMOVED_ALPHA + _diff(
+        "tests/test_part.py",
+        ("", ['+@unittest.skip("x")', "+class TestOne:", "+    pass"]),
+        ("", ["+    def test_alpha_is_stable(self):", *[f"+        {a}" for a in _TWO]]),
+    )
+    assert _scan(diff) == ()
+    deco = _REMOVED_ALPHA + _diff(
+        "tests/test_part.py",
+        ("", ["+@pytest.mark.skip"]),
+        ("", _came(_ALPHA)),
+    )
+    assert _scan(deco) == ()
+
+
+_APP = _diff("app.py", ("", ["-x = 1", "+x = 2"]))
+
+
+def _marked_raw(raw_lines, *, removed=_REMOVED_ALPHA):
+    """Like `_marked` for a counterpart file given as diff lines."""
+    found = _scan(removed + _diff("tests/test_part.py", ("", raw_lines)))
+    return bool(found)
+
+
+@pytest.mark.parametrize(
+    ("decorator", "marked"),
+    [
+        (["@pytest.mark.skipif(", "    cond, reason='not :)',", ")"], True),
+        (["@pytest.mark.skipif(", '    cond, reason="not :) at all",', ")"], True),
+        (["@pytest.mark.skipif(", '    cond, reason="""not', "    :)", '    """,', ")"], True),
+        (["@pytest.mark.skipif(", "    cond,  # why :)", "    reason='x',", ")"], True),
+        (["@pytest.mark.skipif(", "    cond, reason='a (b',", ")"], True),
+        (["@pytest.mark.skip(reason='a (b')"], True),
+        (["@pytest.mark.skipif(", "    cond, reason='plain',", ")"], True),
+        (["@pytest.mark.parametrize(", "    'x', ['(', ')'],", ")"], False),
+        (["@pytest.mark.parametrize('x', ['not :)'])"], False),
+        (["@pytest.mark.parametrize('x', ['(', 'a (b'])"], False),
+        (["@pytest.mark.parametrize(", "    'x', ['it\\'s ('],", ")"], False),
+        (["@pytest.mark.parametrize(", '    "x", ["say \\"hi\\" ("],', ")"], False),
+    ],
+)
+def test_parentheses_inside_strings_do_not_end_or_extend_a_decorator(decorator, marked):
+    assert _marked([*decorator, *_ALPHA]) is marked
+
+
+def test_a_stray_closing_line_does_not_clear_a_skip_decorator():
+    assert _marked(["@pytest.mark.skip(reason=x))", ")", *_ALPHA])
+
+
+def test_a_counterpart_named_otherwise_is_not_a_counterpart():
+    helper = _pytest_test("alpha_is_stable", *_TWO)
+    helper[0] = "def check_alpha_is_stable():"
+    assert _marked(helper)
+    renamed = list(helper)
+    renamed[0] = "def test_other_name_entirely():"
+    assert not _marked(renamed)
+
+
+def test_a_skip_decorator_followed_by_another_decorator_still_skips():
+    assert _marked(["@pytest.mark.skip", "@pytest.mark.slow", *_ALPHA])
+    assert _marked(["@pytest.mark.skip", "@pytest.mark.slow", "@pytest.mark.network", *_ALPHA])
+    assert _marked(["@pytest.mark.slow", "@pytest.mark.skip", *_ALPHA])
+
+
+def test_a_skip_word_on_a_decorator_continuation_line_counts():
+    deco = ["@some.decorator(", "    pytest.mark.skip,", ")"]
+    assert _marked([*deco, *_ALPHA])
+
+
+@pytest.mark.parametrize(
+    "decorator",
+    ["@expectedFailure", '@skip("x")', '@skipIf(True, "x")', '@skipUnless(False, "x")'],
+)
+def test_a_bare_imported_skip_decorator_skips(decorator):
+    assert _marked([decorator, *_ALPHA])
+
+
+@pytest.mark.parametrize("quotes", ['"""', "'''"])
+def test_a_one_line_docstring_then_a_skip_call_skips(quotes):
+    body = ["def test_alpha_is_stable():", f"    {quotes}One line.{quotes}",
+            '    pytest.skip("later")', *[f"    {a}" for a in _TWO]]
+    assert _marked(body)
+    after = ["def test_alpha_is_stable():", f"    {quotes}One line.{quotes}",
+             *[f"    {a}" for a in _TWO]]
+    assert not _marked(after)
+
+
+def test_context_lines_are_read_so_a_decorator_or_class_above_an_added_def_counts():
+    added = [f"+{ln}" for ln in _ALPHA]
+    assert _marked_raw([" @pytest.mark.skip", *added])
+    assert _marked_raw([' @unittest.skip("x")', " class TestOne:",
+                        "+    def test_alpha_is_stable(self):", *[f"+        {a}" for a in _TWO]])
+    assert not _marked_raw([" @pytest.mark.slow", *added])
+
+
+def test_a_tab_indented_method_in_a_skipped_class_is_inside_the_class():
+    tabbed = ['@unittest.skip("x")', "class TestOne:", "\tdef test_alpha_is_stable(self):",
+              *[f"\t\t{a}" for a in _TWO]]
+    assert _marked(tabbed)
+    nested = ['@unittest.skip("x")', "class TestOuter:", "\tclass TestInner:",
+              "\t\tdef test_alpha_is_stable(self):", *[f"\t\t\t{a}" for a in _TWO]]
+    assert _marked(nested)
+    sibling = ['@unittest.skip("x")', "class TestOne:", "\tpass", "class TestTwo:",
+               "\tdef test_alpha_is_stable(self):", *[f"\t\t{a}" for a in _TWO]]
+    assert not _marked(sibling)
+
+
+def test_a_tab_indented_module_skip_inside_a_block_is_not_a_module_skip():
+    assert not _marked(["if sys.platform:", "\tpytestmark = pytest.mark.skip", "", *_ALPHA])
+    assert _marked(["pytestmark = pytest.mark.skip", "", *_ALPHA])
+
+
+def test_pytest_raises_counts_as_an_assertion_of_the_detector():
+    raises = ["with pytest.raises(ValueError):", "    widget.go()"]
+    gone = _file("tests/test_big.py", _pytest_test("alpha_is_stable", *raises), "-") + _APP
+    assert _scan(gone)
+    came = _file("tests/test_part.py", _pytest_test("alpha_is_stable", *raises))
+    assert _scan(gone + came) == ()
+
+
+def test_a_counterpart_in_a_conftest_does_not_count_but_a_removed_conftest_test_is_marked():
+    conf = _file("tests/conftest.py", _ALPHA)
+    assert _scan(_REMOVED_ALPHA + conf)
+    assert _scan(_file("tests/conftest.py", _ALPHA, "-") + _file("tests/test_part.py", _ALPHA)) == ()
+    assert _scan(_file("tests/conftest.py", _ALPHA, "-") + _APP)
 
 
 def test_a_cut_short_hunk_is_not_evaluated():
