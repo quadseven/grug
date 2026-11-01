@@ -100,6 +100,16 @@ def _render_file_block(path: str, content: str | None) -> str:
 
 # Hunk header new-side start: `@@ -a[,b] +c[,d] @@`.
 _HUNK_NEW_START_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# SQL column reads: the SELECT list, and a column read from a row mapping.
+# These are context heuristics, not a SQL parser - enough to put every read
+# of the same column beside each other.
+_SQL_SELECT_RE = re.compile(r"(?is)\bselect\b\s+(.*?)(?:\s+\bfrom\b|$)")
+_ROW_COLUMN_RE = re.compile(
+    r"""(?:\b[A-Za-z_]\w*\s*\[\s*["']([A-Za-z_]\w*)["']\s*\]"""
+    r"""|\.get\(\s*["']([A-Za-z_]\w*)["']\s*\))"""
+)
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
+_MAX_COLUMN_READ_LINES = 40
 # A signature longer than this is cut: the parameter names are what the
 # model needs, not a pathological 200-line argument list.
 _MAX_SIGNATURE_LINES = 30
@@ -126,6 +136,99 @@ def _first_changed_new_line(body: str) -> int | None:
 
 
 _ScopeNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+
+
+def _changed_new_lines(body: str) -> set[int]:
+    """New-side line numbers of every added line in one hunk."""
+    lines = body.splitlines()
+    if not lines:
+        return set()
+    m = _HUNK_NEW_START_RE.match(lines[0])
+    if not m:
+        return set()
+    n = int(m.group(1))
+    out: set[int] = set()
+    for ln in lines[1:]:
+        if ln.startswith("+"):
+            out.add(n)
+            n += 1
+        elif ln.startswith(("-", "\\")):
+            continue
+        else:
+            n += 1
+    return out
+
+
+def _sql_select_columns(line: str) -> set[str]:
+    """Column names in every SELECT list on `line` (aliases/functions skipped)."""
+    cols: set[str] = set()
+    for match in _SQL_SELECT_RE.finditer(line):
+        for item in match.group(1).split(","):
+            tokens = item.strip().split()
+            if not tokens:
+                continue
+            name = tokens[0].split(".")[-1]
+            if name != "*" and _IDENTIFIER_RE.fullmatch(name):
+                cols.add(name)
+    return cols
+
+
+def _row_columns(line: str) -> set[str]:
+    """Column names read from a row mapping on `line`."""
+    return {m.group(1) or m.group(2) for m in _ROW_COLUMN_RE.finditer(line)}
+
+
+def _column_read_lines(content: str) -> dict[str, set[int]]:
+    """{column: 1-based line numbers that read it} across one file."""
+    reads: dict[str, set[int]] = {}
+    for lineno, line in enumerate(content.splitlines(), 1):
+        for col in _sql_select_columns(line) | _row_columns(line):
+            reads.setdefault(col, set()).add(lineno)
+    return reads
+
+
+def _render_column_reads(content: str, hunks: Sequence[Hunk]) -> str:
+    """Every read of a column the diff touches, for type-mismatch visibility.
+
+    The live miss (2026-10-28) compared a Unix-integer column with datetimes
+    while another reader of the same column called `int()` on it. The file
+    was over the full-file budget, so the other reader was not in the prompt
+    at all. This block is size-independent: it names the columns read on the
+    changed lines and renders every SQL/row read of those columns in the
+    current file, so one storage type and two interpretations are visible
+    together. Context only; findings still anchor on diff additions.
+    """
+    reads = _column_read_lines(content)
+    if not reads:
+        return ""
+    changed: set[int] = set()
+    for hunk in hunks:
+        changed |= _changed_new_lines(hunk.body)
+    if not changed:
+        return ""
+    src = content.splitlines()
+    candidates = {
+        col
+        for col in reads
+        if any(
+            0 < n <= len(src) and re.search(rf"\b{re.escape(col)}\b", src[n - 1])
+            for n in changed
+        )
+    }
+    if not candidates:
+        return ""
+    lines = sorted({n for col in candidates for n in reads[col]})
+    if not any(n not in changed for n in lines):
+        return ""
+    lines = lines[:_MAX_COLUMN_READ_LINES]
+    rendered = "\n".join(f"{n}: {src[n - 1]}" for n in lines)
+    return (
+        "SQL COLUMN READS (every read of a column this diff touches, from the "
+        f"current file; columns: {', '.join(sorted(candidates))}. A column has "
+        "one storage type - compare these reads for int vs datetime/string "
+        "handling; context only, do not flag these lines):\n"
+        f"```\n{rendered}\n```\n"
+    )
 
 
 def _scope_chain(tree: ast.AST, line: int) -> list[_ScopeNode]:
@@ -317,7 +420,8 @@ class ElderEvidence:
         )
 
     def _diff_blocks(self, cross_file_template: str) -> list[str]:
-        """Hunks (each with its full-file or signature context), then the
+        """Hunks (each with its full-file or signature context), the
+        size-independent column reads for each changed file, then the
         cross-file snippets for paths outside the rendered hunks, so the
         diff stays primary. The full-file block renders once per path."""
         shown: dict[str, bool] = {}
@@ -325,6 +429,16 @@ class ElderEvidence:
         for h in self.hunks:
             ctx = _render_hunk_context(h.path, self.file_contents.get(h.path), h.body, shown)
             blocks.append(f"### {h.path}\n{ctx}```diff\n{h.body}\n```")
+        for path in dict.fromkeys(h.path for h in self.hunks):
+            content = self.file_contents.get(path)
+            if not content:
+                continue
+            column_block = _render_column_reads(
+                content,
+                [h for h in self.hunks if h.path == path],
+            )
+            if column_block:
+                blocks.append(f"### {path} (SQL column reads)\n{column_block}")
         for path, content in self.cross_file_contents.items():
             if path not in shown:
                 blocks.append(cross_file_template.format(path=path, content=content))
