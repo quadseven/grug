@@ -49,6 +49,9 @@ def _setup_env(monkeypatch):
             _tier(Backend.POOLSIDE, _LAGUNA),
         ],
     )
+    monkeypatch.setattr(
+        lc, "_OPENCODE_GO_PRIVATE_SAFE_MODELS", lc._OPENCODE_GO_PRIVATE_SAFE_MODELS | {_CLAUDE},
+    )
     monkeypatch.setattr(lc, "_free_provider_fallback_configs", list)
     monkeypatch.setattr(lc, "_subscription_fallback_config", lambda: None)
 
