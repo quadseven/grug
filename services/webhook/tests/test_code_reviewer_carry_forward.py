@@ -257,6 +257,31 @@ def test_filter_reraises_finding_when_code_changed_without_reply():
     assert "changed since earlier answer" in reraised.message
 
 
+def test_finding_resolved_with_reply_is_not_raised_unless_code_changed():
+    """#1457: A finding whose thread a person resolved with a reply is not raised
+    again on a later review of the same pull request unless the code it points at changed."""
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+
+    # When code did not change (outdated=False): finding is suppressed
+    thread_unchanged = _thread_for_filter(
+        resolved=True, outdated=False, reply="Removed because feature was deprecated",
+    )
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread_unchanged],
+    )
+    assert filtered == ()
+
+    # When code changed (outdated=True): finding is re-raised with explanation
+    thread_changed = _thread_for_filter(
+        resolved=True, outdated=True, reply="Removed because feature was deprecated",
+    )
+    (reraised,) = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread_changed],
+    )
+    assert reraised.rule_name == "weakened-test"
+    assert "changed since earlier answer" in reraised.message
+
+
 # --- verdict plumbing -----------------------------------------------------
 
 def _carried(*sevs):
