@@ -343,8 +343,9 @@ def _pr(number, updated_at, sha="s"):
 def test_pulse_nudges_stale_green_pr_once(monkeypatch):
     stale = _pr(1, "2020-01-01T00:00:00Z")
     monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: False)
-    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True, "pulse_delivery": "comment"})
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [stale])
+    monkeypatch.setattr(pulse, "_idle_labeled_prs", lambda *args: [])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
     claims = []
     monkeypatch.setattr(
@@ -367,8 +368,77 @@ def test_pulse_nudges_stale_green_pr_once(monkeypatch):
     assert verdicts[0]["persona_key"] == "pulse"
 
 
-def test_pulse_lost_claim_posts_nothing(monkeypatch):
+def test_pulse_label_delivery_marks_idle_and_updates_board_without_comment(monkeypatch):
+    stale = _pr(8, "2020-01-01T00:00:00Z")
     monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    monkeypatch.setattr(pulse, "_stale_prs", lambda *args: [stale])
+    monkeypatch.setattr(pulse, "_dor_green", lambda *args: True)
+    monkeypatch.setattr(pulse, "_idle_labeled_prs", lambda *args: [])
+    claims, verdicts = [], []
+    monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda *args: claims.append(args) or True)
+    monkeypatch.setattr(pulse, "record_check_verdict", lambda **kw: verdicts.append(kw))
+    posts, boards = [], []
+    monkeypatch.setattr(pulse, "get_app_id", lambda: "1")
+    monkeypatch.setattr(pulse.httpx, "get", lambda url, **kw: httpx.Response(200, request=httpx.Request("GET", url), json={}))
+    monkeypatch.setattr(pulse.httpx, "post", lambda url, **kw: posts.append((url, kw)) or httpx.Response(200, request=httpx.Request("POST", url), json=[]))
+    monkeypatch.setattr(pulse.board_client, "upsert_board_section", lambda *a, **kw: boards.append((a, kw)))
+
+    assert pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 1
+    assert not any(url.endswith("/comments") for url, _ in posts)
+    assert posts[0][1]["json"] == {"labels": ["grug:idle"]}
+    assert "Idle since 2020-01-01" in boards[0][1]["section"]
+    # The weekly claim is what keeps the gauge at one neutral row per idle week.
+    assert claims == [(1, "o/r", 8)]
+    assert len(verdicts) == 1
+    assert verdicts[0]["persona_key"] == "pulse"
+    assert verdicts[0]["conclusion"] == "neutral"
+    assert verdicts[0]["findings_count"] == 0
+
+
+def test_pulse_removes_idle_label_when_pr_is_no_longer_stale(monkeypatch):
+    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    monkeypatch.setattr(pulse, "_stale_prs", lambda *args: [])
+    monkeypatch.setattr(pulse, "_idle_labeled_prs", lambda *args: [_pr(8, "2026-10-30T00:00:00Z")])
+    monkeypatch.setattr(pulse, "_dor_green", lambda *args: True)
+    deletes = []
+    monkeypatch.setattr(pulse.httpx, "delete", lambda url, **kw: deletes.append(url) or httpx.Response(204, request=httpx.Request("DELETE", url)))
+    monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda *args: True)
+    monkeypatch.setattr(pulse, "record_check_verdict", lambda **kw: None)
+    monkeypatch.setattr(pulse.board_client, "upsert_board_section", lambda *a, **kw: None)
+
+    pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+    assert deletes == ["https://api.github.com/repos/o/r/issues/8/labels/grug%3Aidle"]
+
+
+def test_cleanup_keeps_idle_label_on_pr_that_is_still_stale(monkeypatch):
+    deletes = []
+    monkeypatch.setattr(pulse, "_remove_idle_label", lambda *args: deletes.append(args[3]))
+    still_idle = _pr(8, "2020-01-01T00:00:00Z")
+
+    pulse._cleanup_idle_labels(
+        "tok", "o", "r", "label", [still_idle], [still_idle, _pr(9, "2026-10-30T00:00:00Z")],
+    )
+    assert deletes == [9]
+
+
+def test_pulse_comment_delivery_keeps_weekly_comment_without_label(monkeypatch):
+    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True, "pulse_delivery": "comment"})
+    monkeypatch.setattr(pulse, "_stale_prs", lambda *args: [_pr(8, "2020-01-01T00:00:00Z")])
+    monkeypatch.setattr(pulse, "_dor_green", lambda *args: True)
+    monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda *args: False)
+    monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda *args: True)
+    monkeypatch.setattr(pulse, "record_check_verdict", lambda **kw: None)
+    posts = []
+    monkeypatch.setattr(pulse.httpx, "post", lambda url, **kw: posts.append((url, kw)) or httpx.Response(201, request=httpx.Request("POST", url), json={}))
+    monkeypatch.setattr(pulse, "_idle_labeled_prs", lambda *args: [])
+
+    assert pulse.run_pulse_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}]) == 1
+    assert len(posts) == 1 and posts[0][0].endswith("/issues/8/comments")
+
+
+def test_pulse_lost_claim_posts_nothing(monkeypatch):
+    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True, "pulse_delivery": "comment"})
+    monkeypatch.setattr(pulse, "_idle_labeled_prs", lambda *args: [])
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [_pr(1, "2020-01-01T00:00:00Z")])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
     monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda i, repo, pr: False)
@@ -390,9 +460,10 @@ def test_pulse_disabled_repo_costs_no_github_calls(monkeypatch):
 
 def test_pulse_respects_per_install_cap(monkeypatch):
     monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: False)
-    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True, "pulse_delivery": "comment"})
     many = [_pr(i, "2020-01-01T00:00:00Z") for i in range(10)]
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: many)
+    monkeypatch.setattr(pulse, "_idle_labeled_prs", lambda *args: [])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
     monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda i, repo, pr: True)
     posts = []
@@ -411,6 +482,7 @@ def test_pulse_respects_per_install_cap(monkeypatch):
 def test_pulse_dor_not_green_skips(monkeypatch):
     monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [_pr(1, "2020-01-01T00:00:00Z")])
+    monkeypatch.setattr(pulse, "_idle_labeled_prs", lambda *args: [])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: False)
     monkeypatch.setattr(
         pulse, "claim_pulse_nudge",
@@ -435,8 +507,9 @@ def test_warder_only_wakes_on_closed_action():
 
 
 def _wire_pulse_happy(monkeypatch, released):
-    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True})
+    monkeypatch.setattr(pulse, "get_repo_config", lambda i, r: {"pulse_enabled": True, "pulse_delivery": "comment"})
     monkeypatch.setattr(pulse, "_stale_prs", lambda t, o, r: [_pr(1, "2020-01-01T00:00:00Z")])
+    monkeypatch.setattr(pulse, "_idle_labeled_prs", lambda *args: [])
     monkeypatch.setattr(pulse, "_dor_green", lambda t, o, r, s: True)
     monkeypatch.setattr(pulse, "_recent_nudge_exists", lambda t, o, r, p: False)
     monkeypatch.setattr(pulse, "claim_pulse_nudge", lambda i, repo, pr: True)
@@ -508,3 +581,52 @@ def test_stale_prs_paginates_past_ineligible_prefix(monkeypatch):
     out = pulse._stale_prs("tok", "o", "r")
     assert len(out) == 31           # 30 from page 1 + 1 stale from page 2
     assert all(p_["number"] != 31 for p_ in out)  # fresh PR excluded, scan ended
+
+
+def test_idle_labeled_prs_scans_every_page_past_a_large_backlog(monkeypatch):
+    """A repo with more than 500 labeled items still gets every page read:
+    a label past page five must stay reachable by cleanup. A short page
+    ends the scan."""
+    full_pages = 6
+    pages = {
+        page: [
+            {"number": (page - 1) * 100 + i, "pull_request": {}}
+            for i in range(100)
+        ]
+        for page in range(1, full_pages + 1)
+    }
+    last_number = full_pages * 100
+    pages[full_pages + 1] = [{"number": last_number, "pull_request": {}}]
+    requested = []
+
+    def fake_get(url, params=None, **kw):
+        page = params["page"]
+        requested.append(page)
+        return httpx.Response(200, json=pages[page], request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(pulse.httpx, "get", fake_get)
+    out = pulse._idle_labeled_prs("tok", "o", "r")
+    assert requested == list(range(1, full_pages + 2))
+    assert len(out) == last_number + 1
+    assert out[-1]["number"] == last_number
+
+
+def test_idle_labeled_prs_reads_newest_updated_first_and_logs_at_the_cap(
+    monkeypatch, caplog,
+):
+    """The scan is bounded even when every page is full, says so in the log,
+    and sorts so the labels cleanup must remove are read first."""
+    requested = []
+
+    def fake_get(url, params=None, **kw):
+        requested.append(params)
+        body = [{"number": i, "pull_request": {}} for i in range(100)]
+        return httpx.Response(200, json=body, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(pulse.httpx, "get", fake_get)
+    with caplog.at_level("WARNING", logger=pulse.log.name):
+        out = pulse._idle_labeled_prs("tok", "o", "r")
+    assert len(requested) == pulse._MAX_LABEL_PAGES
+    assert len(out) == pulse._MAX_LABEL_PAGES * 100
+    assert (requested[0]["sort"], requested[0]["direction"]) == ("updated", "desc")
+    assert "pulse_idle_label_scan_page_cap" in caplog.text

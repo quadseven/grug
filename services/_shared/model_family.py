@@ -6,9 +6,13 @@ of each review arm. The table is closed on purpose: the author's name comes
 from an untrusted pull request body, and only a family from this table ever
 reaches a check summary. A name it does not know has no family, which keeps
 today's arm order.
+
+For PRs opened by GitHub Apps (bots), a trusted source (grug#1553) maps
+App logins to model families instead of using the Loom footer.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 
@@ -35,6 +39,33 @@ _FAMILY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("muse", "muse"),
     )
 )
+
+# Trusted source for App author families (grug#1553). GRUG_APP_AUTHOR_FAMILIES
+# lists `login:family` pairs, separated by `;` or newlines, for example
+# `lane-app[bot]:claude;other-app[bot]:gpt`. Unset or empty means no App gets a
+# family. A login matches only exactly (case-insensitive), never as a
+# substring, so a login that merely contains a model name gains nothing.
+_APP_AUTHOR_FAMILIES_ENV = "GRUG_APP_AUTHOR_FAMILIES"
+_KNOWN_FAMILIES = frozenset(family for family, _ in _FAMILY_PATTERNS)
+
+
+def app_author_family(login: str | None) -> str | None:
+    """The family listed for the GitHub App `login`, or None when unlisted.
+
+    The table is parsed from the environment on each call, so a changed value
+    (or a test's monkeypatch) takes effect without a reload."""
+    wanted = (login or "").strip().lower()
+    if not wanted:
+        return None
+    raw = os.environ.get(_APP_AUTHOR_FAMILIES_ENV, "")
+    table: dict[str, str] = {}
+    for pair in raw.replace("\n", ";").split(";"):
+        name, sep, family = pair.partition(":")
+        family = family.strip().lower()
+        # Only a family the closed table knows may reach a check summary.
+        if sep and name.strip() and family in _KNOWN_FAMILIES:
+            table[name.strip().lower()] = family
+    return table.get(wanted)
 
 
 def model_family(model: str | None) -> str | None:

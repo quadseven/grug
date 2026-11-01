@@ -1573,7 +1573,7 @@ def run_chief_recheck(
     Unexpected errors propagate; each caller owns its containment."""
     from personas.tpm.issue_fetcher import (  # type: ignore
         build_changed_files_fetcher, build_issue_facts_fetcher,
-        build_issue_fetcher,
+        build_issue_fetcher, build_merged_siblings_fetcher,
     )
     from personas.tpm.persona import (  # type: ignore
         _ADVISORY_CHECKS, evaluate_pull_request, publish_tpm_evaluation,
@@ -1606,6 +1606,10 @@ def run_chief_recheck(
         pr_body,
         fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
         fetch_changed_files=fetch_changed_files,
+        fetch_siblings=build_merged_siblings_fetcher(
+            installation_id=installation_id, owner=owner, repo=repo,
+            pr_number=pr_number,
+        ),
         author_trusted=author_trusted,
         advisory_checks=advisory_checks,
     )

@@ -145,7 +145,7 @@ def filter_intent_mismatch_findings(
 # Fail-open: a finding the scope cannot attribute to a box is kept as is,
 # unless every linked issue is Refs-only and the body claims no box at all.
 
-# (issue, criterion number, "open" | "ticked", cleaned text), the shape
+# (issue, criterion number, "open" | "ticked" | "delivered", cleaned text), the shape
 # `linked_issue.rendered_criteria_with_state` returns.
 LinkedBox = tuple[int, int, str, str]
 
@@ -268,6 +268,10 @@ def _scoped(finding: Finding, scope: _BoxScope) -> tuple[Finding | None, str]:
         if blocking and not scope.any_closed and not scope.any_claim:
             return _advisory(finding, []), "lowered"
         return finding, "kept"
+    # A merged PR on the ticket delivered these, by a heuristic: it stops the
+    # block, even on the PR that closes the ticket, but stays visible.
+    if all(b[2] == "delivered" for b in matched):
+        return _advisory(finding, matched), "lowered"
     if any(b[0] in scope.closed for b in matched):
         return _annotated(finding, matched), "kept"
     if all(b[2] == "ticked" for b in matched):

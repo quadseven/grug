@@ -1015,12 +1015,15 @@ def test_warder_pulse_flags_flow_through_config(pg):
 
     cfg = store.get_repo_config(1, 55)
     assert cfg["warder_enabled"] is False and cfg["pulse_enabled"] is False
+    assert cfg["pulse_delivery"] == "label"
     store.set_repo_config(
         install_id=1, repo_id=55, repo_full_name="o/r",
         updated_by_user_id="9", warder_enabled=True, pulse_enabled=True,
+        pulse_delivery="comment",
     )
     cfg = store.get_repo_config(1, 55)
     assert cfg["warder_enabled"] is True and cfg["pulse_enabled"] is True
+    assert cfg["pulse_delivery"] == "comment"
     assert store.is_persona_enabled(1, 55, "warder") is True
     assert store.is_persona_enabled(1, 55, "pulse") is True
 
