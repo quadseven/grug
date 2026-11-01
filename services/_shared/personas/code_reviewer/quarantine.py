@@ -27,6 +27,11 @@ SECURITY_SCOPE = (
     "security defects only: authentication, authorization, cryptography, "
     "secret handling, injection, and CI or reviewer configuration"
 )
+SINGLE_LINEAGE_NOTE = (
+    "Single-lineage review: a second model lineage did not review this "
+    "high-risk change on this head."
+)
+SECOND_LINEAGE_MARK = "[Second lineage] "
 UNAVAILABLE_NOTE = (
     "The code-only security pass did not finish on this head, so only the "
     "normal review covered the sensitive paths."
@@ -54,6 +59,10 @@ _FALSE_VALUES = frozenset({"", "0", "false", "off", "no"})
 def switch_on(name: str) -> bool:
     """A review switch that spends model calls: off unless set."""
     return os.getenv(name, "").strip().lower() not in _FALSE_VALUES
+
+
+def second_lineage_enabled() -> bool:
+    return switch_on("GRUG_SECOND_LINEAGE_REVIEW")
 
 
 def quarantined_pass_enabled() -> bool:
@@ -99,6 +108,7 @@ class MergedFindings:
     findings: tuple[Finding, ...]
     added: int
     raised: int
+    added_findings: tuple[Finding, ...] = ()
 
 
 def _fingerprint(finding: Finding) -> tuple[str, int, str]:
@@ -110,10 +120,11 @@ def _in_scope(finding: Finding) -> bool:
 
 
 def merge_by_fingerprint(
-    primary: tuple[Finding, ...], second: tuple[Finding, ...],
+    primary: tuple[Finding, ...], second: tuple[Finding, ...], *, mark: str = "",
 ) -> MergedFindings:
     """One marking per fingerprint, at the stricter severity. A second-pass
-    finding outside the security scope is a duplicate nit and is dropped."""
+    finding outside the security scope is a duplicate nit and is dropped.
+    `mark` prefixes a finding only the second pass raised."""
     merged = list(primary)
     positions: dict[tuple[str, int, str], int] = {}
     for index, finding in enumerate(primary):
@@ -125,11 +136,15 @@ def merge_by_fingerprint(
         if position is None:
             if _in_scope(finding):
                 positions[key] = len(merged)
-                merged.append(finding)
+                merged.append(
+                    dataclasses.replace(finding, message=f"{mark}{finding.message}"),
+                )
                 added += 1
         elif _SEVERITY_RANK[finding.severity] > _SEVERITY_RANK[merged[position].severity]:
             merged[position] = dataclasses.replace(
                 merged[position], severity=finding.severity,
             )
             raised += 1
-    return MergedFindings(tuple(merged), added, raised)
+    return MergedFindings(
+        tuple(merged), added, raised, tuple(merged[len(merged) - added:]) if added else (),
+    )

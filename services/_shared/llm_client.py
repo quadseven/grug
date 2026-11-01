@@ -7495,6 +7495,36 @@ def _run_subscription_fallback(
     )
 
 
+def review_second_lineage(
+    evidence: ElderEvidence,
+    installation_id: int,
+    primary_models: tuple[str, ...],
+    cancel_event: threading.Event | None = None,
+) -> LlmReviewResponse:
+    """One review on the operator's subscription lane (#1573): no paid API
+    spend, and no other backend. The lane serves two families and picks one,
+    so it hears the primary pass's family the way it hears an author's. The
+    caller compares the family that answered. A missing or spent lane is a
+    failed pass, never a fallback. `cancel_event` is checked before the call."""
+    if cancel_event is not None and cancel_event.is_set():
+        return LlmReviewResponse(kind="all_failed", error="cancelled")
+    known = [family for family in map(model_family, primary_models) if family]
+    pr_context = evidence.pr_context
+    messages = _build_messages(evidence, "v2")
+    token = _FAMILY_GATE.set((known[0], False)) if known else None
+    try:
+        response = _run_subscription_fallback(
+            messages, "v2", _llmobs_tags(pr_context), list(evidence.hunks),
+            pr_context, installation_id,
+        )
+    finally:
+        if token is not None:
+            _FAMILY_GATE.reset(token)
+    if response is None:
+        return LlmReviewResponse(kind="all_failed", error="subscription lane unavailable")
+    return response
+
+
 def _review_diff_dispatch_cave_primary(
     evidence: ElderEvidence,
     installation_id: int,

@@ -66,6 +66,10 @@ Path instructions come first because they name specific files. `.grug.yaml` and 
 
 When `GRUG_QUARANTINED_SECURITY_PASS` is set on the deployment, a pull request touching a sensitive path gets a second security review of those paths. That pass, its judge, and its refute gate read the diff and code context only: no title, body, linked issue, repo docs, or agent guideline files. Its findings merge with the normal review by file, line, and rule at the stricter severity, and it can never remove a finding. The default list is auth, crypto, payment, secret, and credential paths plus `.github/workflows/`, `.github/actions/`, and `.grug.yaml`.
 
+## Second-lineage review
+
+When `GRUG_SECOND_LINEAGE_REVIEW` is set on the deployment, a pull request touching a path in the same sensitive list gets a second review of those paths from a different model family, on the subscription lane, with code-only evidence. Findings merge into the one review, and a finding only this pass raised reads `[Second lineage]`. If no different family answered, the summary says `Single-lineage review`.
+
 ## Comment budget
 
 The budget applies only when `GRUG_COMMENT_BUDGET` is set on the deployment. Deterministic scanner findings are never capped or dropped. A held finding has no inline comment, is listed on the board by severity and judge confidence, and still counts toward the check. A non-blocking finding the judge called not real, or graded below 0.7, is held too. When a blocking finding is held for the cap, the next push reviews that ground again.

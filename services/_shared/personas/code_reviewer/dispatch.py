@@ -68,7 +68,10 @@ from llm_client import (
     review_diff,
     review_is_staged,
     review_reasoner_diff,
+    review_second_lineage,
 )
+from ledger import SECOND_LINEAGE_REVIEWER
+from model_family import model_family
 from voice_pack import VoiceSelection, entitled_voice
 from review_evidence import ElderEvidence, assemble_evidence
 from review_types import EFFORTS, SEVERITIES
@@ -157,10 +160,13 @@ from personas.code_reviewer.comment_budget import (
     budget_enabled, drip_fed, held_lines, is_model_blocking, split_for_budget,
 )
 from personas.code_reviewer.quarantine import (
+    SECOND_LINEAGE_MARK,
+    SINGLE_LINEAGE_NOTE,
     UNAVAILABLE_NOTE as QUARANTINE_UNAVAILABLE_NOTE,
     merge_by_fingerprint,
     quarantined_evidence,
     quarantined_pass_enabled,
+    second_lineage_enabled,
     sensitive_paths,
 )
 from personas.code_reviewer.persona import (
@@ -4041,6 +4047,16 @@ def dispatch_code_review(
     )
     if quarantine_gap:
         config_note = f"{config_note}\n\n{quarantine_gap}".strip()
+    evaluation, lineage_gap = _run_second_lineage_pass(
+        evaluation, hunks, evidence, installation_id,
+        primary_models=llm_response.models_used,
+        repo_config=repo_config, started=run_started_monotonic,
+        cancel_event=cancel_event, owner=owner, repo_name=repo_name,
+        pull_number=pull_number, head_sha=head_sha,
+        skip=llm_response.kind != "reviewed",
+    )
+    if lineage_gap:
+        config_note = f"{config_note}\n\n{lineage_gap}".strip()
 
     # #532: deterministic complexity source. A changed Python function over the
     # cyclomatic/cognitive cap merges as an advisory MEDIUM finding - no LLM, no
@@ -4758,6 +4774,123 @@ def _run_quarantined_pass(
     if merged is not None and merged.findings != evaluation.findings:
         evaluation = with_findings(evaluation, merged.findings)
     return evaluation, "" if outcome == "reviewed" else QUARANTINE_UNAVAILABLE_NOTE
+
+
+def _is_second_lineage(response: LlmReviewResponse, primary_models: tuple[str, ...]) -> bool:
+    """A finished reply from a known family the primary pass did not use."""
+    primary = {model_family(model) for model in primary_models}
+    answered = {model_family(model) for model in response.models_used}
+    return (
+        response.kind == "reviewed" and not response.error
+        and bool(answered) and None not in answered and not answered & primary
+    )
+
+
+def _second_lineage_rows(
+    outcome: str, findings: tuple[Finding, ...], *, repo: str, pull_number: int,
+    head_sha: str, model_calls: int,
+) -> list[dict]:
+    """Ledger rows: one per blocking finding only this pass raised, then one
+    for the run. They carry no reaction label."""
+    base = {
+        "repo": repo, "pr": pull_number, "reviewer": SECOND_LINEAGE_REVIEWER,
+        "ts": "", "commit": head_sha or None, "head_sha": head_sha or None,
+    }
+    rows = [
+        {
+            **base, "severity": f.severity, "class": f.rule_name,
+            "category": f.category, "finding": f.message, "verdict": "second-only",
+            "evidence": f"second-lineage:{head_sha}:{f.file}:{f.line}",
+        }
+        for f in findings if f.severity in ("high", "critical")
+    ]
+    rows.append({
+        **base, "severity": "", "class": "second-lineage", "finding": "run",
+        "verdict": outcome, "evidence": f"second-lineage:{head_sha}",
+        "model_calls": model_calls,
+    })
+    return rows
+
+
+def put_second_lineage_rows(rows: list[dict]) -> None:
+    put_verifier_verdicts(rows)
+
+
+def _run_second_lineage_pass(
+    evaluation: CodeReviewEvaluation,
+    hunks: tuple[DiffHunk, ...],
+    evidence: ElderEvidence,
+    installation_id: int,
+    *,
+    primary_models: tuple[str, ...],
+    repo_config: RepoConfig,
+    started: float,
+    cancel_event: threading.Event | None,
+    owner: str,
+    repo_name: str,
+    pull_number: int,
+    head_sha: str,
+    skip: bool,
+) -> tuple[CodeReviewEvaluation, str]:
+    """A second review of the high-risk paths on the subscription lane
+    (#1573), in a fresh context with the quarantined evidence. Findings merge
+    one way into `evaluation`, and one only this pass raised is marked, so its
+    incremental value can be measured. It never breaks a tie on the primary
+    pass's findings. Returns a single-lineage note when no second lineage
+    answered, so the gap is never silent."""
+    if skip or not second_lineage_enabled():
+        return evaluation, ""
+    paths = sensitive_paths(
+        dict.fromkeys(h.path for h in evidence.hunks), repo_config,
+    )
+    if not paths:
+        return evaluation, ""
+    fresh = quarantined_evidence(evidence, paths)
+    pr = f"{owner}/{repo_name}#{pull_number}"
+    merged = None
+    response: LlmReviewResponse | None = None
+    model_calls = 1
+    try:
+        with _review_deadline(started + _staged_review_budget_s()):
+            response = review_second_lineage(
+                fresh, installation_id, primary_models, cancel_event=cancel_event,
+            )
+            if response.kind == "reviewed":
+                graded, _, _, _ = _grade_deep_response(
+                    response, hunks, fresh, installation_id,
+                    pr_context=fresh.pr_context or {}, owner=owner,
+                    repo_name=repo_name, pull_number=pull_number,
+                    head_sha=head_sha, arm="second-lineage",
+                )
+                model_calls += _adjudication_calls(response)
+                merged = merge_by_fingerprint(
+                    evaluation.findings, graded.findings,
+                    mark=SECOND_LINEAGE_MARK,
+                )
+    except Exception as e:  # noqa: BLE001 - additive; the normal review stands
+        log.warning(
+            "elder_second_lineage_failed",
+            extra={"pr": pr, "kind": type(e).__name__}, exc_info=True,
+        )
+    two_lineages = response is not None and _is_second_lineage(response, primary_models)
+    outcome = "second-lineage-run" if two_lineages else "single-lineage"
+    second_only = merged.added_findings if merged else ()
+    put_second_lineage_rows(_second_lineage_rows(
+        outcome, second_only, repo=f"{owner}/{repo_name}",
+        pull_number=pull_number, head_sha=head_sha, model_calls=model_calls,
+    ))
+    log.info(
+        "elder_second_lineage",
+        extra={
+            "installation_id": installation_id, "pr": pr, "outcome": outcome,
+            "sensitive_paths": len(paths), "model_calls": model_calls,
+            "added": merged.added if merged else 0,
+            "raised": merged.raised if merged else 0,
+        },
+    )
+    if merged is not None and merged.findings != evaluation.findings:
+        evaluation = with_findings(evaluation, merged.findings)
+    return evaluation, "" if two_lineages else SINGLE_LINEAGE_NOTE
 
 
 def _adjudication_calls(response: LlmReviewResponse) -> int:
