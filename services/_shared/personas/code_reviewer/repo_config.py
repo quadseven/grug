@@ -175,6 +175,18 @@ def _mute_settings(
     return min_labeled, below, locked
 
 
+def _security_paths(
+    data: dict, problems: list[str],
+) -> tuple[str, ...] | None:
+    """A malformed list keeps the default list: a typo must not end a
+    security control the way a deliberate empty list does."""
+    if "security_review_paths" not in data:
+        return None
+    before = len(problems)
+    paths = _string_list(data["security_review_paths"], "security_review_paths", problems)
+    return None if len(problems) > before else paths
+
+
 def parse_repo_config(text: str | None) -> RepoConfig:
     """Parse `.grug.yaml` text. Never raises."""
     if text is None or not text.strip():
@@ -214,10 +226,7 @@ def parse_repo_config(text: str | None) -> RepoConfig:
             )
     skip = _skip_prs(data["skip_prs"], problems) if "skip_prs" in data else SkipPrs()
     min_labeled, below, locked = _mute_settings(data, problems)
-    security_paths = (
-        _string_list(data["security_review_paths"], "security_review_paths", problems)
-        if "security_review_paths" in data else None
-    )
+    security_paths = _security_paths(data, problems)
     return RepoConfig(
         ignore, instructions, floor, tuple(problems), skip,
         min_labeled, below, locked, security_paths,

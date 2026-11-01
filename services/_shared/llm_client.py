@@ -245,6 +245,8 @@ class PrContext(TypedDict, total=False):
     deferred_lint_unfinished: tuple[str, ...]
     review_scope: str
     sensitive_review: bool
+    # A quarantined pass reads no text the PR's author could write (grug#1569).
+    code_only: bool
     # The webhook's `repository.private` (grug#1269). Unset means unknown,
     # which every reader treats as private.
     repo_private: bool
@@ -4207,6 +4209,9 @@ def _repo_guidelines_block(pr_context: Optional[PrContext]) -> str:
     fetch error) returns "" so the review runs without them - a missing or
     unreadable guideline file must never fail a review."""
     if not pr_context or "repo" not in pr_context or "installation_id" not in pr_context:
+        return ""
+    # grug#1569: these files come from the PR head, so its author wrote them.
+    if pr_context.get("code_only"):
         return ""
     repo = str(pr_context["repo"])
     if "/" not in repo:

@@ -62,7 +62,7 @@ Path instructions come first because `.grug.yaml` is read from the base commit, 
 
 ## Code-only security pass
 
-When `GRUG_QUARANTINED_SECURITY_PASS` is set on the deployment, a pull request touching a sensitive path gets a second security review of those paths. That pass, its judge, and its refute gate read the diff and code context only: no title, body, linked issue, or repo docs. Its findings merge with the normal review by file, line, and rule at the stricter severity, and it can never remove a finding. The default list is auth, crypto, payment, secret, and credential paths plus `.github/workflows/`, `.github/actions/`, and `.grug.yaml`.
+When `GRUG_QUARANTINED_SECURITY_PASS` is set on the deployment, a pull request touching a sensitive path gets a second security review of those paths. That pass, its judge, and its refute gate read the diff and code context only: no title, body, linked issue, repo docs, or agent guideline files. Its findings merge with the normal review by file, line, and rule at the stricter severity, and it can never remove a finding. The default list is auth, crypto, payment, secret, and credential paths plus `.github/workflows/`, `.github/actions/`, and `.grug.yaml`.
 
 ## Example
 

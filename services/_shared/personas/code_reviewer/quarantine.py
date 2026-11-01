@@ -16,7 +16,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from personas.code_reviewer.persona import Finding
-from personas.code_reviewer.repo_config import RepoConfig, path_matches
+from personas.code_reviewer.repo_config import (
+    _SEVERITY_RANK,
+    RepoConfig,
+    path_matches,
+)
 from review_evidence import ElderEvidence, without_author_text
 
 SECURITY_SCOPE = (
@@ -30,14 +34,17 @@ UNAVAILABLE_NOTE = (
 
 # Whole words, so `authors.md` and `tokenizer.py` stay ordinary paths.
 _SENSITIVE_WORDS = frozenset({
-    "auth", "oauth", "authn", "authz", "authentication", "authorization",
+    "auth", "oauth", "authn", "authz", "authenticate", "authentication",
+    "authorization", "authorize",
     "crypto", "cryptography", "encryption", "jwt", "kms",
     "payment", "payments", "billing",
     "secret", "secrets", "credential", "credentials", "password", "passwords",
 })
-_CONFIG_GLOBS = (".github/workflows/**", ".github/actions/**", ".grug.yaml")
-_WORD_RE = re.compile(r"[a-z0-9]+")
-_SEVERITY_ORDER = ("low", "medium", "high", "critical")
+_CONFIG_GLOBS = (
+    ".github/workflows/**", ".github/actions/**", ".gitlab-ci.yml", ".grug.yaml",
+)
+# Splits `AuthService` and `oauth2`: words are runs of letters, camelCase too.
+_WORD_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+")
 _BLOCKING = frozenset({"high", "critical"})
 _FALSE_VALUES = frozenset({"", "0", "false", "off", "no"})
 
@@ -50,10 +57,10 @@ def quarantined_pass_enabled() -> bool:
 
 
 def _is_default_sensitive(path: str) -> bool:
-    lowered = path.lower()
-    if any(path_matches(lowered, glob) for glob in _CONFIG_GLOBS):
+    if any(path_matches(path, glob) for glob in _CONFIG_GLOBS):
         return True
-    return not _SENSITIVE_WORDS.isdisjoint(_WORD_RE.findall(lowered))
+    words = {word.lower() for word in _WORD_RE.findall(path)}
+    return not _SENSITIVE_WORDS.isdisjoint(words)
 
 
 def sensitive_paths(paths: Iterable[str], config: RepoConfig) -> tuple[str, ...]:
@@ -71,7 +78,7 @@ def quarantined_evidence(
     """`evidence` narrowed to `paths`, with diff and code context only. Repo
     docs come from the PR head, so the author can write those too."""
     context = without_author_text(evidence.pr_context) or {}
-    context = {**context, "review_scope": SECURITY_SCOPE}
+    context = {**context, "review_scope": SECURITY_SCOPE, "code_only": True}
     return dataclasses.replace(
         evidence.scoped_to(paths),
         pr_context=context,
@@ -114,9 +121,7 @@ def merge_by_fingerprint(
                 positions[key] = len(merged)
                 merged.append(finding)
                 added += 1
-        elif _SEVERITY_ORDER.index(finding.severity) > _SEVERITY_ORDER.index(
-            merged[position].severity,
-        ):
+        elif _SEVERITY_RANK[finding.severity] > _SEVERITY_RANK[merged[position].severity]:
             merged[position] = dataclasses.replace(
                 merged[position], severity=finding.severity,
             )

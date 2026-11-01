@@ -59,7 +59,10 @@ from llm_client import (
     DeepEscalationDecision,
     Hunk as LlmHunk,
     LlmReviewResponse,
+    JUDGE_BATCH_SIZE,
     PrContext,
+    _review_deadline,
+    _staged_review_budget_s,
     decide_deep_escalation,
     review_cohort_char_budget,
     review_diff,
@@ -67,7 +70,6 @@ from llm_client import (
     review_reasoner_diff,
 )
 from voice_pack import VoiceSelection, entitled_voice
-from llm_client import JUDGE_BATCH_SIZE, _review_deadline, _staged_review_budget_s
 from review_evidence import ElderEvidence, assemble_evidence
 from review_types import EFFORTS, SEVERITIES
 from personas.review_publish import (
@@ -3998,10 +4000,11 @@ def dispatch_code_review(
     evaluation, quarantine_gap = _run_quarantined_pass(
         evaluation, hunks, evidence, installation_id,
         repo_config=repo_config, started=run_started_monotonic,
+        voice=voice, cancel_event=cancel_event,
         owner=owner, repo_name=repo_name, pull_number=pull_number,
         head_sha=head_sha,
         skip=(
-            correctness_only or llm_response.kind != "reviewed"
+            llm_response.kind != "reviewed"
             or (cancel_event is not None and cancel_event.is_set())
         ),
     )
@@ -4631,6 +4634,8 @@ def _run_quarantined_pass(
     *,
     repo_config: RepoConfig,
     started: float,
+    voice: VoiceSelection,
+    cancel_event: threading.Event | None,
     owner: str,
     repo_name: str,
     pull_number: int,
@@ -4658,15 +4663,22 @@ def _run_quarantined_pass(
     model_calls = 0
     try:
         with _review_deadline(started + _staged_review_budget_s()):
-            response = review_diff(quarantined, installation_id=installation_id)
+            response = review_diff(
+                quarantined, installation_id=installation_id, voice=voice,
+                cancel_event=cancel_event,
+            )
             coverage = response.coverage
             model_calls = coverage.total_cohorts if coverage else 1
             if response.kind == "reviewed":
-                graded, _, _, _ = _grade_deep_response(
+                graded, judged, verdicts, _ = _grade_deep_response(
                     response, hunks, quarantined, installation_id,
                     pr_context=quarantined.pr_context or {}, owner=owner,
                     repo_name=repo_name, pull_number=pull_number,
                     head_sha=head_sha, arm="quarantined",
+                )
+                submit_evals(
+                    judged, verdicts,
+                    review_span_context=response.review_span_context,
                 )
                 merged = merge_by_fingerprint(evaluation.findings, graded.findings)
                 outcome = "partial" if response.error else "reviewed"
