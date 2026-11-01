@@ -66,6 +66,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from typing import NamedTuple
 
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import Finding
@@ -255,6 +256,15 @@ def _write(tmp: str, files: dict[str, str]) -> None:
             fh.write(text)
 
 
+class RuffHit(NamedTuple):
+    """One ruff violation, with no diff anchoring applied."""
+
+    path: str
+    row: int
+    code: str
+    message: str
+
+
 def scan_ruff(
     hunks: tuple[DiffHunk, ...], file_contents: dict[str, str],
     policy: RepoRuffPolicy | None = None,
@@ -287,6 +297,40 @@ def scan_ruff(
         return ()
 
     timeout = _TIMEOUT_S if timeout_s is None else min(_TIMEOUT_S, timeout_s)
+    ran = _run_ruff(kept, timeout, strict)
+    if ran is None:
+        return ()
+    results, prefix = ran
+    return _map_results(results, prefix, added, file_contents, policy, policy_dropped)
+
+
+def ruff_hits(file_contents: dict[str, str]) -> tuple[RuffHit, ...]:
+    """Every violation in the given Python files, whatever the diff touched.
+
+    The deferred-finding re-check (#1477) measures a named file at the head,
+    where the violation is on a line no PR added. Raises `AnalyzerSkip` when
+    ruff could not run: that caller must not read a failed run as a clean one.
+    A file over the byte budget is not scanned, so it raises the same way."""
+    kept = _budget(file_contents)
+    if len(kept) < len([p for p in file_contents if p.endswith(".py")]):
+        raise AnalyzerSkip("over-budget")
+    if not kept:
+        return ()
+    ran = _run_ruff(kept, _TIMEOUT_S, strict=True)
+    if ran is None:
+        raise AnalyzerSkip("error")
+    results, prefix = ran
+    if not isinstance(results, list):
+        raise AnalyzerSkip("unparseable")
+    parsed = (_parse_result(r, prefix) for r in results)
+    return tuple(RuffHit(*hit) for hit in parsed if hit is not None)
+
+
+def _run_ruff(
+    kept: dict[str, str], timeout: float, strict: bool,
+) -> tuple[object, str] | None:
+    """(parsed ruff JSON, temp dir prefix), or None when ruff did not finish.
+    `strict` raises `AnalyzerSkip` with the reason instead of returning None."""
     try:
         with tempfile.TemporaryDirectory(prefix="grug-lint-") as tmp:
             _write(tmp, kept)
@@ -310,8 +354,7 @@ def scan_ruff(
                     },
                 )
                 return _degrade(strict, "error")
-            results = json.loads(proc.stdout or "[]")
-            prefix = tmp.rstrip("/") + "/"
+            return json.loads(proc.stdout or "[]"), tmp.rstrip("/") + "/"
     except FileNotFoundError:
         # WARNING, not info: reaching here means someone set
         # GRUG_LINT_EVIDENCE=ruff and is getting silent nothing, because the
@@ -327,14 +370,11 @@ def scan_ruff(
         log.warning("lint_ruff_unparseable", extra={"kind": type(e).__name__})
         return _degrade(strict, "unparseable")
 
-    return _map_results(results, prefix, added, file_contents, policy, policy_dropped)
 
-
-def _degrade(strict: bool, reason: str) -> tuple[Finding, ...]:
-    """() for the best-effort caller; a recorded skip for the strict one."""
+def _degrade(strict: bool, reason: str) -> None:
+    """None for the best-effort caller; a recorded skip for the strict one."""
     if strict:
         raise AnalyzerSkip(reason)
-    return ()
 
 
 def _is_reportable(

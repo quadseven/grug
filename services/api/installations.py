@@ -332,6 +332,8 @@ def list_activity(
             "summary": r["summary"],
             "findings_count": r["findings_count"],
             "created_at": r["created_at"],
+            # Elder rows of a footer-named author only (grug#1437).
+            **{k: r[k] for k in ("author_family", "reviewer_family") if k in r},
         })
         if len(out) >= limit:
             break

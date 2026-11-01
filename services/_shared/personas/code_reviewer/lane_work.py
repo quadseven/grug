@@ -60,7 +60,7 @@ from personas.tpm.ticket_compliance import closes_refs
 # The footer a Loom lane writes on every pull request it opens.
 _LANE_FOOTER_RE = re.compile(r"^Loom ticket \S+, lane \S+", re.MULTILINE)
 
-# (issue, criterion number, "open" | "ticked", text): the shape
+# (issue, criterion number, "open" | "ticked" | "delivered", text): the shape
 # `linked_issue.rendered_criteria_with_state` returns.
 LinkedBox = tuple[int, int, str, str]
 
@@ -77,7 +77,8 @@ def criteria_in_scope(
 
     Those of an issue the PR closes; every linked criterion of a lane PR,
     whose ticket the station closes on merge; and, on any other PR, an open
-    box whose text the body repeats or names by number (a claim)."""
+    box whose text the body repeats or names by number (a claim). A criterion
+    a merged PR on the ticket delivered is none of these (grug#1530)."""
     body = pr_body or ""
     boxes = tuple(boxes)
     closed = set(closes_refs(body))
@@ -87,8 +88,11 @@ def criteria_in_scope(
     return tuple(
         LinkedCriterion(issue, number, text)
         for issue, number, state, text in boxes
-        if issue in closed or lane
-        or (state == "open" and body_claims_box((issue, number, state, text), body, single))
+        if state != "delivered"
+        and (
+            issue in closed or lane
+            or (state == "open" and body_claims_box((issue, number, state, text), body, single))
+        )
     )
 
 

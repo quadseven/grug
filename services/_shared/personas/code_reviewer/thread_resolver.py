@@ -19,7 +19,9 @@ Ownership is conservative on every axis:
   - a reply from the PR author that starts with "Fixed in" is treated as
     the author confirming the fix, so the thread may still be resolved;
   - "code changed" is GitHub's own `isOutdated`, which flips only when a
-    later commit changed or removed the anchored lines;
+    later commit changed or removed the anchored lines. A deferred-ruff
+    thread is the exception: its anchor can be a line the fix never touches,
+    so the review no longer raising it is what says it is fixed (#1477);
   - a thread whose original commit is gone (force-push) is skipped.
 
 Entry point: `resolve_fixed_threads`. It never raises; every failure is
@@ -35,6 +37,7 @@ import httpx
 from github_app_auth import with_install_token_retry
 
 from personas import board, board_client
+from personas.code_reviewer import deferred_ruff
 from personas.code_reviewer.dedup import parse_rule
 from personas.code_reviewer.persona import Finding
 
@@ -231,17 +234,25 @@ def _blocked_by_person_reply(thread: dict, pr_author: str | None) -> bool:
     return False
 
 
+def _is_remeasured(thread: dict) -> bool:
+    nodes = (thread.get("comments") or {}).get("nodes") or []
+    return bool(nodes) and parse_rule(nodes[0].get("body") or "") == deferred_ruff.RULE
+
+
 def select_fixed_threads(
     threads: list[dict], findings: tuple[Finding, ...],
     *, pr_author: str | None = None,
 ) -> tuple[list[str], int, int]:
-    """Node ids of threads that are Elder's, outdated, and not re-raised,
-    plus skip counts for person replies and re-raised findings."""
+    """Node ids of threads that are Elder's, outdated (or re-measured on
+    every review), and not re-raised, plus skip counts for person replies
+    and re-raised findings."""
     picked: list[str] = []
     skipped_person = 0
     skipped_reraised = 0
     for t in threads:
-        if t.get("isResolved") or not t.get("isOutdated"):
+        if t.get("isResolved"):
+            continue
+        if not t.get("isOutdated") and not _is_remeasured(t):
             continue
         owned = _owned_rule_and_line(t, pr_author)
         if owned is None:
