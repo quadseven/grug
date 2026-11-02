@@ -214,7 +214,7 @@ spec:
             # UNMODIFIED Cave path unconditionally on total cloud failure;
             # "cave" priority elsewhere (self-hosted deployments, tests)
             # is untouched by this flag existing.
-            - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: cloud}
+            - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: subscription}
             # opencode Go (deepseek-v4-flash): qualified live 2026-08-27,
             # small/medium diffs fast (1-9s) and deterministic; occasional
             # instability on large diffs (grug#910's own evidence) - bounded
@@ -270,7 +270,7 @@ spec:
             # the real daily counts across all pods; this cap is per process.
             - {name: GRUG_SUBSCRIPTION_URL, value: http://forward.subscription-lane.svc:8080/v1/chat/completions}
             - {name: GRUG_SUBSCRIPTION_MODEL, value: subscription-lane}
-            - {name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "750"}
+            - {name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "3000"}
             - {name: GRUG_SUBSCRIPTION_TOKEN_SSM, value: /grug/subscription-lane-token}
             # infra#2451/#2454 precedent: the second GPU host's vLLM resident is not a
             # fixed identity (infra#2452 swapped poolside/Laguna-S-2.1-NVFP4 ->

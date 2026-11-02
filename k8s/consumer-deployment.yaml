@@ -159,7 +159,7 @@ spec:
             # grug#906/#910: try cloud before owned Sparks hardware - full
             # rationale in webhook-deployment.yaml, kept identical on both
             # Elder-capable workloads (this is the PRODUCTION review path).
-            - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: cloud}
+            - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: subscription}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             # OpenRouter :free as the chain's tier 2 - rationale and eval
             # evidence in webhook-deployment.yaml.
@@ -278,7 +278,7 @@ spec:
             # the real daily counts across all pods; this cap is per process.
             - {name: GRUG_SUBSCRIPTION_URL, value: http://forward.subscription-lane.svc:8080/v1/chat/completions}
             - {name: GRUG_SUBSCRIPTION_MODEL, value: subscription-lane}
-            - {name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "750"}
+            - {name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "3000"}
             - {name: GRUG_SUBSCRIPTION_TOKEN_SSM, value: /grug/subscription-lane-token}
             # infra#2451/#2454 precedent: the second GPU host's vLLM resident is not a
             # fixed identity (infra#2452 swapped poolside/Laguna-S-2.1-NVFP4 ->

@@ -441,6 +441,10 @@ _RUNG_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "grug_rung_deadline", default=None,
 )
 _SUBSCRIPTION_RESERVE_SECONDS = 60.0
+# Set once a lane-first walk has asked the lane, so its last rung does not.
+_LANE_ASKED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "grug_lane_asked", default=False,
+)
 # A tight share still asks the first rungs: Go answers in about 8s, and a
 # healthy model must not lose every cohort of a long review to the lane's cap.
 _MIN_RUNG_SECONDS = 30.0
@@ -6912,7 +6916,7 @@ def decide_deep_escalation(
     )
 
 
-_REVIEW_BACKEND_PRIORITY_VALUES = ("cave", "cloud")
+_REVIEW_BACKEND_PRIORITY_VALUES = ("cave", "cloud", "subscription")
 
 
 def _review_backend_priority() -> str:
@@ -7252,11 +7256,13 @@ def _review_diff_dispatch(
     def walk(gate: tuple[str, bool] | None) -> "LlmReviewResponse":
         token = _FAMILY_GATE.set(gate)
         calls_token = _WALK_GATEWAY_CALLS.set([])
+        lane_token = _LANE_ASKED.set(False)
         try:
             return _walk_review_ladder(
                 evidence, installation_id, voice, cancel_event, review_map,
             )
         finally:
+            _LANE_ASKED.reset(lane_token)
             _WALK_GATEWAY_CALLS.reset(calls_token)
             _FAMILY_GATE.reset(token)
 
@@ -7296,7 +7302,8 @@ def _walk_review_ladder(
     result instead of failing the chunk."""
     low_confidence: LlmReviewResponse | None = None
     pr_context = evidence.pr_context
-    if _review_backend_priority() == "cloud":
+    priority = _review_backend_priority()
+    if priority in ("cloud", "subscription"):
         depth = _review_depth()
         variant: PromptVariant = (
             "v2" if depth != "fast" else select_prompt_variant(installation_id)
@@ -7311,6 +7318,16 @@ def _walk_review_ladder(
             review_map=review_map,
         )
         pr_tags = _llmobs_tags(pr_context)
+        if priority == "subscription":
+            # The operator's plans review first; the lane paces itself against
+            # its plan windows and says so with a refusal, and the chain below
+            # then serves the chunk. It is not asked again in this walk.
+            lane = _run_subscription_fallback(
+                messages, variant, pr_tags, list(evidence.hunks), pr_context, installation_id,
+            )
+            if lane is not None and lane.kind == "reviewed":
+                return lane
+            _LANE_ASKED.set(True)
         cloud_result = _try_cloud_primary(
             list(evidence.hunks), messages, variant, pr_tags, installation_id,
             pr_context, cancel_event,
@@ -7860,7 +7877,7 @@ def _review_diff_dispatch_cave_primary(
         # Only after every self-hosted target and every free provider has failed.
         # Uses headless subscription lanes, never pay-per-token API keys.
         # Bounded by configured daily cap.
-        sub_resp = _run_subscription_fallback(
+        sub_resp = None if _LANE_ASKED.get() else _run_subscription_fallback(
             messages=messages,
             variant=variant,
             pr_tags=pr_tags,

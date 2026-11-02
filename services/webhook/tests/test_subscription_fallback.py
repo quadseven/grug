@@ -823,3 +823,45 @@ def test_the_workloads_ship_the_model_the_sparks_serve() -> None:
             'name: GRUG_CAVE_TRUSTED_EMPTY_MODELS, value: "nemotron-3.5-super-vl"'
             in (root / manifest).read_text()
         )
+
+
+def _lane_first(monkeypatch, responses: dict[str, object]):
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "subscription")
+    recorder = _Recorder(responses)
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = lc._walk_review_ladder(assemble_evidence([_hunk()]), 1, "caveman", None)
+    return resp, recorder
+
+
+def test_the_lane_reviews_first_when_it_is_the_priority(monkeypatch) -> None:
+    resp, recorder = _lane_first(monkeypatch, {"subscription": _finding_body()})
+
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert len(recorder.called_urls) == 1
+
+
+def test_a_refusing_lane_hands_on_to_go_and_is_not_asked_twice(monkeypatch) -> None:
+    resp, recorder = _lane_first(monkeypatch, {
+        "subscription": httpx.Response(429, json={"error": {"message": "limit"}}),
+        "opencode": _finding_body(),
+    })
+
+    assert resp.backend_used == Backend.OPENCODE_GO
+    assert sum("subscription" in url for url in recorder.called_urls) == 1
+
+
+def test_a_lane_failure_with_every_rung_down_passes_nothing(monkeypatch) -> None:
+    resp, recorder = _lane_first(monkeypatch, {
+        "subscription": httpx.ConnectTimeout("lane down"),
+    })
+
+    assert resp.kind != "reviewed"
+    assert sum("subscription" in url for url in recorder.called_urls) == 1
+
+
+def test_the_workloads_ship_the_lane_first_within_its_cap() -> None:
+    root = Path(__file__).resolve().parents[3] / "k8s"
+    for manifest in ("consumer-deployment.yaml", "webhook-deployment.yaml"):
+        text = (root / manifest).read_text()
+        assert "name: GRUG_REVIEW_BACKEND_PRIORITY, value: subscription" in text
+        assert 'name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "3000"' in text
