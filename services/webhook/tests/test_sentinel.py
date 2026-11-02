@@ -169,6 +169,7 @@ def test_flags_abandoned_finding_even_when_last_verdict_clean(monkeypatch):
     monkeypatch.setattr(sentinel, "get_check_verdict", lambda iid, sha, persona: _verdict(blocking=False))
     monkeypatch.setattr(sentinel, "_high_severity_records", lambda iid, o, r, pr: [_record()])
     monkeypatch.setattr(sentinel, "_replied_to_comment_ids", lambda token, o, r, pr: set())
+    monkeypatch.setattr(sentinel, "_resolved_thread_root_ids", lambda token, o, r, pr: set())
     monkeypatch.setattr(sentinel, "_find_marker_comment", lambda token, o, r, pr: None)
     posted = []
     monkeypatch.setattr(
@@ -193,6 +194,7 @@ def test_skips_when_high_severity_finding_has_a_human_reply(monkeypatch):
     monkeypatch.setattr(sentinel, "get_check_verdict", lambda iid, sha, persona: _verdict(blocking=False))
     monkeypatch.setattr(sentinel, "_high_severity_records", lambda iid, o, r, pr: [_record()])
     monkeypatch.setattr(sentinel, "_replied_to_comment_ids", lambda token, o, r, pr: {1})
+    monkeypatch.setattr(sentinel, "_resolved_thread_root_ids", lambda token, o, r, pr: set())
     monkeypatch.setattr(sentinel, "with_install_token_retry", lambda iid, fn: fn("tok"))
     monkeypatch.setattr(
         sentinel.httpx, "post",
@@ -311,6 +313,7 @@ def test_skips_merged_pr_when_elder_fixed_reply_is_latest(monkeypatch):
     monkeypatch.setattr(sentinel, "get_check_verdict", lambda iid, sha, persona: _verdict(blocking=False))
     monkeypatch.setattr(sentinel, "_high_severity_records", lambda iid, o, r, pr: [rec])
     monkeypatch.setattr(sentinel, "_replied_to_comment_ids", lambda token, o, r, pr: {1})
+    monkeypatch.setattr(sentinel, "_resolved_thread_root_ids", lambda token, o, r, pr: set())
     monkeypatch.setattr(sentinel, "with_install_token_retry", lambda iid, fn: fn("tok"))
     monkeypatch.setattr(
         sentinel.httpx, "post",
@@ -328,6 +331,7 @@ def test_unresolved_or_unreplied_high_finding_still_warns(monkeypatch):
     monkeypatch.setattr(sentinel, "get_check_verdict", lambda iid, sha, persona: _verdict(blocking=False))
     monkeypatch.setattr(sentinel, "_high_severity_records", lambda iid, o, r, pr: [rec])
     monkeypatch.setattr(sentinel, "_replied_to_comment_ids", lambda token, o, r, pr: set())
+    monkeypatch.setattr(sentinel, "_resolved_thread_root_ids", lambda token, o, r, pr: set())
     monkeypatch.setattr(sentinel, "_find_marker_comment", lambda token, o, r, pr: None)
     monkeypatch.setattr(sentinel, "with_install_token_retry", lambda iid, fn: fn("tok"))
     monkeypatch.setattr(sentinel, "record_check_verdict", lambda **kw: None)
@@ -519,6 +523,7 @@ def test_reply_scan_counts_configured_agent_bot_as_handled(monkeypatch):
 
     # The finding with the configured agent bot should be marked as handled
     assert sentinel._replied_to_comment_ids("tok", "owner", "repo", 5) == {1}
+    monkeypatch.setattr(sentinel, "_resolved_thread_root_ids", lambda t, o, r, pr: set())
     candidates = [
         {"comment_id": 1, "severity": "high", "rule_name": "configured-bot"},
         {"comment_id": 3, "severity": "high", "rule_name": "other-bot"},
@@ -610,3 +615,136 @@ def test_flags_non_lane_pr_closed_by_loom_app(monkeypatch):
 
     assert out["result"] == "flagged"
     assert len(posted) == 1
+
+
+# --- grug#1559: a resolved thread is handled, whoever replied -----------------
+
+_HIGH_REC = {"comment_id": 11, "finding_tags": {"severity": "high"}, "rule_name": "ssrf"}
+
+
+class _Resp:
+    def __init__(self, data):
+        self._data = data
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._data
+
+
+def _threads_payload(*threads):
+    return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [
+            {"isResolved": resolved, "comments": {"nodes": [{"databaseId": root}]}}
+            for root, resolved in threads
+        ],
+    }}}}}
+
+
+def _arm_clean_verdict_with_high_finding(monkeypatch, *, rest_comments, graphql):
+    """Last verdict clean, one high finding (comment 11) on record. REST
+    serves `rest_comments`; the GraphQL endpoint answers via `graphql`.
+    Returns the list of notice bodies posted."""
+    monkeypatch.setattr(sentinel, "get_app_id", lambda: "42")
+    monkeypatch.setattr(sentinel, "_high_severity_records", lambda iid, o, r, pr: [_HIGH_REC])
+    monkeypatch.setattr(
+        sentinel, "get_check_verdict", lambda iid, sha, persona: _verdict(blocking=False),
+    )
+    monkeypatch.setattr(sentinel, "_find_marker_comment", lambda t, o, r, pr: None)
+    monkeypatch.setattr(sentinel, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(sentinel, "record_check_verdict", lambda **kw: None)
+    monkeypatch.setattr(sentinel.httpx, "get", lambda *a, **kw: _Resp(rest_comments))
+    posted = []
+
+    def _post(url, **kw):
+        if url.endswith("/graphql"):
+            return graphql(kw)
+        posted.append(kw["json"]["body"])
+        return httpx.Response(201, request=httpx.Request("POST", url), json={})
+
+    monkeypatch.setattr(sentinel.httpx, "post", _post)
+    return posted
+
+
+def test_resolved_thread_with_only_an_app_reply_raises_no_notice(monkeypatch):
+    """The 49-notice false alarm: the finding's thread is resolved and its
+    only reply came from an App outside any list. Resolved means handled."""
+    elder = {"login": "grug-tribe[bot]", "type": "Bot"}
+    app = {"login": "some-unlisted-app[bot]", "type": "Bot"}
+    posted = _arm_clean_verdict_with_high_finding(
+        monkeypatch,
+        rest_comments=[
+            {"id": 11, "in_reply_to_id": None, "user": elder, "body": "high | x"},
+            {"id": 12, "in_reply_to_id": 11, "user": app, "body": "Addressed."},
+        ],
+        graphql=lambda kw: _Resp(_threads_payload((11, True))),
+    )
+
+    out = sentinel.dispatch_pull_request(_ctx({"pull_request": {"merged": True}}))
+
+    assert out == {"persona": "sentinel", "result": "skipped"}
+    assert posted == []
+
+
+def test_unresolved_high_finding_with_no_reply_still_raises_notice(monkeypatch):
+    elder = {"login": "grug-tribe[bot]", "type": "Bot"}
+    posted = _arm_clean_verdict_with_high_finding(
+        monkeypatch,
+        rest_comments=[{"id": 11, "in_reply_to_id": None, "user": elder, "body": "high | x"}],
+        graphql=lambda kw: _Resp(_threads_payload((11, False))),
+    )
+
+    out = sentinel.dispatch_pull_request(_ctx({"pull_request": {"merged": True}}))
+
+    assert out == {"persona": "sentinel", "result": "flagged"}
+    assert len(posted) == 1
+    assert "never got a reply" in posted[0]
+
+
+def test_graphql_failure_falls_back_to_rest_reply_rules(monkeypatch):
+    """A GraphQL error must not crash Haunt or hide the REST answer: a
+    human reply still counts, and an unanswered finding still raises."""
+    human = {"login": "a-reviewer", "type": "User"}
+    elder = {"login": "grug-tribe[bot]", "type": "Bot"}
+
+    def _boom(kw):
+        raise httpx.ConnectError("down")
+
+    posted = _arm_clean_verdict_with_high_finding(
+        monkeypatch,
+        rest_comments=[
+            {"id": 11, "in_reply_to_id": None, "user": elder, "body": "high | x"},
+            {"id": 12, "in_reply_to_id": 11, "user": human, "body": "Intended."},
+        ],
+        graphql=_boom,
+    )
+    out = sentinel.dispatch_pull_request(_ctx({"pull_request": {"merged": True}}))
+    assert out == {"persona": "sentinel", "result": "skipped"}
+    assert posted == []
+
+    posted = _arm_clean_verdict_with_high_finding(
+        monkeypatch,
+        rest_comments=[{"id": 11, "in_reply_to_id": None, "user": elder, "body": "high | x"}],
+        graphql=lambda kw: _Resp({"errors": [{"type": "FORBIDDEN"}]}),
+    )
+    out = sentinel.dispatch_pull_request(_ctx({"pull_request": {"merged": True}}))
+    assert out == {"persona": "sentinel", "result": "flagged"}
+    assert len(posted) == 1
+
+
+def test_fleet_agent_apps_count_as_replies_by_default():
+    """The fleet's Apps are a tested constant, not an empty env default;
+    the env var only adds logins."""
+    default = sentinel._agent_reply_bots("")
+    for login in (
+        "loom-brain[bot]", "loom-station[bot]", "loom-lanes[bot]",
+        "agent-anthropic-claude-code[bot]", "agent-meta-muse[bot]",
+        "agent-openai-dot[bot]",
+    ):
+        assert login in default
+    assert "some-unlisted-app[bot]" not in default
+    extended = sentinel._agent_reply_bots("extra-app[bot]  another[bot]")
+    assert {"extra-app[bot]", "another[bot]"} <= extended
+    assert default <= extended
