@@ -264,6 +264,30 @@ def _replied_to_comment_ids(token: str, owner: str, repo: str, pr_number: int) -
     return handled
 
 
+def _review_threads(payload: dict) -> dict:
+    """The reviewThreads connection from one GraphQL answer. Raises
+    RuntimeError on an `errors` answer."""
+    if payload.get("errors"):
+        # Type codes only: GraphQL messages can echo request content.
+        types = ",".join(
+            str(e.get("type") or "") for e in payload["errors"] if isinstance(e, dict)
+        )
+        raise RuntimeError(f"graphql returned errors: {types}")
+    pull = ((payload.get("data") or {}).get("repository") or {}).get("pullRequest") or {}
+    return pull.get("reviewThreads") or {}
+
+
+def _resolved_roots_in_page(payload: dict) -> tuple[set[int], dict]:
+    """Resolved thread root ids and pageInfo from one reviewThreads answer."""
+    threads = _review_threads(payload)
+    roots: set[int] = set()
+    for node in threads.get("nodes") or []:
+        first = ((node.get("comments") or {}).get("nodes") or [{}])[0]
+        if node.get("isResolved") and first.get("databaseId") is not None:
+            roots.add(int(first["databaseId"]))
+    return roots, threads.get("pageInfo") or {}
+
+
 def _resolved_thread_root_ids(token: str, owner: str, repo: str, pr_number: int) -> set[int]:
     """REST ids of the first comment of every resolved review thread on the
     PR. Raises on a transport error or a GraphQL `errors` answer; the caller
@@ -280,21 +304,8 @@ def _resolved_thread_root_ids(token: str, owner: str, repo: str, pr_number: int)
             headers=_headers(token), timeout=_TIMEOUT,
         )
         resp.raise_for_status()
-        payload = resp.json()
-        if payload.get("errors"):
-            # Type codes only: GraphQL messages can echo request content.
-            types = ",".join(
-                str(e.get("type") or "") for e in payload["errors"] if isinstance(e, dict)
-            )
-            raise RuntimeError(f"graphql returned errors: {types}")
-        threads = (
-            ((payload.get("data") or {}).get("repository") or {}).get("pullRequest") or {}
-        ).get("reviewThreads") or {}
-        for node in threads.get("nodes") or []:
-            first = ((node.get("comments") or {}).get("nodes") or [{}])[0]
-            if node.get("isResolved") and first.get("databaseId") is not None:
-                resolved.add(int(first["databaseId"]))
-        page_info = threads.get("pageInfo") or {}
+        page_roots, page_info = _resolved_roots_in_page(resp.json())
+        resolved |= page_roots
         if not page_info.get("hasNextPage"):
             return resolved
         after = page_info.get("endCursor")
