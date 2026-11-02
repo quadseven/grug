@@ -265,16 +265,6 @@ def get_latest_push_digest(service: str) -> tuple[str, str]:
     return "", ""
 
 
-def check_deployment(service: str) -> bool:
-    """Return True if the deployed image matches the pushed image.
-
-    The function compares the digests of the latest deployed
-    instance and the most recent tag pushed for the service.
-    """
-    verdicts = deployment_stage_verdicts(service)
-    return bool(verdicts) and all(v.ok for v in verdicts)
-
-
 def deployment_chain_verdict(service: str) -> StageVerdict:
     """Collapse the stage verdicts into one: the first failure, else the last.
 
