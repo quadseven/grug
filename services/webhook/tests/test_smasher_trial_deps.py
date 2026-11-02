@@ -41,6 +41,23 @@ def test_sanitize_keeps_a_plain_pinned_file_unchanged():
     assert sanitize_requirements(plain) == plain
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "python-dateutil==2.9.0.post0",
+        "zope.interface>=6",
+        "typing_extensions",
+        "Django!=4.2.1,<5",
+        "numpy==1.*",
+        "uvicorn[standard]~=0.30",
+        "pywin32>=306 ; sys_platform == 'win32'",
+        "tomli ; python_version < '3.11'",
+    ],
+)
+def test_sanitize_keeps_ordinary_requirement_lines_unchanged(line):
+    assert sanitize_requirements(line + "\n") == line + "\n"
+
+
 def test_sanitize_strips_comments_and_per_line_options():
     text = "# a comment\nrequests==2.32.3  # pinned\nidna==3.7 --hash=sha256:abc \\\n    --hash=sha256:def\n"
     assert sanitize_requirements(text).splitlines() == ["requests==2.32.3", "idna==3.7"]

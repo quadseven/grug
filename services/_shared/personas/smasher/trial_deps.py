@@ -114,8 +114,8 @@ def _pip_install(requirements: Path, target: Path) -> bool:
         with tempfile.NamedTemporaryFile(
             "w", suffix=".txt", prefix=".grug-req-", dir=target.parent, delete=False
         ) as fh:
+            filtered_path = Path(fh.name)  # tracked before the write, so a failed write is still cleaned
             fh.write(filtered)
-            filtered_path = Path(fh.name)
         proc = subprocess.run(
             [
                 sys.executable, "-m", "pip", "install",
