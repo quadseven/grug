@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from cave_drawings import is_protected_finding
 from ledger import LedgerRow
 
 # A file-token is a path component or dotted-name atom - enough to tell
@@ -50,6 +51,9 @@ class ClassPrecision:
     finding_class: str
     accepted: int
     rejected: int
+    # Any row of the class carried the security category. Class names alone
+    # miss it: the category travels per finding (#1571).
+    has_security: bool = False
 
     @property
     def labeled(self) -> int:
@@ -68,13 +72,18 @@ def class_precision(rows: list[LedgerRow]) -> dict[str, ClassPrecision]:
     Only labeled rows (accepted or false_positive) count; unlabeled/pending
     rows are ignored so a class's precision reflects decided outcomes."""
     tally: dict[str, list[int]] = {}
+    security: set[str] = set()
     for r in rows:
+        if r.category == "security":
+            security.add(r.finding_class)
         if r.accepted:
             tally.setdefault(r.finding_class, [0, 0])[0] += 1
         elif r.false_positive:
             tally.setdefault(r.finding_class, [0, 0])[1] += 1
     return {
-        cls: ClassPrecision(finding_class=cls, accepted=a, rejected=fp)
+        cls: ClassPrecision(
+            finding_class=cls, accepted=a, rejected=fp, has_security=cls in security,
+        )
         for cls, (a, fp) in tally.items()
     }
 
@@ -87,13 +96,24 @@ def muted_classes(
 
     A class is muted when it has at least `min_labeled` labeled ledger rows
     and measured precision strictly below `below_precision`. A class in
-    `locked` is never muted, whatever its precision."""
+    `locked` is never muted, whatever its precision, and neither is a security
+    or SAST class: reactions feed this precision (#1571, ADR-0026). This is
+    the class-level half; `finding_is_muted` decides for one finding."""
     return {
         cls: cp for cls, cp in precisions.items()
         if cls not in locked
+        and not cp.has_security
+        and not is_protected_finding(cls)
         and cp.labeled >= min_labeled
         and cp.precision < below_precision
     }
+
+
+def finding_is_muted(
+    rule_name: str, category: str | None, muted: dict[str, ClassPrecision],
+) -> bool:
+    """A security finding is never muted, even in a class muted on other rows."""
+    return rule_name in muted and not is_protected_finding(rule_name, category)
 
 
 def mute_note(cp: ClassPrecision) -> str:

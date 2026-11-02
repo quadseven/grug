@@ -94,7 +94,7 @@ from personas.code_reviewer.move_detection import (
     SubtreeImport, split_move_hunks, subtree_imports,
 )
 from personas.code_reviewer.precedent import (
-    ClassPrecision, class_precision, match_precedent, mute_note,
+    ClassPrecision, class_precision, finding_is_muted, match_precedent, mute_note,
     muted_classes, render_precedent_note,
 )
 from personas.code_reviewer.claim_check import (
@@ -2536,7 +2536,10 @@ def _muted_lines(
     muted: dict[str, ClassPrecision] | None,
 ) -> str:
     """Board/summary list of the muted classes this review hit, or ''."""
-    classes = sorted({f.rule_name for f in findings if muted and f.rule_name in muted})
+    classes = sorted({
+        f.rule_name for f in findings
+        if muted and finding_is_muted(f.rule_name, f.category, muted)
+    })
     if not classes:
         return ""
     bullets = "\n".join(
@@ -2615,7 +2618,8 @@ def build_review_result(
         # thread is what carries the block across later pushes.
         new_findings = tuple(
             f for f in new_findings
-            if f.severity in ("high", "critical") or f.rule_name not in muted
+            if f.severity in ("high", "critical")
+            or not finding_is_muted(f.rule_name, f.category, muted)
         )
     if held_back:
         # #1570: over-budget findings stay in the summary and on the board.

@@ -1783,6 +1783,74 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     assert comments and "Markings remembered" in comments[0] and "prefer early returns" in comments[0]
 
 
+def _learn_on(monkeypatch, tags, learning="prefer early returns"):
+    put_calls: list[dict] = []
+    posted: list[tuple] = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment", lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": tags},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning",
+                        lambda **kw: put_calls.append(kw))
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
+    monkeypatch.setattr(
+        "llm_client.classify_learning",
+        lambda *a, **k: {"durable": True, "learning": learning, "scope_path": ""},
+    )
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    monkeypatch.setattr(rerun, "_org_learning_approval_delay", lambda i, r: 0)
+    monkeypatch.setattr(rerun, "_sync_living_review", lambda *a, **k: None)
+    reply = "this is safe because the caller already checks it"
+    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, reply, "teammate")
+    return result, put_calls, posted
+
+
+def test_run_learn_redelivery_does_not_restart_the_rule(monkeypatch):
+    puts: list[dict] = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: {"text": "prefer early returns", "scope_path": ""},
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning", lambda **kw: puts.append(kw))
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
+    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "a reason", "teammate") == "learn_duplicate"
+    assert puts == []
+
+
+def test_run_learn_stores_the_reason_and_the_finding_class(monkeypatch):
+    result, puts, _ = _learn_on(
+        monkeypatch, {"rule_name": "null-deref", "category": "correctness"},
+    )
+    assert result == "learned"
+    assert puts[0]["reason"] == "this is safe because the caller already checks it"
+    assert puts[0]["finding_class"] == "null-deref"
+    assert puts[0]["finding_category"] == "correctness"
+
+
+@pytest.mark.parametrize(
+    ("tags", "learning"),
+    [
+        ({"rule_name": "sql-injection", "category": "general"}, "prefer early returns"),
+        ({"rule_name": "whatever", "category": "security"}, "prefer early returns"),
+        ({"rule_name": "style", "category": "general"}, "do not flag sql injection here"),
+    ],
+)
+def test_run_learn_refuses_a_rule_that_touches_security(monkeypatch, tags, learning):
+    result, puts, posted = _learn_on(monkeypatch, tags, learning)
+    assert result == "learn_refused_protected"
+    assert puts == []
+    bodies = [b.get("body", "") for (_u, b) in posted]
+    assert any("security" in body for body in bodies)
+
+
 def test_run_learn_one_off_declines_without_storing(monkeypatch):
     put_calls = []
     posted = []

@@ -162,6 +162,7 @@ def _finding_to_repr(f: Finding) -> JudgeFindingRepr:
     the judge prompt."""
     return {
         "rule_name": f.rule_name,
+        "category": f.category,
         "file": f.file,
         "line": f.line,
         "severity": f.severity,

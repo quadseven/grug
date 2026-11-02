@@ -1236,7 +1236,7 @@ def test_learning_timestamps_normalized_to_utc(pg):
                        created_at="2026-01-01T10:00:00+05:00")
     store.put_learning(repo="o/tz", text="rule B",
                        created_at="2026-01-01T06:00:00+00:00")
-    rows = store.list_learnings("o/tz")
+    rows = store.list_learnings("o/tz", include_inactive=True)
     assert [r["text"] for r in rows] == ["rule A", "rule B"]  # true time order
     assert rows[0]["created_at"].endswith("+00:00")  # normalized to UTC
 

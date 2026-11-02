@@ -63,6 +63,11 @@ def test_classify_empty_returns_none():
 
 # --- poll_and_annotate orchestration ---
 
+@pytest.fixture(autouse=True)
+def _no_commit_lookup(monkeypatch):
+    monkeypatch.setattr(cr_reactions, "pr_commit_logins", lambda *a: frozenset())
+
+
 @pytest.fixture
 def _patch_store(monkeypatch):
     updates: list[dict] = []
@@ -241,7 +246,7 @@ def _learning_record(comment_id=1):
     record.update({
         "finding_text": "Optional value is dereferenced without a guard.",
         "head_sha": "abc123",
-        "author_login": "alice",
+        "author_login": "pr-author",
         "trust_reactors": True,
     })
     record["finding_tags"]["severity"] = "high"

@@ -965,6 +965,49 @@ def _defer_learn(
     return True
 
 
+def _store_learning(
+    install_id: int, repo_full: str, pr_number: int, comment_id: int,
+    author: str, reply_text: str, record: dict, classification: dict,
+    *, stored: bool,
+) -> tuple[str, str, bool]:
+    """Store a durable verdict and return `(ack, result, refused)`.
+
+    A rule that touches a security or SAST class is refused before the
+    store, so no later edit or status change can arm it; select_for_prompt
+    checks again at read time for rows that predate #1571. `stored` marks a
+    redelivery whose rule is already kept: it stores nothing, since a
+    re-stamp would restart the 90 days with no human act behind it."""
+    from adapters.install_store import put_learning  # type: ignore
+    from cave_drawings import MAX_TEXT_CHARS, touches_protected  # type: ignore
+    from redact import redact_secrets  # type: ignore
+
+    if not classification["durable"]:
+        # Deliberate one-off: acknowledge without storing.
+        return LEARN_REACTION_ONE_OFF, "learn_one_off", False
+    finding_tags = dict(record.get("finding_tags", {}))
+    finding_class = str(finding_tags.get("rule_name", ""))
+    finding_category = str(finding_tags.get("category", ""))
+    if touches_protected({
+        "text": classification["learning"],
+        "finding_class": finding_class, "finding_category": finding_category,
+    }):
+        return LEARN_REACTION_ONE_OFF, "learn_refused_protected", True
+    if not stored:
+        put_learning(
+            repo=repo_full,
+            text=classification["learning"],
+            scope_path=classification["scope_path"],
+            source_pr=pr_number,
+            source_comment_id=comment_id,
+            author=author,  # the maintainer who TAUGHT it (reply sender)
+            approval_delay_seconds=_org_learning_approval_delay(install_id, repo_full),
+            reason=redact_secrets(reply_text)[:MAX_TEXT_CHARS],
+            finding_class=finding_class,
+            finding_category=finding_category,
+        )
+    return LEARN_REACTION_LEARNED, "learned", False
+
+
 def _run_learn(
     install_id: int, repo_full: str, pr_number: int,
     comment_id: int, parent_comment_id: int, reply_text: str,
@@ -985,7 +1028,6 @@ def _run_learn(
     so the finding thread never gets duplicate acknowledgments."""
     from adapters.install_store import (  # type: ignore
         claim_delivery, get_comment_record, get_learning_by_source_comment,
-        put_learning,
     )
     from llm_client import (  # type: ignore
         LearnClassifierUnavailable, LearnClassifierUnusable, classify_learning,
@@ -1072,24 +1114,10 @@ def _run_learn(
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
             "result": result})
         return result
-    if classification["durable"]:
-        # Org-configurable approval delay: default 0 = active immediately.
-        delay = _org_learning_approval_delay(install_id, repo_full)
-        put_learning(
-            repo=repo_full,
-            text=classification["learning"],
-            scope_path=classification["scope_path"],
-            source_pr=pr_number,
-            source_comment_id=comment_id,
-            author=author,  # the maintainer who TAUGHT it (reply sender)
-            approval_delay_seconds=delay,
-        )
-        ack = LEARN_REACTION_LEARNED
-        result = "learned"
-    else:
-        # Deliberate one-off: acknowledge without storing.
-        ack = LEARN_REACTION_ONE_OFF
-        result = "learn_one_off"
+    ack, result, refused = _store_learning(
+        install_id, repo_full, pr_number, comment_id, author, reply_text,
+        record, classification, stored=already is not None,
+    )
 
     # The claim guards ONLY the ack (the one non-idempotent side effect): a
     # redelivery whose learning is already stored must not re-post the reply.
@@ -1114,7 +1142,7 @@ def _run_learn(
     try:
         body = _learn_ack_body(
             repo_full, classification["learning"], classification["scope_path"],
-            author, pr_number, classification["durable"],
+            author, pr_number, classification["durable"], refused=refused,
         )
         _post_learn_reply(install_id, owner, repo_name, comment_id, body)
     except Exception as e:  # noqa: BLE001
@@ -1192,15 +1220,26 @@ def _post_learn_reply(
 
 def _learn_ack_body(
     repo_full: str, text: str, scope_path: str, author: str,
-    source_pr: int, durable: bool,
+    source_pr: int, durable: bool, refused: bool = False,
 ) -> str:
     """Collapsible acknowledgment for a reply-mined learning. `text`/`scope`/
     `author` are defused (classifier-/reply-produced, untrusted) so a hostile
-    reply can't break out of the <details> or inject mentions."""
+    reply can't break out of the <details> or inject mentions. `refused`
+    means a durable rule that touches a security or SAST class (#1571)."""
     text_d = _defuse_md(text)
     scope_d = _defuse_md(scope_path)
     author_d = _defuse_md(author)
     scope_line = f", scoped to `{scope_d}`" if scope_d else ""
+    if refused:
+        return (
+            "<details>\n"
+            "<summary>Not remembered (security rule)</summary>\n\n"
+            f"Grug read your reply but will NOT carry it into future reviews on "
+            f"`{repo_full}`: learned rules never touch security or SAST findings. "
+            "It applies to this PR only.\n\n"
+            f"Replied by `{author_d}` (PR #{source_pr}).\n"
+            "</details>"
+        )
     if durable:
         return (
             "<details>\n"

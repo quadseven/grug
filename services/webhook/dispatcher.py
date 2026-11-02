@@ -678,60 +678,12 @@ def _actor_permission(
         return None
 
 
-# GitHub's pull request commits endpoint returns at most this many commits,
-# so a list this long may be cut short.
-_PR_COMMITS_CAP = 250
-
-
 def _pr_commit_logins(
     installation_id: int, owner: str, repo_name: str, pr_number: int,
 ) -> frozenset[str] | None:
-    """Lower-case logins that authored or committed any commit on the PR
-    (GitHub's web-flow committer excluded), or None, which refuses a trusted
-    operator: the list could not be read, it reached GitHub's 250-commit cap
-    on that endpoint (so it may be cut short), or a commit's author or
-    committer maps to no GitHub login (an unlinked identity could be anyone). Git metadata can still name another person's
-    linked address; push-actor proof is out of scope, since the owner
-    chooses whom to trust."""
-    from urllib.parse import quote as _q
-    from github_app_auth import with_install_token_retry  # type: ignore
-    import httpx  # type: ignore
+    from pr_commits import pr_commit_logins  # type: ignore
 
-    def _read(token: str) -> frozenset[str] | None:
-        logins: set[str] = set()
-        total = 0
-        for page in (1, 2, 3):
-            r = httpx.get(
-                f"https://api.github.com/repos/{_q(owner, safe='')}/"
-                f"{_q(repo_name, safe='')}/pulls/{int(pr_number)}/commits"
-                f"?per_page=100&page={page}",
-                headers={
-                    "Authorization": f"token {token}",
-                    "Accept": "application/vnd.github+json",
-                },
-                timeout=10,
-            )
-            r.raise_for_status()
-            rows = r.json() or []
-            total += len(rows)
-            if total >= _PR_COMMITS_CAP:
-                return None
-            for row in rows:
-                for role in ("author", "committer"):
-                    who = str(((row or {}).get(role) or {}).get("login") or "").lower()
-                    if not who:
-                        return None
-                    if who != "web-flow":
-                        logins.add(who)
-            if len(rows) < 100:
-                return frozenset(logins)
-        return None
-
-    try:
-        return with_install_token_retry(int(installation_id), _read)
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        log.warning("pr_commits_lookup_failed", extra={"pr_number": pr_number, "kind": type(e).__name__})
-        return None
+    return pr_commit_logins(installation_id, owner, repo_name, pr_number)
 
 
 def _handle_issues(payload: dict[str, Any]) -> dict[str, str]:
@@ -1834,7 +1786,14 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "no_op", "reason": "not a reply"}
 
     # Never learn from a bot's reply (grug's own acknowledgments, other bots).
-    if str((comment.get("user") or {}).get("type", "")) == "Bot":
+    # An App can hold write access, so the permission gate below cannot do this.
+    from cave_drawings import is_app_actor, is_reasoned_dismissal  # type: ignore
+    comment_user = comment.get("user") or {}
+    payload_sender = payload.get("sender") or {}
+    if any(
+        is_app_actor(str(actor.get("login") or ""), str(actor.get("type") or ""))
+        for actor in (comment_user, payload_sender)
+    ):
         return {"status": "no_op", "reason": "reply author is a bot"}
 
     if not body:
@@ -1907,6 +1866,9 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
             return {"status": "skip", "reason": "enqueue_failed"}
         return {"status": "dispatched", "kind": "ask"}
 
+    if not is_reasoned_dismissal(body):
+        return {"status": "no_op", "reason": "reply gives no reason"}
+
     # Trust gate: ALWAYS require write-or-above, even for the PR author. Unlike
     # /grug recheck (an author re-running their own PR is harmless), a learning
     # poisons the review corpus for EVERY future PR, so a fork contributor (who
@@ -1926,6 +1888,18 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "skip", "reason": "perm_lookup_failed"}
     if not has_write:
         return {"status": "no_op", "reason": "reply author lacks write perm"}
+
+    # The reviewed must not teach the reviewer (#1571): a coding agent working
+    # under a person's account looks human and holds write access, but it is
+    # the PR's author or a committer. This refuses a person on their own PR too.
+    pr_writers = {str((pr.get("user") or {}).get("login") or "").lower()}
+    commit_logins = _pr_commit_logins(
+        int(installation_id), owner, repo_name, int(pr_number),
+    )
+    if commit_logins is None:
+        return {"status": "skip", "reason": "pr_commits_unreadable"}
+    if sender_login.lower() in pr_writers | commit_logins:
+        return {"status": "no_op", "reason": "reply author wrote this PR"}
 
     from rerun import enqueue_learn  # type: ignore
     try:

@@ -567,9 +567,11 @@ trusts only users with `write` or `admin` access. A changed verdict:
 3. recomputes the bounded practice and few-shot caches used by later reviews.
 
 A thumbs-up becomes positive practice/few-shot evidence. A thumbs-down records a
-false positive, removes it from positive examples, and creates bounded `AVOID
-FALSE POSITIVE` guidance requiring materially new evidence before Elder repeats
-the pattern. Reactions by users without write access do not annotate or train.
+false positive and removes it from positive examples, but never creates a
+suppression (ADR-0026): a rule that quiets Elder comes only from a reasoned reply
+by a person who did not write the PR, and it lapses after 90 days unless
+re-affirmed. Reactions by Apps or by users without write access do not annotate
+or train.
 Legacy records without capture metadata remain observable under the old DD-only
 behavior and never auto-train.
 
