@@ -97,7 +97,9 @@ spec:
                 # Poolside stays off while it answers 400 on review calls: 3 of 1112 calls
                 # succeeded over 24h on 2026-11-01. The OpenRouter free chain tier is unset: its
                 # model left the catalogue, and that tier has no private-code data-terms gate.
-                - {name: GRUG_DISABLED_BACKENDS, value: "openrouter:paid,poolside"}
+                # The free pool stays off until the Elder walk trusts its empties; it times out or
+                # garbles while the Sparks are away. The Cave stays on: secrets are judged there.
+                - {name: GRUG_DISABLED_BACKENDS, value: "openrouter:paid,poolside,free-pool"}
                 # grug#1269: the gateway's free provider pool is a cloud tier after
                 # Poolside, ahead of the Sparks (free cloud models first).
                 - {name: GRUG_CLOUD_FREE_POOL, value: "true"}
