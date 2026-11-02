@@ -86,7 +86,6 @@ spec:
                 # Published terms read 2026-11-01: prompts are not used for training, data is
                 # retained 30 days for safety. _OPENCODE_GO_PRIVATE_SAFE_MODELS gates private code.
                 - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "beam-free"}
-                - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
                 # grug#1225: a listed backend is never called. Re-enable one by deleting
                 # its entry; `openrouter:free` or `openrouter:paid` narrows to one pool.
                 # grug#1269: OpenRouter's paid pool stays off. grug#1575: OpenCode Go is back
@@ -95,7 +94,10 @@ spec:
                 # 40k tokens is about 78% of the plan over 27 days (doc prices, 2026-11-01);
                 # the shared key keeps the rest. Identical on all three Elder workloads.
                 - {name: GRUG_OPENCODE_GO_DAILY_CAP, value: "200"}
-                - {name: GRUG_DISABLED_BACKENDS, value: "openrouter:paid"}
+                # Poolside stays off while it answers 400 on review calls: 3 of 1112 calls
+                # succeeded over 24h on 2026-11-01. The OpenRouter free chain tier is unset: its
+                # model left the catalogue, and that tier has no private-code data-terms gate.
+                - {name: GRUG_DISABLED_BACKENDS, value: "openrouter:paid,poolside"}
                 # grug#1269: the gateway's free provider pool is a cloud tier after
                 # Poolside, ahead of the Sparks (free cloud models first).
                 - {name: GRUG_CLOUD_FREE_POOL, value: "true"}

@@ -238,8 +238,8 @@ def _shipped(name: str) -> dict[str, str]:
     return found
 
 
-def test_every_workload_ships_go_on_with_the_paid_openrouter_pool_off() -> None:
-    assert set(_shipped("GRUG_DISABLED_BACKENDS").values()) == {"openrouter:paid"}
+def test_every_workload_ships_go_on_with_paid_openrouter_and_poolside_off() -> None:
+    assert set(_shipped("GRUG_DISABLED_BACKENDS").values()) == {"openrouter:paid,poolside"}
 
 
 def test_every_workload_ships_the_same_daily_cap() -> None:

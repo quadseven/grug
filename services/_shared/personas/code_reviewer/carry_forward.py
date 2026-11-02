@@ -174,14 +174,108 @@ def list_threads(
         return None
 
 
+_KNOWN_SECURITY_RULES = frozenset({
+    # SAST vulnerability classes and scanners
+    "cleartext-secret-log",
+    "command-injection",
+    "env-file-static-delimiter-injection",
+    "exposed-secret",
+    "hardcoded-credential",
+    "iac-misconfig",
+    "lint-security",
+    "path-traversal",
+    "removed-verification-layer",
+    "secret-in-log-or-trace",
+    "sql-injection",
+    "ssrf",
+    "template-injection",
+    "tls-verification-disabled",
+    "unsafe-deserialization",
+    "unvalidated-external-input",
+    "weak-crypto",
+    "xxe",
+    # Specific rule IDs
+    "gha-run-untrusted-interpolation",
+    "gha-run-block-untrusted-interpolation",
+    "ansible-tls-verification-disabled",
+    "ansible-shell-interpolates-variable",
+    "sql-injection-concat",
+})
+
+
+def _is_security_or_sast(finding: Finding) -> bool:
+    """True when the finding is in the security category or comes from a SAST rule."""
+    if getattr(finding, "category", None) == "security":
+        return True
+    rule = getattr(finding, "rule_name", "") or ""
+    norm = rule.removeprefix("grug-")
+    if norm in _KNOWN_SECURITY_RULES or rule in _KNOWN_SECURITY_RULES:
+        return True
+    return bool("security" in rule or "sast" in rule)
+
+
+def _normalize_login(login: str | None) -> str:
+    """Normalize a GitHub login for comparison by stripping [bot] and lowercasing."""
+    if not login:
+        return ""
+    return str(login).removesuffix("[bot]").strip().lower()
+
+
+def _is_app_actor(actor: dict | str | None) -> bool:
+    """True when the actor is a GitHub App or Bot."""
+    if not actor:
+        return False
+    if isinstance(actor, dict):
+        typename = str(actor.get("__typename") or actor.get("type") or "").strip().lower()
+        if typename == "bot":
+            return True
+        login = str(actor.get("login") or "")
+    else:
+        login = str(actor)
+    login_clean = login.strip().lower()
+    return bool(login_clean.endswith("[bot]") or is_grug(login))
+
+
+def _is_pr_author(actor: dict | str | None, pr_author: str) -> bool:
+    """True when the actor matches the PR author."""
+    if not pr_author or not actor:
+        return False
+    actor_login = actor.get("login") if isinstance(actor, dict) else actor
+    norm_actor = _normalize_login(str(actor_login or ""))
+    norm_author = _normalize_login(pr_author)
+    return bool(norm_actor and norm_actor == norm_author)
+
+
+def _thread_resolver_counts(thread: dict, pr_author: str) -> bool:
+    """True when the thread was resolved by a valid maintainer (not author, not App).
+
+    A resolve by the PR author or an App must never hide a finding on re-review (#1582).
+    A thread with no resolver recorded or an unknown PR author is not counted as a
+    maintainer resolve.
+    """
+    if not _thread_is_resolved(thread) or not pr_author:
+        return False
+    resolver = thread.get("resolvedBy")
+    if not resolver:
+        return False
+    if _is_pr_author(resolver, pr_author):
+        return False
+    if _is_app_actor(resolver):
+        return False
+    return True
+
+
+def _thread_is_dismissed(thread: dict) -> bool:
+    """True when the first comment has been dismissed via living review."""
+    first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
+    return living_review.parse_state(first.get("body") or "") == living_review.DISMISSED
+
+
 def _thread_is_resolved_or_dismissed(thread: dict) -> bool:
     """True when the thread is resolved (by a person) or dismissed (living review)."""
     if _thread_is_resolved(thread):
         return True
-    first = ((thread.get("comments") or {}).get("nodes") or [{}])[0]
-    if living_review.parse_state(first.get("body") or "") == living_review.DISMISSED:
-        return True
-    return False
+    return _thread_is_dismissed(thread)
 
 
 def _elder_thread_rule_and_line(thread: dict) -> tuple[str, str, int] | None:
@@ -229,20 +323,94 @@ def _with_reraised_explanation(finding: Finding, earlier_answer: str | None) -> 
     return replace(finding, message=f"{finding.message}\n\n{note}")
 
 
+@dataclass(frozen=True)
+class _ThreadBuckets:
+    dismissed: list[tuple[str, str, int]]
+    resolved_unchanged: list[tuple[str, str, int]]
+    resolved_outdated: list[tuple[str, str, int, str | None]]
+
+    @property
+    def has_matches(self) -> bool:
+        return bool(self.dismissed or self.resolved_unchanged or self.resolved_outdated)
+
+
+def _partition_threads(threads: list[dict], pr_author: str) -> _ThreadBuckets:
+    """Classify threads into dismissed, maintainer-resolved unchanged, and outdated."""
+    dismissed: list[tuple[str, str, int]] = []
+    resolved_unchanged: list[tuple[str, str, int]] = []
+    resolved_outdated: list[tuple[str, str, int, str | None]] = []
+
+    for t in threads:
+        owned = _elder_thread_rule_and_line(t)
+        if owned is None:
+            continue
+        rule, path, line = owned
+
+        if _thread_is_dismissed(t):
+            dismissed.append((rule, path, line))
+            continue
+
+        if not _thread_resolver_counts(t, pr_author=pr_author):
+            continue
+
+        if t.get("isOutdated"):
+            resolved_outdated.append((rule, path, line, _earlier_answer(t)))
+        else:
+            resolved_unchanged.append((rule, path, line))
+
+    return _ThreadBuckets(dismissed, resolved_unchanged, resolved_outdated)
+
+
+def _matches_any(finding: Finding, targets: list[tuple[str, str, int]]) -> bool:
+    """True when finding matches any (rule, path, line) within _NEARBY_LINES."""
+    return any(
+        finding.rule_name == rule and finding.file == path and abs(finding.line - line) <= _NEARBY_LINES
+        for rule, path, line in targets
+    )
+
+
+def _filter_one_finding(finding: Finding, buckets: _ThreadBuckets) -> Finding | None:
+    """Decide whether to keep, drop, or annotate a finding against thread buckets."""
+    if _matches_any(finding, buckets.dismissed):
+        return None
+
+    if finding.rule_name == deferred_ruff.RULE or _is_security_or_sast(finding):
+        return finding
+
+    if _matches_any(finding, buckets.resolved_unchanged):
+        return None
+
+    for rule, path, line, ans in buckets.resolved_outdated:
+        if (
+            finding.rule_name == rule
+            and finding.file == path
+            and abs(finding.line - line) <= _NEARBY_LINES
+        ):
+            return _with_reraised_explanation(finding, ans)
+
+    return finding
+
+
 def filter_findings_against_resolved_threads(
     findings: tuple[Finding, ...],
     installation_id: int, owner: str, repo: str, pull_number: int,
     *,
+    pr_author: str,
     threads: list[dict] | None = None,
 ) -> tuple[Finding, ...]:
     """Remove findings that match resolved or dismissed Elder threads.
 
     A finding matches a thread when they share the same rule, file, and
     the finding's line is within `_NEARBY_LINES` of the thread's anchor line.
-    This prevents re-raising findings that a human has already addressed,
-    unless the code it points at changed (`thread.isOutdated`): then the
-    finding is re-raised and its message explains what changed since the
+    This prevents re-raising findings that a human maintainer has already
+    addressed, unless the code it points at changed (`thread.isOutdated`): then
+    the finding is re-raised and its message explains what changed since the
     earlier answer (#1457).
+
+    A thread resolved by the PR author or an App does not hide a matching
+    finding on re-review (#1582). A security or SAST finding is never dropped
+    by a thread resolve alone: only code changes or maintainer dismissal
+    (living review) can clear it.
 
     If `threads` is provided, it is used instead of fetching a new listing.
     """
@@ -250,41 +418,16 @@ def filter_findings_against_resolved_threads(
         threads = list_threads(installation_id, owner, repo, pull_number)
     if threads is None:
         return findings
-    resolved_unchanged: list[tuple[str, str, int]] = []
-    resolved_outdated: list[tuple[str, str, int, str | None]] = []
-    for t in threads:
-        if not _thread_is_resolved_or_dismissed(t):
-            continue
-        owned = _elder_thread_rule_and_line(t)
-        if owned is None:
-            continue
-        rule, path, line = owned
-        if t.get("isOutdated"):
-            resolved_outdated.append((rule, path, line, _earlier_answer(t)))
-        else:
-            resolved_unchanged.append((rule, path, line))
-    if not resolved_unchanged and not resolved_outdated:
+
+    buckets = _partition_threads(threads, pr_author)
+    if not buckets.has_matches:
         return findings
+
     out: list[Finding] = []
     for f in findings:
-        # A deferred-ruff finding was measured at this head, and a resolved thread
-        # is not evidence of a fix (#1477).
-        if f.rule_name == deferred_ruff.RULE:
-            out.append(f)
-            continue
-        if any(
-            f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
-            for rule, path, line in resolved_unchanged
-        ):
-            continue
-        matching_outdated = [
-            ans for rule, path, line, ans in resolved_outdated
-            if f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
-        ]
-        if matching_outdated:
-            out.append(_with_reraised_explanation(f, matching_outdated[0]))
-        else:
-            out.append(f)
+        kept = _filter_one_finding(f, buckets)
+        if kept is not None:
+            out.append(kept)
     return tuple(out)
 
 
