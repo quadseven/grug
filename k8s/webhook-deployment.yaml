@@ -285,6 +285,9 @@ spec:
             # strict membership test in the router, so all three lanes ask
             # for whatever is resident (2026-09-02).
             - {name: GRUG_CAVE_JUDGE_MODEL, value: "spark:warm-any"}
+            # The one model the Sparks serve. Its empty answers are trusted; the route
+            # spills to free models while the Sparks are away, and theirs are not.
+            - {name: GRUG_CAVE_TRUSTED_EMPTY_MODELS, value: "nemotron-3.5-super-vl"}
             # The model the Sparks serve, by name: warm-any spills to free models that garble
             # (2026-11-01), which stops the walk; a named model answers 503 at once while the
             # Sparks are away, and the walk goes on to the lane. The judge stays on warm-any.
