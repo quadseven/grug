@@ -7764,7 +7764,7 @@ def _review_diff_dispatch_cave_primary(
         last_error = outcome.error_text
 
     cancelled = cancel_event is not None and cancel_event.is_set()
-    if not successes and (first_parse_fail is None or not cancelled):
+    if not successes:
         if cancelled:
             # Superseded mid-flight (#635 follow-up): both Cave arms were
             # deliberately aborted because the review input moved, not

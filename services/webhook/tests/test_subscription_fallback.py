@@ -650,11 +650,13 @@ def test_a_cancelled_review_after_a_garbled_cave_answer_asks_no_one_else() -> No
 
     recorder = _Recorder({_CAVE_URL: garble_and_cancel})
     with patch.object(httpx, "post", side_effect=recorder):
-        route_elder_model_call(
+        resp = route_elder_model_call(
             assemble_evidence([_hunk()]), installation_id=1, cancel_event=cancel,
         )
 
     assert recorder.called_urls == [_CAVE_URL]
+    assert resp.kind == "all_failed"
+    assert resp.error.startswith("cancelled:")
 
 
 _EMPTY_SHORT = json.dumps({
