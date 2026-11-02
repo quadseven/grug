@@ -14,6 +14,7 @@ Acceptance criteria verified:
 from __future__ import annotations
 
 import json
+import threading
 from unittest.mock import patch
 
 import httpx
@@ -593,3 +594,63 @@ def test_a_degradation_takes_the_models_only_with_their_tier() -> None:
     merged = cr_persona.with_degradation(untiered, other)
     assert merged.tier_served == "free-pool"
     assert merged.models_used == ("other-model",)
+
+
+_GARBLED = json.dumps({
+    "choices": [{"message": {"content": "no json here, only prose", "role": "assistant"}}],
+    "model": "free-model",
+})
+
+
+def test_a_garbled_cave_answer_still_reaches_the_subscription_lane() -> None:
+    """A Cave parse failure is a miss, not the review's end. It kept every
+    public cohort off the lane while the Cave spilled to a free model that
+    spent its output on reasoning (2026-11-02)."""
+    recorder = _Recorder({
+        _CAVE_URL: _GARBLED,
+        _FREE_GATEWAY_URL: _GARBLED,
+        _POOLSIDE_URL: httpx.ConnectTimeout("poolside down"),
+        _OPENROUTER_URL: httpx.ConnectTimeout("openrouter down"),
+        _SUBSCRIPTION_URL: _finding_body(),
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = route_elder_model_call(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert resp.kind == "reviewed"
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert resp.tier_served == "subscription"
+    assert len(resp.findings) == 1
+
+
+def test_every_tier_garbled_or_down_stays_a_parse_failure() -> None:
+    """Fail-safe: with the lane down too, no tier reviewed, so the result
+    stays the specific parse failure and can never pass the check."""
+    recorder = _Recorder({
+        _CAVE_URL: _GARBLED,
+        _FREE_GATEWAY_URL: httpx.ConnectTimeout("gateway free down"),
+        _POOLSIDE_URL: httpx.ConnectTimeout("poolside down"),
+        _OPENROUTER_URL: httpx.ConnectTimeout("openrouter down"),
+        _SUBSCRIPTION_URL: httpx.ConnectTimeout("lane down"),
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = route_elder_model_call(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert resp.kind == "parse_failed"
+    assert resp.backend_used == Backend.CAVE
+
+
+def test_a_cancelled_review_after_a_garbled_cave_answer_asks_no_one_else() -> None:
+    """A superseded review spends nothing on a snapshot about to be dropped."""
+    cancel = threading.Event()
+
+    def garble_and_cancel(url: str, **kwargs):
+        cancel.set()
+        return httpx.Response(200, text=_GARBLED)
+
+    recorder = _Recorder({_CAVE_URL: garble_and_cancel})
+    with patch.object(httpx, "post", side_effect=recorder):
+        route_elder_model_call(
+            assemble_evidence([_hunk()]), installation_id=1, cancel_event=cancel,
+        )
+
+    assert recorder.called_urls == [_CAVE_URL]

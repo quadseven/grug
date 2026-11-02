@@ -1591,10 +1591,10 @@ def test_saas_overload_fallback_never_engages_when_a_cave_arm_succeeds(monkeypat
     assert lc._OPENROUTER_MODEL not in call_log
 
 
-def test_saas_overload_fallback_skipped_when_cave_returns_parse_failed(monkeypatch) -> None:
-    """A Cave arm that DID respond but unparseably is a model/prompt bug, not
-    overload - the fallback must not engage (retrying on SaaS would not fix
-    a prompt/parsing issue) and parse_failed must still win over all_failed."""
+def test_every_tier_garbled_keeps_the_cave_parse_failure(monkeypatch) -> None:
+    """A Cave arm that answers unparseably is a miss, so the walk goes on to
+    the fallback tiers. When they garble too, nothing reviewed, and
+    parse_failed still wins over all_failed."""
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
     call_log: list[str] = []
 
@@ -1607,9 +1607,8 @@ def test_saas_overload_fallback_skipped_when_cave_returns_parse_failed(monkeypat
         out = _one_ladder_walk([_hunk()], installation_id=1)
 
     assert out.kind == "parse_failed"
-    assert len(call_log) == 2  # both Cave arms only, no SaaS fallback
-    assert lc._POOLSIDE_MODEL not in call_log
-    assert lc._OPENROUTER_MODEL not in call_log
+    assert out.backend_used == Backend.CAVE
+    assert lc._POOLSIDE_MODEL in call_log
 
 
 # --- OpenRouter free-tier rate limiter gate (grug#870, epic #869) ----------
@@ -6076,6 +6075,36 @@ def test_low_confidence_cohort_does_not_starve_the_next_cohort(monkeypatch) -> N
     assert src_primary_calls == 1
     evaluation = evaluate_diff((), out)
     assert evaluation.degraded_reason == "low_confidence_review"
+
+
+def test_deepseek_degenerate_then_a_garbled_cave_reaches_the_subscription_lane(
+    monkeypatch,
+) -> None:
+    """The fleet outage of 2026-11-01: DeepSeek answered short and empty, the
+    Cave spilled to a free model that spent its output on reasoning, and the
+    parse failure stopped the walk short of the lane. The review ended low
+    confidence, so a blocking repo's check failed with the lane idle."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    paid = _pin_deepseek_primary(monkeypatch)
+    lanes: list[str] = []
+
+    def respond(url, **kwargs) -> httpx.Response:
+        if kwargs["json"].get("model", "") == paid:
+            return _degenerate_response()
+        if "/subscription/" in url:
+            lanes.append(url)
+            return _usage_response('{"findings": []}', 15_000, 400)
+        return httpx.Response(200, json=_openai_json_response("not json"))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert len(lanes) == 1
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.SUBSCRIPTION
+    assert evaluate_diff((), out).degraded_reason is None
 
 
 def test_deep_append_keeps_a_degenerate_answer_when_the_reasoner_fails(
