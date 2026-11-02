@@ -813,26 +813,31 @@ _WITHDRAWN_TAIL = re.compile(
     re.IGNORECASE,
 )
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
-# grug#1529: a hint, never a verdict. It decides nothing but a note and a log
-# line; only the structured verdict removes a candidate.
-_OMIT_HINT = re.compile(r"^omit(?: [-\u2013\u2014] not a secret)?\.?$", re.IGNORECASE)
+# grug#1529: the same backstop for a candidate whose last sentence is exactly
+# "Omit." or "Omit - not a secret." The model decided to drop it. Any other
+# wording ("Omit the token from the log.") is a real finding and still posts.
+_OMIT_TAIL = re.compile(r"^omit(?: [-\u2013\u2014] not a secret)?\.?$", re.IGNORECASE)
 
 
 def is_withdrawn_finding(finding: "Finding") -> bool:
     """Whether the reviewer itself withdrew this candidate (grug#1397).
 
     The structured `is_finding: false` verdict decides first; the phrase
-    check on the message's final sentence is only a backstop."""
+    checks on the message's final sentence are only a backstop: "No
+    finding." (grug#1397) and an exact omit form (grug#1529)."""
     if finding.withdrawn:
         return True
     sentences = [s for s in _SENTENCE_SPLIT.split(finding.message.strip()) if s]
-    return bool(sentences) and bool(_WITHDRAWN_TAIL.match(sentences[-1].strip()))
+    return bool(sentences) and bool(
+        _WITHDRAWN_TAIL.match(sentences[-1].strip())
+        or _OMIT_TAIL.match(sentences[-1].strip())
+    )
 
 
 def concludes_omit(finding: "Finding") -> bool:
     """Whether the message's final sentence says to omit it (grug#1529)."""
     sentences = [s for s in _SENTENCE_SPLIT.split(finding.message.strip()) if s]
-    return bool(sentences) and bool(_OMIT_HINT.match(sentences[-1].strip()))
+    return bool(sentences) and bool(_OMIT_TAIL.match(sentences[-1].strip()))
 
 
 @dataclass(frozen=True, slots=True)

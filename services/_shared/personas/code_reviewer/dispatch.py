@@ -3085,11 +3085,11 @@ def _note_deferred_lint(
 def _log_omit_markings(
     evaluation: CodeReviewEvaluation, *, pr: str, head_sha: str,
 ) -> None:
-    """One line per marking whose own text says to omit it (grug#1529), to
-    measure how often the model skips the structured verdict."""
-    for rule in evaluation.omit_flagged_rules:
+    """One line per marking dropped because its own text says to omit it
+    (grug#1529), to measure how often the model skips the structured verdict."""
+    for rule in evaluation.omit_dropped_rules:
         log.info(
-            "code_review_omit_marking_flagged",
+            "code_review_omit_marking_dropped",
             extra={"pr": pr, "head_sha": head_sha[:8], "rule": rule},
         )
 
