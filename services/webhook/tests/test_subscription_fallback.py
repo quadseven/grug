@@ -711,3 +711,40 @@ def test_a_free_pool_finding_is_still_a_review() -> None:
     assert resp.backend_used == Backend.FREE_POOL
     assert len(resp.findings) == 1
     assert resp.error == ""
+
+
+def _cave_answer(model: str, completion_tokens: int) -> str:
+    return json.dumps({
+        "choices": [{"message": {"content": '{"findings": []}', "role": "assistant"}}],
+        "model": model,
+        "usage": {"prompt_tokens": 30_000, "completion_tokens": completion_tokens},
+    })
+
+
+@pytest.mark.parametrize(
+    ("model", "tokens"),
+    [("nvidia/spilled-model:free", 900), ("resident-spark-model", 6)],
+)
+def test_an_untrusted_cave_empty_walks_on_to_the_lane(model, tokens) -> None:
+    """With the Sparks away the Cave route spills to free models, and a free
+    model's empty answer proves nothing, whatever its length."""
+    resp = _walk_to_free_pool(
+        _EMPTY_LONG, cave=_cave_answer(model, tokens), lane=_finding_body(),
+    )
+
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert len(resp.findings) == 1
+
+
+def test_an_untrusted_cave_empty_with_nothing_after_it_is_low_confidence() -> None:
+    resp = _walk_to_free_pool(_EMPTY_LONG, cave=_cave_answer("nvidia/spilled-model:free", 900))
+
+    assert resp.error.startswith(lc._LOW_CONFIDENCE_PREFIX)
+    assert cr_persona.evaluate_diff((), resp).degraded_reason == "low_confidence_review"
+
+
+def test_a_resident_spark_empty_of_real_length_stays_a_clean_review() -> None:
+    resp = _walk_to_free_pool(_EMPTY_SHORT, cave=_cave_answer("resident-spark-model", 900))
+
+    assert resp.backend_used == Backend.CAVE
+    assert not resp.error

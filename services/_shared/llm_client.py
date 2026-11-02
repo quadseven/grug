@@ -7606,6 +7606,7 @@ def _review_diff_dispatch_cave_primary(
     # than collapsing to `all_failed`.
     first_parse_fail = None
     successes: list[_SuccessfulReview] = []
+    cave_low_confidence: LlmReviewResponse | None = None
 
     # run_both: concurrent dual-arm before publish (`deep` only).
     # early_exit: return after first success (`fast` only).
@@ -7682,6 +7683,15 @@ def _review_diff_dispatch_cave_primary(
             # kinds leave it None.
             assert outcome.model is not None
             resolved_model = outcome.model
+            # The Cave route spills to free models while the Sparks are away,
+            # and their empty answers prove nothing: same miss as tier 2.
+            if not outcome.findings and (
+                outcome.degenerate or is_free_tier_model(resolved_model)
+            ):
+                last_error = f"{backend.value}: untrusted empty review"
+                if cave_low_confidence is None:
+                    cave_low_confidence = _low_confidence_success(outcome, hunks, pr_context)
+                continue
             origin = _finding_origin(
                 backend=backend,
                 model=resolved_model,
@@ -7775,8 +7785,9 @@ def _review_diff_dispatch_cave_primary(
         if sub_resp is not None and sub_resp.kind == "reviewed":
             return sub_resp
         if first_parse_fail is None:
-            if free_low_confidence is not None:
-                return free_low_confidence
+            low_confidence = cave_low_confidence or free_low_confidence
+            if low_confidence is not None:
+                return low_confidence
             if sub_resp is not None:
                 return sub_resp
 
