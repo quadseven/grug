@@ -157,7 +157,6 @@ def test_the_shipped_chain_leads_with_go_then_the_free_cloud_tiers(monkeypatch) 
     assert [(t.backend, t.model) for t in lc._cloud_chain_tiers()] == [
         (Backend.OPENCODE_GO, "deepseek-v4.1-flash"),
         (Backend.OPENCODE_GO, "beam-free"),
-        (Backend.FREE_POOL, "free-pool"),
     ]
     assert not lc._backend_enabled(Backend.OPENROUTER, "anthropic/claude-opus-4.7")
     assert lc._backend_enabled(Backend.OPENROUTER, _FREE)
@@ -564,3 +563,24 @@ def test_opencode_go_monthly_usage_limit_still_trips_the_breaker() -> None:
     with patch.object(httpx, "post", return_value=httpx.Response(429, json=body)):
         lc._call_backend(_go("longcat-2.5-preview-free"), _MESSAGES)
     assert not lc._provider_available(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
+
+
+def test_a_secret_candidate_survives_the_shipped_switches(monkeypatch) -> None:
+    """Secrets are judged only on the Cave. With the Cave switched off,
+    `judge_candidates` suppresses them, so a detection would vanish."""
+    from personas.code_reviewer.sast import EXPOSED_SECRET, Candidate, judge_candidates
+    from personas.code_reviewer.diff_parser import DiffHunk
+
+    monkeypatch.setenv("GRUG_DISABLED_BACKENDS", _shipped_env("GRUG_DISABLED_BACKENDS"))
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    monkeypatch.setenv("GRUG_CAVE_JUDGE_MODEL", _shipped_env("GRUG_CAVE_JUDGE_MODEL"))
+    verdict = '{"verdicts": [{"index": 0, "is_real_bug": true, "confidence": 0.9, "reasoning": "r"}]}'
+    body = {"choices": [{"message": {"role": "assistant", "content": verdict}}], "model": "m"}
+    candidate = Candidate(file="src/x.py", line=1, vuln_class=EXPOSED_SECRET, snippet="k=<redacted>")
+
+    with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
+        kept = judge_candidates(
+            (candidate,), (DiffHunk(file_path="src/x.py", new_start=1, new_lines=frozenset({1}), body="@@ -1 +1 @@\n+k=v"),), 1,
+        )
+
+    assert [f.rule_name for f in kept] == [EXPOSED_SECRET]
