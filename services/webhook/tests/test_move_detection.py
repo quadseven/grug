@@ -155,6 +155,18 @@ def test_summary_names_moved_files() -> None:
     assert _move_note(()) == ""
 
 
+def test_summary_text_keeps_ordinary_paths_and_says_the_scope_shrank() -> None:
+    from personas.code_reviewer.dispatch import _clean_review_scope, _move_note
+
+    note = _move_note((("old/a|b.py", "new/a b.py"), ("old/`c.py", "new/c.py")))
+    assert "`old/a|b.py` -> `new/a b.py`" in note
+    assert "`old/c.py` -> `new/c.py`" in note
+
+    moved = _clean_review_scope("", (), move_paths=(("old/a.py", "new/a.py"),))
+    assert moved == _clean_review_scope("", ("data.json",))
+    assert moved != _clean_review_scope("", ())
+
+
 def test_split_copied_hunks_reports_pure_rename(monkeypatch) -> None:
     from personas.code_reviewer import dispatch
 

@@ -464,7 +464,8 @@ def _fetch_head_blobs(
 _MAX_SUBTREE_IMPORTS = 5
 
 
-# The pull request commits endpoint lists at most 250 commits: 3 pages of 100.
+# GitHub's pull request commits endpoint serves at most 250 commits, so at
+# 100 per page the walk needs 3 requests and the last page comes back short.
 _MAX_COMMIT_PAGES = 3
 
 
