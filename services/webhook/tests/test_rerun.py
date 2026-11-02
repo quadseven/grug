@@ -2715,6 +2715,19 @@ def test_review_payload_keeps_the_head_repo_for_the_fork_check():
     )["pull_request"]["head"] == {"sha": "h", "repo": None}
 
 
+def test_review_payload_keeps_the_steering_source_fields():
+    """grug#1578: a rerun must still tell a PR into a non-default branch
+    apart, so the fetched base ref and default branch survive."""
+    pr = {"head": {"sha": "h", "repo": {"id": 99}},
+          "base": {"sha": "b", "ref": "feature",
+                   "repo": {"id": 7, "default_branch": "main"}}}
+    payload = rerun._review_payload(
+        install_id=1, owner="o", repo_name="r", pr_number=2, pr=pr,
+    )
+    assert payload["pull_request"]["base"] == {"sha": "b", "ref": "feature"}
+    assert payload["repository"]["default_branch"] == "main"
+
+
 # --- grug#1270: the `grug:reviewing` label, and the deferred re-run --------
 
 

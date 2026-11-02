@@ -1196,6 +1196,109 @@ def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
     }
 
 
+def _stacked_payload() -> dict:
+    """A PR into `feature`, a branch its author may be able to push to."""
+    payload = _payload()
+    payload["repository"]["default_branch"] = "main"
+    payload["pull_request"]["base"] = {"sha": "base5678ijkl", "ref": "feature"}
+    return payload
+
+
+def _ref_response(sha: str):
+    r = MagicMock(spec=httpx.Response)
+    r.status_code = 200
+    r.raise_for_status = MagicMock()
+    r.json = MagicMock(return_value={"object": {"sha": sha, "type": "commit"}})
+    return r
+
+
+def _steering_capture(monkeypatch):
+    """Run dispatch on the stub pipeline; return (pr_contexts, GET calls)."""
+    contexts: list[dict] = []
+    monkeypatch.setattr(
+        cr_dispatch, "review_diff",
+        lambda evidence, *a, **kw: (
+            contexts.append(dict(evidence.pr_context))
+            or LlmReviewResponse(kind="no_diff")
+        ),
+    )
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+    return contexts
+
+
+def test_stacked_pr_reads_steering_files_from_the_default_branch(monkeypatch):
+    """grug#1578: a PR into a non-default branch is steered by the default
+    branch's head, resolved once, not by a base its author may control."""
+    contexts = _steering_capture(monkeypatch)
+    gets: list[tuple[str, dict | None]] = []
+
+    def fake_get(url, *, headers, timeout, params=None):
+        gets.append((url, params))
+        if url.endswith("/git/ref/heads/main"):
+            return _ref_response("mainhead9999")
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=fake_get):
+        cr_dispatch.dispatch_code_review(_stacked_payload(), blocking=False)
+
+    assert len(contexts) == 1
+    assert contexts[0]["pr_base_sha"] == "mainhead9999"
+    # The diff still starts at the PR's own base.
+    assert contexts[0]["base_sha"] == "base5678ijkl"
+    assert sum(url.endswith("/git/ref/heads/main") for url, _ in gets) == 1
+    config_refs = [p["ref"] for url, p in gets if url.endswith("/contents/.grug.yaml")]
+    assert config_refs == ["mainhead9999"]
+
+
+def test_stacked_pr_falls_back_to_the_default_branch_name(monkeypatch, caplog):
+    """A failed ref lookup still never reads the author-writable base: the
+    default branch name is a ref the contents API resolves itself."""
+    contexts = _steering_capture(monkeypatch)
+
+    def fake_get(url, *, headers, timeout, params=None):
+        if url.endswith("/git/ref/heads/main"):
+            raise httpx.ConnectError("down")
+        return _diff_response()
+
+    with caplog.at_level("INFO"), patch("httpx.get", side_effect=fake_get):
+        cr_dispatch.dispatch_code_review(_stacked_payload(), blocking=False)
+
+    assert contexts[0]["pr_base_sha"] == "main"
+    assert any(r.message == "steering_ref_lookup_failed" for r in caplog.records)
+
+
+def test_pr_into_default_branch_keeps_its_base_sha(monkeypatch):
+    """A PR into the default branch is steered by its own base, as before,
+    with no extra API call."""
+    contexts = _steering_capture(monkeypatch)
+    payload = _payload()
+    payload["repository"]["default_branch"] = "main"
+    payload["pull_request"]["base"] = {"sha": "base5678ijkl", "ref": "main"}
+    urls: list[str] = []
+
+    def fake_get(url, *, headers, timeout, params=None):
+        urls.append(url)
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=fake_get):
+        cr_dispatch.dispatch_code_review(payload, blocking=False)
+
+    assert contexts[0]["pr_base_sha"] == "base5678ijkl"
+    assert not any("/git/ref/" in url for url in urls)
+
+
+def test_steering_ref_reads_default_branch_from_the_pr_base_repo():
+    """Reruns build `repository` without default_branch; the fetched PR's
+    base.repo carries it."""
+    pr = {"base": {"sha": "s1", "ref": "feature",
+                   "repo": {"default_branch": "trunk"}}}
+    with patch("httpx.get", return_value=_ref_response("trunkhead")) as get:
+        ref = cr_dispatch.steering_base_ref(pr, {}, 11, "myorg", "myrepo")
+    assert ref == "trunkhead"
+    assert get.call_args.args[0].endswith("/repos/myorg/myrepo/git/ref/heads/trunk")
+
+
 def test_dispatch_fetches_immutable_base_head_diff(monkeypatch):
     """Diff, full files, and publication all target the event snapshot."""
     captured = []

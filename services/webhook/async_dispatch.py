@@ -187,7 +187,11 @@ def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "pull_request": {
             "number": pr.get("number"),
             "head": {"sha": (pr.get("head") or {}).get("sha")},
-            "base": {"sha": (pr.get("base") or {}).get("sha")},
+            # base.ref with default_branch: grug#1578 steering source.
+            "base": {
+                "sha": (pr.get("base") or {}).get("sha"),
+                "ref": (pr.get("base") or {}).get("ref"),
+            },
             "title": str(pr.get("title") or ""),
             "body": body,
             "draft": bool(pr.get("draft", False)),
@@ -200,6 +204,7 @@ def _slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "name": repo.get("name"),
             # grug#1269: Elder tells the spark-gateway whether it is public.
             "private": repo.get("private"),
+            "default_branch": repo.get("default_branch"),
         },
         "installation": {"id": (payload.get("installation") or {}).get("id")},
     }
