@@ -16,8 +16,10 @@ those lines again.
 v2 (this extension) ALSO checks every high/critical CommentRecord Elder
 posted across the PR's WHOLE history for a human reply (a genuine per-
 finding "was this addressed" proxy that needs no new GitHub capability -
-REST review-comment `in_reply_to_id` chains, not GraphQL thread
-`isResolved`, which this codebase has never called). Still deliberately
+REST review-comment `in_reply_to_id` chains). A thread resolved on
+GitHub also counts as handled (grug#1559), read through GraphQL
+`reviewThreads.isResolved`; a failed read falls back to the reply chains
+alone. Still deliberately
 coarse: a real per-finding resolution lifecycle (open/addressed/
 dismissed/outdated/superseded) is epic #732 Hunt Board's job, which this
 can migrate onto once it ships. A CommentRecord's TTL is 30 days, so a PR
@@ -53,6 +55,20 @@ _API = "https://api.github.com"
 _TIMEOUT = 10.0
 _MAX_MARKER_SCAN_PAGES = 20
 _MAX_COMMENT_PAGES = 20
+_MAX_THREAD_PAGES = 10
+_GRAPHQL_URL = f"{_API}/graphql"
+_RESOLVED_THREADS_QUERY = """
+query($owner: String!, $repo: String!, $pr: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { isResolved comments(first: 1) { nodes { databaseId } } }
+      }
+    }
+  }
+}
+"""
 # Same severities Elder's own dispatch treats as blocking
 # (personas.code_reviewer.persona._BLOCKING_SEVERITIES) - duplicated as a
 # literal rather than imported to avoid coupling Sentinel to Elder's
@@ -65,11 +81,28 @@ MARKER = "<!-- grug-sentinel:abandoned-review -->"
 # reason as _HIGH_SEVERITY; Elder's GraphQL form, without the [bot] suffix,
 # is personas.code_reviewer.thread_resolver._BOT_LOGIN.
 _ELDER_BOT_LOGIN = "grug-tribe[bot]"
-# List of agent bot logins that count as handled findings when they reply.
-# Configured via GRUG_AGENT_REPLY_BOTS environment variable; empty list
-# means no agent bot replies are counted as handled (only human replies and
-# Elder's "Fixed in" replies).
-_AGENT_REPLY_BOTS = os.getenv("GRUG_AGENT_REPLY_BOTS", "").split()
+# The fleet's agent Apps, whose reply on a finding thread counts as handled
+# (grug#1559). The brains post through their own Apps, so with an empty list
+# every one of their answers read as no reply at all.
+FLEET_AGENT_APP_LOGINS = frozenset((
+    "loom-brain[bot]",
+    "loom-station[bot]",
+    "loom-lanes[bot]",
+    "agent-anthropic-claude-code[bot]",
+    "agent-meta-muse[bot]",
+    "agent-openai-dot[bot]",
+    "agent-openai-codex-luna[bot]",
+    "agent-google-gemini[bot]",
+))
+
+
+def _agent_reply_bots(extra: str) -> frozenset[str]:
+    """FLEET_AGENT_APP_LOGINS plus any whitespace-separated logins in `extra`
+    (GRUG_AGENT_REPLY_BOTS), which adds to the list and never replaces it."""
+    return FLEET_AGENT_APP_LOGINS | frozenset(extra.split())
+
+
+_AGENT_REPLY_BOTS = _agent_reply_bots(os.getenv("GRUG_AGENT_REPLY_BOTS", ""))
 # Logins of the Loom Apps (station and brain) whose deliberate close of a lane
 # pull request is not an abandoned review. Configured via GRUG_LOOM_APP_LOGINS;
 # empty means no close is exempt (grug#1403).
@@ -164,13 +197,13 @@ def _is_own_bot(comment: dict, own_app_id: str) -> bool:
 
 def _replied_to_comment_ids(token: str, owner: str, repo: str, pr_number: int) -> set[int]:
     """Finding comments handled by a human reply, Elder's latest Fixed in, or
-    a configured agent bot reply.
+    a fleet agent App reply.
 
-    REST review comments do not expose GraphQL's `isResolved`, so use the
-    reply chain as the per-finding addressed signal. Elder's own reply counts
-    only when it is the newest comment in the thread and starts with
-    `Fixed in`; other bot replies are unhandled unless they match a configured
-    agent bot login.
+    REST review comments do not expose GraphQL's `isResolved`, so this reads
+    the reply chain; `_resolved_thread_root_ids` adds resolved threads. Elder's
+    own reply counts only when it is the newest comment in the thread and
+    starts with `Fixed in`; other bot replies are unhandled unless the login
+    is in `_AGENT_REPLY_BOTS`.
     """
     own_app_id = get_app_id()
     comments_by_id: dict[int, dict] = {}
@@ -231,11 +264,71 @@ def _replied_to_comment_ids(token: str, owner: str, repo: str, pr_number: int) -
     return handled
 
 
+def _review_threads(payload: dict) -> dict:
+    """The reviewThreads connection from one GraphQL answer. Raises
+    RuntimeError on an `errors` answer."""
+    if payload.get("errors"):
+        # Type codes only: GraphQL messages can echo request content.
+        types = ",".join(
+            str(e.get("type") or "") for e in payload["errors"] if isinstance(e, dict)
+        )
+        raise RuntimeError(f"graphql returned errors: {types}")
+    pull = ((payload.get("data") or {}).get("repository") or {}).get("pullRequest") or {}
+    return pull.get("reviewThreads") or {}
+
+
+def _resolved_roots_in_page(payload: dict) -> tuple[set[int], dict]:
+    """Resolved thread root ids and pageInfo from one reviewThreads answer."""
+    threads = _review_threads(payload)
+    roots: set[int] = set()
+    for node in threads.get("nodes") or []:
+        first = ((node.get("comments") or {}).get("nodes") or [{}])[0]
+        if node.get("isResolved") and first.get("databaseId") is not None:
+            roots.add(int(first["databaseId"]))
+    return roots, threads.get("pageInfo") or {}
+
+
+def _resolved_thread_root_ids(token: str, owner: str, repo: str, pr_number: int) -> set[int]:
+    """REST ids of the first comment of every resolved review thread on the
+    PR. Raises on a transport error or a GraphQL `errors` answer; the caller
+    falls back to the reply rules."""
+    resolved: set[int] = set()
+    after: str | None = None
+    for _ in range(_MAX_THREAD_PAGES):
+        resp = httpx.post(
+            _GRAPHQL_URL,
+            json={
+                "query": _RESOLVED_THREADS_QUERY,
+                "variables": {"owner": owner, "repo": repo, "pr": pr_number, "after": after},
+            },
+            headers=_headers(token), timeout=_TIMEOUT,
+        )
+        resp.raise_for_status()
+        page_roots, page_info = _resolved_roots_in_page(resp.json())
+        resolved |= page_roots
+        if not page_info.get("hasNextPage"):
+            return resolved
+        after = page_info.get("endCursor")
+    log.warning(
+        "sentinel_thread_scan_capped",
+        extra={"repo": f"{owner}/{repo}", "pr": pr_number},
+    )
+    return resolved
+
+
 def _abandoned_findings(
     token: str, owner: str, repo: str, pr_number: int, candidates: list[CommentRecord],
 ) -> list[CommentRecord]:
-    replied = _replied_to_comment_ids(token, owner, repo, pr_number)
-    return [r for r in candidates if r["comment_id"] not in replied]
+    handled = _replied_to_comment_ids(token, owner, repo, pr_number)
+    try:
+        handled |= _resolved_thread_root_ids(token, owner, repo, pr_number)
+    except (httpx.HTTPError, RuntimeError, ValueError) as e:
+        # Best-effort: the reply rules above still decide every finding.
+        log.warning(
+            "sentinel_thread_scan_failed",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number, "kind": type(e).__name__},
+        )
+    return [r for r in candidates if r["comment_id"] not in handled]
 
 
 def _build_comment(
