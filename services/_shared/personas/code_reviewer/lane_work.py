@@ -28,6 +28,8 @@ and the offline corpus runner call exactly the same code:
 - partial delivery (#1389): an open in-scope criterion with no evidence
   in the diff. Dispatch passes a model `criteria_judge` for the criteria
   the deterministic mapping cannot decide; the corpus runner does not.
+- sanitisers (#1497): a text-stripping function that changes ordinary
+  text, or that has no test asserting ordinary text comes back unchanged.
 
 Pure: diff text, parsed hunks, file contents and PR text in; findings out.
 """
@@ -35,7 +37,7 @@ Pure: diff text, parsed hunks, file contents and PR text in; findings out.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from personas.code_reviewer.criteria_coverage import (
     LinkedCriterion,
@@ -49,6 +51,7 @@ from personas.code_reviewer.intent_filter import body_claims_box
 from personas.code_reviewer.measurement_only import scan_measurement_only
 from personas.code_reviewer.partial_delivery import CriteriaJudge, scan_partial_delivery
 from personas.code_reviewer.persona import Finding
+from personas.code_reviewer.sanitizer_review import scan_sanitizers
 from personas.code_reviewer.unbacked_claim import scan_unbacked_claims
 from personas.code_reviewer.weakened_verification import scan_weakened_verification
 from personas.code_reviewer.wrong_target import scan_wrong_target
@@ -57,7 +60,7 @@ from personas.tpm.ticket_compliance import closes_refs
 # The footer a Loom lane writes on every pull request it opens.
 _LANE_FOOTER_RE = re.compile(r"^Loom ticket \S+, lane \S+", re.MULTILINE)
 
-# (issue, criterion number, "open" | "ticked", text): the shape
+# (issue, criterion number, "open" | "ticked" | "delivered", text): the shape
 # `linked_issue.rendered_criteria_with_state` returns.
 LinkedBox = tuple[int, int, str, str]
 
@@ -74,7 +77,8 @@ def criteria_in_scope(
 
     Those of an issue the PR closes; every linked criterion of a lane PR,
     whose ticket the station closes on merge; and, on any other PR, an open
-    box whose text the body repeats or names by number (a claim)."""
+    box whose text the body repeats or names by number (a claim). A criterion
+    a merged PR on the ticket delivered is none of these (grug#1530)."""
     body = pr_body or ""
     boxes = tuple(boxes)
     closed = set(closes_refs(body))
@@ -84,8 +88,11 @@ def criteria_in_scope(
     return tuple(
         LinkedCriterion(issue, number, text)
         for issue, number, state, text in boxes
-        if issue in closed or lane
-        or (state == "open" and body_claims_box((issue, number, state, text), body, single))
+        if state != "delivered"
+        and (
+            issue in closed or lane
+            or (state == "open" and body_claims_box((issue, number, state, text), body, single))
+        )
     )
 
 
@@ -103,8 +110,8 @@ def lane_work_findings(
     hunks: tuple[DiffHunk, ...],
     file_contents: dict[str, str],
     base_line_counts: dict[str, int],
-    boxes: Iterable[LinkedBox],
-    pr_title: str,
+    boxes: Iterable[LinkedBox] | Callable[[], Iterable[LinkedBox]],
+    pr_title: str | Callable[[], str],
     pr_body: str,
     changes: tuple[FileChange, ...] | None = None,
     health_issues: Iterable[int] = (),
@@ -122,7 +129,8 @@ def lane_work_findings(
     decides the criteria the partial-delivery mapping cannot (#1389)."""
     if changes is None:
         changes = file_changes(diff_text)
-    boxes = tuple(boxes)
+    boxes = tuple(boxes() if callable(boxes) else boxes)
+    pr_title = pr_title() if callable(pr_title) else pr_title
     criteria = criteria_in_scope(boxes, pr_body)
     findings = list(scan_criteria_coverage(
         hunks, file_contents, criteria=criteria,
@@ -141,6 +149,7 @@ def lane_work_findings(
     findings.extend(scan_weakened_verification(
         changes, hunks, criteria=criteria, pr_title=pr_title,
     ))
+    findings.extend(scan_sanitizers(changes, hunks))
     findings.extend(scan_fabricated_results(changes, hunks))
     findings.extend(scan_unbacked_claims(pr_body, criteria=criteria, hunks=hunks))
     # A ticked box was delivered by an earlier slice; only open boxes can

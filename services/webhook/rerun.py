@@ -37,6 +37,7 @@ import httpx
 
 from adapters.install_store import get_repo_config, is_elder_paused  # type: ignore
 from github_app_auth import get_app_id, with_install_token_retry
+from github_budget import count_review_calls
 from check_run_reconciler import _STUCK_IN_PROGRESS_MAX_AGE_MINUTES
 from github_checks_client import (
     CheckRunResult,
@@ -97,6 +98,15 @@ _sqs = boto3.client("sqs")
 # local/dev/tests -> enqueue raises, surfaced as best-effort by the caller.
 _RERUN_QUEUE_URL = os.getenv("GRUG_RERUN_QUEUE_URL", "")
 SCHEMA_VERSION = 1
+# grug#1494: a review where every model failed (`all_failed`) raises, so the
+# queue redelivers it. A partial or low-confidence review with nothing
+# blocking in it rides the same bound: dispatch leaves it pending and marks
+# the result `rerun_scheduled`, which raises below. Deliveries below this
+# number leave a blocking repo's Elder check pending; from this one on the
+# failure is published, so a long provider outage still ends in a red check
+# instead of waiting forever. The queue's own dead-letter limit stays the
+# outer bound.
+_ALL_FAILED_AUTO_RERUN_DELIVERIES = 3
 # A learn job whose classifier backends are all rate limited or down (the
 # OpenRouter key is free-tier only and refuses intermittently - operator
 # decision 2026-09-23) is DEFERRED: re-enqueued as a fresh message with a
@@ -601,11 +611,15 @@ def enqueue_review(
 # The static TPM check is requestable but logged + skipped below (deliberate).
 
 
-def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, question: str) -> None:
+def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, question: str, reply_to_comment_id: int = 0) -> None:
     """Enqueue a `/grug ask` job (#528) so the heavy LLM Q&A runs in the
     consumer, NOT inline in the webhook ACK path. Dedup keys on comment_id
     (each question is distinct - unlike a persona rerun), so a re-delivered
-    comment collapses but two different questions do not."""
+    comment collapses but two different questions do not.
+
+    `reply_to_comment_id` (#822) is the review-thread root when the question
+    was asked inside a review thread; the consumer then answers IN that
+    thread with its hunk as context. 0 = a plain PR comment (top-level)."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
     _sqs.send_message(
@@ -614,6 +628,7 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
             "schema_version": SCHEMA_VERSION, "kind": "ask",
             "install_id": install_id, "repo": repo, "pr_number": pr_number,
             "comment_id": comment_id, "question": question,
+            "reply_to_comment_id": reply_to_comment_id,
         }),
         MessageGroupId=_ask_group_id(install_id, repo, pr_number),
         MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:ask:{comment_id}",
@@ -704,11 +719,46 @@ def _gh_post(token: str, url: str, json_body: dict[str, Any]) -> None:
     resp.raise_for_status()
 
 
-def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> str:
+def _thread_context(token: str, owner: str, repo_name: str, root_comment_id: int) -> str:
+    """The review-thread block for an in-thread ask (#822): the comment the
+    thread is about (usually one of Grug's findings) plus its diff hunk, so
+    the answer can cite the specific finding and lines. Best-effort - an
+    unreadable thread degrades to the plain diff context, never to silence."""
+    from urllib.parse import quote as _q
+    try:
+        c = _gh_get(
+            token,
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+            f"/pulls/comments/{root_comment_id}",
+        )
+    except Exception as e:  # noqa: BLE001 - context enrichment must not kill the answer
+        log.warning(
+            "ask_thread_context_failed",
+            extra={"comment_id": root_comment_id, "kind": type(e).__name__},
+        )
+        return ""
+    parts = ["REVIEW THREAD the question was asked in:"]
+    path = str(c.get("path") or "")
+    line = c.get("line") or c.get("original_line")
+    if path:
+        parts.append(f"File: {path}" + (f", line {line}" if line else ""))
+    if c.get("body"):
+        parts.append(f"Comment under discussion:\n{c['body']}")
+    if c.get("diff_hunk"):
+        parts.append(f"Diff hunk:\n{c['diff_hunk']}")
+    return "\n".join(parts) if len(parts) > 1 else ""
+
+
+def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str, reply_to_comment_id: int = 0) -> str:
     """Answer a /grug ask question in the consumer (async, #528). Fetches the
     diff, runs the JSON-constrained Q&A over the REDACTED question + diff, and
     posts the answer as a reply. Records an activity row. Never raises past
-    the job (a bad answer degrades to a fallback reply)."""
+    the job (a bad answer degrades to a fallback reply).
+
+    With `reply_to_comment_id` (#822) the question came from a review thread:
+    the answer posts as a reply IN that thread (the one notification GitHub
+    already sends for a thread reply - no extra email), with the thread's
+    finding + hunk ahead of the diff as context."""
     from urllib.parse import quote as _q
     from llm_client import _redact_secrets, answer_pr_question  # type: ignore
     from markdown_safety import neutralize_mentions  # type: ignore
@@ -722,9 +772,32 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
             f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/pulls/{pr_number}",
             accept="application/vnd.github.v3.diff",
         )
+        context = diff
+        post_url = (
+            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+            f"/issues/{pr_number}/comments"
+        )
+        footer = "*(Grug answered from the PR diff - may be wrong; verify.)*"
+        thread_note = ""
+        if reply_to_comment_id:
+            thread = _thread_context(token, owner, repo_name, reply_to_comment_id)
+            if thread:
+                context = f"{thread}\n\nFULL PR DIFF:\n{diff}"
+            else:
+                # Say so in the open: an answer that silently lost its
+                # thread context would read as if it had seen the finding.
+                thread_note = (
+                    "\n\n*(Grug could not load the thread itself, so this "
+                    "answer is from the PR diff only.)*"
+                )
+            post_url = (
+                f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
+                f"/pulls/{pr_number}/comments/{reply_to_comment_id}/replies"
+            )
+            footer = "*(Grug answered from the thread and the PR diff - may be wrong; verify.)*"
         answer = answer_pr_question(
             q,
-            diff,
+            context,
             install_id,
             pr_context={
                 "installation_id": install_id,
@@ -737,14 +810,19 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str) -> 
         # @mention in it would notify a real GitHub user as if Grug itself
         # pinged them (#561, same class as Teller's #554 round-4 fix).
         safe_answer = neutralize_mentions(answer) if answer else answer
-        body = (f"{safe_answer}\n\n*(Grug answered from the PR diff - may be wrong; verify.)*"
-                if safe_answer else
-                "Grug could not answer that right now (the thinking-rock is tired). Try again.")
-        _gh_post(
-            token,
-            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/issues/{pr_number}/comments",
-            {"body": body},
-        )
+        if safe_answer:
+            body = f"{safe_answer}\n\n{footer}{thread_note}"
+            if not reply_to_comment_id:
+                # A top-level answer names the question it answers (#822
+                # criterion 1: the reply belongs to its thread - the PR
+                # conversation). The quote is neutralized like the answer:
+                # it is echoed user text posted under Grug's authority.
+                quoted = neutralize_mentions(q[:280])
+                body = f"> {quoted}\n\n{body}"
+        else:
+            # Criterion 6's wording, even when the model gave nothing back.
+            body = "Grug not know. The thinking-rock is tired - try again."
+        _gh_post(token, post_url, {"body": body})
         return "answered" if answer else "ask_no_answer"
     result = with_install_token_retry(install_id, _do)
     try:
@@ -857,6 +935,49 @@ def _defer_learn(
     return True
 
 
+def _store_learning(
+    install_id: int, repo_full: str, pr_number: int, comment_id: int,
+    author: str, reply_text: str, record: dict, classification: dict,
+    *, stored: bool,
+) -> tuple[str, str, bool]:
+    """Store a durable verdict and return `(ack, result, refused)`.
+
+    A rule that touches a security or SAST class is refused before the
+    store, so no later edit or status change can arm it; select_for_prompt
+    checks again at read time for rows that predate #1571. `stored` marks a
+    redelivery whose rule is already kept: it stores nothing, since a
+    re-stamp would restart the 90 days with no human act behind it."""
+    from adapters.install_store import put_learning  # type: ignore
+    from cave_drawings import MAX_TEXT_CHARS, touches_protected  # type: ignore
+    from redact import redact_secrets  # type: ignore
+
+    if not classification["durable"]:
+        # Deliberate one-off: acknowledge without storing.
+        return LEARN_REACTION_ONE_OFF, "learn_one_off", False
+    finding_tags = dict(record.get("finding_tags", {}))
+    finding_class = str(finding_tags.get("rule_name", ""))
+    finding_category = str(finding_tags.get("category", ""))
+    if touches_protected({
+        "text": classification["learning"],
+        "finding_class": finding_class, "finding_category": finding_category,
+    }):
+        return LEARN_REACTION_ONE_OFF, "learn_refused_protected", True
+    if not stored:
+        put_learning(
+            repo=repo_full,
+            text=classification["learning"],
+            scope_path=classification["scope_path"],
+            source_pr=pr_number,
+            source_comment_id=comment_id,
+            author=author,  # the maintainer who TAUGHT it (reply sender)
+            approval_delay_seconds=_org_learning_approval_delay(install_id, repo_full),
+            reason=redact_secrets(reply_text)[:MAX_TEXT_CHARS],
+            finding_class=finding_class,
+            finding_category=finding_category,
+        )
+    return LEARN_REACTION_LEARNED, "learned", False
+
+
 def _run_learn(
     install_id: int, repo_full: str, pr_number: int,
     comment_id: int, parent_comment_id: int, reply_text: str,
@@ -877,7 +998,6 @@ def _run_learn(
     so the finding thread never gets duplicate acknowledgments."""
     from adapters.install_store import (  # type: ignore
         claim_delivery, get_comment_record, get_learning_by_source_comment,
-        put_learning,
     )
     from llm_client import (  # type: ignore
         LearnClassifierUnavailable, LearnClassifierUnusable, classify_learning,
@@ -964,24 +1084,10 @@ def _run_learn(
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
             "result": result})
         return result
-    if classification["durable"]:
-        # Org-configurable approval delay: default 0 = active immediately.
-        delay = _org_learning_approval_delay(install_id, repo_full)
-        put_learning(
-            repo=repo_full,
-            text=classification["learning"],
-            scope_path=classification["scope_path"],
-            source_pr=pr_number,
-            source_comment_id=comment_id,
-            author=author,  # the maintainer who TAUGHT it (reply sender)
-            approval_delay_seconds=delay,
-        )
-        ack = LEARN_REACTION_LEARNED
-        result = "learned"
-    else:
-        # Deliberate one-off: acknowledge without storing.
-        ack = LEARN_REACTION_ONE_OFF
-        result = "learn_one_off"
+    ack, result, refused = _store_learning(
+        install_id, repo_full, pr_number, comment_id, author, reply_text,
+        record, classification, stored=already is not None,
+    )
 
     # The claim guards ONLY the ack (the one non-idempotent side effect): a
     # redelivery whose learning is already stored must not re-post the reply.
@@ -1006,7 +1112,7 @@ def _run_learn(
     try:
         body = _learn_ack_body(
             repo_full, classification["learning"], classification["scope_path"],
-            author, pr_number, classification["durable"],
+            author, pr_number, classification["durable"], refused=refused,
         )
         _post_learn_reply(install_id, owner, repo_name, comment_id, body)
     except Exception as e:  # noqa: BLE001
@@ -1084,15 +1190,26 @@ def _post_learn_reply(
 
 def _learn_ack_body(
     repo_full: str, text: str, scope_path: str, author: str,
-    source_pr: int, durable: bool,
+    source_pr: int, durable: bool, refused: bool = False,
 ) -> str:
     """Collapsible acknowledgment for a reply-mined learning. `text`/`scope`/
     `author` are defused (classifier-/reply-produced, untrusted) so a hostile
-    reply can't break out of the <details> or inject mentions."""
+    reply can't break out of the <details> or inject mentions. `refused`
+    means a durable rule that touches a security or SAST class (#1571)."""
     text_d = _defuse_md(text)
     scope_d = _defuse_md(scope_path)
     author_d = _defuse_md(author)
     scope_line = f", scoped to `{scope_d}`" if scope_d else ""
+    if refused:
+        return (
+            "<details>\n"
+            "<summary>Not remembered (security rule)</summary>\n\n"
+            f"Grug read your reply but will NOT carry it into future reviews on "
+            f"`{repo_full}`: learned rules never touch security or SAST findings. "
+            "It applies to this PR only.\n\n"
+            f"Replied by `{author_d}` (PR #{source_pr}).\n"
+            "</details>"
+        )
     if durable:
         return (
             "<details>\n"
@@ -1157,7 +1274,10 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     repo_full = str(job["repo"])  # "owner/name"
     pr_number = int(job["pr_number"])
     if job.get("kind") == "ask":
-        return _run_ask(install_id, repo_full, pr_number, str(job.get("question", "")))
+        return _run_ask(
+            install_id, repo_full, pr_number, str(job.get("question", "")),
+            reply_to_comment_id=int(job.get("reply_to_comment_id", 0) or 0),
+        )
     if job.get("kind") == "learn":
         # A deferred job (every classifier backend was rate limited) arrives
         # at once; FIFO queues have no per-message delay. Hold it until due.
@@ -1174,7 +1294,9 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
             first_deferred_at=float(job.get("first_deferred_at", 0) or 0),
         )
     if job.get("kind") == "review":
-        return _run_hot_review(job, install_id, repo_full, pr_number)
+        return _run_hot_review(
+            job, install_id, repo_full, pr_number, receive_count=receive_count,
+        )
     persona = str(job.get("persona", "elder"))
 
     if persona not in _RERUNNABLE:
@@ -1743,6 +1865,33 @@ def _fetch_current_pr(
     )
 
 
+def _fetch_pr_if_changed(
+    install_id: int, owner: str, repo_name: str, pr_number: int, etag: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Read the PR only if it moved since `etag`: the PR and its new ETag, or
+    None and the same ETag on a 304. GitHub does not charge a 304 against the
+    rate limit, so a poll on an unchanged PR is free (grug#1537)."""
+    url = (
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
+        f"/pulls/{pr_number}"
+    )
+
+    def _do(token: str) -> tuple[dict[str, Any] | None, str]:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        if etag:
+            headers["If-None-Match"] = etag
+        resp = httpx.get(url, headers=headers, timeout=_FETCH_TIMEOUT)
+        if resp.status_code == 304:
+            return None, etag
+        resp.raise_for_status()
+        return resp.json(), resp.headers.get("ETag", "")
+
+    return with_install_token_retry(install_id, _do)
+
+
 def _elder_blocking_from_pr(install_id: int, pr: dict[str, Any]) -> bool | None:
     """The repo's `code_reviewer_blocking` for an already-fetched PR, or
     None when it cannot be read. Callers hand None to `degraded_conclusion`,
@@ -1802,6 +1951,8 @@ def _review_payload(
             "owner": {"login": owner},
             # grug#1269: Elder tells the spark-gateway whether it is public.
             "private": base_repo.get("private"),
+            # grug#1578: with base.ref, picks the steering source.
+            "default_branch": base_repo.get("default_branch"),
         },
         "pull_request": {
             "number": pr_number,
@@ -1817,7 +1968,7 @@ def _review_payload(
                 "sha": (pr.get("head") or {})["sha"],
                 "repo": _repo_id_only((pr.get("head") or {}).get("repo")),
             },
-            "base": {"sha": base.get("sha")},
+            "base": {"sha": base.get("sha"), "ref": base.get("ref")},
         },
     }
 
@@ -2122,6 +2273,7 @@ def _board_in_progress_note(
 
 def _run_hot_review(
     job: dict[str, Any], install_id: int, repo_full: str, pr_number: int,
+    receive_count: int = 0,
 ) -> str:
     """Settle, cancel stale work, then run Elder on one current snapshot.
 
@@ -2148,7 +2300,39 @@ def _run_hot_review(
     if not sep or not owner or not repo_name:
         raise ValueError(f"invalid repo coordinate: {repo_full!r}")
 
-    before = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+    try:
+        before = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code != 403:
+            raise
+        queued_head_sha = str(job.get("requested_head_sha") or "")
+        log.error(
+            "elder_pr_read_forbidden",
+            extra={
+                "install_id": install_id,
+                "repo": repo_full,
+                "pr": pr_number,
+                "status": 403,
+                "head_sha": queued_head_sha[:8],
+            },
+        )
+        posted = _complete_elder_check_open(
+            install_id=install_id,
+            owner=owner,
+            repo_name=repo_name,
+            pr_number=pr_number,
+            head_sha=queued_head_sha,
+            title="Grug cannot read this pull request: 403 from GitHub",
+            summary=(
+                "GitHub denied Elder's pull request read with HTTP 403. "
+                "Review the GitHub App installation's repository access, "
+                "token permissions, and repository rules before re-running Elder."
+            ),
+            conclusion="failure",
+        )
+        if not posted:
+            raise RuntimeError("Elder 403 check completion did not land") from error
+        return "pr_read_forbidden"
     head_sha = str((before.get("head") or {}).get("sha") or "")
     if not head_sha:
         raise ValueError("current PR has no head SHA")
@@ -2331,20 +2515,22 @@ def _run_hot_review(
             watch = start_staleness_watch(
                 install_id, owner, repo_name, pr_number,
                 str((after.get("head") or {}).get("sha") or ""),
-                fetch_current_pr=_fetch_current_pr,
+                fetch_pr_if_changed=_fetch_pr_if_changed,
             )
             try:
-                result = dispatch_code_review(
-                    _review_payload(
-                        install_id=install_id,
-                        owner=owner,
-                        repo_name=repo_name,
-                        pr_number=pr_number,
-                        pr=after,
-                    ),
-                    blocking=elder_blocking,
-                    cancel_event=watch.cancel,
-                )
+                with count_review_calls(repo_full, pr_number):
+                    result = dispatch_code_review(
+                        _review_payload(
+                            install_id=install_id,
+                            owner=owner,
+                            repo_name=repo_name,
+                            pr_number=pr_number,
+                            pr=after,
+                        ),
+                        blocking=elder_blocking,
+                        cancel_event=watch.cancel,
+                        rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
+                    )
             finally:
                 stop_staleness_watch(watch)
             degraded_reason = result.get("degraded_reason", "")
@@ -2458,6 +2644,15 @@ def _run_hot_review(
                 # poison monitor covers a sustained outage.
                 raise RuntimeError(
                     f"Elder review degraded: {degraded_reason}"
+                )
+            if result_status == "skipped" and result.get("rerun_scheduled"):
+                # A partial or low-confidence review on a blocking repo left
+                # the check pending because a re-run is still scheduled
+                # (dispatch's `_rerun_before_failing`). Raise for the queue's
+                # re-run, the same bounded lane all_failed uses; the last
+                # delivery publishes the degraded failure and completes.
+                raise RuntimeError(
+                    f"Elder review degraded: {degraded_reason}; re-run scheduled"
                 )
             if (
                 result_status == "skipped"

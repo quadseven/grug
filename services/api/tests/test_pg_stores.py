@@ -903,6 +903,25 @@ def test_re_auth_with_new_refresh_replaces(pg, fake_kms):
     assert got.oauth_refresh_token == "r2"
 
 
+def test_check_verdict_families_round_trip_and_stay_sparse(pg):
+    from adapters import pg_install_store as store
+
+    common = dict(
+        install_id=778, persona="elder", repo="o/r", pr_number=1,
+        conclusion="success", summary="s", findings_count=0, blocking=False,
+        created_at="2026-05-16T00:00:00+00:00",
+    )
+    store.put_check_verdict(
+        head_sha="a" * 40, author_family="claude", reviewer_family="laguna", **common,
+    )
+    store.put_check_verdict(head_sha="b" * 40, **common)
+    rows = {row["head_sha"][0]: row for row in store.list_check_verdicts(778)}
+    assert rows["a"]["author_family"] == "claude"
+    assert rows["a"]["reviewer_family"] == "laguna"
+    assert "author_family" not in rows["b"]
+    assert "reviewer_family" not in rows["b"]
+
+
 def test_check_verdict_degraded_reason_round_trips_as_errored(pg):
     """/activity's errored filter depends on the degraded write arm; the
     sparse-when-absent arm alone leaves it unexecuted."""
@@ -1085,12 +1104,15 @@ def test_warder_pulse_flags_flow_through_config(pg):
 
     cfg = store.get_repo_config(1, 55)
     assert cfg["warder_enabled"] is False and cfg["pulse_enabled"] is False
+    assert cfg["pulse_delivery"] == "label"
     store.set_repo_config(
         install_id=1, repo_id=55, repo_full_name="o/r",
         updated_by_user_id="9", warder_enabled=True, pulse_enabled=True,
+        pulse_delivery="comment",
     )
     cfg = store.get_repo_config(1, 55)
     assert cfg["warder_enabled"] is True and cfg["pulse_enabled"] is True
+    assert cfg["pulse_delivery"] == "comment"
     assert store.is_persona_enabled(1, 55, "warder") is True
     assert store.is_persona_enabled(1, 55, "pulse") is True
 
@@ -1274,6 +1296,24 @@ def test_ledger_exemplars_cache_and_corpus_scan_exclusion(pg):
     assert store.get_repo_exemplars("o/none") == []
 
 
+def test_ledger_verdict_filter_applies_before_limit(pg):
+    """The verdict predicate sits in the query, so LIMIT counts matches: the
+    match sorted past `limit` non-matching rows is still returned, and rows
+    written through put_ledger_row are bounded by `limit` once filtered."""
+    from adapters import pg_install_store as store
+
+    repo = "o/sparse"
+    for pr, verdict in ((1, "declined"), (2, "declined"), (3, "fixed"), (4, "fixed")):
+        store.put_ledger_row({
+            "repo": repo, "pr": pr, "reviewer": "codex", "severity": "HIGH",
+            "class": "correctness", "finding": f"row {pr}", "verdict": verdict,
+        })
+    rows = store.list_ledger_rows(repo, limit=1, verdict="fixed")
+    assert [r["pr"] for r in rows] == [3]
+    assert len(store.list_ledger_rows(repo, limit=None, verdict="fixed")) == 2
+    assert len(store.list_ledger_rows(repo, limit=None)) == 4
+
+
 def test_learning_timestamps_normalized_to_utc(pg):
     """Caller-supplied stamps in other offsets normalize to UTC ISO, so the
     text ORDER BY stays chronological across mixed inputs."""
@@ -1285,7 +1325,7 @@ def test_learning_timestamps_normalized_to_utc(pg):
                        created_at="2026-01-01T10:00:00+05:00")
     store.put_learning(repo="o/tz", text="rule B",
                        created_at="2026-01-01T06:00:00+00:00")
-    rows = store.list_learnings("o/tz")
+    rows = store.list_learnings("o/tz", include_inactive=True)
     assert [r["text"] for r in rows] == ["rule A", "rule B"]  # true time order
     assert rows[0]["created_at"].endswith("+00:00")  # normalized to UTC
 

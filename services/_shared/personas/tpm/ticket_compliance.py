@@ -190,7 +190,7 @@ def advisory_markdown(issue_number: int, unaddressed: list[str]) -> str | None:
         f"{CHIEF_PORTRAIT_IMG}\n\n"
         f"**Chief - ticket compliance.** This PR says it closes #{issue_number}, "
         f"but these acceptance criteria don't look addressed by the diff "
-        f"(heuristic - Chief may be wrong; a criterion met by a sibling PR or "
-        f"already-merged work will show here):\n\n{lines}\n\n"
+        f"(heuristic - Chief may be wrong; criteria a merged PR on this ticket "
+        f"delivered are left out):\n\n{lines}\n\n"
         f"Advisory only - it does not gate the merge. So speaks Grug."
     )

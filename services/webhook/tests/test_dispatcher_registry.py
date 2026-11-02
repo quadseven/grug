@@ -25,6 +25,7 @@ def _full_pr_payload():
             "number": 42,
             "body": "## Why\nbecause\n## Acceptance criteria\n- a\n- b\n- c\n## Out of scope\nx\nSize: S\ncloses #1",
             "head": {"sha": "abc123def456"},
+            "labels": [{"name": "grug:walkthrough"}],
         },
         "repository": {"id": 7777, "name": "infra", "owner": {"login": "quadseven"}, "full_name": "quadseven/infra"},
         "installation": {"id": 999},

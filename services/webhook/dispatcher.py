@@ -678,60 +678,12 @@ def _actor_permission(
         return None
 
 
-# GitHub's pull request commits endpoint returns at most this many commits,
-# so a list this long may be cut short.
-_PR_COMMITS_CAP = 250
-
-
 def _pr_commit_logins(
     installation_id: int, owner: str, repo_name: str, pr_number: int,
 ) -> frozenset[str] | None:
-    """Lower-case logins that authored or committed any commit on the PR
-    (GitHub's web-flow committer excluded), or None, which refuses a trusted
-    operator: the list could not be read, it reached GitHub's 250-commit cap
-    on that endpoint (so it may be cut short), or a commit's author or
-    committer maps to no GitHub login (an unlinked identity could be anyone). Git metadata can still name another person's
-    linked address; push-actor proof is out of scope, since the owner
-    chooses whom to trust."""
-    from urllib.parse import quote as _q
-    from github_app_auth import with_install_token_retry  # type: ignore
-    import httpx  # type: ignore
+    from pr_commits import pr_commit_logins  # type: ignore
 
-    def _read(token: str) -> frozenset[str] | None:
-        logins: set[str] = set()
-        total = 0
-        for page in (1, 2, 3):
-            r = httpx.get(
-                f"https://api.github.com/repos/{_q(owner, safe='')}/"
-                f"{_q(repo_name, safe='')}/pulls/{int(pr_number)}/commits"
-                f"?per_page=100&page={page}",
-                headers={
-                    "Authorization": f"token {token}",
-                    "Accept": "application/vnd.github+json",
-                },
-                timeout=10,
-            )
-            r.raise_for_status()
-            rows = r.json() or []
-            total += len(rows)
-            if total >= _PR_COMMITS_CAP:
-                return None
-            for row in rows:
-                for role in ("author", "committer"):
-                    who = str(((row or {}).get(role) or {}).get("login") or "").lower()
-                    if not who:
-                        return None
-                    if who != "web-flow":
-                        logins.add(who)
-            if len(rows) < 100:
-                return frozenset(logins)
-        return None
-
-    try:
-        return with_install_token_retry(int(installation_id), _read)
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
-        log.warning("pr_commits_lookup_failed", extra={"pr_number": pr_number, "kind": type(e).__name__})
-        return None
+    return pr_commit_logins(installation_id, owner, repo_name, pr_number)
 
 
 def _handle_issues(payload: dict[str, Any]) -> dict[str, str]:
@@ -1055,6 +1007,116 @@ def _defer_if_budget_spent(
     )
 
 
+def _enqueue_walkthrough_for_pr(
+    pr: dict[str, Any], *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, comment_id: int,
+) -> str:
+    """Enqueue one Teller walkthrough for the PR a `/grug walkthrough`
+    named. No `labeled` pull_request action is dispatched, so without this
+    the opt-in would wait for the next push. Returns `queued` or
+    `enqueue_failed`; a failed enqueue gets the same durable self-recover
+    the pull_request path uses."""
+    from async_dispatch import enqueue_walkthrough_review, self_recover_review  # lazy: webhook-only
+
+    base_repo = (pr.get("base") or {}).get("repo") or {}
+    payload = {
+        "action": "walkthrough_command",
+        "pull_request": {**pr, "number": int(pr_number)},
+        "repository": {
+            "owner": {"login": owner},
+            "name": repo_name,
+            "private": base_repo.get("private"),
+        },
+        "installation": {"id": int(installation_id)},
+    }
+    delivery_id = f"grug-walkthrough-{int(pr_number)}-{int(comment_id)}"
+    if enqueue_walkthrough_review(payload=payload, delivery_id=delivery_id, blocking=False):
+        return "queued"
+    self_recover_review(payload, delivery_id, persona="walkthrough")
+    log.error(
+        "walkthrough_command_enqueue_failed",
+        extra={
+            "installation_id": installation_id,
+            "owner": owner,
+            "repo": repo_name,
+            "pr_number": pr_number,
+            "delivery_id": delivery_id,
+        },
+    )
+    return "enqueue_failed"
+
+
+def _handle_grug_walkthrough(
+    pr: dict[str, Any], *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, comment_id: int, token_fn,
+) -> dict[str, str]:
+    """Handle `/grug walkthrough` - add the opt-in label, then enqueue the
+    walkthrough for the PR's current head.
+
+    The label `grug:walkthrough` keeps the walkthrough running on later
+    pushes. Idempotent - adding an existing label is a no-op. A label
+    failure enqueues nothing: the opt-in did not land.
+    """
+    import httpx  # type: ignore
+    from urllib.parse import quote as _q
+
+    def _add_label(token: str) -> dict[str, Any]:
+        r = httpx.post(
+            f"https://api.github.com/repos/{_q(owner, safe='')}/"
+            f"{_q(repo_name, safe='')}/issues/{int(pr_number)}/labels",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"labels": ["grug:walkthrough"]},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    try:
+        token_fn(_add_label)
+    except httpx.HTTPStatusError as e:
+        log.warning(
+            "grug_walkthrough_label_failed",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": pr_number,
+                "status": e.response.status_code,
+            },
+        )
+        return {"status": "skip", "reason": "label_add_failed"}
+    except httpx.RequestError as e:
+        log.warning(
+            "grug_walkthrough_label_transport_failed",
+            extra={
+                "installation_id": installation_id,
+                "owner": owner,
+                "repo": repo_name,
+                "pr_number": pr_number,
+                "kind": type(e).__name__,
+            },
+        )
+        return {"status": "skip", "reason": "label_add_transport_failed"}
+
+    log.info(
+        "grug_walkthrough_opt_in",
+        extra={
+            "installation_id": installation_id,
+            "owner": owner,
+            "repo": repo_name,
+            "pr_number": pr_number,
+        },
+    )
+    result = _enqueue_walkthrough_for_pr(
+        pr, installation_id=installation_id, owner=owner, repo_name=repo_name,
+        pr_number=pr_number, comment_id=comment_id,
+    )
+    return {"status": "ok", "trigger": "walkthrough", "result": result}
+
+
 def _answer_pr_fetch_failed(
     cmd, *, installation_id: int, owner: str, repo_name: str, pr_number: int,
 ) -> None:
@@ -1372,6 +1434,13 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # Interactive commands (#528) reuse the SAME gating above (allowlist +
     # tpm + author-or-write-collaborator), then branch to their own actions.
     # recheck keeps the original DoR-re-evaluate path below.
+    if cmd.verb == "walkthrough":
+        return _handle_grug_walkthrough(
+            pr, installation_id=int(installation_id), owner=owner,
+            repo_name=repo_name, pr_number=int(pr_number),
+            comment_id=int(comment_id) if comment_id is not None else 0,
+            token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
+        )
     if cmd.verb != "recheck":
         from interactive import run_command  # type: ignore
         return run_command(
@@ -1456,7 +1525,7 @@ def run_chief_recheck(
     Unexpected errors propagate; each caller owns its containment."""
     from personas.tpm.issue_fetcher import (  # type: ignore
         build_changed_files_fetcher, build_issue_facts_fetcher,
-        build_issue_fetcher,
+        build_issue_fetcher, build_merged_siblings_fetcher,
     )
     from personas.tpm.persona import (  # type: ignore
         _ADVISORY_CHECKS, evaluate_pull_request, publish_tpm_evaluation,
@@ -1489,6 +1558,10 @@ def run_chief_recheck(
         pr_body,
         fetch_issue=fetcher, fetch_issue_facts=facts_fetcher,
         fetch_changed_files=fetch_changed_files,
+        fetch_siblings=build_merged_siblings_fetcher(
+            installation_id=installation_id, owner=owner, repo=repo,
+            pr_number=pr_number,
+        ),
         author_trusted=author_trusted,
         advisory_checks=advisory_checks,
     )
@@ -1698,16 +1771,31 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
 
     comment = payload.get("comment") or {}
     in_reply_to = comment.get("in_reply_to_id")
-    if not in_reply_to:
+    body = (comment.get("body") or "").strip()
+
+    # #822: a /grug question inside a review thread - as a reply, or as the
+    # root comment of a new thread - is answered in that thread. Detect it
+    # before the learnings-only flow below, which requires a reply.
+    from grug_commands import parse_command  # type: ignore
+    cmd = parse_command(body) if body else None
+    thread_ask = cmd is not None and cmd.verb == "ask" and bool(cmd.arg)
+
+    if not in_reply_to and not thread_ask:
         # A NEW inline comment (a thread root), not a reply. Grug only learns
         # from replies to its findings; a root comment has nothing to join.
         return {"status": "no_op", "reason": "not a reply"}
 
     # Never learn from a bot's reply (grug's own acknowledgments, other bots).
-    if str((comment.get("user") or {}).get("type", "")) == "Bot":
+    # An App can hold write access, so the permission gate below cannot do this.
+    from cave_drawings import is_app_actor, is_reasoned_dismissal  # type: ignore
+    comment_user = comment.get("user") or {}
+    payload_sender = payload.get("sender") or {}
+    if any(
+        is_app_actor(str(actor.get("login") or ""), str(actor.get("type") or ""))
+        for actor in (comment_user, payload_sender)
+    ):
         return {"status": "no_op", "reason": "reply author is a bot"}
 
-    body = (comment.get("body") or "").strip()
     if not body:
         return {"status": "no_op", "reason": "empty reply"}
 
@@ -1741,6 +1829,46 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
     from github_app_auth import with_install_token_retry  # type: ignore
     import httpx  # type: ignore
 
+    if thread_ask:
+        # #822: an in-thread question takes the same gate as a /grug command
+        # on the PR conversation - the PR author or a write collaborator -
+        # NOT the stricter learnings gate below: asking about a finding is
+        # not teaching, and the author asking "why did you flag this?" in
+        # the finding's own thread is the feature's main case.
+        pr_author_login = str((pr.get("user") or {}).get("login") or "")
+        try:
+            may_ask = _actor_has_write(
+                int(installation_id), owner, repo_name, sender_login,
+                allow_author=True, pr_author_login=pr_author_login,
+            )
+        except httpx.RequestError as e:
+            log.warning(
+                "perm_lookup_transport_failed",
+                extra={"sender": sender_login, "kind": type(e).__name__},
+            )
+            return {"status": "skip", "reason": "perm_lookup_transport_failed"}
+        if may_ask is None:
+            return {"status": "skip", "reason": "perm_lookup_failed"}
+        if not may_ask:
+            return {"status": "no_op", "reason": "ask author lacks write perm"}
+        from rerun import enqueue_ask  # type: ignore
+        try:
+            enqueue_ask(
+                install_id=int(installation_id),
+                repo=f"{owner}/{repo_name}",
+                pr_number=int(pr_number),
+                comment_id=int(comment_id),
+                question=cmd.arg,
+                reply_to_comment_id=int(in_reply_to or comment_id),
+            )
+        except Exception as e:  # noqa: BLE001 - same containment as the learn enqueue
+            log.warning("ask_enqueue_failed", extra={"kind": type(e).__name__})
+            return {"status": "skip", "reason": "enqueue_failed"}
+        return {"status": "dispatched", "kind": "ask"}
+
+    if not is_reasoned_dismissal(body):
+        return {"status": "no_op", "reason": "reply gives no reason"}
+
     # Trust gate: ALWAYS require write-or-above, even for the PR author. Unlike
     # /grug recheck (an author re-running their own PR is harmless), a learning
     # poisons the review corpus for EVERY future PR, so a fork contributor (who
@@ -1760,6 +1888,18 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "skip", "reason": "perm_lookup_failed"}
     if not has_write:
         return {"status": "no_op", "reason": "reply author lacks write perm"}
+
+    # The reviewed must not teach the reviewer (#1571): a coding agent working
+    # under a person's account looks human and holds write access, but it is
+    # the PR's author or a committer. This refuses a person on their own PR too.
+    pr_writers = {str((pr.get("user") or {}).get("login") or "").lower()}
+    commit_logins = _pr_commit_logins(
+        int(installation_id), owner, repo_name, int(pr_number),
+    )
+    if commit_logins is None:
+        return {"status": "skip", "reason": "pr_commits_unreadable"}
+    if sender_login.lower() in pr_writers | commit_logins:
+        return {"status": "no_op", "reason": "reply author wrote this PR"}
 
     from rerun import enqueue_learn  # type: ignore
     try:

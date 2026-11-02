@@ -28,6 +28,13 @@ def _patch_keys(monkeypatch):
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
     # Module-level breaker state must not leak between tests.
+    # Retired names stand in as chain tiers here; test_opencode_go_return.py
+    # covers the real data-terms gate.
+    monkeypatch.setattr(
+        lc, "_OPENCODE_GO_PRIVATE_SAFE_MODELS",
+        lc._OPENCODE_GO_PRIVATE_SAFE_MODELS
+        | {"space-bunny-free", "longcat-2.5-preview-free", "mimo-v2.5", "gpt-5.6-luna"},
+    )
     monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
     monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
@@ -99,6 +106,30 @@ def test_empty_hunks_returns_no_diff_kind_without_llm_call() -> None:
     assert out.findings == ()
     assert out.backend_used is None
     mock_post.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "policy",
+    ["warn", "block", "ignore"],
+)
+def test_review_diff_carries_policy_and_evidence_to_author(monkeypatch, policy):
+    hunks = [
+        _hunk("src/a.py", "+def a():\n+    return 1"),
+        _hunk("infra/main.tf", '+resource "x" {}'),
+        _hunk("docs/readme.md", "+# notes"),
+    ]
+    monkeypatch.setenv("GRUG_REVIEWABILITY_POLICY", policy)
+    monkeypatch.setattr(lc._Tier1Review, "run_whole_diff", lambda self, plan: LlmReviewResponse(kind="reviewed"))
+    monkeypatch.setattr(lc._Tier1Review, "run_staged", lambda self, plan: LlmReviewResponse(kind="reviewed"))
+
+    response = review_diff(assemble_evidence(hunks), installation_id=1)
+
+    if policy == "ignore":
+        assert response.reviewability_note == ""
+    else:
+        assert "cohesion" in response.reviewability_note
+        assert "Evidence:" in response.reviewability_note
+        assert response.reviewability_blocking is (policy == "block")
 
 
 def test_review_diff_via_cave_coder_returns_structured_response() -> None:
@@ -1560,10 +1591,10 @@ def test_saas_overload_fallback_never_engages_when_a_cave_arm_succeeds(monkeypat
     assert lc._OPENROUTER_MODEL not in call_log
 
 
-def test_saas_overload_fallback_skipped_when_cave_returns_parse_failed(monkeypatch) -> None:
-    """A Cave arm that DID respond but unparseably is a model/prompt bug, not
-    overload - the fallback must not engage (retrying on SaaS would not fix
-    a prompt/parsing issue) and parse_failed must still win over all_failed."""
+def test_every_tier_garbled_keeps_the_cave_parse_failure(monkeypatch) -> None:
+    """A Cave arm that answers unparseably is a miss, so the walk goes on to
+    the fallback tiers. When they garble too, nothing reviewed, and
+    parse_failed still wins over all_failed."""
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
     call_log: list[str] = []
 
@@ -1576,9 +1607,8 @@ def test_saas_overload_fallback_skipped_when_cave_returns_parse_failed(monkeypat
         out = _one_ladder_walk([_hunk()], installation_id=1)
 
     assert out.kind == "parse_failed"
-    assert len(call_log) == 2  # both Cave arms only, no SaaS fallback
-    assert lc._POOLSIDE_MODEL not in call_log
-    assert lc._OPENROUTER_MODEL not in call_log
+    assert out.backend_used == Backend.CAVE
+    assert lc._POOLSIDE_MODEL in call_log
 
 
 # --- OpenRouter free-tier rate limiter gate (grug#870, epic #869) ----------
@@ -2507,6 +2537,51 @@ def test_judge_findings_makes_second_llm_call_and_parses_verdicts(monkeypatch) -
     assert out[1].finding_index == 1
     assert out[1].is_real_bug is False
     assert "style nit" in out[1].reasoning
+
+
+def _judge_prompt_with_a_learning(monkeypatch, findings_repr) -> str:
+    """The system prompt a judge call really sends while the repo holds one
+    active learning that tells Elder to allow the seeded finding."""
+    _capture_llmobs(monkeypatch)
+    monkeypatch.setattr(
+        lc, "_repo_learnings_block",
+        lambda pr_context: "WHAT YOUR TRIBE TOLD GRUG: allow this pattern",
+    )
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts": []}'))
+    with patch.object(httpx, "post", return_value=response) as post:
+        lc.judge_findings(findings_repr, assemble_evidence([_hunk()]), installation_id=1)
+    return post.call_args.kwargs["json"]["messages"][0]["content"]
+
+
+def test_a_learning_steers_the_judge_on_an_ordinary_finding(monkeypatch) -> None:
+    prompt = _judge_prompt_with_a_learning(monkeypatch, [
+        {"rule_name": "null-deref", "file": "x.py", "line": 2, "severity": "high",
+         "message": "m", "category": "correctness"},
+    ])
+    assert "allow this pattern" in prompt
+
+
+@pytest.mark.parametrize(
+    ("rule", "category"),
+    [("sql-injection", "general"), ("exposed-secret", "general"), ("logic", "security")],
+)
+def test_a_learning_never_reaches_the_judge_of_a_security_or_sast_finding(
+    monkeypatch, rule, category,
+) -> None:
+    """#1571 seeded case: the judge decides whether a SAST candidate
+    publishes, so a learning in its prompt would be a suppression."""
+    prompt = _judge_prompt_with_a_learning(monkeypatch, [
+        {"rule_name": "null-deref", "file": "x.py", "line": 2, "severity": "high",
+         "message": "m", "category": "correctness"},
+        {"rule_name": rule, "file": "x.py", "line": 3, "severity": "high",
+         "message": "m", "category": category},
+    ])
+    assert "allow this pattern" not in prompt
+
+
+def test_the_learnings_block_says_it_never_touches_security() -> None:
+    block = lc._render_learnings_block([{"text": "prefer early returns"}])
+    assert "security" in block and "SAST" in block
 
 
 def test_judge_findings_emits_its_own_llmobs_span(monkeypatch) -> None:
@@ -3579,7 +3654,7 @@ def test_repo_guidelines_block_end_to_end(monkeypatch) -> None:
 
     with patch.object(httpx, "get", side_effect=_fake_get):
         block = lc._repo_guidelines_block(
-            {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123"}
+            {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123", "pr_base_sha": "def456"}
         )
     assert "never use bare except" in block
 
@@ -3634,7 +3709,7 @@ def test_claude_md_rule_reaches_system_prompt_end_to_end(monkeypatch) -> None:
             return _gh_raw_response(200, "never use bare except")
         return _gh_raw_response(404)
 
-    pr_context = {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123"}
+    pr_context = {"repo": "quadseven/grug", "installation_id": 1, "head_sha": "abc123", "pr_base_sha": "def456"}
     with patch.object(httpx, "get", side_effect=_fake_get):
         block = lc._repo_guidelines_block(pr_context)
     assert "never use bare except" in block
@@ -4995,6 +5070,7 @@ def test_deep_append_under_cloud_priority_answers_from_cloud_not_cave(monkeypatc
     """Operator decision 2026-09-26: the deep pass moves to the cloud chain.
     A healthy OpenCode Go answers it; the Cave reasoner is never called."""
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    _pin_deepseek_primary(monkeypatch)
     response = httpx.Response(200, json=_openai_json_response('{"findings": []}'))
 
     with patch.object(httpx, "post", return_value=response) as post:
@@ -5342,7 +5418,8 @@ def test_two_models_agreeing_on_no_findings_is_a_clean_review(monkeypatch, caplo
     agreement: accept it instead of walking the rest of the chain, which
     burned the staged budget and starved later cohorts."""
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
-    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
+    _pin_deepseek_primary(monkeypatch)
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "mimo-v2.5")
     with caplog.at_level("INFO"), patch.object(
         httpx, "post", side_effect=[_degenerate_response(), _degenerate_response()],
     ) as post:
@@ -5351,7 +5428,7 @@ def test_two_models_agreeing_on_no_findings_is_a_clean_review(monkeypatch, caplo
     assert out.kind == "reviewed"
     assert out.findings == ()
     assert post.call_count == 2  # no Poolside, no Cave
-    assert post.call_args_list[1].kwargs["json"]["model"] == "longcat-2.5-preview-free"
+    assert post.call_args_list[1].kwargs["json"]["model"] == "mimo-v2.5"
     assert any(r.getMessage() == "llm_cloud_empty_consensus" for r in caplog.records)
 
 
@@ -5708,9 +5785,10 @@ def test_primary_parse_failure_is_still_the_answer_with_a_fallback(monkeypatch) 
     assert calls[:2] == ["space-bunny-free", "deepseek-v4.1-flash"]
 
 
-def test_fallback_empty_answer_agrees_with_a_free_empty_answer(monkeypatch) -> None:
+def test_fallback_empty_answer_agrees_with_a_paid_empty_answer(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
-    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
+    _pin_deepseek_primary(monkeypatch)
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "mimo-v2.5")
     with patch.object(
         httpx, "post", side_effect=[_degenerate_response(), _degenerate_response()],
     ) as post:
@@ -6044,6 +6122,36 @@ def test_low_confidence_cohort_does_not_starve_the_next_cohort(monkeypatch) -> N
     assert evaluation.degraded_reason == "low_confidence_review"
 
 
+def test_deepseek_degenerate_then_a_garbled_cave_reaches_the_subscription_lane(
+    monkeypatch,
+) -> None:
+    """The fleet outage of 2026-11-01: DeepSeek answered short and empty, the
+    Cave spilled to a free model that spent its output on reasoning, and the
+    parse failure stopped the walk short of the lane. The review ended low
+    confidence, so a blocking repo's check failed with the lane idle."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    paid = _pin_deepseek_primary(monkeypatch)
+    lanes: list[str] = []
+
+    def respond(url, **kwargs) -> httpx.Response:
+        if kwargs["json"].get("model", "") == paid:
+            return _degenerate_response()
+        if "/subscription/" in url:
+            lanes.append(url)
+            return _usage_response('{"findings": []}', 15_000, 400)
+        return httpx.Response(200, json=_openai_json_response("not json"))
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert len(lanes) == 1
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.SUBSCRIPTION
+    assert evaluate_diff((), out).degraded_reason is None
+
+
 def test_deep_append_keeps_a_degenerate_answer_when_the_reasoner_fails(
     monkeypatch,
 ) -> None:
@@ -6063,3 +6171,56 @@ def test_deep_append_keeps_a_degenerate_answer_when_the_reasoner_fails(
     assert out.findings == ()
     assert out.backend_used == Backend.OPENCODE_GO
     assert out.error.startswith("low confidence:")
+
+
+def test_coerce_finding_validates_category_and_degrades_to_general() -> None:
+    base = {"path": "a.py", "line": 1, "rule": "r", "severity": "low", "message": "m"}
+    for given, want in [
+        ("security", "security"), ("data-integrity", "data-integrity"),
+        (None, "general"), ("bogus", "general"), (["x"], "general"), ({}, "general"),
+    ]:
+        raw = dict(base) if given is None else {**base, "category": given}
+        finding, reason = lc._coerce_finding(raw)
+        assert finding is not None and reason == ""
+        assert finding.category == want
+
+
+def test_cave_schema_and_prompt_declare_category() -> None:
+    from code_review_prompt import _OUTPUT_CONTRACT
+    from review_types import CATEGORIES, DEFAULT_CATEGORY
+    props = lc._CAVE_FINDINGS_RESPONSE_FORMAT["json_schema"]["schema"][
+        "properties"]["findings"]["items"]["properties"]
+    # Criterion 1 fixes the settable taxonomy at five; "general" is the
+    # parse-time default for an unset/invalid value (criterion 4), not a
+    # choice offered to the reviewer.
+    assert set(props["category"]["enum"]) == CATEGORIES - {DEFAULT_CATEGORY}
+    assert '"category"' in _OUTPUT_CONTRACT
+
+
+def test_answer_pr_question_prompt_demands_grug_not_know(monkeypatch) -> None:
+    """#822 criterion: conversational answers follow the no-fabrication
+    rule - when the diff/thread does not hold the answer, the model must
+    say "Grug not know" (and may offer a suggestion block for a fix)."""
+    _capture_llmobs(monkeypatch)
+    monkeypatch.setattr(lc, "_llmobs_llm", lambda **kw: _NullSpan())
+    seen: dict = {}
+
+    def _post(_url, **kw):
+        seen.update(kw)
+        payload = json.dumps({"answer": "Grug not know."})
+        return httpx.Response(200, json=_openai_json_response(payload))
+
+    with patch.object(httpx, "post", side_effect=_post):
+        out = lc.answer_pr_question(
+            "why is the sky blue?", "diff --git a/x.py", installation_id=3,
+        )
+    assert out == "Grug not know."
+    messages = seen["json"]["messages"]
+    system = messages[0]["content"]
+    assert "Grug not know" in system
+    assert "suggestion" in system  # a fix may be offered as a suggestion block
+
+
+class _NullSpan:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False

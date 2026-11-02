@@ -16,6 +16,16 @@ def test_registered_personas():
     }
 
 
+def test_posts_pr_check_run_only_real_check_posters():
+    # grug#1431: only personas that post a real check-run on an open PR
+    # carry the flag. Comment-only (walkthrough, sentinel), closed-only
+    # (warder, sentinel) and scheduled (pulse, pulse_comment_nudge)
+    # personas must stay False, or the check-run reconciler expects a
+    # check from them that can never appear.
+    posters = {p.key for p in registry.REGISTRY if p.posts_pr_check_run}
+    assert posters == {"tpm", "code_reviewer", "guard", "smasher"}
+
+
 def test_smasher_is_advisory_async_optin():
     # Smasher (#469) runs author code in a Job (async) and is opt-in per repo
     # (default OFF); mutation findings are advisory so it has no blocking mode.

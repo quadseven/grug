@@ -32,10 +32,11 @@ def _wire(diff_hunks) -> list[Hunk]:
 
 def _finding(
     rule="r", line=2, severity="medium", origins=(), file="src/x.py",
+    category="general",
 ) -> Finding:
     return Finding(
         file=file, line=line, severity=severity, rule_name=rule,
-        message="m", suggestion=None, origins=origins,
+        message="m", suggestion=None, origins=origins, category=category,
     )
 
 
@@ -705,3 +706,12 @@ def test_refute_findings_scopes_review_evidence_to_candidate_files(monkeypatch):
     assert [h.path for h in evidence.hunks] == ["src/x.py"]
     assert evidence.file_contents == {"src/x.py": "changed"}
     assert captured["refute"] is True
+
+
+def test_eval_tags_carry_the_finding_category():
+    """#683: the finding's taxonomy category rides its identity tags, so the
+    reaction-time ledger row built from those tags can be sliced per
+    category later. An unset category tags as the default."""
+    tags = cr_judge.eval_tags(_finding(rule="null-deref", category="security"))
+    assert tags["category"] == "security"
+    assert cr_judge.eval_tags(_finding(rule="style"))["category"] == "general"

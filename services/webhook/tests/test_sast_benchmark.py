@@ -486,10 +486,97 @@ def test_run_backend_all_errored_is_flagged(monkeypatch):
     assert all(v == 0 for v in run.findings_by_sample.values())
 
 
-def _bench_backend():
+def _bench_backend(name="t"):
     from sast_benchmark.backends import BenchBackend
 
-    return BenchBackend(name="t", url="http://x/v1", model="m", api_key="")
+    return BenchBackend(name=name, url="http://x/v1", model="m", api_key="")
+
+
+# --- parse failures are errored samples, not empty reviews (#1565) ----------
+
+
+def _stub_call(monkeypatch, parsed):
+    from sast_benchmark import runner
+
+    monkeypatch.setattr(runner, "_build_messages", lambda hunks, ver, *a: [{"role": "user", "content": "x"}])
+    monkeypatch.setattr(runner, "_post", lambda b, m: object())
+    monkeypatch.setattr(runner, "_parse_response", lambda resp: parsed)
+    return runner
+
+
+def test_run_sample_parse_error_is_errored(monkeypatch):
+    """A response the parser rejected was never reviewed. Scoring it as a
+    successful zero-finding review turns an HTTP 403 into a model miss."""
+    runner = _stub_call(monkeypatch, ([], "model", "bad json"))
+    assert runner.run_sample(_bench_backend(), _TP_A) == (0, True)
+
+
+def test_run_sample_successful_empty_response_is_not_errored(monkeypatch):
+    runner = _stub_call(monkeypatch, ([], "model", ""))
+    assert runner.run_sample(_bench_backend(), _TP_A) == (0, False)
+
+
+def test_run_backend_all_parse_errors_is_flagged(monkeypatch):
+    runner = _stub_call(monkeypatch, ([], "model", "http_403"))
+    run = runner.run_backend(_bench_backend(), _SAMPLES)
+    assert run.errors == len(_SAMPLES)
+    assert run.all_errored is True
+
+
+def _run_cli(monkeypatch, tmp_path, argv, runs):
+    """Drive `main` with canned BackendRuns (one per backend, in order)."""
+    from sast_benchmark import __main__ as cli
+
+    baseline = tmp_path / "baseline.json"
+    monkeypatch.setattr(cli, "_BASELINE_PATH", str(baseline))
+    monkeypatch.setattr(cli, "load_corpus", lambda: _SAMPLES)
+    monkeypatch.setattr(cli, "configured_backends", lambda: [_bench_backend(n) for n in runs])
+    by_name = dict(runs)
+    monkeypatch.setattr(cli, "run_backend", lambda b, corpus: by_name[b.name])
+    return cli.main(argv), baseline
+
+
+def _canned_run(errors, flagged=0):
+    from sast_benchmark.runner import BackendRun
+
+    counts = {s.name: 0 for s in _SAMPLES}
+    counts[_TP_A.name] = flagged
+    return BackendRun(findings_by_sample=counts, errors=errors, total=len(_SAMPLES))
+
+
+def test_cli_record_refuses_an_all_parse_error_backend(monkeypatch, tmp_path, capsys):
+    code, baseline = _run_cli(monkeypatch, tmp_path, ["--record"], {"t": _canned_run(len(_SAMPLES))})
+    assert code != 0
+    assert not baseline.exists()
+    assert "4/4 samples errored" in capsys.readouterr().err
+
+
+def test_cli_mixed_run_reports_errors_and_is_not_scored(monkeypatch, tmp_path, capsys):
+    """One errored sample of four: the backend is not scored (its errored
+    samples would read as misses) and the run exits nonzero."""
+    code, _ = _run_cli(
+        monkeypatch, tmp_path, [], {"partial": _canned_run(1), "clean": _canned_run(0, flagged=1)}
+    )
+    out = capsys.readouterr()
+    assert code != 0
+    assert "1/4 samples errored" in out.err
+    assert "backend: partial" not in out.out
+    assert "backend: clean" in out.out
+
+
+def test_cli_record_with_any_incomplete_backend_writes_nothing(monkeypatch, tmp_path):
+    """A partial baseline would silently drop the broken backend's entry."""
+    code, baseline = _run_cli(
+        monkeypatch, tmp_path, ["--record"], {"partial": _canned_run(1), "clean": _canned_run(0, flagged=1)}
+    )
+    assert code != 0
+    assert not baseline.exists()
+
+
+def test_cli_record_clean_run_writes_baseline(monkeypatch, tmp_path):
+    code, baseline = _run_cli(monkeypatch, tmp_path, ["--record"], {"clean": _canned_run(0, flagged=1)})
+    assert code == 0
+    assert baseline.exists()
 
 
 # --- bench request ceiling is operator-tunable (#863 follow-on) --------------

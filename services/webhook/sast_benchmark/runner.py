@@ -142,10 +142,13 @@ def run_sample(backend: BenchBackend, sample: CorpusSample) -> tuple[int, bool]:
         )
         return (0, True)
     if err:
-        log.info(
+        # The response was never reviewed (HTTP error, bad envelope, bad JSON).
+        # Scoring it as an empty review turns a 403 into a model miss (#1565).
+        log.warning(
             "bench_sample_parse_degraded",
             extra={"backend": backend.name, "sample": sample.name, "err": err},
         )
+        return (0, True)
     # Count only findings on THIS sample's path (each corpus path is unique, so
     # cross-sample contamination is impossible, but match defensively).
     return (sum(1 for f in findings if f.path == sample.path), False)

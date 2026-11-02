@@ -159,22 +159,32 @@ spec:
             # grug#906/#910: try cloud before owned Sparks hardware - full
             # rationale in webhook-deployment.yaml, kept identical on both
             # Elder-capable workloads (this is the PRODUCTION review path).
-            - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: cloud}
+            # The lane reviews public repos first. Private repos start at Go: both lane plans
+            # are consumer plans, whose training terms turn on an account setting no code here
+            # can read (ChatGPT "Improve the model for everyone"; Claude "Model Improvement").
+            - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: subscription}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             # OpenRouter :free as the chain's tier 2 - rationale and eval
             # evidence in webhook-deployment.yaml.
-            # Chain after the deepseek-v4.1-flash primary (default in llm_client.py): paid
-            # mimo-v2.5 second opinion, then the free Longcat. Unset = no tier.
-            - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "longcat-2.5-preview-free"}
-            - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
-            # grug#1225: switched off 2026-10-17, the OpenCode Go allowance and
-            # the OpenRouter credit are spent and not being refilled (36 Go 401s,
-            # 11 OpenRouter paid refusals, 139 free per-day 429s over 402 Elder
-            # runs). A listed backend is never called. Re-enable one by deleting
+            # Chain after the deepseek-v4.1-flash primary (default in llm_client.py): the
+            # free Beam model, which still answers when paid Go is capped or spent.
+            # Published terms read 2026-11-01: prompts are not used for training, data is
+            # retained 30 days for safety. _OPENCODE_GO_PRIVATE_SAFE_MODELS gates private code.
+            - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "beam-free"}
+            # grug#1225: a listed backend is never called. Re-enable one by deleting
             # its entry; `openrouter:free` or `openrouter:paid` narrows to one pool.
-            # grug#1269: OpenRouter's free pool is back on 2026-10-19 (the operator
-            # wants the free tiers used up first); its paid pool stays off.
-            - {name: GRUG_DISABLED_BACKENDS, value: "opencode-go,openrouter:paid"}
+            # grug#1269: OpenRouter's paid pool stays off. grug#1575: OpenCode Go is back
+            # on 2026-11-01, its allowance renewed.
+            # The cap counts paid Go calls per UTC day across every pod. 200 calls at
+            # 40k tokens is about 78% of the plan over 27 days (doc prices, 2026-11-01);
+            # the shared key keeps the rest. Identical on all three Elder workloads.
+            - {name: GRUG_OPENCODE_GO_DAILY_CAP, value: "200"}
+            # Poolside stays off while it answers 400 on review calls: 3 of 1112 calls
+            # succeeded over 24h on 2026-11-01. The OpenRouter free chain tier is unset: its
+            # model left the catalogue, and that tier has no private-code data-terms gate.
+            # The free pool stays off until the Elder walk trusts its empties; it times out or
+            # garbles while the Sparks are away. The Cave stays on: secrets are judged there.
+            - {name: GRUG_DISABLED_BACKENDS, value: "openrouter:paid,poolside,free-pool"}
             # grug#1269: the gateway's free provider pool is a cloud tier after
             # Poolside, ahead of the Sparks (free cloud models first).
             - {name: GRUG_CLOUD_FREE_POOL, value: "true"}
@@ -187,6 +197,11 @@ spec:
             # escalation / sample. Rollback to always-on dual-arm: deep.
             # Fast = coder-first with reasoner only if coder fails.
             - {name: GRUG_REVIEW_DEPTH, value: tiered}
+            # grug#1553: GitHub App logins whose PRs carry an author family, as
+            # `login:family` pairs split by `;` (e.g. `lane-app[bot]:claude`). Exact
+            # login match only; family must be in model_family.py's table. Empty =
+            # no App gets a family (Elder keeps its usual arm order for App PRs).
+            - {name: GRUG_APP_AUTHOR_FAMILIES, value: ""}
             # Escalation knobs (llm_client.decide_deep_escalation). Were
             # tuned for speed: 0.05 sample, auto-deep only above 500 added
             # lines (exclusive bound - 500 does NOT escalate).
@@ -259,6 +274,15 @@ spec:
             # permanently hot reasoner adjudicates bounded candidate packets;
             # cloud fallback receives redacted evidence only.
             - {name: GRUG_CAVE_GATEWAY_URL, value: http://spark-gateway.spark-gateway.svc:8080}
+            # Elder's last resort (#1276, #1546): the operator's plans, Luna then
+            # Haiku, chosen by the serving side. The model name is deliberately no
+            # family: the reply names the model that ran, and the family gate must
+            # not rule out a lane that serves two families. The serving side keeps
+            # the real daily counts across all pods; this cap is per process.
+            - {name: GRUG_SUBSCRIPTION_URL, value: http://forward.subscription-lane.svc:8080/v1/chat/completions}
+            - {name: GRUG_SUBSCRIPTION_MODEL, value: subscription-lane}
+            - {name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "3000"}
+            - {name: GRUG_SUBSCRIPTION_TOKEN_SSM, value: /grug/subscription-lane-token}
             # infra#2451/#2454 precedent: the second GPU host's vLLM resident is not a
             # fixed identity (infra#2452 swapped poolside/Laguna-S-2.1-NVFP4 ->
             # Qwen/Qwen3.8-27B-FP8 same-day). spark_gateway.py's `spark:warm-any`
@@ -276,7 +300,13 @@ spec:
             # Ollama model, and both Sparks now serve one vLLM model and no Ollama,
             # so the exact tag matched no target and every review call got a 503.
             # Same value as the webhook; test_cave_models_match_the_webhook holds them.
-            - {name: GRUG_CAVE_REVIEW_MODEL, value: "spark:warm-any"}
+            # The one model the Sparks serve. Its empty answers are trusted; the route
+            # spills to free models while the Sparks are away, and theirs are not.
+            - {name: GRUG_CAVE_TRUSTED_EMPTY_MODELS, value: "nemotron-3.5-super-vl"}
+            # The model the Sparks serve, by name: warm-any spills to free models that garble
+            # (2026-11-01), which stops the walk; a named model answers 503 at once while the
+            # Sparks are away, and the walk goes on to the lane. The judge stays on warm-any.
+            - {name: GRUG_CAVE_REVIEW_MODEL, value: "nemotron-3.5-super-vl"}
             - {name: GRUG_CAVE_REASONER_MODEL, value: "spark:warm-any"}
             # grug#1191: the optional vLLM deep arm (services/_shared/deep_shadow.py).
             # off = the reasoner above, unchanged. shadow = also replay the deep

@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1].parent))
+import shepherd
 from shepherd import (
     BotFinding,
     BotSurfaces,
@@ -10,7 +11,6 @@ from shepherd import (
     PRState,
     StageVerdict,
     build_pr_queue,
-    check_deployment,
     escalate_once,
     evaluate_chain,
     format_duration,
@@ -48,66 +48,6 @@ def make_patch(set_digest, set_push):
         return set_push
 
     return patched_get_latest_digest, patched_get_latest_push_digest
-
-
-# Test when digests match
-
-
-def test_check_deployment_true(monkeypatch):
-    patch_digest, patch_push = make_patch(("tag1", "abc123"), ("tag2", "abc123"))
-    monkeypatch.setattr("shepherd.get_latest_digest", patch_digest)
-    monkeypatch.setattr("shepherd.get_latest_push_digest", patch_push)
-    assert check_deployment("service") is True
-
-
-# Test when digests differ
-
-
-def test_check_deployment_false_on_diff(monkeypatch):
-    patch_digest, patch_push = make_patch(("deployed", "diff1"), ("pushed", "diff2"))
-    monkeypatch.setattr("shepherd.get_latest_digest", patch_digest)
-    monkeypatch.setattr("shepherd.get_latest_push_digest", patch_push)
-    assert check_deployment("service") is False
-
-
-# Test when pushed digest missing
-
-
-def test_check_deployment_false_on_missing_push(monkeypatch):
-    patch_digest, patch_push = make_patch(("deployed", "abc123"), ("tag", ""))
-    monkeypatch.setattr("shepherd.get_latest_digest", patch_digest)
-    monkeypatch.setattr("shepherd.get_latest_push_digest", patch_push)
-    assert check_deployment("service") is False
-
-
-# Test when deployed digest missing
-
-
-def test_check_deployment_false_on_missing_deploy(monkeypatch):
-    patch_digest, patch_push = make_patch(("", ""), ("tag", "abc123"))
-    monkeypatch.setattr("shepherd.get_latest_digest", patch_digest)
-    monkeypatch.setattr("shepherd.get_latest_push_digest", patch_push)
-    assert check_deployment("service") is False
-
-
-# Test that get_latest_push_digest is used (implicit via patch)
-
-
-def test_check_deployment_calls(monkeypatch):
-    called = {"push": False, "deploy": False}
-
-    def fake_push(service):
-        called["push"] = True
-        return ("tag", "abc")
-
-    def fake_deploy(service):
-        called["deploy"] = True
-        return ("tag", "abc")
-
-    monkeypatch.setattr("shepherd.get_latest_push_digest", fake_push)
-    monkeypatch.setattr("shepherd.get_latest_digest", fake_deploy)
-    assert check_deployment("svc") == True
-    assert called["push"] and called["deploy"]
 
 
 # ---- chain escalation (T832) ----
@@ -789,3 +729,19 @@ def test_shepherd_main_cli_pr_queue(monkeypatch, capsys):
     assert code == 0
     captured = capsys.readouterr().out
     assert "Queue report for example/test-repo" in captured
+
+
+def test_deployment_chain_verdict_empty_is_broken(monkeypatch):
+    monkeypatch.setattr(shepherd, "deployment_stage_verdicts", lambda service: [])
+    verdict = shepherd.deployment_chain_verdict("webhook")
+    assert verdict.ok is False
+    assert verdict.name == "deploy"
+
+
+def test_deployment_chain_verdict_returns_first_failure(monkeypatch):
+    stages = [
+        shepherd.StageVerdict("reference", True, "ok"),
+        shepherd.StageVerdict("deploy", False, "stale"),
+    ]
+    monkeypatch.setattr(shepherd, "deployment_stage_verdicts", lambda service: stages)
+    assert shepherd.deployment_chain_verdict("webhook") is stages[1]

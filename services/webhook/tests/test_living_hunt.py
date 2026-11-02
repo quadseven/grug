@@ -556,8 +556,12 @@ def test_push_after_first_review_is_a_scoped_delta_review(monkeypatch):
         full_calls.append(k)
         return "diff --git a/earlier.py b/earlier.py\n--- a/earlier.py\n+++ b/earlier.py\n@@ -1 +1 @@\n-a\n+b\n"
 
+    contexts: list[dict] = []
+    steering_refs: list[tuple[str, str]] = []
+
     def _review(evidence, *_a, **_k):
         reviewed_paths.append({h.path for h in evidence.hunks})
+        contexts.append(dict(evidence.pr_context))
         return llm
 
     def _check(*a, **k):
@@ -565,6 +569,16 @@ def test_push_after_first_review_is_a_scoped_delta_review(monkeypatch):
         titles.append(result.title)
         return {"id": 1}
 
+    def _docs(_token, _owner, _repo, ref, _hunks):
+        steering_refs.append(("docs", ref))
+
+    def _ruff(_install, _owner, _repo, ref):
+        steering_refs.append(("ruff", ref))
+        return cr_dispatch.parse_repo_ruff_policy(None)
+
+    monkeypatch.setenv("GRUG_ELDER_ANALYZERS", "ruff")
+    monkeypatch.setattr(cr_dispatch, "_load_repo_docs", _docs)
+    monkeypatch.setattr(cr_dispatch, "_load_repo_ruff_policy", _ruff)
     monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda _i, fn: fn("t"))
     monkeypatch.setattr(review_publish, "with_install_token_retry", lambda _i, fn: fn("t"))
     monkeypatch.setattr(cr_dispatch, "review_diff", _review)
@@ -607,6 +621,12 @@ def test_push_after_first_review_is_a_scoped_delta_review(monkeypatch):
     assert [(c["base_sha"], c["head_sha"]) for c in full_calls] == [
         ("base5678ijkl", "abcd1234efgh"),
     ]
+    # grug#1574: the diff starts at a PR commit, the steering files do not.
+    assert contexts[0]["base_sha"] == "prior0001head"
+    assert contexts[0]["pr_base_sha"] == "base5678ijkl"
+    assert ("docs", "base5678ijkl") in steering_refs
+    assert ("ruff", "base5678ijkl") in steering_refs
+    assert {ref for _, ref in steering_refs} == {"base5678ijkl"}
 
 
 # --- #1343: the lane-work checks judge the whole PR on every pass ------------

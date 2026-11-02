@@ -52,6 +52,11 @@ _TIMEOUT = 10.0
 # labeled at once; the cap is a runaway backstop, not a real ceiling (the
 # same convention as the pagination caps elsewhere).
 _LABEL_MAX_PAGES = 10
+# Last answer per repo, so the sweep can ask "has this changed?" and pay
+# nothing when it has not: GitHub does not charge a 304 against the rate limit
+# (grug#1537). Bounded by clearing: the worst case is one paid pass.
+_LABEL_LIST_MEMORY = 512
+_label_lists: dict[tuple[str, str], tuple[str, list[int]]] = {}
 
 # Every check name that counts as "the Elder check" - the current title plus
 # its legacy aliases, so a run posted before the rename still answers the
@@ -252,8 +257,12 @@ def _labeled_prs_for_repo(token: str, owner: str, repo: str) -> list[int]:
     qualifier - so a label whose name contains a colon needs no escaping
     trick and no query-parser bet. `state=all` so a PR that was merged or
     closed with the label still on it gets cleaned."""
+    known_etag, known_numbers = _label_lists.get((owner, repo), ("", []))
     numbers: list[int] = []
     for page in range(1, _LABEL_MAX_PAGES + 1):
+        headers = _headers(token)
+        if page == 1 and known_etag:
+            headers["If-None-Match"] = known_etag
         resp = httpx.get(
             f"{_repo_path(owner, repo)}/issues",
             params={
@@ -262,9 +271,11 @@ def _labeled_prs_for_repo(token: str, owner: str, repo: str) -> list[int]:
                 "per_page": 100,
                 "page": page,
             },
-            headers=_headers(token),
+            headers=headers,
             timeout=_TIMEOUT,
         )
+        if resp.status_code == 304:
+            return list(known_numbers)
         resp.raise_for_status()
         batch = resp.json() or []
         for item in batch:
@@ -272,8 +283,21 @@ def _labeled_prs_for_repo(token: str, owner: str, repo: str) -> list[int]:
             if number:
                 numbers.append(int(number))
         if len(batch) < 100:
+            if page == 1:
+                _remember_label_list(owner, repo, resp.headers.get("ETag", ""), numbers)
             break
     return numbers
+
+
+def _remember_label_list(owner: str, repo: str, etag: str, numbers: list[int]) -> None:
+    """Keep a one-page answer. A longer list is rare, and a 304 on its first
+    page would say nothing about the pages after it."""
+    if not etag:
+        _label_lists.pop((owner, repo), None)
+        return
+    if len(_label_lists) >= _LABEL_LIST_MEMORY:
+        _label_lists.clear()
+    _label_lists[owner, repo] = (etag, list(numbers))
 
 
 def _pr_head_sha(token: str, owner: str, repo: str, pr_number: int) -> str:

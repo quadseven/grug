@@ -32,7 +32,10 @@ from __future__ import annotations
 
 import re
 
-from personas.code_reviewer.criteria_coverage import LinkedCriterion
+from personas.code_reviewer.criteria_coverage import (
+    LinkedCriterion,
+    is_future_post_merge_observation,
+)
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.test_paths import is_test_file
@@ -125,14 +128,15 @@ def _anchor(hunks: tuple[DiffHunk, ...]) -> tuple[str, int] | None:
 
 def _ticked_boxes(body: str, criteria: tuple[LinkedCriterion, ...]) -> list[str] | None:
     """The ticked boxes in `body`; None when the check is not evaluated
-    (past a bound, or the body cites a run or pastes output)."""
+    (past a bound). When the body cites a run or pastes output, only the
+    boxes for a CI run after the merge, which no pre-merge run can be."""
     if len(body) > MAX_BODY_CHARS or len(criteria) > MAX_CRITERIA:
-        return None
-    if _RUN_LINK_RE.search(body) or _FENCE_RE.search(body):
         return None
     ticked = [m.group(1).strip() for m in map(_TICKED_RE.match, body.splitlines()) if m]
     if len(ticked) > MAX_BOXES:
         return None
+    if _RUN_LINK_RE.search(body) or _FENCE_RE.search(body):
+        return [t for t in ticked if is_future_post_merge_observation(t)]
     return ticked
 
 
@@ -142,10 +146,13 @@ def _unbacked_name(text: str, known: list[_Known]) -> str | None:
     match = _criterion_for(text, known)
     criterion = match[0] if match else None
     claim, evidence = _split(text, match)
-    if not _LIVE_CLAIM_RE.search(claim) or _TEST_RE.search(claim):
-        return None
-    if _backed(evidence) or (criterion is None and _backed(claim)):
-        return None
+    # A CI run after the merge cannot have happened yet: no evidence backs
+    # a tick on it before the merge (#1509).
+    if not is_future_post_merge_observation(claim):
+        if not _LIVE_CLAIM_RE.search(claim) or _TEST_RE.search(claim):
+            return None
+        if _backed(evidence) or (criterion is None and _backed(claim)):
+            return None
     label = f"#{criterion.issue} criterion {criterion.number}: " if criterion else ""
     return f'{label}"{claim.strip()[:160]}"'
 
@@ -161,8 +168,9 @@ def _unbacked_finding(anchor: tuple[str, int], unbacked: list[str]) -> Finding:
             f"The PR body ticks {len(unbacked)} {noun} for a check of a live "
             f"system, host or measurement: {'; '.join(unbacked)}. A diff cannot "
             "show that such a check passed, and the body cites no output, run "
-            "link or number for it. Paste the command and its output, link "
-            "the run, or leave the box unticked for the operator."
+            "link or number for it, or the check is a CI run after the merge, "
+            "which cannot have happened yet. Paste the command and its output, "
+            "link the run, or leave the box unticked for the operator."
         ),
         suggestion=None,
         effort="quick-win",

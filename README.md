@@ -160,6 +160,7 @@ reads it from the PR's base commit, so a PR cannot loosen its own review.
 | `ignore` | Path globs Elder never reviews |
 | `path_instructions` | Extra review instructions for files matching a path |
 | `min_inline_severity` | Findings below this level stay in the summary, with no inline comment |
+| `elder_mute_min_labeled`, `elder_mute_below_precision`, `elder_mute_locked_classes` | A finding class with enough labeled history (default 20) and a fixed-rate below the threshold (default 0.2) stops posting inline and shows on the board and summary as muted; high and critical findings and locked classes still post inline |
 | `skip_prs` | Skip Elder and Teller for PRs matching `authors`, `labels` or `title_patterns` |
 
 ```yaml

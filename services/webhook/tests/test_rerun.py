@@ -681,6 +681,41 @@ def test_hot_review_requeues_latest_when_dispatch_detects_stale(monkeypatch):
     complete.assert_not_called()
 
 
+def test_hot_review_pr_read_403_completes_check_without_redrive(monkeypatch):
+    response = httpx.Response(
+        403,
+        request=httpx.Request(
+            "GET", "https://api.github.com/repos/myorg/myrepo/pulls/7",
+        ),
+    )
+
+    attempts = []
+
+    def denied_then_post(iid, fn):
+        attempts.append(iid)
+        if len(attempts) == 1:
+            raise httpx.HTTPStatusError("Forbidden", request=response.request, response=response)
+        return fn("token")
+
+    posted = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", denied_then_post)
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
+    )
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="head-that-was-queued",
+    ))
+
+    assert status == "pr_read_forbidden"
+    assert len(posted) == 1
+    assert posted[0].title == "Grug cannot read this pull request: 403 from GitHub"
+    assert posted[0].head_sha == "head-that-was-queued"
+    assert posted[0].conclusion == "failure"
+    assert len(attempts) == 2
+
+
 def test_hot_review_gives_up_mid_flight_once_the_redrive_cap_is_exhausted(monkeypatch):
     """grug#773 AC3's other call site: the EXPENSIVE mid-flight staleness
     path (a real dispatch already ran) must also stop redriving once the
@@ -1749,6 +1784,74 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     assert comments and "Markings remembered" in comments[0] and "prefer early returns" in comments[0]
 
 
+def _learn_on(monkeypatch, tags, learning="prefer early returns"):
+    put_calls: list[dict] = []
+    posted: list[tuple] = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment", lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": tags},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning",
+                        lambda **kw: put_calls.append(kw))
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
+    monkeypatch.setattr(
+        "llm_client.classify_learning",
+        lambda *a, **k: {"durable": True, "learning": learning, "scope_path": ""},
+    )
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    monkeypatch.setattr(rerun, "_org_learning_approval_delay", lambda i, r: 0)
+    monkeypatch.setattr(rerun, "_sync_living_review", lambda *a, **k: None)
+    reply = "this is safe because the caller already checks it"
+    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, reply, "teammate")
+    return result, put_calls, posted
+
+
+def test_run_learn_redelivery_does_not_restart_the_rule(monkeypatch):
+    puts: list[dict] = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: {"text": "prefer early returns", "scope_path": ""},
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning", lambda **kw: puts.append(kw))
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
+    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "a reason", "teammate") == "learn_duplicate"
+    assert puts == []
+
+
+def test_run_learn_stores_the_reason_and_the_finding_class(monkeypatch):
+    result, puts, _ = _learn_on(
+        monkeypatch, {"rule_name": "null-deref", "category": "correctness"},
+    )
+    assert result == "learned"
+    assert puts[0]["reason"] == "this is safe because the caller already checks it"
+    assert puts[0]["finding_class"] == "null-deref"
+    assert puts[0]["finding_category"] == "correctness"
+
+
+@pytest.mark.parametrize(
+    ("tags", "learning"),
+    [
+        ({"rule_name": "sql-injection", "category": "general"}, "prefer early returns"),
+        ({"rule_name": "whatever", "category": "security"}, "prefer early returns"),
+        ({"rule_name": "style", "category": "general"}, "do not flag sql injection here"),
+    ],
+)
+def test_run_learn_refuses_a_rule_that_touches_security(monkeypatch, tags, learning):
+    result, puts, posted = _learn_on(monkeypatch, tags, learning)
+    assert result == "learn_refused_protected"
+    assert puts == []
+    bodies = [b.get("body", "") for (_u, b) in posted]
+    assert any("security" in body for body in bodies)
+
+
 def test_run_learn_one_off_declines_without_storing(monkeypatch):
     put_calls = []
     posted = []
@@ -2095,7 +2198,7 @@ def _run_watch_once(monkeypatch, current_pr, expected_pr):
 
     def _fetch(*_a, **_kw):
         stop.set()  # one iteration only
-        return current_pr
+        return current_pr, "etag"
 
     elder_review._review_staleness_watch_loop(
         1, "o", "r", 7,
@@ -2143,6 +2246,57 @@ def test_staleness_watch_ignores_a_transient_fetch_failure(monkeypatch):
         1, "o", "r", 7, "aaaa1111", stop, cancel, _boom,
     )
     assert cancel.is_set() is False
+
+
+def _watch_github(monkeypatch, answers):
+    """Run the real staleness loop against scripted GitHub answers and return
+    each request's If-None-Match plus whether the review was cancelled."""
+    import threading
+
+    monkeypatch.setattr(elder_review, "_STALENESS_WATCH_INTERVAL_S", 0.001)
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _i, fn: fn("tok"))
+    stop, cancel = threading.Event(), threading.Event()
+    sent, pending = [], list(answers)
+
+    def _get(_url, headers=None, timeout=None):
+        sent.append(headers.get("If-None-Match", ""))
+        if len(pending) == 1:
+            stop.set()
+        return pending.pop(0)
+
+    monkeypatch.setattr(rerun.httpx, "get", _get)
+    elder_review._review_staleness_watch_loop(
+        1, "o", "r", 7, "aaaa1111", stop, cancel, rerun._fetch_pr_if_changed,
+    )
+    return sent, cancel.is_set()
+
+
+def _pr_answer(head_sha, etag):
+    request = httpx.Request("GET", "https://api.github.com/repos/o/r/pulls/7")
+    return httpx.Response(
+        200, json=_pr(head_sha), headers={"ETag": etag}, request=request,
+    )
+
+
+def test_staleness_watch_pays_once_for_an_unchanged_pull_request(monkeypatch):
+    """Only the first poll is a full read. Every later one sends the ETag and
+    a 304 keeps the review running, which costs no rate limit."""
+    request = httpx.Request("GET", "https://api.github.com/repos/o/r/pulls/7")
+    unchanged = [httpx.Response(304, request=request) for _ in range(3)]
+    sent, cancelled = _watch_github(
+        monkeypatch, [_pr_answer("aaaa1111", 'W/"one"'), *unchanged],
+    )
+    assert sent == ["", 'W/"one"', 'W/"one"', 'W/"one"']
+    assert cancelled is False
+
+
+def test_staleness_watch_still_cancels_when_the_etag_moves(monkeypatch):
+    sent, cancelled = _watch_github(monkeypatch, [
+        _pr_answer("aaaa1111", 'W/"one"'),
+        _pr_answer("bbbb2222", 'W/"two"'),
+    ])
+    assert sent == ["", 'W/"one"']
+    assert cancelled is True
 
 
 def test_diff_too_large_completes_instead_of_redriving(monkeypatch):
@@ -2555,6 +2709,19 @@ def test_review_payload_keeps_the_head_repo_for_the_fork_check():
     assert rerun._review_payload(
         install_id=1, owner="o", repo_name="r", pr_number=2, pr=deleted_fork,
     )["pull_request"]["head"] == {"sha": "h", "repo": None}
+
+
+def test_review_payload_keeps_the_steering_source_fields():
+    """grug#1578: a rerun must still tell a PR into a non-default branch
+    apart, so the fetched base ref and default branch survive."""
+    pr = {"head": {"sha": "h", "repo": {"id": 99}},
+          "base": {"sha": "b", "ref": "feature",
+                   "repo": {"id": 7, "default_branch": "main"}}}
+    payload = rerun._review_payload(
+        install_id=1, owner="o", repo_name="r", pr_number=2, pr=pr,
+    )
+    assert payload["pull_request"]["base"] == {"sha": "b", "ref": "feature"}
+    assert payload["repository"]["default_branch"] == "main"
 
 
 # --- grug#1270: the `grug:reviewing` label, and the deferred re-run --------
@@ -3101,3 +3268,91 @@ def test_elder_running_on_reads_an_unreadable_listing_as_not_running(monkeypatch
     monkeypatch.setattr(rerun, "with_install_token_retry", _boom)
     assert rerun._elder_run_in_flight(11, "o", "r", "abc") is None
 
+
+
+# --- #822: ask in a review thread ------------------------------------------
+
+def test_enqueue_ask_carries_reply_target(monkeypatch):
+    sent = {}
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/review.fifo")
+    monkeypatch.setattr(
+        rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs),
+    )
+    rerun.enqueue_ask(
+        install_id=11, repo="o/r", pr_number=7, comment_id=5001,
+        question="why did you flag this?", reply_to_comment_id=4000,
+    )
+    job = json.loads(sent["MessageBody"])
+    assert job["kind"] == "ask" and job["reply_to_comment_id"] == 4000
+
+
+def test_run_ask_in_thread_replies_in_thread_with_hunk_context(monkeypatch):
+    """The answer posts to the review-thread replies endpoint, and the
+    model sees the thread's finding + diff hunk, not just the PR diff."""
+    posted = []
+    seen = {}
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get_text", lambda _t, _u, accept=None: "diff --git a/x.py b/x.py")
+    monkeypatch.setattr(rerun, "_gh_get", lambda _t, url: {
+        "body": "Grug finding: this lock is held over a network call",
+        "diff_hunk": "@@ -10,3 +10,4 @@ def f():\n lock.acquire()",
+        "path": "x.py", "line": 12,
+    })
+    monkeypatch.setattr(rerun, "_gh_post", lambda _t, url, body: posted.append((url, body)))
+
+    def _answer(q, diff, _iid, pr_context=None):
+        seen["diff"] = diff
+        return "Because the lock is held over the call in x.py."
+
+    monkeypatch.setattr("llm_client.answer_pr_question", _answer)
+    monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
+
+    result = rerun._run_ask(11, "o/r", 7, "why did you flag this?", reply_to_comment_id=4000)
+
+    assert result == "answered"
+    assert posted and "/pulls/7/comments/4000/replies" in posted[0][0]
+    assert "lock.acquire()" in seen["diff"]  # the thread's hunk
+    assert "held over a network call" in seen["diff"]  # the finding under discussion
+    assert "x.py" in posted[0][1]["body"]
+
+
+def test_run_ask_top_level_quotes_the_question(monkeypatch):
+    """#822 criterion 1 on the conversation surface: the answer names the
+    question it answers."""
+    posted = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get_text", lambda _t, _u, accept=None: "diff --git a b")
+    monkeypatch.setattr(rerun, "_gh_post", lambda _t, url, body: posted.append((url, body)))
+    monkeypatch.setattr(
+        "llm_client.answer_pr_question",
+        lambda _q, _d, _iid, pr_context=None: "It adds a retry.",
+    )
+    monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
+
+    rerun._run_ask(11, "o/r", 7, "what does this add?")
+
+    assert posted[0][1]["body"].startswith("> what does this add?")
+
+
+def test_run_ask_thread_context_failure_is_disclosed(monkeypatch):
+    """If the thread itself cannot be loaded, the answer still posts in
+    the thread but says plainly it never saw the finding."""
+    posted = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get_text", lambda _t, _u, accept=None: "diff --git a b")
+
+    def _boom(_t, _url):
+        raise RuntimeError("api down")
+
+    monkeypatch.setattr(rerun, "_gh_get", _boom)
+    monkeypatch.setattr(rerun, "_gh_post", lambda _t, url, body: posted.append((url, body)))
+    monkeypatch.setattr(
+        "llm_client.answer_pr_question",
+        lambda _q, _d, _iid, pr_context=None: "From the diff alone.",
+    )
+    monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
+
+    rerun._run_ask(11, "o/r", 7, "why did you flag this?", reply_to_comment_id=4000)
+
+    assert "/pulls/7/comments/4000/replies" in posted[0][0]
+    assert "could not load the thread" in posted[0][1]["body"]

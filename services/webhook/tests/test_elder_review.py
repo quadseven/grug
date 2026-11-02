@@ -223,7 +223,7 @@ def test_start_stop_staleness_watch():
     watch = start_staleness_watch(
         install_id=1, owner="owner", repo_name="name", pr_number=42,
         expected_head_sha="head-sha",
-        fetch_current_pr=lambda *a, **k: {"head": {"sha": "head-sha"}},
+        fetch_pr_if_changed=lambda *a, **k: ({"head": {"sha": "head-sha"}}, ""),
     )
     assert isinstance(watch, StalenessWatch)
     assert watch.thread.is_alive()
@@ -242,12 +242,12 @@ def test_staleness_watch_cancels_on_head_sha_change(monkeypatch):
     cancel_triggered = threading.Event()
 
     def fetch(*a, **k):
-        return {"head": {"sha": "new-sha"}}
+        return {"head": {"sha": "new-sha"}}, "etag"
 
     watch = start_staleness_watch(
         install_id=1, owner="owner", repo_name="name", pr_number=42,
         expected_head_sha="old-sha",
-        fetch_current_pr=fetch,
+        fetch_pr_if_changed=fetch,
     )
     # Give the watcher a tick to detect the change
     time.sleep(0.2)
@@ -262,12 +262,12 @@ def test_staleness_watch_transient_fetch_failure_does_not_cancel():
         calls["n"] += 1
         if calls["n"] == 1:
             raise httpx.RequestError("boom", request=httpx.Request("GET", "https://example.com"))
-        return {"head": {"sha": "expected-sha"}}
+        return {"head": {"sha": "expected-sha"}}, "etag"
 
     watch = start_staleness_watch(
         install_id=1, owner="owner", repo_name="name", pr_number=42,
         expected_head_sha="expected-sha",
-        fetch_current_pr=fetch,
+        fetch_pr_if_changed=fetch,
     )
     # Let it run a couple of ticks, then stop
     time.sleep(0.35)

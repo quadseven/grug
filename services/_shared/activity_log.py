@@ -35,6 +35,8 @@ def record_check_verdict(
     findings_count: int,
     blocking: bool,
     degraded_reason: Optional[str] = None,
+    author_family: Optional[str] = None,
+    reviewer_family: Optional[str] = None,
 ) -> None:
     """Derive + persist one persona check-run's Check verdict.
 
@@ -61,6 +63,8 @@ def record_check_verdict(
             blocking=blocking,
             created_at=datetime.now(timezone.utc).isoformat(),
             degraded_reason=degraded_reason,
+            author_family=author_family,
+            reviewer_family=reviewer_family,
         )
     except Exception as e:  # noqa: BLE001
         # Intentional broad catch: this is a best-effort telemetry write on the

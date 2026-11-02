@@ -50,6 +50,19 @@ def _post_reply(token: str, owner: str, repo: str, pr_number: int, body: str) ->
     ).raise_for_status()
 
 
+def _post_reaction(token: str, owner: str, repo: str, comment_id: int, content: str) -> None:
+    """Add a reaction to a PR conversation comment. A `/grug` command arrives
+    as `issue_comment`, so its reactions live under issues/comments: the
+    pulls/comments path is for review comments on a diff and answers 404 for
+    this id. GitHub de-duplicates repeated reactions."""
+    httpx.post(
+        f"{_API}/repos/{_q(owner, safe='')}/{_q(repo, safe='')}/issues/comments/{comment_id}/reactions",
+        json={"content": content},
+        headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"},
+        timeout=_TIMEOUT,
+    ).raise_for_status()
+
+
 def _escape_html(s: str) -> str:
     """Escape HTML-significant chars in a displayed learning so a taught
     rule can't break out of the comment markup or inject tags."""
@@ -67,6 +80,20 @@ def _reply(token_fn, owner: str, repo: str, pr_number: int, body: str) -> bool:
         token_fn(lambda t: _post_reply(t, owner, repo, pr_number, body))
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.warning("interactive_reply_failed", extra={"kind": type(e).__name__})
+        return False
+    return True
+
+
+def _react(token_fn, owner: str, repo: str, comment_id: int, content: str) -> bool:
+    """Add a reaction to a comment. True when the reaction landed.
+
+    Best-effort: the command's effect (the enqueue) already happened, so a
+    reaction GitHub refuses must not raise out of the command. GitHub
+    de-duplicates repeated reactions, so a redelivery is harmless."""
+    try:
+        token_fn(lambda t: _post_reaction(t, owner, repo, comment_id, content))
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        log.warning("interactive_reaction_failed", extra={"kind": type(e).__name__})
         return False
     return True
 
@@ -436,19 +463,13 @@ def _run_persona_rerun(
             token_fn=token_fn, owner=owner, repo=repo, pr_number=pr_number,
         )
     if queued:
-        note = _queued_note(head_sha, elder_state)
         log.info(
             "interactive_elder_rerun_queued_behind_review",
             extra={"verb": verb, "repo": repo_full, "pr": pr_number,
                    "head_sha": head_sha[:8], "state": elder_state},
         )
-    else:
-        note = ("Elder is re-reviewing this PR." if verb == "improve"
-                else "Smasher is checking for test gaps.")
-    try:
-        token_fn(lambda t: _post_reply(t, owner, repo, pr_number, f"{note} So speaks Grug."))
-    except Exception as e:  # noqa: BLE001 - the rerun is enqueued; the ack reply is cosmetic
-        log.warning("interactive_ack_failed", extra={"verb": verb, "kind": type(e).__name__})
+    # Post a reaction to the command comment as acknowledgement (no reply comment)
+    _react(token_fn, owner, repo, comment_id, "eyes")
     if queued:
         return {"status": "queued", "reason": "queued_behind_review",
                 "verb": verb, "persona": persona}
@@ -487,6 +508,33 @@ def _run_autofix(
             "Comment `/grug fix` again. So speaks Grug.",
         )
         return {"status": "skip", "reason": "fix_failed", "verb": "fix"}
+
+
+def _run_docstrings(
+    *, install_id: int, owner: str, repo: str, pr_number: int,
+    comment_id: int, token_fn, claim, head_sha: str,
+) -> dict:
+    """`/grug docstrings`: generate docs and land them in one bot commit."""
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": "docstrings"}
+    try:
+        from docstring_action import run_docstrings  # type: ignore
+        return run_docstrings(
+            install_id=install_id, owner=owner, repo=repo,
+            pr_number=pr_number, head_sha=head_sha, token_fn=token_fn,
+        )
+    except Exception as e:  # noqa: BLE001 - claimed: answer, never 500
+        log.warning(
+            "interactive_docstrings_failed",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number,
+                   "kind": type(e).__name__},
+        )
+        _reply(
+            token_fn, owner, repo, pr_number,
+            "Grug could not generate docstrings. Nothing was committed. "
+            "Comment `/grug docstrings` again. So speaks Grug.",
+        )
+        return {"status": "skip", "reason": "docstrings_failed", "verb": "docstrings"}
 
 
 def run_command(
@@ -543,6 +591,13 @@ def run_command(
 
     if verb == "fix":
         return _run_autofix(
+            install_id=install_id, owner=owner, repo=repo, pr_number=pr_number,
+            comment_id=comment_id, token_fn=token_fn, claim=claim,
+            head_sha=head_sha,
+        )
+
+    if verb == "docstrings":
+        return _run_docstrings(
             install_id=install_id, owner=owner, repo=repo, pr_number=pr_number,
             comment_id=comment_id, token_fn=token_fn, claim=claim,
             head_sha=head_sha,

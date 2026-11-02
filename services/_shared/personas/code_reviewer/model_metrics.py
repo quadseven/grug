@@ -12,6 +12,8 @@ Three signals, all tagged `backend` + `model` (the same two values the ledger
   accepted / labeled and the labeled total for that model, derived from the
   ingested ledger corpus (`ledger.reviewer_precision`), refreshed whenever a
   verdict touches the model.
+- `grug.elder.learning_write` (count, + `verdict` + `class`): one per producing
+  origin when a learning row is written to the ledger store (#539).
 
 A finding with no recorded producer is tagged `unknown`/`unknown`.
 Emission never raises: telemetry must not break a review or the poller.
@@ -82,5 +84,29 @@ def emit_verdict(
             if score is not None and score.total:
                 emit_gauge("grug.elder.reviewer_precision", score.precision, tags)
                 emit_gauge("grug.elder.reviewer_labeled", float(score.total), tags)
+    except Exception as e:  # noqa: BLE001 - telemetry never breaks the poller
+        log.warning("elder_model_metric_failed", extra={"kind": type(e).__name__})
+
+
+def emit_learning_write(
+    origins: Iterable[Mapping] | None,
+    verdict: str,
+    finding_class: str = "",
+) -> None:
+    """Count each learning write into the ledger store (#539).
+
+    Emits `grug.elder.learning_write` (count) per distinct producing origin,
+    tagged `backend`, `model`, `verdict`, and optionally `class`."""
+    try:
+        from observability import emit_count  # type: ignore
+        for _label, backend, model in origin_dims(origins):
+            tags = {
+                "backend": backend,
+                "model": model,
+                "verdict": verdict,
+            }
+            if finding_class:
+                tags["class"] = finding_class
+            emit_count("grug.elder.learning_write", 1, tags)
     except Exception as e:  # noqa: BLE001 - telemetry never breaks the poller
         log.warning("elder_model_metric_failed", extra={"kind": type(e).__name__})

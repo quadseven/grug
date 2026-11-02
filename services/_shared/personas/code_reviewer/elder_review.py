@@ -426,6 +426,12 @@ class ReviewClaimLease:
 
 _STALENESS_WATCH_INTERVAL_S = 10.0
 
+# `(install_id, owner, repo_name, pr_number, etag) -> (pr or None, etag)`:
+# the PR JSON and its new ETag, or None and the same ETag when unchanged.
+FetchPrIfChanged = Callable[
+    [int, str, str, int, str], tuple[dict[str, Any] | None, str],
+]
+
 
 @dataclass(frozen=True, slots=True)
 class StalenessWatch:
@@ -442,7 +448,7 @@ def _review_staleness_watch_loop(
     expected_head_sha: str,
     stop: threading.Event,
     cancel: threading.Event,
-    fetch_current_pr: Callable[..., dict[str, Any]],
+    fetch_pr_if_changed: FetchPrIfChanged,
 ) -> None:
     """Poll the PR every `_STALENESS_WATCH_INTERVAL_S` while Elder is
     actually generating a review.
@@ -451,11 +457,16 @@ def _review_staleness_watch_loop(
     diff changed, because that is the only case where the answer being
     generated is worthless. A transient GitHub hiccup is logged and skipped,
     not treated as staleness.
+
+    Polls are conditional: only the first one, and one after the PR changes,
+    spends a call from the installation's budget (grug#1537). The fetch
+    returns `(None, etag)` on a 304.
     """
+    etag = ""
     while not stop.wait(_STALENESS_WATCH_INTERVAL_S):
         try:
-            latest = fetch_current_pr(
-                install_id, owner, repo_name, pr_number,
+            latest, etag = fetch_pr_if_changed(
+                install_id, owner, repo_name, pr_number, etag,
             )
         except Exception as error:  # noqa: BLE001 - transient fetch failure
             log.warning(
@@ -466,6 +477,8 @@ def _review_staleness_watch_loop(
                     "kind": type(error).__name__,
                 },
             )
+            continue
+        if latest is None:
             continue
         latest_head = str((latest.get("head") or {}).get("sha") or "")
         if not latest_head:
@@ -493,7 +506,7 @@ def start_staleness_watch(
     repo_name: str,
     pr_number: int,
     expected_head_sha: str,
-    fetch_current_pr: Callable[..., dict[str, Any]],
+    fetch_pr_if_changed: FetchPrIfChanged,
 ) -> StalenessWatch:
     """Start the background staleness watcher for an in-flight review."""
     stop = threading.Event()
@@ -502,7 +515,7 @@ def start_staleness_watch(
         target=_review_staleness_watch_loop,
         args=(
             install_id, owner, repo_name, pr_number,
-            expected_head_sha, stop, cancel, fetch_current_pr,
+            expected_head_sha, stop, cancel, fetch_pr_if_changed,
         ),
         name="review-staleness-watch",
         daemon=True,

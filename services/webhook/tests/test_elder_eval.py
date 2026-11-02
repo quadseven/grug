@@ -11,6 +11,7 @@ The live replay (real backends over real PR diffs) is the on-demand
 from __future__ import annotations
 
 import hashlib
+import json
 
 from elder_eval.corpus import (
     build_cases,
@@ -21,6 +22,7 @@ from elder_eval.gate import (
     BASELINE_PATH,
     compute_prompt_sha,
     load_baseline,
+    measured_sha_failures,
     merge_baseline,
 )
 from elder_eval.runner import classes_for_findings, diff_to_hunks
@@ -1116,6 +1118,67 @@ def test_baseline_exists_and_prompt_sha_matches():
         "re-recorded - run `python -m elder_eval --record` and commit the "
         "refreshed baseline in this PR"
     )
+    assert not measured_sha_failures(baseline), measured_sha_failures(baseline)
+
+
+def _baseline_with(**entry_fields):
+    return {"prompt_sha": "new", "backends": {"cave": {"overall_catch": 0.5, **entry_fields}}}
+
+
+def test_gate_fails_a_prompt_sha_bumped_by_hand():
+    """grug#1511: only the top-level sha moved, so the scores are the old
+    prompt's. The message names the command that fixes it."""
+    failures = measured_sha_failures(_baseline_with(measured_prompt_sha="old"))
+    assert len(failures) == 1
+    assert "'cave'" in failures[0]
+    assert "python -m elder_eval --backend cave --record" in failures[0]
+
+
+def test_gate_fails_an_entry_with_no_measured_sha():
+    assert measured_sha_failures(_baseline_with())
+
+
+def test_gate_passes_a_baseline_written_by_the_record_command(tmp_path, monkeypatch):
+    cli, path = _record_into(tmp_path, monkeypatch)
+    assert cli._record_report(_one_case_report(served_models=["tag"]), "cave", "tag") == 0
+    written = json.loads(path.read_text())
+    assert written["backends"]["cave"]["measured_prompt_sha"] == "abc"
+    assert measured_sha_failures(written) == []
+
+
+def test_record_keeps_failing_a_second_backend_left_at_the_old_prompt(tmp_path, monkeypatch):
+    """A hand bump makes the next record merge as same-prompt, so the other
+    backend's old scores stay in the file. The gate still names them."""
+    from elder_eval import gate
+
+    cli, path = _record_into(tmp_path, monkeypatch)
+    monkeypatch.setattr(gate, "BASELINE_PATH", path)
+    path.write_text(
+        json.dumps(
+            {"prompt_sha": "abc", "backends": {"other": {"measured_prompt_sha": "old"}}}
+        )
+    )
+    assert cli._record_report(_one_case_report(served_models=["tag"]), "cave", "tag") == 0
+    failures = measured_sha_failures(json.loads(path.read_text()))
+    assert len(failures) == 1 and "'other'" in failures[0]
+
+
+def test_carried_scores_pass_only_at_the_sha_they_were_carried_to():
+    carried = {"measured_prompt_sha": "old", "carried_prompt_sha": "new"}
+    assert measured_sha_failures(_baseline_with(**carried)) == []
+    bumped = {**_baseline_with(**carried), "prompt_sha": "newer"}
+    assert measured_sha_failures(bumped)
+
+
+def test_migration_left_the_committed_scores_alone():
+    """grug#1511 added sha fields to the entry and moved no score. A live
+    re-record drops `carried_prompt_sha`, and the scores may then move."""
+    entry = load_baseline()["backends"]["cave"]
+    if "carried_prompt_sha" not in entry:
+        return
+    assert entry["cases_scored"] == 17
+    assert entry["overall_catch"] == 0.1746031746031746
+    assert entry["noise_rate"] == 0.0
 
 
 # --- runner pure bits (no network) -------------------------------------------

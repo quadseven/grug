@@ -28,9 +28,10 @@ import dataclasses
 import re
 from collections.abc import Iterable
 
+from personas.code_reviewer.criteria_coverage import is_future_post_merge_observation
 from personas.code_reviewer.persona import Finding
 
-_INTENT_MISMATCH = "intent-mismatch"
+INTENT_MISMATCH = "intent-mismatch"
 
 # A quote is a double-quoted span long enough to carry a real sentence,
 # not a lone identifier the model quoted for emphasis. 12 is the tuned
@@ -112,7 +113,7 @@ def filter_intent_mismatch_findings(
     dropped = 0
     lowered = 0
     for finding in findings:
-        if finding.rule_name != _INTENT_MISMATCH:
+        if finding.rule_name != INTENT_MISMATCH:
             kept.append(finding)
             continue
         spans = _quoted_spans(finding.message)
@@ -145,7 +146,7 @@ def filter_intent_mismatch_findings(
 # Fail-open: a finding the scope cannot attribute to a box is kept as is,
 # unless every linked issue is Refs-only and the body claims no box at all.
 
-# (issue, criterion number, "open" | "ticked", cleaned text), the shape
+# (issue, criterion number, "open" | "ticked" | "delivered", cleaned text), the shape
 # `linked_issue.rendered_criteria_with_state` returns.
 LinkedBox = tuple[int, int, str, str]
 
@@ -226,6 +227,13 @@ _ADVISORY_NOTE = (
 )
 
 
+_DEFERRED_NOTE = (
+    " This box observes a CI run that happens only after the merge, so no "
+    "pre-merge diff or PR body can meet it: the finding is advisory, and the "
+    "box stays outstanding until that run is checked."
+)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class _BoxScope:
     """What the scope knows about one PR's linked boxes."""
@@ -268,6 +276,16 @@ def _scoped(finding: Finding, scope: _BoxScope) -> tuple[Finding | None, str]:
         if blocking and not scope.any_closed and not scope.any_claim:
             return _advisory(finding, []), "lowered"
         return finding, "kept"
+    # A merged PR on the ticket delivered these, by a heuristic: it stops the
+    # block, even on the PR that closes the ticket, but stays visible.
+    if all(b[2] == "delivered" for b in matched):
+        return _advisory(finding, matched), "lowered"
+    # A future post-merge CI run is deferred verification, not a missing
+    # hunk, even on the PR that closes the ticket (#1509).
+    if blocking and all(is_future_post_merge_observation(b[3]) for b in matched):
+        return dataclasses.replace(
+            _annotated(finding, matched, _DEFERRED_NOTE), severity="medium",
+        ), "lowered"
     if any(b[0] in scope.closed for b in matched):
         return _annotated(finding, matched), "kept"
     if all(b[2] == "ticked" for b in matched):
@@ -289,7 +307,7 @@ def scope_intent_mismatch_to_claimed_boxes(
     kept: list[Finding] = []
     counts = {"kept": 0, "dropped": 0, "lowered": 0}
     for finding in findings:
-        if finding.rule_name != _INTENT_MISMATCH or not scope.boxes:
+        if finding.rule_name != INTENT_MISMATCH or not scope.boxes:
             kept.append(finding)
             continue
         result, outcome = _scoped(finding, scope)

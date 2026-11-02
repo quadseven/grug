@@ -128,6 +128,7 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,
         "enforcement_emitted": 0,
+        "enforcement_skipped": 0,
         "enforcement_failed_installs": 0,
     }
 
@@ -276,6 +277,7 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,
         "enforcement_emitted": 0,
+        "enforcement_skipped": 0,
         "enforcement_failed_installs": 0,
     }
 
@@ -531,6 +533,7 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,
         "enforcement_emitted": 0,
+        "enforcement_skipped": 0,
         "enforcement_failed_installs": 2,
     }
     errs = [r for r in caplog.records if r.msg == "reaction_poll_all_installs_failed"]
@@ -576,6 +579,7 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
         "install_reconciliation_stale": 0,
         "install_reconciliation_failed": 0,
         "enforcement_emitted": 0,
+        "enforcement_skipped": 0,
         "enforcement_failed_installs": 0,
     }
 

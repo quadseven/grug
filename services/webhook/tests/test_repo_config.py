@@ -139,3 +139,29 @@ def test_skip_pr_rule_matches_and_misses():
     )
     assert skip_pr_rule(cfg, author="h", labels=("other",), title="feat: x") is None
     assert skip_pr_rule(parse_repo_config(None), author="bot[bot]", labels=(), title="x") is None
+
+
+# --- elder_mute_* (#1436) ---------------------------------------------------
+
+def test_mute_settings_default_and_parse():
+    cfg = rc.parse_repo_config(None)
+    assert (cfg.elder_mute_min_labeled, cfg.elder_mute_below_precision) == (20, 0.2)
+    assert cfg.elder_mute_locked_classes == ()
+    cfg = rc.parse_repo_config(
+        "elder_mute_min_labeled: 30\nelder_mute_below_precision: 0.1\n"
+        "elder_mute_locked_classes: [a, b]\n"
+    )
+    assert cfg.elder_mute_min_labeled == 30
+    assert cfg.elder_mute_below_precision == 0.1
+    assert cfg.elder_mute_locked_classes == ("a", "b")
+    assert cfg.problems == ()
+
+
+def test_bad_mute_settings_keep_defaults_and_report():
+    cfg = rc.parse_repo_config(
+        "elder_mute_min_labeled: lots\nelder_mute_below_precision: 2\n"
+        "elder_mute_locked_classes: nope\n"
+    )
+    assert (cfg.elder_mute_min_labeled, cfg.elder_mute_below_precision) == (20, 0.2)
+    assert cfg.elder_mute_locked_classes == ()
+    assert len(cfg.problems) == 3

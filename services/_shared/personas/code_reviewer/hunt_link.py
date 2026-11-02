@@ -13,6 +13,8 @@ code survive this pass? Only code this pass READ can be judged:
     addressed, since that is no evidence of a fix;
   - the file was read and the anchored line is no longer in it as a whole line: `changed`
     (addressed, if the pass does not raise it again);
+  - a `high-complexity` row whose function the head's source no longer
+    scores as the row says (gone, or another score): `changed`;
   - anything else, including every file a delta review did not read:
     `unchanged`, so the finding stays open. A moved line, or a file nobody
     looked at, never closes one.
@@ -24,10 +26,11 @@ degradation means the pass did not look, and is recorded as a failed run.
 """
 from __future__ import annotations
 
-from typing import Callable, Iterable, Mapping, Optional
+from typing import Iterable, Mapping, Optional
 
 import review_session as rs
 from personas import hunt_recorder
+from personas.code_reviewer.complexity import recorded_score_is_current
 from personas.code_reviewer.persona import Finding
 from personas.review_publish import PUBLISHABLE_DEGRADATIONS
 
@@ -57,7 +60,6 @@ def observe(
     findings: Iterable[Finding],
     file_contents: Mapping[str, str],
     comment_ids: CommentIds,
-    category_of: Callable[[str], str],
 ) -> tuple[rs.ObservedFinding, ...]:
     return tuple(
         rs.ObservedFinding(
@@ -65,7 +67,9 @@ def observe(
             path=f.file,
             line=f.line,
             rule=f.rule_name,
-            category=category_of(f.rule_name),
+            # #683: the finding's taxonomy category, the same value the
+            # Marking chip and the ledger row carry.
+            category=f.category,
             severity=f.severity,
             confidence=None,
             message=f.message,
@@ -88,7 +92,14 @@ def _anchor(
         return "gone"
     text = file_contents.get(rec.path)
     needle = _squash(rec.evidence)
-    if text is None or not needle:
+    if text is None:
+        return "unchanged"
+    # A complexity row names a score; judge it against the head's own source,
+    # never by its anchor line, which a carried-forward row keeps from the
+    # review that first raised it.
+    if rec.rule == "high-complexity" and not recorded_score_is_current(rec.message, text):
+        return "changed"
+    if not needle:
         return "unchanged"
     present = needle in {_squash(line) for line in text.splitlines()}
     return "unchanged" if present else "changed"
@@ -121,7 +132,6 @@ def record_elder_run(
     delta: bool,
     comment_ids: CommentIds,
     check_run_id: Optional[int],
-    category_of: Callable[[str], str],
     degraded_reason: str = "",
 ) -> Optional[rs.ReviewSession]:
     """Record one Elder pass in the PR's canonical session. Never raises."""
@@ -137,7 +147,7 @@ def record_elder_run(
     return hunt_recorder.record_run(
         ref, meta,
         findings=() if did_not_look else observe(
-            findings, file_contents, comment_ids, category_of),
+            findings, file_contents, comment_ids),
         anchors=anchors,
         check_run_id=check_run_id,
         error=degraded_reason if did_not_look else "",

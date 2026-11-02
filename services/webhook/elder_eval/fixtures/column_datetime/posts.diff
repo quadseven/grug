@@ -1,0 +1,11 @@
+@@ -16,7 +16,9 @@
+ 
+ def list_recent(conn, author, since):
+     rows = list_posts(conn, author)
+-    return rows
++    cutoff = since - timedelta(days=1)
++    recent = [row for row in rows if row["created_at"] > cutoff]
++    return recent
+ 
+ 
+ def created_at(row):

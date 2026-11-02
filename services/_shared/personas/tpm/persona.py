@@ -25,6 +25,7 @@ from typing import Any
 from github_checks_client import CheckConclusion
 from personas.publish_check import PUBLISH_FAILED, publish_persona_check
 from personas.tpm.dor_checks import CheckResult, IssueFactsFetcher, run_all
+from personas.tpm.sibling_evidence import SiblingFetcher
 from personas.tpm.dor_checks import (
     IssueFetcher,
     has_loom_footer,
@@ -324,6 +325,7 @@ def evaluate_pull_request(
     fetch_issue: IssueFetcher | None = None,
     fetch_issue_facts: IssueFactsFetcher | None = None,
     fetch_changed_files: Callable[[], list[str]] | None = None,
+    fetch_siblings: SiblingFetcher | None = None,
     author_trusted: bool = False,
     advisory_checks: frozenset[str] = _ADVISORY_CHECKS,
 ) -> TpmEvaluation:
@@ -343,7 +345,9 @@ def evaluate_pull_request(
     `fetch_issue` is passed through to check_linked_issue_completeness and
     check_in_scope; `fetch_issue_facts` to check_linked_issue_in_epic;
     `fetch_changed_files` to check_in_scope. When either is None, its
-    check fails open (pass, marked `skipped`). Real callers build the
+    check fails open (pass, marked `skipped`). `fetch_siblings` gives
+    check_linked_issue_completeness the merged PRs on a ticket; None means
+    no sibling evidence. Real callers build the
     fetchers via `personas.tpm.issue_fetcher.build_issue_fetcher`. The
     fetchers are parameters, not call targets inside this function -- the
     spec's purity attestation (attest_persona_purity.py) sees only the
@@ -375,6 +379,7 @@ def evaluate_pull_request(
         fetch_issue=fetch_issue,
         fetch_issue_facts=fetch_issue_facts,
         fetch_changed_files=fetch_changed_files,
+        fetch_siblings=fetch_siblings,
     )
     blocking = _blocking_failures(results, advisory_checks)
     conclusion: CheckConclusion = "success" if not blocking else "failure"

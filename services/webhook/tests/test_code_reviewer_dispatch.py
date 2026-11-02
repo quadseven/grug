@@ -1189,10 +1189,114 @@ def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
         "pr_number": 7,
         "head_sha": "abcd1234efgh",
         "base_sha": "base5678ijkl",
+        "pr_base_sha": "base5678ijkl",
         "title": "Preserve PR intent",
         "body": "Reviewer should understand the requested behavior.",
         "sensitive_review": False,
     }
+
+
+def _stacked_payload() -> dict:
+    """A PR into `feature`, a branch its author may be able to push to."""
+    payload = _payload()
+    payload["repository"]["default_branch"] = "main"
+    payload["pull_request"]["base"] = {"sha": "base5678ijkl", "ref": "feature"}
+    return payload
+
+
+def _ref_response(sha: str):
+    r = MagicMock(spec=httpx.Response)
+    r.status_code = 200
+    r.raise_for_status = MagicMock()
+    r.json = MagicMock(return_value={"object": {"sha": sha, "type": "commit"}})
+    return r
+
+
+def _steering_capture(monkeypatch):
+    """Run dispatch on the stub pipeline; return (pr_contexts, GET calls)."""
+    contexts: list[dict] = []
+    monkeypatch.setattr(
+        cr_dispatch, "review_diff",
+        lambda evidence, *a, **kw: (
+            contexts.append(dict(evidence.pr_context))
+            or LlmReviewResponse(kind="no_diff")
+        ),
+    )
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+    return contexts
+
+
+def test_stacked_pr_reads_steering_files_from_the_default_branch(monkeypatch):
+    """grug#1578: a PR into a non-default branch is steered by the default
+    branch's head, resolved once, not by a base its author may control."""
+    contexts = _steering_capture(monkeypatch)
+    gets: list[tuple[str, dict | None]] = []
+
+    def fake_get(url, *, headers, timeout, params=None):
+        gets.append((url, params))
+        if url.endswith("/git/ref/heads/main"):
+            return _ref_response("mainhead9999")
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=fake_get):
+        cr_dispatch.dispatch_code_review(_stacked_payload(), blocking=False)
+
+    assert len(contexts) == 1
+    assert contexts[0]["pr_base_sha"] == "mainhead9999"
+    # The diff still starts at the PR's own base.
+    assert contexts[0]["base_sha"] == "base5678ijkl"
+    assert sum(url.endswith("/git/ref/heads/main") for url, _ in gets) == 1
+    config_refs = [p["ref"] for url, p in gets if url.endswith("/contents/.grug.yaml")]
+    assert config_refs == ["mainhead9999"]
+
+
+def test_stacked_pr_falls_back_to_the_default_branch_name(monkeypatch, caplog):
+    """A failed ref lookup still never reads the author-writable base: the
+    default branch name is a ref the contents API resolves itself."""
+    contexts = _steering_capture(monkeypatch)
+
+    def fake_get(url, *, headers, timeout, params=None):
+        if url.endswith("/git/ref/heads/main"):
+            raise httpx.ConnectError("down")
+        return _diff_response()
+
+    with caplog.at_level("INFO"), patch("httpx.get", side_effect=fake_get):
+        cr_dispatch.dispatch_code_review(_stacked_payload(), blocking=False)
+
+    assert contexts[0]["pr_base_sha"] == "main"
+    assert any(r.message == "steering_ref_lookup_failed" for r in caplog.records)
+
+
+def test_pr_into_default_branch_keeps_its_base_sha(monkeypatch):
+    """A PR into the default branch is steered by its own base, as before,
+    with no extra API call."""
+    contexts = _steering_capture(monkeypatch)
+    payload = _payload()
+    payload["repository"]["default_branch"] = "main"
+    payload["pull_request"]["base"] = {"sha": "base5678ijkl", "ref": "main"}
+    urls: list[str] = []
+
+    def fake_get(url, *, headers, timeout, params=None):
+        urls.append(url)
+        return _diff_response()
+
+    with patch("httpx.get", side_effect=fake_get):
+        cr_dispatch.dispatch_code_review(payload, blocking=False)
+
+    assert contexts[0]["pr_base_sha"] == "base5678ijkl"
+    assert not any("/git/ref/" in url for url in urls)
+
+
+def test_steering_ref_reads_default_branch_from_the_pr_base_repo():
+    """Reruns build `repository` without default_branch; the fetched PR's
+    base.repo carries it."""
+    pr = {"base": {"sha": "s1", "ref": "feature",
+                   "repo": {"default_branch": "trunk"}}}
+    with patch("httpx.get", return_value=_ref_response("trunkhead")) as get:
+        ref = cr_dispatch.steering_base_ref(pr, {}, 11, "myorg", "myrepo")
+    assert ref == "trunkhead"
+    assert get.call_args.args[0].endswith("/repos/myorg/myrepo/git/ref/heads/trunk")
 
 
 def test_dispatch_fetches_immutable_base_head_diff(monkeypatch):
@@ -2138,8 +2242,9 @@ def test_inline_comment_body_effort_chip_and_agent_prompt():
     assert "Grug see unused path" in body
     assert "Why it matters" in body
     assert "Verify each finding against the current code" in body
-    # dead-code rule maps to maintainability in RULES
-    assert "maintainability" in body
+    # #683: the chip carries the finding's taxonomy category ("general"
+    # when unset); the rule-derived class still keys why-it-matters.
+    assert "_general_" in body.split("\n", 1)[0]
     assert cr_dispatch._category_for_rule("dead-code") == "maintainability"
 
 
@@ -3076,6 +3181,57 @@ def test_deep_review_refreshes_stack_comment_with_tier1_findings(monkeypatch):
     assert "tier1-bug" in deep_body  # Tier-1 finding preserved via combined_eval
 
 
+@pytest.mark.parametrize("source, expected", [
+    ("def f():\n    pass\n", "1 changed public function(s) lack docstrings"),
+    ("def f(:\n", "`src/x.py`: Python file does not parse"),
+])
+def test_tier1_and_deep_stacks_both_carry_the_docstring_offer(
+    monkeypatch, source, expected,
+):
+    """Each stack build replaces the whole comment, so the deep refresh must
+    keep the offer and the skip reasons the Tier-1 build published."""
+    monkeypatch.setattr(
+        cr_dispatch, "review_diff",
+        lambda *a, **kw: LlmReviewResponse(
+            kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+            model_name="laguna",
+        ),
+    )
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {"id": 1})
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {"id": 77})
+    monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", lambda *a, **kw: [])
+    monkeypatch.setattr(cr_dispatch, "put_comment_record", lambda **kw: None)
+    stack_bodies = []
+    monkeypatch.setattr(
+        cr_dispatch, "_upsert_review_stack_comment",
+        lambda token, owner, repo, pr, body, **kw: stack_bodies.append(body),
+    )
+    monkeypatch.setattr(cr_dispatch, "review_is_staged", lambda hunks: False)
+    monkeypatch.setattr(
+        cr_dispatch, "decide_deep_escalation",
+        lambda hunks, pr_context: MagicMock(escalate=True, reasons=["t"], added_lines=5),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "review_reasoner_diff",
+        lambda *a, **kw: _deep_llm_with_finding(),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "fetch_file_contents",
+        lambda token, owner, repo, paths, sha: {"src/x.py": source},
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_current_review_snapshot",
+        lambda *a: ("snap", "abcd1234efgh", "open", False),
+    )
+
+    with patch("httpx.get", return_value=_diff_response()):
+        cr_dispatch.dispatch_code_review(_payload(), blocking=False)
+
+    assert len(stack_bodies) == 2
+    assert all(expected in body for body in stack_bodies)
+
+
 # --- the stack comment IS the board (#791) ----------------------------------
 
 def test_stack_body_is_a_board_with_a_verdict_first():
@@ -3106,6 +3262,70 @@ def test_stack_offers_bulk_fix_for_checked_suggestion():
     )
     assert "Finishing touch" in body
     assert "/grug fix" in body
+
+
+def _closing_line(body: str) -> str:
+    """The stack's closing line, which sits under the agent prompt."""
+    return next(l for l in body.splitlines() if "Inline comments carry" in l)
+
+
+def _stack_with_suggestion(suggestion, message="fix value"):
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+    finding = Finding(
+        file="a.py", line=1, severity="low", rule_name="r",
+        message=message, suggestion=suggestion,
+    )
+    return cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(finding,), conclusion="success"),
+        conclusion="success", file_contents={"a.py": "x = 1\n"},
+    )
+
+
+def test_stack_closing_line_names_grug_fix_for_a_checked_suggestion():
+    closing = _closing_line(_stack_with_suggestion("x = 2"))
+    assert "/grug fix" in closing
+    assert "not enabled" not in closing
+
+
+def test_stack_closing_line_names_no_command_without_a_suggestion():
+    body = _stack_with_suggestion(None)
+    assert "/grug" not in _closing_line(body)
+    assert "not enabled" not in body
+
+
+def test_stack_closing_line_names_no_command_for_a_suggestion_fix_would_refuse():
+    # `/grug fix` runs the same check and skips this one, so naming it would
+    # send the reader to a command that commits nothing.
+    closing = _closing_line(_stack_with_suggestion("x = ("))
+    assert "/grug" not in closing
+
+
+def test_stack_names_no_fix_command_for_a_fix_only_promoted_from_prose():
+    # The promoted span is a committable block on the inline comment, but the
+    # session keeps the empty field, so `/grug fix` has nothing to commit.
+    body = _stack_with_suggestion(None, message="Use `x = 2` here")
+    assert "/grug fix" not in body
+
+
+def test_stack_offers_docstrings_for_changed_undocumented_public_function():
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(), conclusion="success"),
+        conclusion="success", docstring_targets=("pkg/mod.py:1",),
+    )
+    assert "changed public function(s) lack docstrings" in body
+    assert "/grug docstrings" in body
+
+
+def test_stack_names_each_docstring_candidate_skipped_with_its_reason():
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(), conclusion="success"),
+        conclusion="success",
+        docstring_skips=(("pkg/`<b>.py", "Python file does not parse"),),
+    )
+    assert f"`{cr_dispatch._md_code_span('pkg/`<b>.py')}`: Python file" in body
+    assert "pkg/`<b>.py" not in body
 
 
 def test_worth_an_email_is_findings_or_degraded_only():
@@ -3974,7 +4194,8 @@ _HEAD = "abcd1234efgh"
 
 
 def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
-                 carried_conclusion=None):
+                 carried_conclusion=None, action="synchronize", messages=None,
+                 check_run=None):
     dismissed = []
     listed = []
     monkeypatch.setattr(
@@ -3988,7 +4209,9 @@ def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
                 (carried_conclusion, title, summary),
         )
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
-    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run", check_run or (lambda *a, **kw: {}),
+    )
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
     monkeypatch.setattr(
         cr_dispatch, "list_reviews",
@@ -3996,10 +4219,14 @@ def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
     )
     monkeypatch.setattr(
         cr_dispatch, "dismiss_review",
-        lambda *a, **kw: dismissed.append(kw["review_id"]) or {},
+        lambda *a, **kw: (
+            dismissed.append(kw["review_id"])
+            or (messages is not None and messages.append(kw["message"]))
+            or {}
+        ),
     )
     with patch("httpx.get", return_value=_diff_response()):
-        cr_dispatch.dispatch_code_review(_payload(action="synchronize"), blocking=blocking)
+        cr_dispatch.dispatch_code_review(_payload(action=action), blocking=blocking)
     return listed, dismissed
 
 
@@ -4105,6 +4332,109 @@ def test_degraded_review_never_unblocks(monkeypatch):
     listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)])
     assert listed == []
     assert dismissed == []
+
+
+# --- grug#1581: a clean `/grug improve` re-review withdraws the block -------
+
+_CLEAN_CHECK_URL = "https://github.com/myorg/myrepo/runs/424242"
+
+
+def _medium_finding() -> LlmFinding:
+    return LlmFinding(
+        path="src/x.py", line=2, rule="sanitizer-missing-negative-test",
+        severity="medium", message="m",  # type: ignore[arg-type]
+    )
+
+
+def test_clean_improve_rerun_dismisses_same_head_block(monkeypatch):
+    """grug#1581: Elder requested changes on a head, then a `/grug improve`
+    re-review (action "rerun") of the same head came back clean. The check
+    turned green but the block stayed, and GitHub refused the merge."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)]
+    _, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=reviews, action="rerun",
+    )
+    assert dismissed == [1]
+
+
+def test_advisory_findings_with_a_green_check_still_dismiss(monkeypatch):
+    """grug#1581: a re-review that repeats only an advisory (medium) finding
+    concludes the check `success`; the dismissal follows the check, not a
+    zero-finding count, so the block is withdrawn."""
+    llm = LlmReviewResponse(
+        kind="reviewed", findings=(_medium_finding(),), backend_used=Backend.POOLSIDE,
+    )
+    recorded: dict = {}
+
+    def _check(_token, _owner, _repo, result, **_kw):
+        recorded["conclusion"] = result.conclusion
+        return {}
+
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN), _review(2)]
+    for action in ("rerun", "synchronize"):
+        _, dismissed = _run_dismiss(
+            monkeypatch, llm, reviews=reviews, action=action, check_run=_check,
+        )
+        assert dismissed == [1, 2], action
+    assert recorded["conclusion"] == "success"
+
+
+def test_failing_improve_rerun_keeps_the_block(monkeypatch):
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/x.py", line=2, rule="silent-failure",
+            severity="high", message="m",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.POOLSIDE,
+    )
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)]
+    listed, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=reviews, action="rerun",
+    )
+    assert listed == []
+    assert dismissed == []
+
+
+def test_neutral_check_keeps_the_block(monkeypatch):
+    """Only a `success` check withdraws a block: an advisory-mode `neutral`
+    check is not a clear verdict."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)]
+    listed, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=reviews, action="synchronize", blocking=False,
+    )
+    assert listed == []
+    assert dismissed == []
+
+
+def test_clean_improve_rerun_never_touches_a_human_block(monkeypatch):
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    reviews = [
+        _review(1, commit=_HEAD, submitted_at=_BEFORE_RUN, login="a-human"),
+        _review(2, login="a-human", body=_ELDER_TAG),
+    ]
+    listed, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=reviews, action="rerun",
+    )
+    assert listed == [7]
+    assert dismissed == []
+
+
+def test_dismissal_message_links_the_clean_check_run(monkeypatch):
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    messages: list[str] = []
+    _, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=[_review(1)], action="rerun",
+        messages=messages,
+        check_run=lambda *a, **kw: {"id": 424242, "html_url": _CLEAN_CHECK_URL},
+    )
+    assert dismissed == [1]
+    assert messages == [(
+        "Superseded: the Elder check on abcd123 concluded success with "
+        f"nothing blocking: {_CLEAN_CHECK_URL}"
+    )]
 
 
 def test_dismiss_failure_does_not_change_the_result(monkeypatch):
@@ -4320,3 +4650,143 @@ def test_dispatch_reviews_a_copy_when_the_head_tree_is_unreadable(monkeypatch):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
     assert reviewed_paths == [copy_path]
+
+
+def test_model_set_category_renders_as_chip_and_beats_rule_category():
+    """The reviewer-set taxonomy category replaces the rule-derived one."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=3, severity="high", rule_name="dead-code",
+        message="m", suggestion=None, category="data-integrity",
+    )
+    head = cr_dispatch._inline_comment_body(f).split("\n", 1)[0]
+    assert "_data-integrity_" in head
+    assert "maintainability" not in head
+
+
+def test_unset_category_renders_as_general():
+    """#683 criterion 4: an unset category degrades to "general" on the
+    Marking too - the chip, the ledger row and the run store all carry the
+    finding's one category, never the rule-derived class."""
+    from personas.code_reviewer.persona import Finding
+    f = Finding(
+        file="x.py", line=3, severity="high", rule_name="dead-code",
+        message="m", suggestion=None,
+    )
+    assert f.category == "general"
+    head = cr_dispatch._inline_comment_body(f).split("\n", 1)[0]
+    assert "_general_" in head
+    assert "maintainability" not in head
+
+
+
+# --- muting a rarely-fixed finding class (#1436) ----------------------------
+# Fixture rows are dicts in the shape ledger.parse_row reads (the writer is
+# services/_shared/ledger.py); no live read.
+
+def _mute_rows(cls, accepted, rejected):
+    def row(i, verdict):
+        return {"repo": "o/r", "pr": i, "reviewer": "claude/x",
+                "severity": "HIGH", "class": cls, "finding": "f",
+                "verdict": verdict, "ts": "2026-06-10T00:00:00Z"}
+    return ([row(i, "fixed") for i in range(accepted)]
+            + [row(100 + i, "false-positive") for i in range(rejected)])
+
+
+def _mute_eval(cls, severity="medium"):
+    from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+
+    f = Finding(file="src/x.py", line=2, severity=severity, rule_name=cls,
+                message="m", suggestion=None)
+    conclusion = "failure" if severity in ("high", "critical") else "success"
+    return CodeReviewEvaluation(findings=(f,), conclusion=conclusion)
+
+
+def _muted(monkeypatch, rows, config=None):
+    monkeypatch.setattr("adapters.install_store.list_ledger_rows",
+                        lambda repo, *a, **k: rows, raising=False)
+    return cr_dispatch._muted_classes_for("o/r", config)
+
+
+def test_rarely_fixed_class_posts_no_inline_and_one_board_line(monkeypatch):
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))  # 25 labeled, 0.08
+    evaluation = _mute_eval("noisy")
+
+    result, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT", muted=muted,
+    )
+
+    assert result is None and posted == ()
+    _, summary = cr_dispatch._summary_markdown(evaluation, muted=muted)
+    assert summary.count("muted: fixed in 2 of 25 past findings") == 1
+    board = cr_dispatch._review_stack_body(
+        evaluation, conclusion="success", muted=muted,
+    )
+    assert board.count("muted: fixed in 2 of 25 past findings") == 1
+
+
+def test_a_security_finding_of_a_muted_class_still_posts_inline(monkeypatch):
+    """#1571: the class was muted on general rows; this finding is security."""
+    from dataclasses import replace
+
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))
+    evaluation = _mute_eval("noisy")
+    finding = replace(evaluation.findings[0], category="security")
+    evaluation = replace(evaluation, findings=(finding,))
+
+    _, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT", muted=muted,
+    )
+
+    assert posted == (finding,)
+
+
+def test_class_below_min_labeled_is_not_muted(monkeypatch):
+    assert _muted(monkeypatch, _mute_rows("noisy", 0, 19)) == {}
+
+
+def test_critical_finding_of_muted_class_still_posts_inline_and_blocks(monkeypatch):
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))
+    evaluation = _mute_eval("noisy", severity="critical")
+
+    result, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="REQUEST_CHANGES", muted=muted,
+    )
+
+    assert result is not None and len(result.comments) == 1
+    assert posted == evaluation.findings
+    outcome = plan_publish(evaluation, mode="blocking")
+    assert (outcome.conclusion, outcome.event) == ("failure", "REQUEST_CHANGES")
+
+
+def test_locked_class_posts_inline_at_zero_precision(monkeypatch):
+    from personas.code_reviewer.repo_config import parse_repo_config
+
+    config = parse_repo_config("elder_mute_locked_classes: [noisy]\n")
+    muted = _muted(monkeypatch, _mute_rows("noisy", 0, 25), config)
+    assert muted == {}
+
+    result, posted = cr_dispatch.build_review_result(
+        _mute_eval("noisy"), head_sha="a" * 40, event="COMMENT", muted=muted,
+    )
+
+    assert result is not None and len(result.comments) == 1
+
+
+def test_mute_thresholds_come_from_repo_config(monkeypatch):
+    from personas.code_reviewer.repo_config import parse_repo_config
+
+    config = parse_repo_config(
+        "elder_mute_min_labeled: 5\nelder_mute_below_precision: 0.5\n"
+    )
+    assert "noisy" in _muted(monkeypatch, _mute_rows("noisy", 2, 4), config)
+    assert _muted(monkeypatch, _mute_rows("noisy", 3, 3), config) == {}
+
+
+def test_high_finding_of_muted_class_keeps_its_inline_thread(monkeypatch):
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))
+    result, _ = cr_dispatch.build_review_result(
+        _mute_eval("noisy", severity="high"), head_sha="a" * 40,
+        event="REQUEST_CHANGES", muted=muted,
+    )
+    assert result is not None and len(result.comments) == 1

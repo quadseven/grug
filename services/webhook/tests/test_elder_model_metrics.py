@@ -157,3 +157,34 @@ def test_reaction_reviewer_labels_stay_deduped_across_backends():
         {"backend": "cave", "model": "other"},
     ]}
     assert _reaction_reviewers(record) == ["grug-elder/m", "grug-elder/other"]
+
+
+def test_learning_write_counts_per_backend_and_model(emitted, store):
+    counts, _ = emitted
+    cr_reactions._record_reaction_learning(_ensemble_learning(), "confirmed")
+    writes = [c for c in counts if c[0] == "grug.elder.learning_write"]
+    assert {(t["backend"], t["model"], t["verdict"], t["class"]) for _, _, t in writes} == {
+        ("poolside", "poolside/laguna-m.1", "declined", "null-deref"),
+        ("openrouter", "anthropic/claude-opus-4.7", "declined", "null-deref"),
+    }
+    assert all(v == 1 for _, v, _ in writes)
+
+
+def test_learning_write_emits_for_false_positive(emitted, store):
+    counts, _ = emitted
+    cr_reactions._record_reaction_learning(_ensemble_learning(), "false_positive")
+    writes = [c for c in counts if c[0] == "grug.elder.learning_write"]
+    assert {t["verdict"] for _, _, t in writes} == {"false-positive"}
+
+
+def test_learning_write_legacy_record_tagged_unknown(emitted, store):
+    counts, _ = emitted
+    cr_reactions._record_reaction_learning(_learning_record(), "confirmed")
+    writes = [c for c in counts if c[0] == "grug.elder.learning_write"]
+    assert len(writes) == 1
+    assert writes[0][2] == {
+        "backend": "unknown",
+        "model": "unknown",
+        "verdict": "declined",
+        "class": "null-deref",
+    }
