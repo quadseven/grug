@@ -4,6 +4,8 @@ all-or-nothing import, and the per-review usage counter."""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 import cave_drawings as cd
@@ -170,3 +172,100 @@ def test_record_usage_counts_once_per_review(store):
     # Usage survives a re-teach (put_learning preserves the counters).
     _teach(store, "rule a")
     assert store.get_learning("o/r", a)["usage_count"] == 2
+
+
+# --- governed learnings (#1571) ---------------------------------------------
+
+def _age(store, lid, days, repo="o/r"):
+    stamp = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with store.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET data = data || jsonb_build_object("
+            "'created_at', %s::text, 'reinforced_at', %s::text) WHERE pk = %s AND sk = %s",
+            (stamp, stamp, f"LEARN#{repo}", f"LEARNING#{lid}"),
+        )
+
+
+def test_a_rule_past_expiry_leaves_review_reads_but_stays_visible(store):
+    lid = _teach(store, "old rule")
+    _age(store, lid, 91)
+    assert store.list_learnings("o/r") == []
+    [row] = store.list_learnings("o/r", include_inactive=True)
+    assert cd.effective_status(dict(row)) == cd.STATUS_EXPIRED
+
+
+def test_approving_an_expired_rule_reaffirms_it(store):
+    lid = _teach(store, "old rule")
+    _age(store, lid, 91)
+    row = store.set_learning_status("o/r", lid, cd.STATUS_ACTIVE, actor="op")
+    assert row["approved_by"] == "op"
+    assert [r["id"] for r in store.list_learnings("o/r")] == [lid]
+
+
+def test_approving_a_live_rule_restarts_its_90_days_and_logs_it(store):
+    lid = _teach(store, "live rule")
+    _age(store, lid, 80)
+    row = store.set_learning_status("o/r", lid, cd.STATUS_ACTIVE, actor="op")
+    assert [h["action"] for h in row["history"]] == ["reaffirmed"]
+    _age(store, lid, 89)  # the taught dates are old; only the affirmation is new
+    assert [r["id"] for r in store.list_learnings("o/r")] == [lid]
+
+
+def test_a_reteach_restarts_the_90_days(store):
+    lid = _teach(store, "old rule")
+    _age(store, lid, 91)
+    _teach(store, "old rule")
+    assert [r["id"] for r in store.list_learnings("o/r")] == [lid]
+
+
+def test_editing_an_expired_rule_reaffirms_it(store):
+    lid = _teach(store, "old rule")
+    _age(store, lid, 91)
+    new = store.edit_learning("o/r", lid, actor="op", text="new rule")
+    assert cd.effective_status(dict(new)) == cd.STATUS_ACTIVE
+    assert [r["text"] for r in store.list_learnings("o/r")] == ["new rule"]
+
+
+def test_a_scope_edit_reaffirms_a_rule(store):
+    lid = _teach(store, "old rule")
+    _age(store, lid, 91)
+    store.edit_learning("o/r", lid, actor="op", scope_path="src/*.py")
+    assert [r["id"] for r in store.list_learnings("o/r")] == [lid]
+
+
+def test_a_reaffirmed_rule_outlives_its_original_row_ttl(store):
+    lid = _teach(store, "rule")
+    with store.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE grug_kv SET ttl = EXTRACT(EPOCH FROM now())::bigint + 86400 "
+            "WHERE pk = 'LEARN#o/r' AND sk = %s", (f"LEARNING#{lid}",),
+        )
+    store.set_learning_status("o/r", lid, cd.STATUS_ACTIVE, actor="op")
+    with store.get_pool().connection() as conn:
+        (ttl,) = conn.execute(
+            "SELECT ttl FROM grug_kv WHERE pk = 'LEARN#o/r' AND sk = %s",
+            (f"LEARNING#{lid}",),
+        ).fetchone()
+    assert ttl > datetime.now(timezone.utc).timestamp() + 90 * 86400
+
+
+def test_a_taught_rule_keeps_its_reason_and_finding_class(store):
+    lid = _teach(
+        store, "rule", reason="the caller validates", finding_class="null-deref",
+        finding_category="correctness",
+    )
+    row = store.get_learning("o/r", lid)
+    assert row["reason"] == "the caller validates"
+    assert row["finding_class"] == "null-deref"
+    assert row["finding_category"] == "correctness"
+
+
+def test_each_review_records_which_rules_fired(store):
+    a, b = _teach(store, "rule a"), _teach(store, "rule b")
+    store.record_learning_usage("o/r", [a], review_key="9@abc")
+    # A later prompt of the same review adds to the record and counts once.
+    store.record_learning_usage("o/r", [a, b], review_key="9@abc")
+    store.record_learning_usage("o/r", [b], review_key="10@def")
+    assert store.get_review_fired_learnings("o/r", "9@abc") == sorted([a, b])
+    assert store.get_review_fired_learnings("o/r", "10@def") == [b]
+    assert store.get_review_fired_learnings("o/r", "11@none") == []

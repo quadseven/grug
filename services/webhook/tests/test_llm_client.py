@@ -2540,6 +2540,51 @@ def test_judge_findings_makes_second_llm_call_and_parses_verdicts(monkeypatch) -
     assert "style nit" in out[1].reasoning
 
 
+def _judge_prompt_with_a_learning(monkeypatch, findings_repr) -> str:
+    """The system prompt a judge call really sends while the repo holds one
+    active learning that tells Elder to allow the seeded finding."""
+    _capture_llmobs(monkeypatch)
+    monkeypatch.setattr(
+        lc, "_repo_learnings_block",
+        lambda pr_context: "WHAT YOUR TRIBE TOLD GRUG: allow this pattern",
+    )
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts": []}'))
+    with patch.object(httpx, "post", return_value=response) as post:
+        lc.judge_findings(findings_repr, assemble_evidence([_hunk()]), installation_id=1)
+    return post.call_args.kwargs["json"]["messages"][0]["content"]
+
+
+def test_a_learning_steers_the_judge_on_an_ordinary_finding(monkeypatch) -> None:
+    prompt = _judge_prompt_with_a_learning(monkeypatch, [
+        {"rule_name": "null-deref", "file": "x.py", "line": 2, "severity": "high",
+         "message": "m", "category": "correctness"},
+    ])
+    assert "allow this pattern" in prompt
+
+
+@pytest.mark.parametrize(
+    ("rule", "category"),
+    [("sql-injection", "general"), ("exposed-secret", "general"), ("logic", "security")],
+)
+def test_a_learning_never_reaches_the_judge_of_a_security_or_sast_finding(
+    monkeypatch, rule, category,
+) -> None:
+    """#1571 seeded case: the judge decides whether a SAST candidate
+    publishes, so a learning in its prompt would be a suppression."""
+    prompt = _judge_prompt_with_a_learning(monkeypatch, [
+        {"rule_name": "null-deref", "file": "x.py", "line": 2, "severity": "high",
+         "message": "m", "category": "correctness"},
+        {"rule_name": rule, "file": "x.py", "line": 3, "severity": "high",
+         "message": "m", "category": category},
+    ])
+    assert "allow this pattern" not in prompt
+
+
+def test_the_learnings_block_says_it_never_touches_security() -> None:
+    block = lc._render_learnings_block([{"text": "prefer early returns"}])
+    assert "security" in block and "SAST" in block
+
+
 def test_judge_findings_emits_its_own_llmobs_span(monkeypatch) -> None:
     """The judge LLM call is itself traced (own span, name elder_judge)
     so its prompt/latency/tokens/cost show up in DD distinct from the

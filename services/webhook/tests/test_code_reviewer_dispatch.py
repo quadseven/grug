@@ -4622,6 +4622,22 @@ def test_rarely_fixed_class_posts_no_inline_and_one_board_line(monkeypatch):
     assert board.count("muted: fixed in 2 of 25 past findings") == 1
 
 
+def test_a_security_finding_of_a_muted_class_still_posts_inline(monkeypatch):
+    """#1571: the class was muted on general rows; this finding is security."""
+    from dataclasses import replace
+
+    muted = _muted(monkeypatch, _mute_rows("noisy", 2, 23))
+    evaluation = _mute_eval("noisy")
+    finding = replace(evaluation.findings[0], category="security")
+    evaluation = replace(evaluation, findings=(finding,))
+
+    _, posted = cr_dispatch.build_review_result(
+        evaluation, head_sha="a" * 40, event="COMMENT", muted=muted,
+    )
+
+    assert posted == (finding,)
+
+
 def test_class_below_min_labeled_is_not_muted(monkeypatch):
     assert _muted(monkeypatch, _mute_rows("noisy", 0, 19)) == {}
 

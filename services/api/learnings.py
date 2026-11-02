@@ -6,11 +6,12 @@ correct them. All endpoints are admin-only (`require_admin`):
 
   GET    /api/v1/admin/learnings?repo=&q=&status=   list + search
   GET    /api/v1/admin/learnings/export?repo=        portable document
+  GET    /api/v1/admin/learnings/fired?repo=&pr=&head_sha=  rules one review got
   POST   /api/v1/admin/learnings/import              dry run by default
   POST   /api/v1/admin/learnings/preview             files a scope matches
   GET    /api/v1/admin/learnings/{owner}/{name}/{id} inspect (with history)
   PATCH  /api/v1/admin/learnings/{owner}/{name}/{id} edit text/scope/links
-  POST   /api/v1/admin/learnings/{owner}/{name}/{id}/approve
+  POST   /api/v1/admin/learnings/{owner}/{name}/{id}/approve  (also re-affirms)
   POST   /api/v1/admin/learnings/{owner}/{name}/{id}/disable
   DELETE /api/v1/admin/learnings/{owner}/{name}/{id}
 
@@ -38,7 +39,9 @@ from cave_drawings import (
     STATUS_DISABLED,
     STATUSES,
     effective_status,
+    expires_at,
     export_document,
+    fired_review_key,
     is_valid_repo,
     matches_query,
     plan_import,
@@ -116,9 +119,15 @@ def _source(row: dict[str, Any], repo: str) -> dict[str, Any]:
     thread_url = f"https://github.com/{repo}/pull/{pr}" if repo and pr else ""
     if thread_url and comment_id:
         thread_url += f"#discussion_r{comment_id}"
+    history = row.get("history") or []
+    imported = bool(history) and history[0].get("action") == "imported"
     return {
         "pr": pr, "comment_id": comment_id,
         "author": _text(row, "author"), "thread_url": thread_url,
+        "signal": "import" if imported else "maintainer-reply",
+        "reason": _text(row, "reason"),
+        "finding_class": _text(row, "finding_class"),
+        "finding_category": _text(row, "finding_category"),
     }
 
 
@@ -138,6 +147,7 @@ def _view(row: dict[str, Any]) -> dict[str, Any]:
         **{key: _text(row, key) for key in _VIEW_STR_FIELDS},
         "repo": repo,
         "status": effective_status(row),
+        "expires_at": expires_at(row),
         "scope": {"kind": "repo", "repo": repo, "org": repo.split("/", 1)[0]},
         "scope_path": scope_path,
         "matcher": {"glob": scope_path, "repo_wide": not scope_path, "engine": "fnmatchcase"},
@@ -197,6 +207,23 @@ def export_learnings(
     rows = [dict(r) for r in install_store.list_learnings(_repo_or_400(repo), include_inactive=True)]
     _audit("learnings_exported", user, repo, "", count=len(rows))
     return export_document(rows)
+
+
+@router.get("/fired")
+def fired_learnings(
+    repo: str,
+    pr: Annotated[int, Query(ge=1)],
+    head_sha: str,
+    user: UserIdentity = Depends(require_admin),
+) -> dict[str, Any]:
+    """Which learned rules one review was given. A rule deleted since keeps
+    its id here, marked `deleted`."""
+    review = fired_review_key(pr, head_sha)
+    fired: list[dict[str, Any]] = []
+    for lid in install_store.get_review_fired_learnings(_repo_or_400(repo), review):
+        row = install_store.get_learning(repo, lid)
+        fired.append(_view(dict(row)) if row else {"id": lid, "text": "", "deleted": True})
+    return {"repo": repo, "review": review, "fired": fired}
 
 
 @router.post("/import")

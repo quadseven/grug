@@ -28,13 +28,11 @@ def test_derive_ranks_by_hits_then_recency():
     assert ps[1].finding_class == "correctness"
 
 
-def test_derive_turns_false_positives_into_negative_guidance():
+def test_a_false_positive_label_derives_no_suppression():
+    """#1571: a ledger label, which a bare reaction can write, never teaches
+    Elder to stay quiet. Suppression lives only in the governed store."""
     rows = [_r(1, "x", "real"), _r(2, "x", "wrong", verdict="false-positive")]
-    ps = derive_practices(rows)
-    assert {(p.disposition, p.rule) for p in ps} == {
-        ("report", "real"),
-        ("avoid", "wrong"),
-    }
+    assert [p.rule for p in derive_practices(rows)] == ["real"]
 
 
 def test_representative_rule_is_most_recent():
@@ -49,14 +47,20 @@ def test_decay_drops_stale_classes():
     assert classes == {"fresh"}
 
 
-def test_empty_yields_no_practices_and_all_fp_yields_avoidance():
+def test_empty_and_all_false_positive_yield_no_practices():
     assert derive_practices([]) == []
-    practices = derive_practices([
-        _r(1, "x", "w", verdict="false-positive"),
-    ])
-    assert len(practices) == 1
-    assert practices[0].disposition == "avoid"
-    assert "AVOID FALSE POSITIVE" in practices_block(practices)
+    assert derive_practices([_r(1, "x", "w", verdict="false-positive")]) == []
+
+
+def test_a_cached_avoid_practice_from_before_1571_never_reaches_a_prompt():
+    cached = [
+        {"finding_class": "x", "rule": "keep me", "hits": 1, "example_prs": [1],
+         "last_pr": 1, "disposition": "report"},
+        {"finding_class": "sql-injection", "rule": "drop me", "hits": 9,
+         "example_prs": [2], "last_pr": 2, "disposition": "avoid"},
+    ]
+    block = practices_block(practices_from_dicts(cached))
+    assert "keep me" in block and "drop me" not in block and "AVOID" not in block
 
 
 def test_block_is_bounded_and_labeled():
