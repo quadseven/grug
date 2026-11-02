@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -605,7 +606,7 @@ _GARBLED = json.dumps({
 def test_a_garbled_cave_answer_still_reaches_the_subscription_lane() -> None:
     """A Cave parse failure is a miss, not the review's end. It kept every
     public cohort off the lane while the Cave spilled to a free model that
-    spent its output on reasoning (2026-11-02)."""
+    spent its output on reasoning (2026-11-01)."""
     recorder = _Recorder({
         _CAVE_URL: _GARBLED,
         _FREE_GATEWAY_URL: _GARBLED,
@@ -723,7 +724,14 @@ def _cave_answer(model: str, completion_tokens: int) -> str:
 
 @pytest.mark.parametrize(
     ("model", "tokens"),
-    [("nvidia/spilled-model:free", 900), ("resident-spark-model", 6)],
+    [
+        ("nvidia/spilled-model:free", 900),
+        ("spilled-model-free", 900),
+        ("free-pool", 900),
+        ("an-unlisted-model", 900),
+        ("", 900),
+        (lc._CAVE_REVIEW_CODER_DEFAULT_MODEL, 6),
+    ],
 )
 def test_an_untrusted_cave_empty_walks_on_to_the_lane(model, tokens) -> None:
     """With the Sparks away the Cave route spills to free models, and a free
@@ -743,8 +751,73 @@ def test_an_untrusted_cave_empty_with_nothing_after_it_is_low_confidence() -> No
     assert cr_persona.evaluate_diff((), resp).degraded_reason == "low_confidence_review"
 
 
-def test_a_resident_spark_empty_of_real_length_stays_a_clean_review() -> None:
-    resp = _walk_to_free_pool(_EMPTY_SHORT, cave=_cave_answer("resident-spark-model", 900))
+def test_the_cave_trusts_an_empty_only_from_its_own_models() -> None:
+    assert {lc._CAVE_REVIEW_CODER_DEFAULT_MODEL, lc._CAVE_REVIEW_REASONER_DEFAULT_MODEL} <= (
+        lc._TRUSTED_EMPTY_CAVE_MODELS
+    )
+    assert not lc._cave_empty_is_trusted(
+        lc._ArmOutcome(backend=Backend.CAVE, kind="success", model="gemma4:31b"),
+    )
+
+
+def test_a_cave_low_confidence_answer_names_its_own_tier() -> None:
+    resp = _walk_to_free_pool(_EMPTY_LONG, cave=_cave_answer("nvidia/spilled-model:free", 900))
+
+    assert resp.tier_served == "self-hosted"
+
+
+def test_a_long_free_pool_empty_in_the_cloud_chain_is_not_a_clean_pass(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    recorder = _Recorder({
+        _FREE_GATEWAY_URL: _EMPTY_LONG,
+        _CAVE_URL: httpx.ConnectTimeout("cave down"),
+        "subscription": httpx.ConnectTimeout("lane down"),
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = lc._walk_review_ladder(assemble_evidence([_hunk()]), 1, "caveman", None)
+
+    assert resp.error.startswith(lc._LOW_CONFIDENCE_PREFIX)
+    assert cr_persona.evaluate_diff((), resp).degraded_reason == "low_confidence_review"
+
+
+def test_a_listed_resident_empty_of_real_length_stays_a_clean_review() -> None:
+    resp = _walk_to_free_pool(
+        _EMPTY_SHORT, cave=_cave_answer(lc._CAVE_REVIEW_CODER_DEFAULT_MODEL, 900),
+    )
 
     assert resp.backend_used == Backend.CAVE
     assert not resp.error
+
+
+def test_a_token_capped_cave_empty_keeps_its_truncation_error() -> None:
+    capped = json.dumps({
+        "choices": [{
+            "message": {"content": '{"findings": []}', "role": "assistant"},
+            "finish_reason": "length",
+        }],
+        "model": "nvidia/spilled-model:free",
+    })
+    resp = _walk_to_free_pool(_EMPTY_LONG, cave=capped)
+
+    assert resp.error.startswith("partial review:")
+    assert resp.tier_served == "self-hosted"
+
+
+def test_the_trusted_empty_list_comes_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CAVE_TRUSTED_EMPTY_MODELS", " resident-a , resident-b ")
+    outcome = lc._ArmOutcome(backend=Backend.CAVE, kind="success", model="resident-b")
+    assert lc._cave_empty_is_trusted(outcome)
+    assert not lc._cave_empty_is_trusted(
+        lc._ArmOutcome(backend=Backend.CAVE, kind="success", model=lc._CAVE_REVIEW_CODER_DEFAULT_MODEL),
+    )
+
+
+def test_the_workloads_ship_the_model_the_sparks_serve() -> None:
+    """`spark:warm-any` hides the served name, so the code defaults never match
+    a reply; an empty list would mark every honest Cave empty untrusted."""
+    root = Path(__file__).resolve().parents[3] / "k8s"
+    for manifest in ("consumer-deployment.yaml", "webhook-deployment.yaml"):
+        assert (
+            'name: GRUG_CAVE_TRUSTED_EMPTY_MODELS, value: "nemotron-3.5-super-vl"'
+            in (root / manifest).read_text()
+        )

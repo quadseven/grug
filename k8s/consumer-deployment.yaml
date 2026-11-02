@@ -295,6 +295,9 @@ spec:
             # Ollama model, and both Sparks now serve one vLLM model and no Ollama,
             # so the exact tag matched no target and every review call got a 503.
             # Same value as the webhook; test_cave_models_match_the_webhook holds them.
+            # The one model the Sparks serve. Its empty answers are trusted; the route
+            # spills to free models while the Sparks are away, and theirs are not.
+            - {name: GRUG_CAVE_TRUSTED_EMPTY_MODELS, value: "nemotron-3.5-super-vl"}
             - {name: GRUG_CAVE_REVIEW_MODEL, value: "spark:warm-any"}
             - {name: GRUG_CAVE_REASONER_MODEL, value: "spark:warm-any"}
             # grug#1191: the optional vLLM deep arm (services/_shared/deep_shadow.py).

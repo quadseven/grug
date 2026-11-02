@@ -6911,6 +6911,52 @@ def _cloud_tier_success(
     )
 
 
+def _untrusted_empty_review(
+    backend: Backend, model: str, served: tuple[str, ...], span_context: Any, tier: str,
+    *, truncated: bool = False,
+) -> LlmReviewResponse:
+    """An empty answer kept only if nothing better comes. Holding one emits no
+    served-tier metric: a later rung may still serve the chunk."""
+    return LlmReviewResponse(
+        kind="reviewed",
+        backend_used=backend,
+        model_name=model,
+        review_span_context=span_context,
+        backends_used=(backend,),
+        models_used=served,
+        error=_truncation_error((backend,)) if truncated else (
+            f"{_LOW_CONFIDENCE_PREFIX}{backend.value} {model} answered no findings "
+            "and no later model answered"
+        ),
+        tier_served=tier,
+    )
+
+
+# The models whose empty answer the Cave path trusts. Everything else is
+# untrusted: the route spills to whatever is free while the Sparks are away,
+# and no name pattern can tell a spill from a resident model.
+_TRUSTED_EMPTY_CAVE_MODELS = frozenset({
+    _CAVE_REVIEW_CODER_DEFAULT_MODEL, _CAVE_REVIEW_REASONER_DEFAULT_MODEL,
+})
+
+
+def _trusted_empty_cave_models() -> frozenset[str]:
+    """`GRUG_CAVE_TRUSTED_EMPTY_MODELS` (comma-separated), else the defaults."""
+    raw = os.getenv("GRUG_CAVE_TRUSTED_EMPTY_MODELS", "")
+    named = frozenset(m.strip() for m in raw.split(",") if m.strip())
+    return named or _TRUSTED_EMPTY_CAVE_MODELS
+
+
+def _cave_empty_is_trusted(outcome: "_ArmOutcome") -> bool:
+    """A named, listed model that took a real look. A reply naming no model
+    fails closed."""
+    return (
+        not outcome.degenerate
+        and not outcome.model_unconfirmed
+        and outcome.model in _trusted_empty_cave_models()
+    )
+
+
 def _low_confidence_success(
     outcome: _ArmOutcome, hunks: list[Hunk], pr_context: PrContext | None,
 ) -> LlmReviewResponse:
@@ -6965,15 +7011,11 @@ def _empty_confirms_nothing(key: "tuple[Backend, str]") -> bool:
     return backend == Backend.FREE_POOL
 
 
-def _free_go_found_nothing(tier: BackendConfig, outcome: _ArmOutcome) -> bool:
-    """An empty answer from a free Go model is never a clean pass. The short-
+def _free_tier_found_nothing(tier: BackendConfig, outcome: _ArmOutcome) -> bool:
+    """An empty answer from a free tier is never a clean pass. The short-
     answer check misses it: Beam Free spent 1792 output tokens, all reasoning,
     on the empty answer above, and an answer with no usage is never flagged."""
-    return (
-        tier.backend == Backend.OPENCODE_GO
-        and _opencode_go_model_is_free(tier.model)
-        and not outcome.findings
-    )
+    return not outcome.findings and _empty_confirms_nothing((tier.backend, tier.model))
 
 
 def _empty_answers_agree(
@@ -7081,7 +7123,7 @@ def _try_cloud_primary(
             backend, messages, variant, pr_tags, cancel_event, config_override=tier,
         )
         if outcome.kind == "success" and (
-            outcome.degenerate or _free_go_found_nothing(tier, outcome)
+            outcome.degenerate or _free_tier_found_nothing(tier, outcome)
         ):
             last_error = f"{backend.value}: degenerate empty review"
             key = (backend, tier.model)
@@ -7325,18 +7367,9 @@ def _run_free_provider_fallback(
             if untrusted_empty:
                 last_error = f"{backend.value}: untrusted empty review"
                 if low_confidence is None:
-                    low_confidence = LlmReviewResponse(
-                        kind="reviewed",
-                        backend_used=backend,
-                        model_name=resolved_model,
-                        review_span_context=span_context,
-                        backends_used=(backend,),
-                        models_used=_served_models(model),
-                        error=(
-                            f"{_LOW_CONFIDENCE_PREFIX}{backend.value} {resolved_model} "
-                            "answered no findings and no later model answered"
-                        ),
-                        tier_served="free-pool",
+                    low_confidence = _untrusted_empty_review(
+                        backend, resolved_model, _served_models(model), span_context,
+                        "free-pool",
                     )
                 continue
             log.info(
@@ -7683,14 +7716,13 @@ def _review_diff_dispatch_cave_primary(
             # kinds leave it None.
             assert outcome.model is not None
             resolved_model = outcome.model
-            # The Cave route spills to free models while the Sparks are away,
-            # and their empty answers prove nothing: same miss as tier 2.
-            if not outcome.findings and (
-                outcome.degenerate or is_free_tier_model(resolved_model)
-            ):
+            if not outcome.findings and not _cave_empty_is_trusted(outcome):
                 last_error = f"{backend.value}: untrusted empty review"
                 if cave_low_confidence is None:
-                    cave_low_confidence = _low_confidence_success(outcome, hunks, pr_context)
+                    cave_low_confidence = _untrusted_empty_review(
+                        backend, resolved_model, outcome.served_models,
+                        outcome.span_context, "self-hosted", truncated=outcome.truncated,
+                    )
                 continue
             origin = _finding_origin(
                 backend=backend,
