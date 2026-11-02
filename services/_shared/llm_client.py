@@ -814,9 +814,10 @@ _WITHDRAWN_TAIL = re.compile(
 )
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 # grug#1529: the same backstop for a candidate whose last sentence is exactly
-# "Omit." or "Omit - not a secret." The model decided to drop it. Any other
-# wording ("Omit the token from the log.") is a real finding and still posts.
-_OMIT_TAIL = re.compile(r"^omit(?: [-\u2013\u2014] not a secret)?\.?$", re.IGNORECASE)
+# "Omit." or "Omit - not a secret.", closing period included. The model decided
+# to drop it. Any other wording ("Omit the token from the log.", or a bare
+# "Omit" with no period) is a real finding and still posts.
+_OMIT_TAIL = re.compile(r"^omit(?: [-\u2013\u2014] not a secret)?\.$", re.IGNORECASE)
 
 
 def is_withdrawn_finding(finding: "Finding") -> bool:

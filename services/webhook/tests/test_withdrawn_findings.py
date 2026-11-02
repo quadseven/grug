@@ -155,6 +155,8 @@ _LIVE_OMIT_TEXTS = (
     "The key is committed here. Omit - not a hardcoded secret.",
     "The token reaches the log line. Omit the token from the log.",
     "Omit. That is what the old comment says, but the key still reaches the log.",
+    "The token reaches the log line. Omit",
+    "The value is a token. Omit - not a secret",
 )
 
 
@@ -186,8 +188,9 @@ def test_the_two_blocking_omit_criticals_no_longer_fail_the_check() -> None:
 
 
 def test_a_real_finding_that_mentions_omit_still_publishes() -> None:
+    # The diff adds lines 2 to 7, so the anchors wrap inside it.
     evaluation = _evaluate(*(
-        _llm(i + 2, text, severity="critical")
+        _llm(2 + i % 6, text, severity="critical")
         for i, text in enumerate(_LIVE_OMIT_TEXTS)
     ))
     assert [f.message for f in evaluation.findings] == list(_LIVE_OMIT_TEXTS)
