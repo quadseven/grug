@@ -297,6 +297,9 @@ spec:
             # Ollama model, and both Sparks now serve one vLLM model and no Ollama,
             # so the exact tag matched no target and every review call got a 503.
             # Same value as the webhook; test_cave_models_match_the_webhook holds them.
+            # The one model the Sparks serve. Its empty answers are trusted; the route
+            # spills to free models while the Sparks are away, and theirs are not.
+            - {name: GRUG_CAVE_TRUSTED_EMPTY_MODELS, value: "nemotron-3.5-super-vl"}
             # The model the Sparks serve, by name: warm-any spills to free models that garble
             # (2026-11-01), which stops the walk; a named model answers 503 at once while the
             # Sparks are away, and the walk goes on to the lane. The judge stays on warm-any.
