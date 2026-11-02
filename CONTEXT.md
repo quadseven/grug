@@ -148,6 +148,8 @@ The single copy of every cross-service module lives in `services/_shared/` - a P
 
 **Comment budget.** The cap on blocking inline markings per PR, plus the drip-feed rule that holds new sub-critical findings on unchanged lines after round one. Held findings stay on the board and in the check (#1570).
 
+**Second-lineage review.** A fresh review of a PR's high-risk paths by a different model family on the subscription lane, merged into the one review. A PR that got only one family is marked single-lineage (#1573).
+
 ## Vocabulary debt (named for future cleanup)
 
 These terms exist in the codebase but are inconsistent or under-named. Resolving them is out of scope for the initial CONTEXT.md authoring; track in dedicated issues.

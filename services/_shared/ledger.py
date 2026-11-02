@@ -50,6 +50,11 @@ _REJECTED = frozenset({"false-positive"})
 # `unavailable`: a model's verdict, not ground truth, so they count as neither
 # accepted nor false-positive and never become eval cases.
 VERIFIER_REVIEWER = "elder-verifier"
+# The same for the second-lineage pass (#1573): `second-only` per blocking
+# finding only it raised, `second-lineage-run` per run, `single-lineage` per
+# high-risk PR that got one lineage.
+SECOND_LINEAGE_REVIEWER = "elder-second-lineage"
+TELEMETRY_REVIEWERS = frozenset({VERIFIER_REVIEWER, SECOND_LINEAGE_REVIEWER})
 
 # CRITICAL first; unknown labels sort last (consumers use .get(sev, 4)).
 # The ONE severity-ranking convention - few_shot (and any future consumer)
@@ -82,6 +87,8 @@ class LedgerRow:
     # #683: taxonomy category (review_types.CATEGORIES) so precedent and
     # precision can be sliced per category. Absent or invalid -> "general".
     category: str = DEFAULT_CATEGORY
+    # Model calls one second-lineage row spent (#1573).
+    model_calls: int = 0
 
     @property
     def accepted(self) -> bool:
@@ -116,6 +123,7 @@ def parse_row(d: dict) -> LedgerRow | None:
             commit=d.get("commit"),
             head_sha=d.get("head_sha"),
             category=category_or_default(d.get("category")),
+            model_calls=int(d.get("model_calls") or 0),
         )
     except (KeyError, ValueError, TypeError):
         return None
@@ -280,6 +288,21 @@ def learning_metrics(rows: list[LedgerRow]) -> dict[str, object]:
     }
 
 
+def second_lineage_yield(rows: list[LedgerRow]) -> dict[str, float]:
+    """What the second pass cost and found (#1573), for the four-week review
+    of its path list."""
+    own = [r for r in rows if r.reviewer == SECOND_LINEAGE_REVIEWER]
+    second_only = sum(1 for r in own if r.verdict == "second-only")
+    calls = sum(r.model_calls for r in own)
+    return {
+        "runs": sum(1 for r in own if r.verdict == "second-lineage-run"),
+        "second_only_blocking": second_only,
+        "single_lineage": sum(1 for r in own if r.verdict == "single-lineage"),
+        "model_calls": calls,
+        "calls_per_finding": calls / second_only if second_only else 0.0,
+    }
+
+
 def tier_rates(rows: list[LedgerRow]) -> dict[str, tuple[int, int]]:
     """{severity: (addressed, labeled)}: the data for tuning the comment
     budget and checking that the top tier earns its place (#1570)."""
@@ -311,6 +334,15 @@ def format_metrics(rows: list[LedgerRow]) -> str:
     for tier in sorted(rates, key=lambda t: SEVERITY_ORDER.get(t, 4)):
         addressed, labeled = rates[tier]
         lines.append(f"  {tier}: {addressed}/{labeled} addressed")
+    second = second_lineage_yield(rows)
+    if second["runs"] or second["single_lineage"]:
+        lines.append(
+            f"second lineage: {second['runs']} runs, "
+            f"{second['second_only_blocking']} second-only blocking, "
+            f"{second['single_lineage']} single-lineage, "
+            f"{second['model_calls']} calls, "
+            f"{second['calls_per_finding']:.1f} calls per finding"
+        )
     return "\n".join(lines)
 
 

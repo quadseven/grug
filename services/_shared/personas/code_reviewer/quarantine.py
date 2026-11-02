@@ -27,6 +27,11 @@ SECURITY_SCOPE = (
     "security defects only: authentication, authorization, cryptography, "
     "secret handling, injection, and CI or reviewer configuration"
 )
+SINGLE_LINEAGE_NOTE = (
+    "Single-lineage review: a second model lineage did not review this "
+    "high-risk change on this head."
+)
+SECOND_LINEAGE_MARK = "[Second lineage] "
 UNAVAILABLE_NOTE = (
     "The code-only security pass did not finish on this head, so only the "
     "normal review covered the sensitive paths."
@@ -40,6 +45,7 @@ _SENSITIVE_WORDS = frozenset({
     "payment", "payments", "billing",
     "secret", "secrets", "token", "tokens", "credential", "credentials", "password", "passwords",
 })
+_MIGRATION_WORDS = frozenset({"migration", "migrations"})
 _CONFIG_GLOBS = (
     ".github/workflows/**", ".github/actions/**", ".gitlab-ci.yml", ".grug.yaml",
 )
@@ -54,6 +60,10 @@ _FALSE_VALUES = frozenset({"", "0", "false", "off", "no"})
 def switch_on(name: str) -> bool:
     """A review switch that spends model calls: off unless set."""
     return os.getenv(name, "").strip().lower() not in _FALSE_VALUES
+
+
+def second_lineage_enabled() -> bool:
+    return switch_on("GRUG_SECOND_LINEAGE_REVIEW")
 
 
 def quarantined_pass_enabled() -> bool:
@@ -78,6 +88,19 @@ def sensitive_paths(paths: Iterable[str], config: RepoConfig) -> tuple[str, ...]
     return tuple(p for p in paths if any(path_matches(p, g) for g in globs))
 
 
+def high_risk_paths(paths: Iterable[str], config: RepoConfig) -> tuple[str, ...]:
+    """The second-lineage list (#1573): the sensitive paths, plus migrations
+    while the repo keeps the default list."""
+    listed = tuple(paths)
+    sensitive = set(sensitive_paths(listed, config))
+    if config.security_review_paths is None:
+        sensitive.update(
+            p for p in listed
+            if not _MIGRATION_WORDS.isdisjoint(_LOWERED_RUN_RE.findall(p.lower()))
+        )
+    return tuple(p for p in listed if p in sensitive)
+
+
 def quarantined_evidence(
     evidence: ElderEvidence, paths: Iterable[str],
 ) -> ElderEvidence:
@@ -99,6 +122,7 @@ class MergedFindings:
     findings: tuple[Finding, ...]
     added: int
     raised: int
+    added_findings: tuple[Finding, ...] = ()
 
 
 def _fingerprint(finding: Finding) -> tuple[str, int, str]:
@@ -110,10 +134,13 @@ def _in_scope(finding: Finding) -> bool:
 
 
 def merge_by_fingerprint(
-    primary: tuple[Finding, ...], second: tuple[Finding, ...],
+    primary: tuple[Finding, ...], second: tuple[Finding, ...], *, mark: str = "",
+    second_opinion: bool = False,
 ) -> MergedFindings:
     """One marking per fingerprint, at the stricter severity. A second-pass
-    finding outside the security scope is a duplicate nit and is dropped."""
+    finding outside the security scope is a duplicate nit and is dropped.
+    `mark` prefixes a finding only the second pass raised. A `second_opinion`
+    pass adds findings only: it never breaks a tie on the primary pass's."""
     merged = list(primary)
     positions: dict[tuple[str, int, str], int] = {}
     for index, finding in enumerate(primary):
@@ -125,11 +152,15 @@ def merge_by_fingerprint(
         if position is None:
             if _in_scope(finding):
                 positions[key] = len(merged)
-                merged.append(finding)
+                merged.append(
+                    dataclasses.replace(finding, message=f"{mark}{finding.message}"),
+                )
                 added += 1
-        elif _SEVERITY_RANK[finding.severity] > _SEVERITY_RANK[merged[position].severity]:
+        elif not second_opinion and (
+            _SEVERITY_RANK[finding.severity] > _SEVERITY_RANK[merged[position].severity]
+        ):
             merged[position] = dataclasses.replace(
                 merged[position], severity=finding.severity,
             )
             raised += 1
-    return MergedFindings(tuple(merged), added, raised)
+    return MergedFindings(tuple(merged), added, raised, tuple(merged[len(primary):]))
