@@ -7689,8 +7689,9 @@ def _review_diff_dispatch_cave_primary(
         # http_failed
         last_error = outcome.error_text
 
-    if not successes and first_parse_fail is None:
-        if cancel_event is not None and cancel_event.is_set():
+    cancelled = cancel_event is not None and cancel_event.is_set()
+    if not successes and (first_parse_fail is None or not cancelled):
+        if cancelled:
             # Superseded mid-flight (#635 follow-up): both Cave arms were
             # deliberately aborted because the review input moved, not
             # because the owned hardware is unavailable. Trying OpenRouter/
@@ -7707,8 +7708,9 @@ def _review_diff_dispatch_cave_primary(
                 error="cancelled: review input changed while the review was running",
             )
         # Tier 2: Free provider pool (grug#1269/#1276).
-        # Both Cave arms produced NO usable response at all. Try the free provider
-        # pool in fixed order (gateway free pool, then free SaaS backends).
+        # No Cave arm gave a usable review, and a garbled answer is no review,
+        # so it walks on like an outage. Try the free provider pool in fixed
+        # order (gateway free pool, then free SaaS backends).
         free_resp, free_parse_fail, free_err = _run_free_provider_fallback(
             messages=messages,
             variant=variant,
@@ -7736,7 +7738,9 @@ def _review_diff_dispatch_cave_primary(
             pr_context=pr_context,
             installation_id=installation_id,
         )
-        if sub_resp is not None:
+        # The lane's own failure outranks only a walk with nothing better to
+        # report; a parse failure stays the more specific answer below.
+        if sub_resp is not None and (sub_resp.kind == "reviewed" or first_parse_fail is None):
             return sub_resp
 
     if successes:
