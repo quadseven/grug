@@ -7279,13 +7279,23 @@ def _run_free_provider_fallback(
     hunks: list[Hunk],
     pr_context: Optional[PrContext],
     installation_id: int,
-) -> tuple[Optional[LlmReviewResponse], Optional[tuple[Backend, Optional[str], str]], str]:
+) -> tuple[
+    Optional[LlmReviewResponse],
+    Optional[tuple[Backend, Optional[str], str]],
+    str,
+    Optional[LlmReviewResponse],
+]:
     """Tier 2: Try free provider pool in fixed order (gateway free pool, then free SaaS).
+
+    An empty answer this tier cannot trust is a miss, the same rule
+    `_try_cloud_primary` applies: the walk goes on, and the first such answer
+    comes back last as a low-confidence review, never a clean pass.
 
     When every gateway call of this walk failed the way an outage does, the
     backends that do not route through the gateway go first and a gateway
     arm that already failed is not asked again (grug#1467)."""
     first_parse_fail: Optional[tuple[Backend, Optional[str], str]] = None
+    low_confidence: Optional[LlmReviewResponse] = None
     last_error = ""
     for config in _gateway_outage_order(_free_provider_fallback_configs()):
         backend = config.backend
@@ -7308,6 +7318,27 @@ def _run_free_provider_fallback(
         span_context = attempt.span_context
         if not err:
             resolved_model = model or config.model
+            untrusted_empty = not findings and (
+                _is_degenerate_empty_review(findings, attempt.usage_metrics)
+                or _empty_confirms_nothing((backend, config.model))
+            )
+            if untrusted_empty:
+                last_error = f"{backend.value}: untrusted empty review"
+                if low_confidence is None:
+                    low_confidence = LlmReviewResponse(
+                        kind="reviewed",
+                        backend_used=backend,
+                        model_name=resolved_model,
+                        review_span_context=span_context,
+                        backends_used=(backend,),
+                        models_used=_served_models(model),
+                        error=(
+                            f"{_LOW_CONFIDENCE_PREFIX}{backend.value} {resolved_model} "
+                            "answered no findings and no later model answered"
+                        ),
+                        tier_served="free-pool",
+                    )
+                continue
             log.info(
                 "llm_saas_overload_fallback_used",
                 extra={"backend": backend.value, "installation_id": installation_id},
@@ -7346,6 +7377,7 @@ def _run_free_provider_fallback(
                 ),
                 first_parse_fail,
                 "",
+                None,
             )
         if resp.status_code == 200:
             log.warning(
@@ -7363,7 +7395,7 @@ def _run_free_provider_fallback(
             error_message=_backend_error_message(resp),
         )
         last_error = f"{backend.value}: {err}"
-    return None, first_parse_fail, last_error
+    return None, first_parse_fail, last_error, low_confidence
 
 
 def _run_subscription_fallback(
@@ -7711,7 +7743,7 @@ def _review_diff_dispatch_cave_primary(
         # No Cave arm gave a usable review, and a garbled answer is no review,
         # so it walks on like an outage. Try the free provider pool in fixed
         # order (gateway free pool, then free SaaS backends).
-        free_resp, free_parse_fail, free_err = _run_free_provider_fallback(
+        free_resp, free_parse_fail, free_err, free_low_confidence = _run_free_provider_fallback(
             messages=messages,
             variant=variant,
             pr_tags=pr_tags,
@@ -7740,8 +7772,13 @@ def _review_diff_dispatch_cave_primary(
         )
         # The lane's own failure outranks only a walk with nothing better to
         # report; a parse failure stays the more specific answer below.
-        if sub_resp is not None and (sub_resp.kind == "reviewed" or first_parse_fail is None):
+        if sub_resp is not None and sub_resp.kind == "reviewed":
             return sub_resp
+        if first_parse_fail is None:
+            if free_low_confidence is not None:
+                return free_low_confidence
+            if sub_resp is not None:
+                return sub_resp
 
     if successes:
         first = successes[0]

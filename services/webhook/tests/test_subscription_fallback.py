@@ -654,3 +654,60 @@ def test_a_cancelled_review_after_a_garbled_cave_answer_asks_no_one_else() -> No
         )
 
     assert recorder.called_urls == [_CAVE_URL]
+
+
+_EMPTY_SHORT = json.dumps({
+    "choices": [{"message": {"content": '{"findings": []}', "role": "assistant"}}],
+    "model": "free-model",
+    "usage": {"prompt_tokens": 30_000, "completion_tokens": 6},
+})
+_EMPTY_LONG = json.dumps({
+    "choices": [{"message": {"content": '{"findings": []}', "role": "assistant"}}],
+    "model": "free-model",
+    "usage": {"prompt_tokens": 30_000, "completion_tokens": 900},
+})
+
+
+def _walk_to_free_pool(free_answer: str, cave: object = _GARBLED, lane: object = None):
+    recorder = _Recorder({
+        _CAVE_URL: cave,
+        _FREE_GATEWAY_URL: free_answer,
+        _POOLSIDE_URL: httpx.ConnectTimeout("poolside down"),
+        _OPENROUTER_URL: httpx.ConnectTimeout("openrouter down"),
+        _SUBSCRIPTION_URL: lane or httpx.ConnectTimeout("lane down"),
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        return route_elder_model_call(assemble_evidence([_hunk()]), installation_id=1)
+
+
+@pytest.mark.parametrize("empty", [_EMPTY_SHORT, _EMPTY_LONG])
+def test_a_free_pool_empty_after_a_garbled_cave_is_not_a_clean_pass(empty) -> None:
+    """The free pool's empty answer proves nothing, whatever its length, so
+    it cannot pass a review the Cave garbled."""
+    resp = _walk_to_free_pool(empty)
+
+    assert resp.kind == "parse_failed"
+    assert cr_persona.evaluate_diff((), resp).degraded_reason is not None
+
+
+def test_a_free_pool_empty_with_the_cave_down_is_low_confidence() -> None:
+    resp = _walk_to_free_pool(_EMPTY_LONG, cave=httpx.ConnectTimeout("cave down"))
+
+    assert resp.kind == "reviewed"
+    assert resp.error.startswith(lc._LOW_CONFIDENCE_PREFIX)
+    assert cr_persona.evaluate_diff((), resp).degraded_reason == "low_confidence_review"
+
+
+def test_a_free_pool_empty_walks_on_to_the_lane() -> None:
+    resp = _walk_to_free_pool(_EMPTY_SHORT, lane=_finding_body())
+
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert len(resp.findings) == 1
+
+
+def test_a_free_pool_finding_is_still_a_review() -> None:
+    resp = _walk_to_free_pool(_finding_body())
+
+    assert resp.backend_used == Backend.FREE_POOL
+    assert len(resp.findings) == 1
+    assert resp.error == ""
