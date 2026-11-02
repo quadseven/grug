@@ -231,7 +231,11 @@ class PrContext(TypedDict, total=False):
     repo: str
     pr_number: int
     head_sha: str
+    # The diff's start: on a Living Hunt this is the last reviewed head, a PR
+    # commit, so nothing that steers a review may read it.
     base_sha: str
+    # The PR's own base commit, on every pass. Steering files read this (#1574).
+    pr_base_sha: str
     title: str
     body: str
     review_phase: str
@@ -2696,9 +2700,9 @@ def _review_system_prompt(
     is therefore stated in words, in BOTH blocks (#1131): the guidelines
     block names a path instruction as the one thing that outranks a carving,
     and `repo_config.instructions_block` says it outranks the agent-guideline
-    files for the files it names. The reason is trust, not taste: `.grug.yaml`
-    is read from the base branch, the guideline files from the PR head, so a
-    PR cannot use its own CLAUDE.md to overrule a maintainer's instruction.
+    files for the files it names. Both are read from the base commit
+    (#1574), so a PR cannot use its own CLAUDE.md to steer its own review;
+    the order is the narrower rule winning over the general one.
     Pinned by `test_path_instructions_outrank_guidelines_in_both_blocks`.
     """
     # Per-repo team-learned practices (#527) append to the system prompt at
@@ -4307,7 +4311,9 @@ def _repo_guidelines_block(pr_context: Optional[PrContext]) -> str:
     if "/" not in repo:
         return ""
     owner, repo_name = repo.split("/", 1)
-    ref = str(pr_context.get("head_sha", ""))
+    # The base commit, never the head (#1574): this text steers the review
+    # from the system prompt, so a PR must not be able to write it.
+    ref = str(pr_context.get("pr_base_sha", ""))
     if not ref:
         return ""
     try:
@@ -4332,13 +4338,13 @@ _GUIDELINE_CANDIDATES = (
     ".github/copilot-instructions.md", ".windsurfrules",
 )
 _GUIDELINE_FETCH_TIMEOUT = 10.0
-# Enough for the reviews in flight on one consumer; each entry is one head.
-_GUIDELINE_CACHE_HEADS = 32
+# Enough for the reviews in flight on one consumer; each entry is one base commit.
+_GUIDELINE_CACHE_REFS = 32
 # Only the first `_MAX_GUIDELINES_CHARS` reach the prompt. Keeping more than
 # that leaves room for redaction, and the limit stops a huge file in a pull
 # request from pinning its size in memory for every cached head.
 _GUIDELINE_CACHE_CHARS = 64_000
-_guideline_cache = RepoFileCache(_GUIDELINE_CACHE_HEADS)
+_guideline_cache = RepoFileCache(_GUIDELINE_CACHE_REFS)
 
 
 def _fetch_guideline_files(
@@ -4351,14 +4357,14 @@ def _fetch_guideline_files(
     unreadable file cannot cost the others.
 
     Every cohort, chunk and retry of a review lands here, so each file is
-    read once per head (grug#1535). A 404 is remembered too, since most repos
+    read once per ref (grug#1535). A 404 is remembered too, since most repos
     carry few of these files. Any other failure is not, so it is retried."""
     from urllib.parse import quote
 
     from github_app_auth import with_install_token_retry  # type: ignore
 
-    head = (installation_id, owner, repo, ref)
-    known = _guideline_cache.known(head)
+    key = (installation_id, owner, repo, ref)
+    known = _guideline_cache.known(key)
     missing = [path for path in _GUIDELINE_CANDIDATES if path not in known]
 
     def _do(token: str) -> dict[str, str | None]:
@@ -4383,7 +4389,7 @@ def _fetch_guideline_files(
             except (httpx.HTTPStatusError, httpx.RequestError):
                 continue
             answered[path] = text
-            _guideline_cache.remember(head, path, text)
+            _guideline_cache.remember(key, path, text)
         return answered
 
     if missing:
@@ -4426,10 +4432,10 @@ def _render_guidelines_block(files: dict[str, str]) -> str:
         "TRIBE'S OWN CARVINGS (this repo's own agent-guideline files - "
         "versioned, team-authored standards; if one of these conflicts with "
         "a taught preference above, follow the carving - it is the current, "
-        "official word. One thing outranks a carving: a `.grug.yaml` review "
-        "instruction in the REPO DOCS block, for the files it names, because "
-        "it is read from the base branch and these files from the PR "
-        "head):\n\n" + body
+        "official word. Read from the base branch, so a change to one in this "
+        "PR is not yet in force. One thing outranks a carving: a `.grug.yaml` "
+        "review instruction in the REPO DOCS block, for the files it "
+        "names):\n\n" + body
     )
 
 
@@ -7487,6 +7493,45 @@ def _run_subscription_fallback(
         error=f"{Backend.SUBSCRIPTION.value}: {err}",
         tier_served="subscription",
     )
+
+
+def review_second_lineage(
+    evidence: ElderEvidence,
+    installation_id: int,
+    primary_models: tuple[str, ...],
+    cancel_event: threading.Event | None = None,
+) -> LlmReviewResponse:
+    """One review on the operator's subscription lane (#1573): no paid API
+    spend, and no other backend. The lane serves two families and picks one,
+    so it hears the family to avoid the way it hears an author's. The caller
+    compares the family that answered. A missing or spent lane is a
+    failed pass, never a fallback. `cancel_event` is checked before the call."""
+    if cancel_event is not None and cancel_event.is_set():
+        return LlmReviewResponse(kind="all_failed", error="cancelled")
+    # Half the daily cap stays for the last resort the primary pass may need.
+    if _subscription_calls_today() * 2 >= _subscription_daily_cap():
+        return LlmReviewResponse(kind="all_failed", error="second-lineage share spent")
+    # One call has no cohort planner, so a diff past one cohort cannot fit.
+    if sum(len(hunk.body) for hunk in evidence.hunks) > review_cohort_char_budget():
+        return LlmReviewResponse(kind="all_failed", error="diff too large for one call")
+    pr_context = evidence.pr_context
+    # The header carries one family, so the author's comes first. The caller
+    # checks the reply against every family to avoid.
+    known = [family for family in map(model_family, primary_models) if family]
+    avoid = (pr_context or {}).get("author_family") or (known[0] if known else "")
+    messages = _build_messages(evidence, "v2")
+    token = _FAMILY_GATE.set((avoid, False)) if avoid else None
+    try:
+        response = _run_subscription_fallback(
+            messages, "v2", _llmobs_tags(pr_context), list(evidence.hunks),
+            pr_context, installation_id,
+        )
+    finally:
+        if token is not None:
+            _FAMILY_GATE.reset(token)
+    if response is None:
+        return LlmReviewResponse(kind="all_failed", error="subscription lane unavailable")
+    return response
 
 
 def _review_diff_dispatch_cave_primary(

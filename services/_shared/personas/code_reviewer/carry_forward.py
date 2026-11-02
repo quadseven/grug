@@ -118,6 +118,19 @@ def _carriable(thread: dict) -> tuple[str, str, int] | None:
     return owned
 
 
+def open_blocking_count(threads: list[dict]) -> int:
+    """Unresolved threads at a blocking severity: what earlier rounds already
+    spent of the comment budget (#1570)."""
+    count = 0
+    for thread in threads:
+        comments = (thread.get("comments") or {}).get("nodes") or []
+        if not comments or _thread_is_resolved(thread):
+            continue
+        if _standing_severity(comments[0].get("body") or "") in ("high", "critical"):
+            count += 1
+    return count
+
+
 def select_carried(
     threads: list[dict], findings: tuple[Finding, ...],
 ) -> tuple[CarriedFinding, ...]:

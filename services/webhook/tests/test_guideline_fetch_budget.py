@@ -18,7 +18,9 @@ from repo_file_cache import RepoFileCache
 from review_evidence import assemble_evidence
 
 _REQUEST = httpx.Request("GET", "https://api.github.com/repos/o/r/contents/f")
-_PR_CONTEXT = {"repo": "o/r", "installation_id": 1, "head_sha": "a" * 40}
+_PR_CONTEXT = {
+    "repo": "o/r", "installation_id": 1, "head_sha": "a" * 40, "pr_base_sha": "b" * 40,
+}
 
 
 @pytest.fixture(autouse=True)

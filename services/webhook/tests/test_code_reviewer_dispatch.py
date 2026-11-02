@@ -1189,6 +1189,7 @@ def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
         "pr_number": 7,
         "head_sha": "abcd1234efgh",
         "base_sha": "base5678ijkl",
+        "pr_base_sha": "base5678ijkl",
         "title": "Preserve PR intent",
         "body": "Reviewer should understand the requested behavior.",
         "sensitive_review": False,
