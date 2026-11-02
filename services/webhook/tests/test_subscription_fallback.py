@@ -825,12 +825,96 @@ def test_the_workloads_ship_the_model_the_sparks_serve() -> None:
         )
 
 
-def _lane_first(monkeypatch, responses: dict[str, object]):
+_PUBLIC_PR = {"repo": "quadseven/grug", "pr_number": 7, "repo_private": False}
+
+
+def _lane_first(monkeypatch, responses: dict[str, object], *, pr=_PUBLIC_PR, gate=None):
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "subscription")
     recorder = _Recorder(responses)
-    with patch.object(httpx, "post", side_effect=recorder):
-        resp = lc._walk_review_ladder(assemble_evidence([_hunk()]), 1, "caveman", None)
+    token = lc._FAMILY_GATE.set(gate)
+    try:
+        with patch.object(httpx, "post", side_effect=recorder), lc._spark_job_scope(pr):
+            resp = lc._walk_review_ladder(assemble_evidence([_hunk()]), 1, "caveman", None)
+    finally:
+        lc._FAMILY_GATE.reset(token)
     return resp, recorder
+
+
+def _lane_answer(content: str, model: str = "gpt-6-luna", completion_tokens: int = 500) -> str:
+    return json.dumps({
+        "choices": [{"message": {"content": content, "role": "assistant"}}],
+        "model": model,
+        "usage": {"prompt_tokens": 30_000, "completion_tokens": completion_tokens},
+    })
+
+
+_NO_FINDINGS = '{"findings": []}'
+
+
+def test_a_short_lane_empty_is_not_a_clean_review_on_its_own(monkeypatch) -> None:
+    resp, _ = _lane_first(monkeypatch, {"subscription": _lane_answer(_NO_FINDINGS, completion_tokens=9)})
+
+    assert resp.error.startswith(lc._LOW_CONFIDENCE_PREFIX)
+    assert resp.backend_used == Backend.SUBSCRIPTION
+
+
+def test_a_second_model_confirms_a_short_lane_empty(monkeypatch) -> None:
+    resp, _ = _lane_first(monkeypatch, {
+        "subscription": _lane_answer(_NO_FINDINGS, completion_tokens=9),
+        "opencode": _lane_answer(_NO_FINDINGS, "deepseek-v4.1-flash", 7),
+    })
+
+    assert resp.kind == "reviewed"
+    assert not resp.error
+
+
+def test_a_lane_empty_of_real_length_is_a_clean_review(monkeypatch) -> None:
+    resp, recorder = _lane_first(monkeypatch, {"subscription": _lane_answer(_NO_FINDINGS)})
+
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert not resp.error
+    assert len(recorder.called_urls) == 1
+
+
+def test_a_private_repo_is_not_reviewed_lane_first(monkeypatch) -> None:
+    private = dict(_PUBLIC_PR, repo_private=True)
+    resp, recorder = _lane_first(
+        monkeypatch,
+        {"subscription": _finding_body(), "opencode": _finding_body()},
+        pr=private,
+    )
+
+    assert resp.backend_used == Backend.OPENCODE_GO
+    assert not any("subscription" in url for url in recorder.called_urls)
+
+
+def test_the_lane_hears_the_data_class(monkeypatch) -> None:
+    _, recorder = _lane_first(monkeypatch, {"subscription": _finding_body()})
+
+    assert recorder.call_headers[0]["X-Spark-Data-Class"] == "public"
+
+
+def test_a_lane_answer_from_the_authors_family_is_a_miss(monkeypatch) -> None:
+    monkeypatch.setattr(lc, "model_family", lambda model: "openai" if "gpt" in model else "other")
+    resp, _ = _lane_first(
+        monkeypatch,
+        {"subscription": _lane_answer(json.loads(_finding_body())["choices"][0]["message"]["content"]),
+         "opencode": _finding_body()},
+        gate=("openai", False),
+    )
+
+    assert resp.backend_used == Backend.OPENCODE_GO
+
+
+@pytest.mark.parametrize("priority", ["cloud", "subscription"])
+def test_the_cloud_chain_is_on_for_both_priorities(monkeypatch, priority) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", priority)
+    assert lc._cloud_chain_enabled()
+
+
+def test_the_cloud_chain_is_off_for_the_cave_priority(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cave")
+    assert not lc._cloud_chain_enabled()
 
 
 def test_the_lane_reviews_first_when_it_is_the_priority(monkeypatch) -> None:

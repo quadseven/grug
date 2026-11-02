@@ -239,11 +239,11 @@ def _print_report(name: str, report: EvalReport) -> None:
         )
         print(f"  backend(s) that actually answered: {served}")
         configured = os.getenv("GRUG_REVIEW_BACKEND_PRIORITY", "cave").strip().lower()
-        if configured == "cloud" and not (
+        if configured in ("cloud", "subscription") and not (
             report.backend_attribution.keys() & _cloud_chain_backend_names()
         ):
             print(
-                "  !! GRUG_REVIEW_BACKEND_PRIORITY=cloud but NO case was "
+                f"  !! GRUG_REVIEW_BACKEND_PRIORITY={configured} but NO case was "
                 "answered by the cloud chain - every case fell through to "
                 "the fallback. This number measures the FALLBACK, not the "
                 "cloud backend you configured."

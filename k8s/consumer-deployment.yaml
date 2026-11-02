@@ -159,6 +159,9 @@ spec:
             # grug#906/#910: try cloud before owned Sparks hardware - full
             # rationale in webhook-deployment.yaml, kept identical on both
             # Elder-capable workloads (this is the PRODUCTION review path).
+            # The lane reviews public repos first. Private repos start at Go: both lane plans
+            # are consumer plans, whose training terms turn on an account setting no code here
+            # can read (ChatGPT "Improve the model for everyone"; Claude "Model Improvement").
             - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: subscription}
             - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
             # OpenRouter :free as the chain's tier 2 - rationale and eval

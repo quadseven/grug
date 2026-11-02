@@ -1215,6 +1215,13 @@ def _validate_subscription_key(key: str) -> None:
         )
 
 
+def _author_family_answered(model: str) -> bool:
+    """The lane picks its own model, so the header is a request: a walk that
+    keeps the author's family off the review checks who really answered."""
+    gate = _FAMILY_GATE.get()
+    return gate is not None and not gate[1] and model_family(model) == gate[0]
+
+
 def _load_subscription_key() -> str:
     return get_subscription_lane_token() or "in-cluster"
 
@@ -1239,7 +1246,10 @@ def _subscription_fallback_config() -> BackendConfig | None:
         url=url,
         model=model,
         key_loader=_load_subscription_key,
-        dynamic_headers={"X-Review-Author-Family": _review_author_family},
+        dynamic_headers={
+            "X-Review-Author-Family": _review_author_family,
+            "X-Spark-Data-Class": _spark_data_class_header,
+        },
         extra_headers={
             "User-Agent": "grug/1.0 (+https://grug.lol)",
             "X-Spark-Priority": "interactive",
@@ -5308,7 +5318,7 @@ def _deep_response(
     priority, then the reasoner arm (`_run_deep_arm`)."""
     # grug#1097: a short empty cloud answer, kept if the reasoner fails too.
     low_confidence: LlmReviewResponse | None = None
-    if _review_backend_priority() == "cloud":
+    if _cloud_chain_enabled():
         cloud_result = _try_cloud_primary(
             hunks, messages, variant, pr_tags, installation_id, pr_context, cancel_event,
         )
@@ -6942,6 +6952,22 @@ def _review_backend_priority() -> str:
     return raw
 
 
+def _cloud_chain_enabled() -> bool:
+    """Every priority but `cave` runs the cloud chain."""
+    return _review_backend_priority() != "cave"
+
+
+def _lane_reviews_first() -> bool:
+    """Public repos only. Both lane plans are consumer plans: whether they
+    train on a prompt turns on an account setting, not on the plan's terms.
+    ChatGPT: "Improve the model for everyone", which also covers Codex.
+    https://help.openai.com/en/articles/5722486-how-your-data-is-used-to-improve-model-performance
+    Claude: the Model Improvement setting, with 30-day retention when it is off
+    and 5 years when on. https://code.claude.com/docs/en/data-usage
+    Nothing here can read those settings, so a private diff is not sent first."""
+    return _review_backend_priority() == "subscription" and _spark_data_class_header() == "public"
+
+
 def _cloud_tier_success(
     outcome: "_ArmOutcome", hunks: list[Hunk], pr_context: Optional[PrContext],
 ) -> "LlmReviewResponse":
@@ -7149,6 +7175,7 @@ def _try_cloud_primary(
     installation_id: int,
     pr_context: Optional[PrContext],
     cancel_event: threading.Event | None,
+    held_empty: "tuple[Backend, str] | None" = None,
 ) -> _CloudPrimaryResult:
     """Try the grug#910 cloud chain - opencode Go, then OpenRouter `:free`
     if configured - as the PRIMARY review attempt (grug#906).
@@ -7174,7 +7201,7 @@ def _try_cloud_primary(
     first_parse_fail: tuple[Backend, str | None, str] | None = None
     # The first model whose answer was a short empty review. A second,
     # DIFFERENT model answering empty too is agreement, and ends the chain.
-    first_empty: tuple[Backend, str] | None = None
+    first_empty: tuple[Backend, str] | None = held_empty
     first_empty_outcome: _ArmOutcome | None = None
     last_error = ""
     for tier in _cloud_chain_tiers():
@@ -7193,6 +7220,7 @@ def _try_cloud_primary(
                 )
             if first_empty is None:
                 first_empty = key
+            if first_empty_outcome is None and held_empty is None:
                 first_empty_outcome = outcome
             continue
         if outcome.kind == "success":
@@ -7302,8 +7330,8 @@ def _walk_review_ladder(
     result instead of failing the chunk."""
     low_confidence: LlmReviewResponse | None = None
     pr_context = evidence.pr_context
-    priority = _review_backend_priority()
-    if priority in ("cloud", "subscription"):
+    held_empty: tuple[Backend, str] | None = None
+    if _cloud_chain_enabled():
         depth = _review_depth()
         variant: PromptVariant = (
             "v2" if depth != "fast" else select_prompt_variant(installation_id)
@@ -7318,23 +7346,27 @@ def _walk_review_ladder(
             review_map=review_map,
         )
         pr_tags = _llmobs_tags(pr_context)
-        if priority == "subscription":
+        if _lane_reviews_first():
             # The operator's plans review first; the lane paces itself against
             # its plan windows and says so with a refusal, and the chain below
             # then serves the chunk. It is not asked again in this walk.
             lane = _run_subscription_fallback(
                 messages, variant, pr_tags, list(evidence.hunks), pr_context, installation_id,
             )
-            if lane is not None and lane.kind == "reviewed":
-                return lane
             _LANE_ASKED.set(True)
+            if lane is not None and lane.kind == "reviewed":
+                if not (lane.error or "").startswith(_LOW_CONFIDENCE_PREFIX):
+                    return lane
+                # A short empty: another model must confirm it.
+                low_confidence = lane
+                held_empty = (Backend.SUBSCRIPTION, lane.model_name or "")
         cloud_result = _try_cloud_primary(
             list(evidence.hunks), messages, variant, pr_tags, installation_id,
-            pr_context, cancel_event,
+            pr_context, cancel_event, held_empty,
         )
         if cloud_result.answer is not None:
             return cloud_result.answer
-        low_confidence = cloud_result.low_confidence
+        low_confidence = low_confidence or cloud_result.low_confidence
         # Total cloud failure: fall through, unconditionally, to the exact
         # path every "cave" deployment runs - "if that fails, use my local
         # sparks" (the operator, 2026-08-27) is not itself configurable away.
@@ -7575,6 +7607,17 @@ def _run_subscription_fallback(
     if not err:
         resolved_model = model or sub_config.model
         _record_subscription_call()
+        if _author_family_answered(resolved_model):
+            return LlmReviewResponse(
+                kind="all_failed",
+                error=f"{Backend.SUBSCRIPTION.value}: {resolved_model} is the author's family",
+                tier_served="subscription",
+            )
+        if _is_degenerate_empty_review(findings, attempt.usage_metrics):
+            return _untrusted_empty_review(
+                Backend.SUBSCRIPTION, resolved_model, _served_models(model), span_context,
+                "subscription",
+            )
         log.info(
             "elder_last_resort_tier_served",
             extra={
@@ -8264,7 +8307,7 @@ def cloud_judge_configs() -> list[BackendConfig]:
     the configured OpenRouter `:free` model, reasoning off. Both are sent
     redacted evidence by the caller. Empty under `cave` priority, which
     keeps the Cave-first judge unchanged."""
-    if _review_backend_priority() != "cloud":
+    if not _cloud_chain_enabled():
         return []
     poolside = _BACKEND_CONFIGS[Backend.POOLSIDE]
     configs = [
