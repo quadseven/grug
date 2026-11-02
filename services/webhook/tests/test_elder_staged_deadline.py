@@ -232,3 +232,52 @@ def test_a_cohort_cut_mid_ladder_by_the_deadline_is_never_attempted(monkeypatch)
     assert out.coverage.completed_cohorts == 1
     # `_Tier1Review.started_at` reads the real clock a moment after `started`.
     assert clock.now - started <= 700.0 + 1.0
+
+
+def test_slow_rungs_leave_every_cohort_room_for_the_subscription_lane(monkeypatch) -> None:
+    """Live 2026-11-01: each cohort spent its time on rungs that could not
+    answer, so six cohorts ran out the budget before the last ones started.
+    Cohorts share what is left, and the lane keeps a reserve inside each share:
+    every cohort below is served by the lane and none is starved."""
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
+    lc._subscription_daily_calls.clear()
+    clock = _Clock()
+    monkeypatch.setattr(lc.time, "monotonic", clock)
+    hunks = [_big_hunk(f"src/m{i}.py", f"C{i}C") for i in range(6)]
+    lane_calls = 0
+
+    def respond(url, **kwargs) -> httpx.Response:
+        nonlocal lane_calls
+        if "/subscription/" in url:
+            lane_calls += 1
+            clock.now += 30.0
+            return _completion(json.dumps({"findings": []}))
+        clock.now += kwargs["timeout"]
+        raise httpx.ReadTimeout("slow")
+
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff(assemble_evidence(hunks), installation_id=2)
+
+    lc._subscription_daily_calls.clear()
+    assert out.kind == "reviewed"
+    assert lane_calls == 6
+    assert not out.error
+
+
+def test_a_lane_at_its_daily_cap_reserves_nothing(monkeypatch) -> None:
+    """A reserve for a lane that cannot answer would only cut working rungs."""
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_DAILY_CAP", "0")
+    with lc._review_deadline(time.monotonic() + 600.0):
+        with lc._cohort_share(0, 6):
+            assert lc._RUNG_DEADLINE.get() is None
+
+
+def test_a_tight_share_still_asks_the_first_rungs(monkeypatch) -> None:
+    """Eleven cohorts share 70s each. Without a floor the reserve eats the
+    share, and every rung but the lane would go unasked."""
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
+    with lc._review_deadline(time.monotonic() + 700.0):
+        with lc._cohort_share(0, 11):
+            left = lc._RUNG_DEADLINE.get() - time.monotonic()
+    assert 25.0 < left <= 30.0

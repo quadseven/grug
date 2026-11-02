@@ -434,6 +434,16 @@ _DEADLINE_CALL_FLOOR_SECONDS = 10.0
 # answer (Poolside's 45s chain timeout) plus parsing. Replaces the
 # worst-case ladder walk as the scheduler's reserve.
 _MIN_DEADLINE_COHORT_SECONDS = 60.0
+# The time every rung but the subscription lane must finish by in this cohort.
+# The lane answers a chunk in about 30s and may queue for a slot; this much of
+# each cohort's share stays its own, so slow rungs ahead of it cannot starve it.
+_RUNG_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "grug_rung_deadline", default=None,
+)
+_SUBSCRIPTION_RESERVE_SECONDS = 60.0
+# A tight share still asks the first rungs: Go answers in about 8s, and a
+# healthy model must not lose every cohort of a long review to the lane's cap.
+_MIN_RUNG_SECONDS = 30.0
 
 
 class ReviewDeadlineReached(httpx.RequestError):
@@ -511,6 +521,35 @@ _CAVE_JOB_HEADERS: dict[str, Callable[[], str | None]] = {
     "X-Spark-Job": _spark_job_header,
     "X-Spark-Data-Class": _spark_data_class_header,
 }
+
+
+@contextlib.contextmanager
+def _cohort_share(index: int, count: int) -> Iterator[None]:
+    """Run one cohort under its share of the time left, less the lane's reserve.
+
+    Time a fast cohort leaves unspent rolls on to the rest. With no deadline,
+    or a lane that cannot answer, there is nothing to reserve."""
+    deadline = _REVIEW_DEADLINE.get()
+    if deadline is None or not _subscription_lane_can_answer():
+        yield
+        return
+    now = time.monotonic()
+    share = (deadline - now) / (count - index)
+    rungs_get = max(share - _SUBSCRIPTION_RESERVE_SECONDS, _MIN_RUNG_SECONDS)
+    token = _RUNG_DEADLINE.set(now + rungs_get)
+    try:
+        yield
+    finally:
+        _RUNG_DEADLINE.reset(token)
+
+
+def _call_deadline(backend: "Backend") -> float | None:
+    """The deadline one model call runs under. The lane has only the review's."""
+    deadline = _REVIEW_DEADLINE.get()
+    rung = _RUNG_DEADLINE.get()
+    if rung is None or backend == Backend.SUBSCRIPTION:
+        return deadline
+    return rung if deadline is None else min(rung, deadline)
 
 
 def _deadline_passed() -> bool:
@@ -1131,6 +1170,15 @@ def _record_subscription_call() -> None:
     with _subscription_cap_lock:
         key = _subscription_today_key()
         _subscription_daily_calls[key] = _subscription_daily_calls.get(key, 0) + 1
+
+
+def _subscription_lane_can_answer() -> bool:
+    config = _subscription_fallback_config()
+    return (
+        config is not None
+        and _backend_usable(config.backend, config.model)
+        and not _is_subscription_cap_reached()
+    )
 
 
 def _subscription_url() -> str:
@@ -2985,7 +3033,7 @@ def _call_backend(
     headers = _merged_headers(config, key)
 
     transport_attempts = _validated_transport_attempts(config)
-    deadline = _REVIEW_DEADLINE.get()
+    deadline = _call_deadline(config.backend)
     if cancel_event is None:
         resp = _post_with_retries(
             config.url, body, headers, config.timeout_seconds,
@@ -5652,9 +5700,14 @@ class _Tier1Review:
         budget_seconds: float,
     ) -> list[LlmReviewResponse]:
         ladder = _ChunkLadder()
+
+        def run_in_share(index: int) -> LlmReviewResponse:
+            with _cohort_share(index, len(cohorts)):
+                return ladder.run(index, lambda: run_chunk(index))
+
         return _run_staged_cohorts(
             cohort_count=len(cohorts),
-            run_cohort=lambda index: ladder.run(index, lambda: run_chunk(index)),
+            run_cohort=run_in_share,
             budget_seconds=budget_seconds,
             reserve_seconds=self.reserve_s(),
             cancel_event=self.cancel_event,
