@@ -214,6 +214,7 @@ def test_a_resolved_thread_never_hides_a_rule_measured_at_this_head():
     thread["comments"]["nodes"][0].update(path=finding.file, line=finding.line)
     assert carry_forward.filter_findings_against_resolved_threads(
         merged.findings, 7, "acme", "widgets", 1470, threads=[thread],
+        pr_author="author-login",
     ) == merged.findings
 
 

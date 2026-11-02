@@ -175,10 +175,31 @@ def list_threads(
 
 
 _KNOWN_SECURITY_RULES = frozenset({
+    # SAST vulnerability classes and scanners
     "cleartext-secret-log",
+    "command-injection",
+    "env-file-static-delimiter-injection",
     "exposed-secret",
+    "hardcoded-credential",
     "iac-misconfig",
     "lint-security",
+    "path-traversal",
+    "removed-verification-layer",
+    "secret-in-log-or-trace",
+    "sql-injection",
+    "ssrf",
+    "template-injection",
+    "tls-verification-disabled",
+    "unsafe-deserialization",
+    "unvalidated-external-input",
+    "weak-crypto",
+    "xxe",
+    # Specific rule IDs
+    "gha-run-untrusted-interpolation",
+    "gha-run-block-untrusted-interpolation",
+    "ansible-tls-verification-disabled",
+    "ansible-shell-interpolates-variable",
+    "sql-injection-concat",
 })
 
 
@@ -187,9 +208,10 @@ def _is_security_or_sast(finding: Finding) -> bool:
     if getattr(finding, "category", None) == "security":
         return True
     rule = getattr(finding, "rule_name", "") or ""
-    if rule in _KNOWN_SECURITY_RULES:
+    norm = rule.removeprefix("grug-")
+    if norm in _KNOWN_SECURITY_RULES or rule in _KNOWN_SECURITY_RULES:
         return True
-    return bool(rule.startswith("grug-") or "security" in rule or "sast" in rule)
+    return bool("security" in rule or "sast" in rule)
 
 
 def _normalize_login(login: str | None) -> str:
@@ -214,7 +236,7 @@ def _is_app_actor(actor: dict | str | None) -> bool:
     return bool(login_clean.endswith("[bot]") or is_grug(login))
 
 
-def _is_pr_author(actor: dict | str | None, pr_author: str | None) -> bool:
+def _is_pr_author(actor: dict | str | None, pr_author: str) -> bool:
     """True when the actor matches the PR author."""
     if not pr_author or not actor:
         return False
@@ -224,18 +246,18 @@ def _is_pr_author(actor: dict | str | None, pr_author: str | None) -> bool:
     return bool(norm_actor and norm_actor == norm_author)
 
 
-def _thread_resolver_counts(thread: dict, pr_author: str | None = None) -> bool:
+def _thread_resolver_counts(thread: dict, pr_author: str) -> bool:
     """True when the thread was resolved by a valid maintainer (not author, not App).
 
     A resolve by the PR author or an App must never hide a finding on re-review (#1582).
-    If resolvedBy is not provided on a resolved thread, it is treated as a valid
-    maintainer resolve for backwards compatibility with test fixtures.
+    A thread with no resolver recorded or an unknown PR author is not counted as a
+    maintainer resolve.
     """
-    if not _thread_is_resolved(thread):
+    if not _thread_is_resolved(thread) or not pr_author:
         return False
     resolver = thread.get("resolvedBy")
     if not resolver:
-        return True
+        return False
     if _is_pr_author(resolver, pr_author):
         return False
     if _is_app_actor(resolver):
@@ -301,12 +323,80 @@ def _with_reraised_explanation(finding: Finding, earlier_answer: str | None) -> 
     return replace(finding, message=f"{finding.message}\n\n{note}")
 
 
+@dataclass(frozen=True)
+class _ThreadBuckets:
+    dismissed: list[tuple[str, str, int]]
+    resolved_unchanged: list[tuple[str, str, int]]
+    resolved_outdated: list[tuple[str, str, int, str | None]]
+
+    @property
+    def has_matches(self) -> bool:
+        return bool(self.dismissed or self.resolved_unchanged or self.resolved_outdated)
+
+
+def _partition_threads(threads: list[dict], pr_author: str) -> _ThreadBuckets:
+    """Classify threads into dismissed, maintainer-resolved unchanged, and outdated."""
+    dismissed: list[tuple[str, str, int]] = []
+    resolved_unchanged: list[tuple[str, str, int]] = []
+    resolved_outdated: list[tuple[str, str, int, str | None]] = []
+
+    for t in threads:
+        owned = _elder_thread_rule_and_line(t)
+        if owned is None:
+            continue
+        rule, path, line = owned
+
+        if _thread_is_dismissed(t):
+            dismissed.append((rule, path, line))
+            continue
+
+        if not _thread_resolver_counts(t, pr_author=pr_author):
+            continue
+
+        if t.get("isOutdated"):
+            resolved_outdated.append((rule, path, line, _earlier_answer(t)))
+        else:
+            resolved_unchanged.append((rule, path, line))
+
+    return _ThreadBuckets(dismissed, resolved_unchanged, resolved_outdated)
+
+
+def _matches_any(finding: Finding, targets: list[tuple[str, str, int]]) -> bool:
+    """True when finding matches any (rule, path, line) within _NEARBY_LINES."""
+    return any(
+        finding.rule_name == rule and finding.file == path and abs(finding.line - line) <= _NEARBY_LINES
+        for rule, path, line in targets
+    )
+
+
+def _filter_one_finding(finding: Finding, buckets: _ThreadBuckets) -> Finding | None:
+    """Decide whether to keep, drop, or annotate a finding against thread buckets."""
+    if _matches_any(finding, buckets.dismissed):
+        return None
+
+    if finding.rule_name == deferred_ruff.RULE or _is_security_or_sast(finding):
+        return finding
+
+    if _matches_any(finding, buckets.resolved_unchanged):
+        return None
+
+    for rule, path, line, ans in buckets.resolved_outdated:
+        if (
+            finding.rule_name == rule
+            and finding.file == path
+            and abs(finding.line - line) <= _NEARBY_LINES
+        ):
+            return _with_reraised_explanation(finding, ans)
+
+    return finding
+
+
 def filter_findings_against_resolved_threads(
     findings: tuple[Finding, ...],
     installation_id: int, owner: str, repo: str, pull_number: int,
     *,
+    pr_author: str,
     threads: list[dict] | None = None,
-    pr_author: str | None = None,
 ) -> tuple[Finding, ...]:
     """Remove findings that match resolved or dismissed Elder threads.
 
@@ -329,69 +419,15 @@ def filter_findings_against_resolved_threads(
     if threads is None:
         return findings
 
-    dismissed_unchanged: list[tuple[str, str, int]] = []
-    resolved_unchanged: list[tuple[str, str, int]] = []
-    resolved_outdated: list[tuple[str, str, int, str | None]] = []
-
-    for t in threads:
-        owned = _elder_thread_rule_and_line(t)
-        if owned is None:
-            continue
-        rule, path, line = owned
-
-        if _thread_is_dismissed(t):
-            dismissed_unchanged.append((rule, path, line))
-            continue
-
-        if not _thread_resolver_counts(t, pr_author=pr_author):
-            continue
-
-        if t.get("isOutdated"):
-            resolved_outdated.append((rule, path, line, _earlier_answer(t)))
-        else:
-            resolved_unchanged.append((rule, path, line))
-
-    if not dismissed_unchanged and not resolved_unchanged and not resolved_outdated:
+    buckets = _partition_threads(threads, pr_author)
+    if not buckets.has_matches:
         return findings
 
     out: list[Finding] = []
     for f in findings:
-        # A finding dismissed via living review was evaluated by a maintainer
-        # as a false positive (#1187).
-        if any(
-            f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
-            for rule, path, line in dismissed_unchanged
-        ):
-            continue
-
-        # A deferred-ruff finding was measured at this head, and a resolved thread
-        # is not evidence of a fix (#1477).
-        if f.rule_name == deferred_ruff.RULE:
-            out.append(f)
-            continue
-
-        # A security or SAST finding was measured at this head; a thread resolve
-        # alone is not evidence of a fix and must never hide the finding on
-        # re-review (#1582). Only code changes or maintainer dismissal (living
-        # review) clear it.
-        if _is_security_or_sast(f):
-            out.append(f)
-            continue
-
-        if any(
-            f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
-            for rule, path, line in resolved_unchanged
-        ):
-            continue
-
-        matching_outdated = [
-            ans for rule, path, line, ans in resolved_outdated
-            if f.rule_name == rule and f.file == path and abs(f.line - line) <= _NEARBY_LINES
-        ]
-        if matching_outdated:
-            out.append(_with_reraised_explanation(f, matching_outdated[0]))
-        else:
-            out.append(f)
+        kept = _filter_one_finding(f, buckets)
+        if kept is not None:
+            out.append(kept)
     return tuple(out)
 
 
