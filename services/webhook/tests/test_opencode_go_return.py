@@ -278,3 +278,22 @@ def test_a_model_off_the_list_may_read_a_public_diff(monkeypatch) -> None:
     http = _Http({_PAID: httpx.ConnectError("down"), "kimi-k3": _finding()})
     _review(http, _Counter(), _PUBLIC)
     assert http.models == [_PAID, "kimi-k3"]
+
+
+def test_a_review_go_served_reports_go_not_the_free_pool(monkeypatch) -> None:
+    """grug#1596: the check summary called a Go-served run `free-pool`."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    body = {
+        "choices": [{"message": {"role": "assistant", "content": json.dumps({"findings": [{
+            "path": "src/x.py", "line": 1, "rule": "r", "severity": "high", "message": "m",
+        }]})}}],
+        "model": "deepseek-v4.1-flash",
+    }
+    with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
+        out = lc.review_diff(
+            assemble_evidence([lc.Hunk(path="src/x.py", body="@@ -1 +1 @@\n-a\n+b")]),
+            installation_id=1,
+        )
+
+    assert out.backend_used == lc.Backend.OPENCODE_GO
+    assert out.tier_served == "opencode-go"

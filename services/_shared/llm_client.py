@@ -908,7 +908,8 @@ class LlmReviewResponse:
     # "model (reason)" labels in ladder order. Set only on a failed chunk, so
     # a neutral check can name what was tried instead of a bare `all_failed`.
     attempts: tuple[str, ...] = field(default_factory=tuple)
-    # grug#1276: which tier served this review ("self-hosted", "free-pool", "subscription").
+    # grug#1276: which tier served this review ("self-hosted", "free-pool",
+    # "opencode-go", "subscription").
     tier_served: Optional[str] = None
     reviewability_note: str = ""
     reviewability_blocking: bool = False
@@ -6895,7 +6896,9 @@ def _cloud_tier_success(
         review_span_context=outcome.span_context,
         pr_context=pr_context, hunks=hunks,
     )
-    _emit_tier_served_metric("free-pool", backend.value, outcome.model)
+    # Go is a plan of its own, so its review names Go, never the free pool.
+    tier = backend.value if backend == Backend.OPENCODE_GO else "free-pool"
+    _emit_tier_served_metric(tier, backend.value, outcome.model)
     return LlmReviewResponse(
         kind="reviewed",
         findings=tuple(
@@ -6907,7 +6910,7 @@ def _cloud_tier_success(
         backends_used=(backend,),
         models_used=outcome.served_models,
         error=_truncation_error((backend,) if outcome.truncated else ()),
-        tier_served="free-pool",
+        tier_served=tier,
     )
 
 
