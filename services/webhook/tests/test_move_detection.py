@@ -164,3 +164,32 @@ def test_split_copied_hunks_reports_pure_rename(monkeypatch) -> None:
         parse_diff(diff), diff, 1, "o", "r", 1, "h" * 40,
     )
     assert (hunks, dups, moves) == ((), (), (("old/a.py", "new/a.py"),))
+
+
+def test_commit_messages_walk_every_page(monkeypatch) -> None:
+    from personas.code_reviewer import dispatch
+
+    pages = {
+        1: [{"commit": {"message": f"m{i}"}} for i in range(100)],
+        2: [{"commit": {"message": "git-subtree-dir: vendor"}}],
+    }
+    seen: list[int] = []
+
+    def fake_page(iid, owner, repo, num, page):
+        seen.append(page)
+        return [c["commit"]["message"] for c in pages[page]]
+
+    monkeypatch.setattr(dispatch, "_fetch_commit_page", fake_page)
+    out = dispatch._fetch_pr_commit_messages(1, "o", "r", 1)
+    assert seen == [1, 2]
+    assert len(out) == 101 and out[-1] == "git-subtree-dir: vendor"
+
+
+def test_commit_messages_keep_earlier_pages_when_a_later_page_fails(monkeypatch) -> None:
+    from personas.code_reviewer import dispatch
+
+    def fake_page(iid, owner, repo, num, page):
+        return ["m"] * 100 if page == 1 else None
+
+    monkeypatch.setattr(dispatch, "_fetch_commit_page", fake_page)
+    assert len(dispatch._fetch_pr_commit_messages(1, "o", "r", 1)) == 100

@@ -464,19 +464,44 @@ def _fetch_head_blobs(
 _MAX_SUBTREE_IMPORTS = 5
 
 
+# The pull request commits endpoint lists at most 250 commits: 3 pages of 100.
+_MAX_COMMIT_PAGES = 3
+
+
 def _fetch_pr_commit_messages(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
 ) -> tuple[str, ...]:
-    """Commit messages of the pull request's first page of commits (#772).
+    """Commit messages of the pull request, every page the API serves (#772).
 
-    Best-effort: a failure returns (), which `subtree_imports` reads as "no
-    trailers", so every file is reviewed as usual."""
+    Best-effort: a failed page stops the walk and keeps the messages read so
+    far, so the worst case is fewer trailers seen and more files reviewed."""
+    messages: list[str] = []
+    for page in range(1, _MAX_COMMIT_PAGES + 1):
+        batch = _fetch_commit_page(
+            installation_id, owner, repo_name, pull_number, page,
+        )
+        if batch is None:
+            break
+        messages.extend(batch)
+        if len(batch) < _COMMITS_PER_PAGE:
+            break
+    return tuple(messages)
+
+
+_COMMITS_PER_PAGE = 100
+
+
+def _fetch_commit_page(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    page: int,
+) -> list[str] | None:
+    """One page of commit messages, or None when the page cannot be read."""
 
     def _get(token: str) -> Any:
         resp = httpx.get(
             f"https://api.github.com/repos/{quote(owner, safe='')}/"
             f"{quote(repo_name, safe='')}/pulls/{pull_number}/commits",
-            params={"per_page": "100"},
+            params={"per_page": str(_COMMITS_PER_PAGE), "page": str(page)},
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
@@ -492,17 +517,21 @@ def _fetch_pr_commit_messages(
     except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
         log.info(
             "code_review_pr_commits_unavailable",
-            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "page": page,
+                "kind": type(e).__name__,
+            },
         )
-        return ()
+        return None
     if not isinstance(data, list):
-        return ()
-    return tuple(
+        return None
+    return [
         str(c["commit"]["message"])
         for c in data
         if isinstance(c, dict) and isinstance(c.get("commit"), dict)
         and isinstance(c["commit"].get("message"), str)
-    )
+    ]
 
 
 def _fetch_subtree_context(
