@@ -106,6 +106,21 @@ _LIVE_STATE_RE = re.compile(
     r"|\bmeasured\b|\bmeasurements?\b|\brun-rate\b",
     re.IGNORECASE,
 )
+# A CI run that exists only once the PR has merged (#1509): "after the
+# merge", "post-merge", "once merged", or the next run on the default branch.
+_POST_MERGE_RE = re.compile(
+    r"\bafter (?:the |this |it )?merg(?:e|es|ed|ing)\b|\bpost-?merge\b"
+    r"|\bonce (?:this |it )?(?:is )?merged\b"
+    r"|\b(?:next|first)\b[^.;\n]{0,60}?(?:\bdefault[- ]branch\b|\bon (?:main|master)\b)",
+    re.IGNORECASE,
+)
+_CI_RUN_RE = re.compile(
+    r"\b(?:runs?|jobs?|workflows?|builds?|pipelines?|CI)\b", re.IGNORECASE,
+)
+_CI_RESULT_RE = re.compile(
+    r"\b(?:succe(?:ss|eds?|ssful(?:ly)?)|pass(?:es|ed)?|green|conclu(?:des?|sion))\b",
+    re.IGNORECASE,
+)
 _ENTRY_POINT_RE = re.compile(
     r"\bentry[ -]?points?\b|\bcli\b|\bcommands?\b|\broutes?\b|"
     r"\bendpoints?\b|\b(?:exported|public)\s+api\b",
@@ -540,6 +555,21 @@ def _is_live_criterion(text: str) -> bool:
     return bool(_LIVE_RE.match(text)) and not _TEST_CRITERION_RE.search(text)
 
 
+def is_future_post_merge_observation(text: str) -> bool:
+    """A criterion that observes a CI run which happens only after the
+    merge ("the next default-branch `unittest-linux` run after the merge
+    concludes success"). No pre-merge diff can meet it, and no pre-merge
+    body can prove it: it stays open for the closure verifier (#1509).
+    Never a check of host, network or deploy state."""
+    rest = _LIVE_RE.sub("", text, count=1)
+    return bool(
+        _POST_MERGE_RE.search(rest)
+        and _CI_RUN_RE.search(rest)
+        and _CI_RESULT_RE.search(rest)
+        and not _LIVE_STATE_RE.search(rest)
+    )
+
+
 def _is_live_state_criterion(text: str) -> bool:
     """A criterion only a change to running state can meet (see
     `_LIVE_STATE_RE`), and not one a test or doc hunk can meet."""
@@ -710,11 +740,13 @@ def _state_criteria(
     criteria: tuple[LinkedCriterion, ...], renamed: tuple[tuple[str, str], ...],
 ) -> list[LinkedCriterion]:
     """The runtime and `Live:` criteria a change must make true, less those
-    a production rename in the diff meets (#1379)."""
+    a production rename in the diff meets (#1379), and less a CI run that
+    happens only after the merge (#1509)."""
     return [
         c for c in criteria
         if (_is_runtime_criterion(c.text) or _is_live_criterion(c.text))
         and not _met_by_rename(c.text, renamed)
+        and not is_future_post_merge_observation(c.text)
     ]
 
 
