@@ -39,6 +39,40 @@ def _print_report(name: str, report) -> None:
         print(f"  !! FALSE POSITIVES flagged (precision miss): {', '.join(report.fp_flagged)}")
 
 
+def _record(reports: dict, broken: list[str]) -> int:
+    """Write baseline.json from `reports`, or refuse (exit 2) if any backend
+    did not complete: a baseline missing a backend silently drops its entry."""
+    if broken:
+        print("baseline NOT written: every backend must complete.", file=sys.stderr)
+        return 2
+    out = {name: to_baseline_dict(rep, backend=name) for name, rep in reports.items()}
+    with open(_BASELINE_PATH, "w") as f:
+        json.dump({"backends": out}, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"\nbaseline written: {_BASELINE_PATH} ({len(out)} backend(s))")
+    return 0
+
+
+def _check(reports: dict) -> bool:
+    """Compare `reports` to baseline.json; print and return True on any regression."""
+    with open(_BASELINE_PATH) as f:
+        baseline = json.load(f).get("backends", {})
+    regressions = []
+    for name, rep in reports.items():
+        base = baseline.get(name)
+        if base is None:
+            print(f"  (no baseline for {name} - skipping regression check)")
+            continue
+        regressions += [(name, r) for r in compare_to_baseline(rep, base)]
+    if regressions:
+        print("\nREGRESSIONS:")
+        for name, r in regressions:
+            print(f"  [{name}] {r.kind}: {r.subject} (baseline={r.baseline} current={r.current})")
+        return True
+    print("\nno regressions vs baseline")
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sast_benchmark")
     mode = parser.add_mutually_exclusive_group()
@@ -87,33 +121,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.record:
-        if broken:
-            # A baseline missing a backend would silently drop its entry.
-            print("baseline NOT written: every backend must complete.", file=sys.stderr)
-            return 2
-        out = {name: to_baseline_dict(rep, backend=name) for name, rep in reports.items()}
-        with open(_BASELINE_PATH, "w") as f:
-            json.dump({"backends": out}, f, indent=2, sort_keys=True)
-            f.write("\n")
-        print(f"\nbaseline written: {_BASELINE_PATH} ({len(out)} backend(s))")
-        return 0
-
-    if args.check:
-        with open(_BASELINE_PATH) as f:
-            baseline = json.load(f).get("backends", {})
-        regressions = []
-        for name, rep in reports.items():
-            base = baseline.get(name)
-            if base is None:
-                print(f"  (no baseline for {name} — skipping regression check)")
-                continue
-            regressions += [(name, r) for r in compare_to_baseline(rep, base)]
-        if regressions:
-            print("\nREGRESSIONS:")
-            for name, r in regressions:
-                print(f"  [{name}] {r.kind}: {r.subject} (baseline={r.baseline} current={r.current})")
-            return 1
-        print("\nno regressions vs baseline")
+        return _record(reports, broken)
+    if args.check and _check(reports):
+        return 1
 
     # Report/check: a backend that did not complete makes the run invalid,
     # so the job goes red instead of printing a partial score as success.
