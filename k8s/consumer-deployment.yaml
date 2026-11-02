@@ -179,7 +179,9 @@ spec:
             # Poolside stays off while it answers 400 on review calls: 3 of 1112 calls
             # succeeded over 24h on 2026-11-01. The OpenRouter free chain tier is unset: its
             # model left the catalogue, and that tier has no private-code data-terms gate.
-            - {name: GRUG_DISABLED_BACKENDS, value: "openrouter:paid,poolside"}
+            # The free pool stays off until the Elder walk trusts its empties; it times out or
+            # garbles while the Sparks are away. The Cave stays on: secrets are judged there.
+            - {name: GRUG_DISABLED_BACKENDS, value: "openrouter:paid,poolside,free-pool"}
             # grug#1269: the gateway's free provider pool is a cloud tier after
             # Poolside, ahead of the Sparks (free cloud models first).
             - {name: GRUG_CLOUD_FREE_POOL, value: "true"}
@@ -295,7 +297,10 @@ spec:
             # Ollama model, and both Sparks now serve one vLLM model and no Ollama,
             # so the exact tag matched no target and every review call got a 503.
             # Same value as the webhook; test_cave_models_match_the_webhook holds them.
-            - {name: GRUG_CAVE_REVIEW_MODEL, value: "spark:warm-any"}
+            # The model the Sparks serve, by name: warm-any spills to free models that garble
+            # (2026-11-01), which stops the walk; a named model answers 503 at once while the
+            # Sparks are away, and the walk goes on to the lane. The judge stays on warm-any.
+            - {name: GRUG_CAVE_REVIEW_MODEL, value: "nemotron-3.5-super-vl"}
             - {name: GRUG_CAVE_REASONER_MODEL, value: "spark:warm-any"}
             # grug#1191: the optional vLLM deep arm (services/_shared/deep_shadow.py).
             # off = the reasoner above, unchanged. shadow = also replay the deep
