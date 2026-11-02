@@ -211,9 +211,9 @@ class CodeReviewEvaluation:
     # published, never counted toward the verdict, but counted here so recall
     # stays measurable.
     dropped_withdrawn: int = 0
-    # grug#1529: the rules of candidates dropped because their own text ends
-    # in an exact omit form, not by the structured verdict. `evaluate_diff` is
-    # pure, so dispatch logs them with the head.
+    # grug#1529: the rules of dropped candidates whose own text ends in an
+    # exact omit form. `evaluate_diff` is pure, so dispatch logs them with
+    # the head.
     omit_dropped_rules: tuple[str, ...] = ()
     tier_served: str | None = None
     # The models that answered, as their replies named them. Empty when no
@@ -410,7 +410,9 @@ def evaluate_diff(
         # not become a thread or move the verdict; count it and move on.
         if is_withdrawn_finding(raw):
             withdrawn += 1
-            if not raw.withdrawn and concludes_omit(raw):
+            # A merge of two omit candidates carries the flag, so the text
+            # decides the log, not the flag.
+            if concludes_omit(raw):
                 omit_dropped.append(raw.rule)
             continue
         allowed_lines = line_index.get(raw.path)

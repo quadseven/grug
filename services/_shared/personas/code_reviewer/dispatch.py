@@ -1266,7 +1266,7 @@ def _review_transparency(
         # reviewer's own text ruled them out, so the drop is never silent.
         lines += (
             f"\n\nGrug dropped {evaluation.dropped_withdrawn} candidate(s) "
-            "the reviewer itself withdrew (its own verdict said no finding)."
+            "the reviewer itself withdrew (its own verdict or text ruled them out)."
         )
     coverage = evaluation.coverage
     if coverage is not None:

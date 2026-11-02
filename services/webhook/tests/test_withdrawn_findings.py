@@ -1,4 +1,5 @@
-"""grug#1397: Elder does not publish a finding its own text withdraws.
+"""grug#1397 and grug#1529: Elder does not publish a finding its own text
+withdraws, by ending in "No finding." or in an exact omit form.
 
 The four withdrawn texts below are the shape seen on one real 4-file review:
 each ended in "No finding." and each still became a reply-required thread.
@@ -142,7 +143,7 @@ def test_merge_keeps_the_live_finding_when_one_model_withdrew_it() -> None:
         assert not lc.is_withdrawn_finding(merged[0])
 
 
-# grug#1529: the two critical markings that blocked a pull request.
+# grug#1529: the two critical markings that blocked a pull request, and a dash variant.
 _OMIT_TEXTS = (
     "Grug see nothing. No GITHUB_ENV writes here. Omit.",
     "The reason is a code the operator chose. Omit - not a secret.",
@@ -195,11 +196,11 @@ def test_a_real_finding_that_mentions_omit_still_publishes() -> None:
     assert evaluation.dropped_withdrawn == 0
 
 
-def test_the_structured_verdict_removes_an_omit_marking_without_an_omit_log() -> None:
+def test_the_structured_verdict_removes_an_omit_marking_and_it_is_logged() -> None:
     evaluation = _evaluate(_llm(2, _OMIT_TEXTS[0], severity="critical", withdrawn=True))
     assert evaluation.findings == ()
     assert evaluation.conclusion == "success"
-    assert evaluation.omit_dropped_rules == ()
+    assert evaluation.omit_dropped_rules == ("logic-error",)
 
 
 def test_merge_keeps_the_live_finding_when_one_model_says_omit() -> None:
@@ -229,7 +230,9 @@ def test_merge_of_two_omit_candidates_stays_withdrawn() -> None:
             for i, f in enumerate(order)
         ])
         assert lc.is_withdrawn_finding(merged[0])
-        assert _evaluate(*merged).findings == ()
+        evaluation = _evaluate(*merged)
+        assert evaluation.findings == ()
+        assert evaluation.omit_dropped_rules == ("logic-error",)
 
 
 def test_merge_of_two_withdrawn_candidates_stays_withdrawn() -> None:
