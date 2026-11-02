@@ -1,258 +1,146 @@
-"""Detect moves: deletions + additions with identical content.
+"""Relocations Elder must not review as new code (#772).
 
-When a diff contains both a deletion and an addition of the same content,
-treat the addition as a move of the deleted file rather than new code.
+A pull request that moves files without changing them carries no new code,
+so reviewing it as new spends the cohort budget and the author's replies on
+lines nobody wrote. Three shapes are provably unchanged and are dropped
+before cohort planning, then named in one summary line:
 
-Only considers:
-- Whole-file deletions (no @@ block)
-- Whole-file additions (old side -0,0)
-- Identical content (byte-for-byte match)
+- a rename git reports at 100% similarity (it has no hunks to review);
+- a whole-file delete plus a whole-file add whose git blob ids match;
+- a file added under the directory a `git subtree add` commit names in its
+  `git-subtree-dir` trailer, whose blob id equals the blob at the same
+  relative path in the tree of its `git-subtree-split` commit.
 
-The function returns moves as (deleted_path, added_path) tuples, in order
-of appearance in the diff. Each pair is returned ONCE, and the deleted file
-is never reviewed, the added file is never reviewed.
+Proof is always git's own blob id, never a rebuild of content from diff
+lines. A file edited after it moved has a different blob id, so it stays in
+review; a rename under 100% similarity keeps its hunks, which hold only the
+changed lines. Anything missing (a tree that was not fetched, a short blob
+id) means no proof, and the file is reviewed as usual.
 
-If any check fails, falls back to no exclusion (grug#772).
+Pure: text in, pairs out. The fetches live in dispatch.
 """
-
 from __future__ import annotations
 
-import hashlib
+import re
 from dataclasses import dataclass
-from typing import Any
+
+from personas.code_reviewer.diff_parser import (
+    DiffHunk, deleted_file_blob_ids, file_changes, new_file_blob_ids,
+)
+
+# Below this, an abbreviated blob id is too short to trust as a prefix.
+_MIN_BLOB_ABBREV = 7
+_SUBTREE_DIR_RE = re.compile(r"^git-subtree-dir:[ \t]*(\S.*?)[ \t]*$", re.M)
+_SUBTREE_SPLIT_RE = re.compile(r"^git-subtree-split:[ \t]*([0-9a-f]{40})[ \t]*$", re.M)
 
 
-def _parse_diff_headers(diff_text: str) -> tuple[list[tuple[str, str, str]], dict[str, str]]:
-    """Extract file change headers from a unified diff.
+@dataclass(frozen=True, slots=True)
+class SubtreeImport:
+    """One `git subtree add` or `merge`: the directory it fills and the
+    commit of the source repo whose tree it copied."""
 
-    Returns:
-        - List of (path, status, similarity) tuples for each file block
-        - Dict mapping blob IDs to paths for files that were added (by diff)
-    """
-    file_headers: list[tuple[str, str, str | None]] = []
-    added_blobs: dict[str, str] = {}
-
-    in_block = False
-    current_path = ""
-    current_status = ""  # added, removed, renamed, modified
-    current_similarity = None
-    in_body = False
-
-    for line in diff_text.splitlines():
-        if line.startswith("diff --git "):
-            if in_block:
-                file_headers.append((current_path, current_status, current_similarity))
-            current_path = ""
-            current_status = ""
-            current_similarity = None
-            in_block = True
-            in_body = False
-
-        if in_block and not in_body:
-            if line.startswith("+++ "):
-                # Extract path from +++ b/path or +++ /dev/null
-                m = line[4:].strip()
-                if m != "/dev/null":
-                    # Strip the leading 'b/' if present
-                    current_path = m[2:] if m.startswith("b/") else m
-            elif line.startswith("--- "):
-                # Extract path from --- a/path (for later matching)
-                m = line[5:].strip()
-                if m != "/dev/null":
-                    # Strip the leading 'a/' if present
-                    current_path = m[2:] if m.startswith("a/") else m
-            elif line.startswith("similarity index"):
-                m = line.strip().split()[2]
-                current_similarity = int(m[:-1])  # Remove the % sign
-            elif line.startswith("new file mode"):
-                current_status = "added"
-            elif line.startswith("deleted file mode"):
-                current_status = "removed"
-            elif line.startswith("rename from"):
-                current_status = "renamed"
-            elif line.startswith("rename to"):
-                pass  # Already captured status above
-            elif line.startswith("index"):
-                # Extract blob ID for added files
-                # Format: index <old>..<new> 
-                # Note: path might not be set yet if +++ line comes after index
-                parts = line.split()
-                if len(parts) >= 2:
-                    # The blob ID is after the first ..
-                    blob_part = parts[1]
-                    new_blob = blob_part.split('..')[1]
-                    if current_status == "added":
-                        # Use current_path if set, otherwise try to extract from context
-                        if current_path and current_path not in added_blobs:
-                            added_blobs[current_path] = new_blob
-                        elif not current_path:
-                            # Path not set yet, try to extract from diff context
-                            # This happens when +++ line comes after index line
-                            # We'll use empty string for now and let caller handle it
-                            pass
-
-        if line.startswith("@@"):
-            in_body = True
-
-    if in_block:
-        file_headers.append((current_path, current_status, current_similarity))
-
-    return file_headers, added_blobs
+    directory: str
+    split_sha: str
 
 
-def _extract_added_file_content(hunks: tuple) -> dict[str, str]:
-    """Extract full content of all added files from hunks.
+def subtree_imports(messages: tuple[str, ...]) -> tuple[SubtreeImport, ...]:
+    """The subtree imports named by commit-message trailers, in order.
 
-    Returns a dict mapping paths to their full content (str).
-    """
-    content: dict[str, str] = {}
-
-    for hunk in hunks:
-        # Check if this is a whole-new-file hunk (-0,0)
-        lines = hunk.body.splitlines()
-        if not lines:
+    A message needs both `git-subtree-dir` and a 40-hex
+    `git-subtree-split`. A directory that is absolute or climbs out with
+    `..` is dropped, so a trailer cannot claim a path outside the repo."""
+    out: list[SubtreeImport] = []
+    for message in messages:
+        d, s = _SUBTREE_DIR_RE.search(message), _SUBTREE_SPLIT_RE.search(message)
+        if not (d and s):
             continue
+        directory = d.group(1).strip("/")
+        if directory and ".." not in directory.split("/"):
+            imp = SubtreeImport(directory, s.group(1))
+            if imp not in out:
+                out.append(imp)
+    return tuple(out)
 
-        header = lines[0]
-        if not header.startswith("@@ -0,0 +"):
-            continue  # Not a whole-new-file
 
-        # Extract the path from the header if present
-        # Format: @@ -0,0 +1,N @@ path
-        import re
-        m = re.search(r"\+([1-9][0-9]*)\s*@@\s*(.+)", header)
-        if not m:
+def _same_blob(abbrev: str, other: str) -> bool:
+    """Whether two blob ids, either possibly abbreviated, name one blob."""
+    short = min(len(abbrev), len(other))
+    return short >= _MIN_BLOB_ABBREV and abbrev[:short] == other[:short]
+
+
+def _pure_renames(diff_text: str) -> list[tuple[str, str]]:
+    return [
+        (c.previous_path, c.path)
+        for c in file_changes(diff_text)
+        if c.status == "renamed" and c.similarity == 100 and c.previous_path
+    ]
+
+
+def _delete_add_pairs(diff_text: str) -> list[tuple[str, str]]:
+    """Each deleted file paired with at most one added file of the same
+    blob; an added file is used once, in diff order."""
+    deleted = deleted_file_blob_ids(diff_text)
+    added = new_file_blob_ids(diff_text)
+    used: set[str] = set()
+    pairs: list[tuple[str, str]] = []
+    for old_path, old_blob in deleted.items():
+        match = next(
+            (p for p, b in added.items() if p not in used and _same_blob(old_blob, b)),
+            None,
+        )
+        if match:
+            used.add(match)
+            pairs.append((old_path, match))
+    return pairs
+
+
+def _subtree_pairs(
+    diff_text: str,
+    imports: tuple[SubtreeImport, ...],
+    split_trees: dict[str, dict[str, str]],
+    skip: set[str],
+) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for path, blob in new_file_blob_ids(diff_text).items():
+        if path in skip:
             continue
+        for imp in imports:
+            prefix = imp.directory + "/"
+            tree = split_trees.get(imp.split_sha, {})
+            source = tree.get(path[len(prefix):]) if path.startswith(prefix) else None
+            if source and _same_blob(blob, source):
+                pairs.append((f"{imp.split_sha[:7]}:{path[len(prefix):]}", path))
+                break
+    return pairs
 
-        new_line = m.group(1)
-        path_part = m.group(2).strip()
-        path = path_part if not path_part.startswith("+") else ""
 
-        # Collect all content lines
-        content_lines = []
-        for raw in lines[1:]:
-            if raw.startswith("\\"):
-                continue  # Skip no-newline marker
-            if raw.startswith("+"):
-                content_lines.append(raw[1:])
-
-        if path:
-            content[path] = "\n".join(content_lines)
-
-    return content
+def find_moves(
+    diff_text: str,
+    imports: tuple[SubtreeImport, ...] = (),
+    split_trees: dict[str, dict[str, str]] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """`((source, destination), ...)` for every provable relocation in the
+    diff, in the order: 100% renames, delete+add pairs, subtree imports.
+    `split_trees` is `{split sha: {path: blob sha}}`; a split commit absent
+    from it proves nothing. Pure."""
+    renames = _pure_renames(diff_text)
+    pairs = _delete_add_pairs(diff_text)
+    taken = {dest for _, dest in pairs}
+    subtree = _subtree_pairs(diff_text, imports, split_trees or {}, taken)
+    return tuple(renames + pairs + subtree)
 
 
 def split_move_hunks(
-    hunks: tuple,
+    hunks: tuple[DiffHunk, ...],
     diff_text: str,
-) -> tuple[tuple, tuple[tuple[str, str], ...]]:
-    """Detect and exclude moves (deletion + identical addition) from review.
+    imports: tuple[SubtreeImport, ...] = (),
+    split_trees: dict[str, dict[str, str]] | None = None,
+) -> tuple[tuple[DiffHunk, ...], tuple[tuple[str, str], ...]]:
+    """Partition hunks into (reviewable, moves).
 
-    Returns:
-        - Kept hunks (those not part of a move)
-        - Moves as (deleted_path, added_path) tuples in diff order
-
-    A move is identified when:
-    1. A file is deleted (no @@ block)
-    2. A file with identical content is added later in the same diff
-    3. Both are whole files (not partial edits)
-
-    If any check fails, falls back to no exclusion (grug#772).
-    """
-    try:
-        hunks_result, moves_result = _split_move_hunks_impl(hunks, diff_text)
-        return hunks_result, moves_result
-    except Exception:
-        # If anything fails, don't exclude anything
-        return hunks, ()
-
-
-def _split_move_hunks_impl(
-    hunks: tuple,
-    diff_text: str,
-) -> tuple[tuple, tuple[tuple[str, str], ...]]:
-    """Internal implementation of move detection.
-
-    Returns:
-        - Kept hunks (those not part of a move)
-        - Moves as (deleted_path, added_path) tuples in diff order
-
-    If any check fails, raises an exception.
-    """
-    # Parse diff headers to find deletions and added blobs
-    try:
-        file_headers, added_blobs = _parse_diff_headers(diff_text)
-    except Exception:
-        raise
-
-    # Extract content of added files from hunks
-    try:
-        added_content = _extract_added_file_content(hunks)
-    except Exception:
-        raise
-
-    # Build a map of blob IDs to added file paths
-    blob_to_path = {blob: path for path, blob in added_blobs.items()}
-
-    # Find moves: a deleted file plus an added file with the same content
-    moves: list[tuple[str, str]] = []
-    seen_deletions: set[str] = set()
-    seen_additions: set[str] = set()
-
-    for path, status, _ in file_headers:
-        if status == "removed":
-            seen_deletions.add(path)
-        elif status == "added" and path in added_content:
-            # Check if this added file has content matching a deleted file
-            content = added_content[path]
-
-            # Find matching deleted path
-            for deleted in seen_deletions:
-                if deleted not in seen_additions:  # Already matched
-                    if content == deleted:
-                        moves.append((deleted, path))
-                        seen_additions.add(path)
-                        break
-
-    if not moves:
-        return (hunks,)  # Return tuple with just hunks when no moves found
-
-    return hunks, tuple(moves)
-    # Parse diff headers to find deletions and added blobs
-    try:
-        file_headers, added_blobs = _parse_diff_headers(diff_text)
-    except Exception:
-        # If header parsing fails, don't exclude anything
-        return hunks, ()
-
-    # Extract content of added files from hunks
-    try:
-        added_content = _extract_added_file_content(hunks)
-    except Exception:
-        # If content extraction fails, don't exclude anything
-        return hunks, ()
-
-    # Build a map of blob IDs to added file paths
-    blob_to_path = {blob: path for path, blob in added_blobs.items()}
-
-    # Find moves: a deleted file plus an added file with the same content
-    moves: list[tuple[str, str]] = []
-    seen_deletions: set[str] = set()
-    seen_additions: set[str] = set()
-
-    for path, status, _ in file_headers:
-        if status == "removed":
-            seen_deletions.add(path)
-        elif status == "added" and path in added_content:
-            # Check if this added file has content matching a deleted file
-            content = added_content[path]
-
-            # Find matching deleted path
-            for deleted in seen_deletions:
-                if deleted not in seen_additions:  # Already matched
-                    if content == deleted:
-                        moves.append((deleted, path))
-                        seen_additions.add(path)
-                        break
-
-    return hunks, tuple(moves)
+    `moves` is `find_moves(...)`. Hunks of a moved destination are dropped;
+    every other hunk, including those of a renamed file with edits, is kept
+    unchanged. Pure."""
+    moves = find_moves(diff_text, imports, split_trees)
+    moved = {dest for _, dest in moves}
+    return tuple(h for h in hunks if h.file_path not in moved), moves

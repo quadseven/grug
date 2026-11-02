@@ -233,6 +233,24 @@ def new_file_blob_ids(unified_diff: str) -> dict[str, str]:
     return out
 
 
+def deleted_file_blob_ids(unified_diff: str) -> dict[str, str]:
+    """`{path: abbreviated old-side blob id}` for each file the diff DELETES.
+
+    The mirror of `new_file_blob_ids`, read from `deleted file mode` plus
+    `index <id>..0000000`. A deletion with no index line is left out. Pure."""
+    out: dict[str, str] = {}
+    for header in _file_headers(unified_diff):
+        if not any(line.startswith("deleted file mode ") for line in header):
+            continue
+        m = _DIFF_GIT_RE.match(header[0])
+        index = next(
+            (_INDEX_RE.match(ln) for ln in header[1:] if _INDEX_RE.match(ln)), None,
+        )
+        if m and index and set(index.group(2)) == {"0"}:
+            out[m.group(1)] = index.group(1)
+    return out
+
+
 def _file_headers(unified_diff: str) -> list[list[str]]:
     """Each file's header lines: `diff --git` up to its first `@@`. Body
     lines never land here, so a content line that happens to read like

@@ -90,7 +90,9 @@ from personas.code_reviewer.diff_parser import (
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
-from personas.code_reviewer.move_detection import split_move_hunks
+from personas.code_reviewer.move_detection import (
+    SubtreeImport, split_move_hunks, subtree_imports,
+)
 from personas.code_reviewer.precedent import (
     ClassPrecision, class_precision, match_precedent, mute_note,
     muted_classes, render_precedent_note,
@@ -458,19 +460,85 @@ def _fetch_head_blobs(
     }
 
 
+# Most subtree imports whose split trees are fetched for one pull request.
+_MAX_SUBTREE_IMPORTS = 5
+
+
+def _fetch_pr_commit_messages(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+) -> tuple[str, ...]:
+    """Commit messages of the pull request's first page of commits (#772).
+
+    Best-effort: a failure returns (), which `subtree_imports` reads as "no
+    trailers", so every file is reviewed as usual."""
+
+    def _get(token: str) -> Any:
+        resp = httpx.get(
+            f"https://api.github.com/repos/{quote(owner, safe='')}/"
+            f"{quote(repo_name, safe='')}/pulls/{pull_number}/commits",
+            params={"per_page": "100"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=DIFF_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        data = with_install_token_retry(installation_id, _get)
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+        log.info(
+            "code_review_pr_commits_unavailable",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        return ()
+    if not isinstance(data, list):
+        return ()
+    return tuple(
+        str(c["commit"]["message"])
+        for c in data
+        if isinstance(c, dict) and isinstance(c.get("commit"), dict)
+        and isinstance(c["commit"].get("message"), str)
+    )
+
+
+def _fetch_subtree_context(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+) -> tuple[tuple[SubtreeImport, ...], dict[str, dict[str, str]]]:
+    """The pull request's subtree imports and each split commit's tree (#772).
+
+    A split commit whose tree cannot be fetched is left out of the result
+    (`_fetch_head_blobs` returns {}), so its files are reviewed in full."""
+    imports = subtree_imports(
+        _fetch_pr_commit_messages(installation_id, owner, repo_name, pull_number)
+    )[:_MAX_SUBTREE_IMPORTS]
+    trees = {
+        imp.split_sha: _fetch_head_blobs(
+            installation_id, owner, repo_name, pull_number, imp.split_sha,
+        )
+        for imp in imports
+    }
+    return imports, {sha: tree for sha, tree in trees.items() if tree}
+
+
 def _split_copied_hunks(
     hunks: tuple[DiffHunk, ...], diff_text: str, installation_id: int,
     owner: str, repo_name: str, pull_number: int, head_sha: str,
-) -> tuple[tuple[DiffHunk, ...], tuple[tuple[str, str], ...]]:
-    """Drop byte-identical relocations before cohort planning.
+) -> tuple[
+    tuple[DiffHunk, ...], tuple[tuple[str, str], ...], tuple[tuple[str, str], ...],
+]:
+    """Drop byte-identical copies and moves before cohort planning.
 
-    Three categories of relocations are handled:
-    - Whole-file copies from the HEAD tree (files already in the repo)
-    - Byte-identical copies within the same diff (one file added twice)
-    - Whole-file deletions plus identical additions in the same diff
-
-    Each exclusion is named in the summary so it is never silent.
-    The tree is fetched only when needed, so most PRs pay nothing."""
+    Returns `(hunks, duplicates, moves)`. Duplicates (#813) are copies of a
+    file already at head, or one file added under two paths in the diff.
+    Moves (#772) are 100% renames, a whole-file delete plus an add of the
+    same blob, and `git subtree add` imports proven against the split
+    commit's tree. Each is named in the summary, never silent. The trees
+    and commit list are fetched only when the diff adds a file, so most
+    PRs pay nothing."""
     blob_ids = new_file_blob_ids(diff_text)
     tree_copies: tuple[tuple[str, str], ...] = ()
     if any(is_tree_copy_candidate(h, blob_ids) for h in hunks):
@@ -479,8 +547,12 @@ def _split_copied_hunks(
         )
         hunks, tree_copies = split_tree_copy_hunks(hunks, blob_ids, head_blobs)
     hunks, same_diff = split_duplicate_hunks(hunks)
-    hunks, moves = split_move_hunks(hunks, diff_text)
-    return hunks, tree_copies + same_diff + moves
+    imports, split_trees = (
+        _fetch_subtree_context(installation_id, owner, repo_name, pull_number)
+        if blob_ids else ((), {})
+    )
+    hunks, moves = split_move_hunks(hunks, diff_text, imports, split_trees)
+    return hunks, tree_copies + same_diff, moves
 
 
 def _load_repo_config(
@@ -1016,6 +1088,25 @@ def _tried_models_note(coverage) -> str:
     return f"\n\nModels tried: {shown}{_path_tail(models, 12)}."
 
 
+def _move_note(move_paths: tuple[tuple[str, str], ...]) -> str:
+    """The one summary line naming relocated files (#772), or empty.
+
+    Names each as `source -> destination` so the claim "unchanged" can be
+    checked. A moved file's edits are not here: they stay in review."""
+    if not move_paths:
+        return ""
+    shown = ", ".join(
+        f"`{src.replace(chr(96), '')}` -> `{dst.replace(chr(96), '')}`"
+        for src, dst in move_paths[:10]
+    )
+    return (
+        f"\n\nGrug did not review {len(move_paths)} moved file(s) as new "
+        f"code - same content as the source, proven by git blob id: "
+        f"{shown}{_path_tail(move_paths)}. Lines edited in a moved file are "
+        f"still reviewed."
+    )
+
+
 def _review_transparency(
     evaluation: CodeReviewEvaluation,
     suppressed_count: int,
@@ -1077,19 +1168,7 @@ def _review_transparency(
             f"already in the repo at this head: {shown}{more}. Any change "
             f"this diff makes to the original is still reviewed."
         )
-    if move_paths:
-        # Named as PAIRS: the exclusion must say WHICH file was deleted and
-        # WHICH was added, not just that they were moved.
-        shown = ", ".join(
-            f"`{deleted.replace(chr(96), '')}` → `{added.replace(chr(96), '')}`"
-            for deleted, added in move_paths[:10]
-        )
-        more = _path_tail(move_paths)
-        lines += (
-            f"\n\nGrug excluded {len(move_paths)} moved file(s) - a whole file was "
-            f"deleted and an identical file added in this diff: {shown}{more}."
-        )
-    return lines
+    return lines + _move_note(move_paths)
 
 
 def _clean_review_scope(
@@ -1375,6 +1454,7 @@ def _summary_markdown(
         )
         scope = _clean_review_scope(
             living_range, excluded_paths, oversized_paths, duplicate_paths,
+            move_paths,
         )
         return _hunt_title(title, living_range), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note + tier_note
 
@@ -6194,7 +6274,6 @@ def _async_deep_append_if_needed(
         review_phase="deep",
         blocking=blocking,
         muted=_muted_classes_for(f"{owner}/{repo_name}", repo_config),
-        move_paths=(),  # Deep arm is an independent pass, already handled in Tier-1
     )
     summary = _intent_paragraph(pr_context) + summary
     summary += config_note
