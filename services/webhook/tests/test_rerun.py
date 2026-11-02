@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 import rerun
+from personas.code_reviewer import elder_review
 
 
 def _job(**over) -> str:
@@ -81,8 +82,8 @@ def test_review_claim_heartbeat_renews_until_stopped(monkeypatch):
         return True
 
     monkeypatch.setattr("adapters.install_store.renew_review_claim", renew)
-    monkeypatch.setattr(rerun, "_REVIEW_CLAIM_HEARTBEAT_SECONDS", 0.001)
-    heartbeat = rerun._start_review_claim_heartbeat({
+    monkeypatch.setattr(elder_review, "_REVIEW_CLAIM_HEARTBEAT_SECONDS", 0.001)
+    heartbeat = elder_review.start_review_claim_heartbeat({
         "install_id": 11,
         "repo": "myorg/myrepo",
         "pr_number": 7,
@@ -92,7 +93,7 @@ def test_review_claim_heartbeat_renews_until_stopped(monkeypatch):
     })
 
     assert renewed.wait(1.0)
-    assert rerun._stop_review_claim_heartbeat(heartbeat) is True
+    assert elder_review.stop_review_claim_heartbeat(heartbeat) is True
 
 
 def test_review_claim_heartbeat_surfaces_lost_ownership(monkeypatch):
@@ -103,8 +104,8 @@ def test_review_claim_heartbeat_surfaces_lost_ownership(monkeypatch):
         return False
 
     monkeypatch.setattr("adapters.install_store.renew_review_claim", renew)
-    monkeypatch.setattr(rerun, "_REVIEW_CLAIM_HEARTBEAT_SECONDS", 0.001)
-    heartbeat = rerun._start_review_claim_heartbeat({
+    monkeypatch.setattr(elder_review, "_REVIEW_CLAIM_HEARTBEAT_SECONDS", 0.001)
+    heartbeat = elder_review.start_review_claim_heartbeat({
         "install_id": 11,
         "repo": "myorg/myrepo",
         "pr_number": 7,
@@ -115,7 +116,7 @@ def test_review_claim_heartbeat_surfaces_lost_ownership(monkeypatch):
 
     assert attempted.wait(1.0)
     heartbeat.thread.join(timeout=1.0)
-    assert rerun._stop_review_claim_heartbeat(heartbeat) is False
+    assert elder_review.stop_review_claim_heartbeat(heartbeat) is False
 
 
 def test_enqueue_review_is_snapshot_scoped_and_carries_quiet_window(monkeypatch):
@@ -382,7 +383,7 @@ def test_hot_review_settles_then_dispatches_same_current_snapshot(monkeypatch):
         persona="code_reviewer",
         head_sha=rerun.review_snapshot_id_from_pr(_pr_data(head_sha="latest")),
         owner_token=ANY,
-        lease_seconds=rerun._REVIEW_CLAIM_LEASE_SECONDS,
+        lease_seconds=elder_review._REVIEW_CLAIM_LEASE_SECONDS,
     )
     owner_token = acquire.call_args.kwargs["owner_token"]
     assert owner_token
@@ -478,7 +479,7 @@ def test_hot_review_gives_up_at_entry_once_the_redrive_cap_is_exhausted(monkeypa
 
     status = rerun._run_one(_job(
         kind="review", requested_head_sha="same-head", settle_seconds=90,
-        redrive_count=rerun._MAX_INTENT_DRIFT_REDRIVES,
+        redrive_count=elder_review._MAX_INTENT_DRIFT_REDRIVES,
     ))
 
     assert status == "intent_drift_exhausted"
@@ -510,7 +511,7 @@ def test_hot_review_new_head_resets_the_redrive_count(monkeypatch):
 
     status = rerun._run_one(_job(
         kind="review", requested_head_sha="same-head", settle_seconds=90,
-        redrive_count=rerun._MAX_INTENT_DRIFT_REDRIVES,
+        redrive_count=elder_review._MAX_INTENT_DRIFT_REDRIVES,
     ))
 
     assert status == "stale_snapshot"
@@ -753,7 +754,7 @@ def test_hot_review_gives_up_mid_flight_once_the_redrive_cap_is_exhausted(monkey
 
     status = rerun._run_one(_job(
         kind="review", settle_seconds=0,
-        redrive_count=rerun._MAX_INTENT_DRIFT_REDRIVES,
+        redrive_count=elder_review._MAX_INTENT_DRIFT_REDRIVES,
     ))
 
     assert status == "intent_drift_exhausted"
@@ -1272,12 +1273,12 @@ def test_shutdown_release_frees_claims_orphaned_by_a_killed_review(monkeypatch):
         "install_id": 11, "repo": "o/r", "pr_number": 7,
         "persona": "code_reviewer", "head_sha": "snap", "owner_token": "tok-1",
     }
-    rerun._register_active_review_claim("tok-1", args)
+    elder_review.register_active_review_claim("tok-1", args)
 
-    assert rerun.release_active_review_claims() == 1
+    assert elder_review.release_active_review_claims() == 1
     release.assert_called_once_with(**args)
     # Registry drained: a second sweep has nothing to do.
-    assert rerun.release_active_review_claims() == 0
+    assert elder_review.release_active_review_claims() == 0
 
 
 def test_shutdown_release_is_best_effort_per_claim(monkeypatch):
@@ -1294,10 +1295,10 @@ def test_shutdown_release_is_best_effort_per_claim(monkeypatch):
     monkeypatch.setattr("adapters.install_store.release_review_claim", _release)
     base = {"install_id": 1, "repo": "o/r", "pr_number": 1,
             "persona": "code_reviewer", "head_sha": "s"}
-    rerun._register_active_review_claim("tok-a", {**base, "owner_token": "tok-a"})
-    rerun._register_active_review_claim("tok-b", {**base, "owner_token": "tok-b"})
+    elder_review.register_active_review_claim("tok-a", {**base, "owner_token": "tok-a"})
+    elder_review.register_active_review_claim("tok-b", {**base, "owner_token": "tok-b"})
 
-    assert rerun.release_active_review_claims() == 1  # tok-b released
+    assert elder_review.release_active_review_claims() == 1  # tok-b released
     assert set(calls) == {"tok-a", "tok-b"}
 
 
@@ -1321,7 +1322,7 @@ def test_in_process_exits_unregister_so_shutdown_sweep_sees_nothing(monkeypatch)
     with pytest.raises(RuntimeError, match="review crashed"):
         rerun._run_one(_job(kind="review", settle_seconds=0))
 
-    assert rerun.release_active_review_claims() == 0
+    assert elder_review.release_active_review_claims() == 0
 
 
 def test_hot_review_publish_failure_releases_claim_and_raises_for_redrive(monkeypatch):
@@ -2192,19 +2193,17 @@ def _run_watch_once(monkeypatch, current_pr, expected_pr):
     """Drive exactly one poll of the staleness loop and report cancellation."""
     import threading
 
-    monkeypatch.setattr(rerun, "_STALENESS_WATCH_INTERVAL_S", 0.001)
+    monkeypatch.setattr(elder_review, "_STALENESS_WATCH_INTERVAL_S", 0.001)
     stop, cancel = threading.Event(), threading.Event()
 
     def _fetch(*_a, **_kw):
         stop.set()  # one iteration only
         return current_pr, "etag"
 
-    monkeypatch.setattr(rerun, "_fetch_pr_if_changed", _fetch)
-    rerun._review_staleness_watch_loop(
+    elder_review._review_staleness_watch_loop(
         1, "o", "r", 7,
-        rerun.review_freshness_id_from_pr(expected_pr),
         str((expected_pr.get("head") or {}).get("sha") or ""),
-        stop, cancel,
+        stop, cancel, _fetch,
     )
     return cancel.is_set()
 
@@ -2214,8 +2213,8 @@ def test_staleness_watch_does_not_cancel_on_an_intent_only_edit(monkeypatch):
     byte of it, so a running review is still producing a valid answer."""
     before = _pr("aaaa1111", body="original why")
     after = _pr("aaaa1111", body="rewritten why, same code")
-    assert rerun.review_freshness_id_from_pr(after) != \
-        rerun.review_freshness_id_from_pr(before), "fixture must move the id"
+    assert elder_review.review_freshness_id_from_pr(after) != \
+        elder_review.review_freshness_id_from_pr(before), "fixture must move the id"
 
     assert _run_watch_once(monkeypatch, after, before) is False, (
         "an intent-only edit must not cancel a running review - that is what "
@@ -2236,18 +2235,15 @@ def test_staleness_watch_ignores_a_transient_fetch_failure(monkeypatch):
     """A GitHub hiccup must never cancel a genuinely current review."""
     import threading
 
-    monkeypatch.setattr(rerun, "_STALENESS_WATCH_INTERVAL_S", 0.001)
+    monkeypatch.setattr(elder_review, "_STALENESS_WATCH_INTERVAL_S", 0.001)
     stop, cancel = threading.Event(), threading.Event()
 
     def _boom(*_a, **_kw):
         stop.set()
         raise RuntimeError("GitHub 502")
 
-    monkeypatch.setattr(rerun, "_fetch_pr_if_changed", _boom)
-    rerun._review_staleness_watch_loop(
-        1, "o", "r", 7,
-        rerun.review_freshness_id_from_pr(_pr("aaaa1111")),
-        "aaaa1111", stop, cancel,
+    elder_review._review_staleness_watch_loop(
+        1, "o", "r", 7, "aaaa1111", stop, cancel, _boom,
     )
     assert cancel.is_set() is False
 
@@ -2257,7 +2253,7 @@ def _watch_github(monkeypatch, answers):
     each request's If-None-Match plus whether the review was cancelled."""
     import threading
 
-    monkeypatch.setattr(rerun, "_STALENESS_WATCH_INTERVAL_S", 0.001)
+    monkeypatch.setattr(elder_review, "_STALENESS_WATCH_INTERVAL_S", 0.001)
     monkeypatch.setattr(rerun, "with_install_token_retry", lambda _i, fn: fn("tok"))
     stop, cancel = threading.Event(), threading.Event()
     sent, pending = [], list(answers)
@@ -2269,8 +2265,8 @@ def _watch_github(monkeypatch, answers):
         return pending.pop(0)
 
     monkeypatch.setattr(rerun.httpx, "get", _get)
-    rerun._review_staleness_watch_loop(
-        1, "o", "r", 7, "freshness", "aaaa1111", stop, cancel,
+    elder_review._review_staleness_watch_loop(
+        1, "o", "r", 7, "aaaa1111", stop, cancel, rerun._fetch_pr_if_changed,
     )
     return sent, cancel.is_set()
 

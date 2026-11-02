@@ -219,7 +219,9 @@ def _release_active_review_leases() -> int:
 
 
 def _release_active_review_claims() -> int:
-    from rerun import release_active_review_claims  # type: ignore[attr-defined]
+    from personas.code_reviewer.elder_review import (
+        release_active_review_claims,
+    )
 
     return release_active_review_claims()
 

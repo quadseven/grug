@@ -183,7 +183,7 @@ from personas.code_reviewer.removed_files import (
     scan_guarded_deletions,
 )
 from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
-from personas.code_reviewer.snapshot import review_freshness_id_from_pr
+from personas.code_reviewer.elder_review import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward, hunt_link, living_review
 from personas.hunt_recorder import PrRef, now as hunt_now
 from personas.code_reviewer.degraded_gate import (
@@ -884,7 +884,7 @@ def _list_dir_contents(
 # known helpers (best-effort) so the claim-check detector can still compare
 # numbers. Harmless no-ops on foreign repos (404 -> skip).
 _CLAIM_CHECK_POLICY_PATHS: tuple[str, ...] = (
-    "services/_shared/personas/code_reviewer/snapshot.py",
+    "services/_shared/personas/code_reviewer/elder_review.py",
     "services/_shared/llm_client.py",
 )
 _CLAIM_HINT_RE = re.compile(

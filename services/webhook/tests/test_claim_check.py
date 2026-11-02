@@ -67,7 +67,7 @@ class TestSettleCapDrift:
         out = scan_claim_checks(
             hunks,
             {
-                "services/_shared/personas/code_reviewer/snapshot.py": _SETTLE_IMPL,
+                "services/_shared/personas/code_reviewer/elder_review.py": _SETTLE_IMPL,
             },
         )
         assert len(out) == 1
@@ -94,7 +94,7 @@ class TestSettleCapDrift:
         out = scan_claim_checks(
             hunks,
             {
-                "services/_shared/personas/code_reviewer/snapshot.py": _SETTLE_IMPL,
+                "services/_shared/personas/code_reviewer/elder_review.py": _SETTLE_IMPL,
             },
         )
         assert out == ()
@@ -282,7 +282,7 @@ class TestNonClaimNoise:
         assert out == ()
 
     def test_conflicting_policy_values_are_unknown_not_last_wins(self):
-        """Two different min(base, N) in snapshot.py -> no fact, no finding."""
+        """Two different min(base, N) in elder_review.py -> no fact, no finding."""
         hunks = (
             _hunk(
                 "k8s/webhook-deployment.yaml",
@@ -298,6 +298,6 @@ class TestNonClaimNoise:
         )
         out = scan_claim_checks(
             hunks,
-            {"services/_shared/personas/code_reviewer/snapshot.py": src},
+            {"services/_shared/personas/code_reviewer/elder_review.py": src},
         )
         assert out == ()
