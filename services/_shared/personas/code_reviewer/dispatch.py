@@ -90,6 +90,9 @@ from personas.code_reviewer.diff_parser import (
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
+from personas.code_reviewer.move_detection import (
+    SubtreeImport, split_move_hunks, subtree_imports,
+)
 from personas.code_reviewer.precedent import (
     ClassPrecision, class_precision, match_precedent, mute_note,
     muted_classes, render_precedent_note,
@@ -457,16 +460,115 @@ def _fetch_head_blobs(
     }
 
 
+# Most subtree imports whose split trees are fetched for one pull request.
+_MAX_SUBTREE_IMPORTS = 5
+
+
+# GitHub's pull request commits endpoint serves at most 250 commits, so at
+# 100 per page the walk needs 3 requests and the last page comes back short.
+_MAX_COMMIT_PAGES = 3
+
+
+def _fetch_pr_commit_messages(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+) -> tuple[str, ...]:
+    """Commit messages of the pull request, every page the API serves (#772).
+
+    Best-effort: a failed page stops the walk and keeps the messages read so
+    far, so the worst case is fewer trailers seen and more files reviewed."""
+    messages: list[str] = []
+    for page in range(1, _MAX_COMMIT_PAGES + 1):
+        batch = _fetch_commit_page(
+            installation_id, owner, repo_name, pull_number, page,
+        )
+        if batch is None:
+            break
+        messages.extend(batch)
+        if len(batch) < _COMMITS_PER_PAGE:
+            break
+    return tuple(messages)
+
+
+_COMMITS_PER_PAGE = 100
+
+
+def _fetch_commit_page(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    page: int,
+) -> list[str] | None:
+    """One page of commit messages, or None when the page cannot be read."""
+
+    def _get(token: str) -> Any:
+        resp = httpx.get(
+            f"https://api.github.com/repos/{quote(owner, safe='')}/"
+            f"{quote(repo_name, safe='')}/pulls/{pull_number}/commits",
+            params={"per_page": str(_COMMITS_PER_PAGE), "page": str(page)},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=DIFF_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        data = with_install_token_retry(installation_id, _get)
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
+        log.info(
+            "code_review_pr_commits_unavailable",
+            extra={
+                "pr": f"{owner}/{repo_name}#{pull_number}",
+                "page": page,
+                "kind": type(e).__name__,
+            },
+        )
+        return None
+    if not isinstance(data, list):
+        return None
+    return [
+        str(c["commit"]["message"])
+        for c in data
+        if isinstance(c, dict) and isinstance(c.get("commit"), dict)
+        and isinstance(c["commit"].get("message"), str)
+    ]
+
+
+def _fetch_subtree_context(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+) -> tuple[tuple[SubtreeImport, ...], dict[str, dict[str, str]]]:
+    """The pull request's subtree imports and each split commit's tree (#772).
+
+    A split commit whose tree cannot be fetched is left out of the result
+    (`_fetch_head_blobs` returns {}), so its files are reviewed in full."""
+    imports = subtree_imports(
+        _fetch_pr_commit_messages(installation_id, owner, repo_name, pull_number)
+    )[:_MAX_SUBTREE_IMPORTS]
+    trees = {
+        imp.split_sha: _fetch_head_blobs(
+            installation_id, owner, repo_name, pull_number, imp.split_sha,
+        )
+        for imp in imports
+    }
+    return imports, {sha: tree for sha, tree in trees.items() if tree}
+
+
 def _split_copied_hunks(
     hunks: tuple[DiffHunk, ...], diff_text: str, installation_id: int,
     owner: str, repo_name: str, pull_number: int, head_sha: str,
-) -> tuple[tuple[DiffHunk, ...], tuple[tuple[str, str], ...]]:
-    """Drop byte-identical whole-file copies before cohort planning (#813).
+) -> tuple[
+    tuple[DiffHunk, ...], tuple[tuple[str, str], ...], tuple[tuple[str, str], ...],
+]:
+    """Drop byte-identical copies and moves before cohort planning.
 
-    First against the head tree (a copy of a file already in the repo -
-    #813's six copied modules), then within the diff itself (one
-    file added under two paths). The tree is fetched only when the diff
-    adds a file big enough to be a candidate, so most PRs pay nothing."""
+    Returns `(hunks, duplicates, moves)`. Duplicates (#813) are copies of a
+    file already at head, or one file added under two paths in the diff.
+    Moves (#772) are 100% renames, a whole-file delete plus an add of the
+    same blob, and `git subtree add` imports proven against the split
+    commit's tree. Each is named in the summary, never silent. The trees
+    and commit list are fetched only when the diff adds a file, so most
+    PRs pay nothing."""
     blob_ids = new_file_blob_ids(diff_text)
     tree_copies: tuple[tuple[str, str], ...] = ()
     if any(is_tree_copy_candidate(h, blob_ids) for h in hunks):
@@ -475,7 +577,12 @@ def _split_copied_hunks(
         )
         hunks, tree_copies = split_tree_copy_hunks(hunks, blob_ids, head_blobs)
     hunks, same_diff = split_duplicate_hunks(hunks)
-    return hunks, tree_copies + same_diff
+    imports, split_trees = (
+        _fetch_subtree_context(installation_id, owner, repo_name, pull_number)
+        if blob_ids else ((), {})
+    )
+    hunks, moves = split_move_hunks(hunks, diff_text, imports, split_trees)
+    return hunks, tree_copies + same_diff, moves
 
 
 def _load_repo_config(
@@ -1011,12 +1118,32 @@ def _tried_models_note(coverage) -> str:
     return f"\n\nModels tried: {shown}{_path_tail(models, 12)}."
 
 
+def _move_note(move_paths: tuple[tuple[str, str], ...]) -> str:
+    """The one summary line naming relocated files (#772), or empty.
+
+    Names each as `source -> destination` so the claim "unchanged" can be
+    checked. A moved file's edits are not here: they stay in review."""
+    if not move_paths:
+        return ""
+    shown = ", ".join(
+        f"`{src.replace(chr(96), '')}` -> `{dst.replace(chr(96), '')}`"
+        for src, dst in move_paths[:10]
+    )
+    return (
+        f"\n\nGrug did not review {len(move_paths)} moved file(s) as new "
+        f"code - same content as the source, proven by git blob id: "
+        f"{shown}{_path_tail(move_paths)}. Lines edited in a moved file are "
+        f"still reviewed."
+    )
+
+
 def _review_transparency(
     evaluation: CodeReviewEvaluation,
     suppressed_count: int,
     excluded_paths: tuple[str, ...],
     oversized_paths: tuple[str, ...] = (),
     duplicate_paths: tuple[tuple[str, str], ...] = (),
+    move_paths: tuple[tuple[str, str], ...] = (),
 ) -> str:
     lines = (
         f"\n\nGrug held back {suppressed_count} weak finding(s) his judge doubted."
@@ -1071,7 +1198,7 @@ def _review_transparency(
             f"already in the repo at this head: {shown}{more}. Any change "
             f"this diff makes to the original is still reviewed."
         )
-    return lines
+    return lines + _move_note(move_paths)
 
 
 def _clean_review_scope(
@@ -1079,6 +1206,7 @@ def _clean_review_scope(
     excluded_paths: tuple[str, ...],
     oversized_paths: tuple[str, ...] = (),
     duplicate_paths: tuple[tuple[str, str], ...] = (),
+    move_paths: tuple[tuple[str, str], ...] = (),
 ) -> str:
     if living_range:
         return (
@@ -1086,7 +1214,7 @@ def _clean_review_scope(
             "runtime signal when mapped). No markings survived the judge. "
             "Code walk steady."
         )
-    if excluded_paths or oversized_paths or duplicate_paths:
+    if excluded_paths or oversized_paths or duplicate_paths or move_paths:
         return (
             "Elder walked the reviewable diff (full file + cross-file + "
             "Omen when mapped), skipping data/generated paths listed "
@@ -1249,6 +1377,7 @@ def _summary_markdown(
     excluded_paths: tuple[str, ...] = (),
     oversized_paths: tuple[str, ...] = (),
     duplicate_paths: tuple[tuple[str, str], ...] = (),
+    move_paths: tuple[tuple[str, str], ...] = (),
     living_range: str = "",
     living_baseline_rejected: str = "",
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
@@ -1277,7 +1406,7 @@ def _summary_markdown(
     """
     held = _review_transparency(
         evaluation, suppressed_count, excluded_paths, oversized_paths,
-        duplicate_paths,
+        duplicate_paths, move_paths,
     )
     defensive_note = _defensive_drop_note(defensive_dropped_count)
     tier_note = _tier_served_note(
@@ -1355,6 +1484,7 @@ def _summary_markdown(
         )
         scope = _clean_review_scope(
             living_range, excluded_paths, oversized_paths, duplicate_paths,
+            move_paths,
         )
         return _hunt_title(title, living_range), ("## Markings Board\n\n" + scope) + held + hunt + defensive_note + tier_note
 
@@ -3679,7 +3809,7 @@ def dispatch_code_review(
         # entirely. Drop it HERE, before cohort planning, named against the
         # path it duplicates, so the budget goes to content nobody has
         # looked at yet.
-        hunks, duplicate_paths = _split_copied_hunks(
+        hunks, duplicate_paths, move_paths = _split_copied_hunks(
             hunks, diff_text, installation_id, owner, repo_name,
             pull_number, head_sha,
         )
@@ -4274,6 +4404,7 @@ def dispatch_code_review(
         excluded_paths=excluded_paths,
         oversized_paths=oversized_paths,
         duplicate_paths=duplicate_paths,
+        move_paths=move_paths,
         living_range=living_range,
         living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
