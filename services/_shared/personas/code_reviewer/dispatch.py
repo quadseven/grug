@@ -90,6 +90,7 @@ from personas.code_reviewer.diff_parser import (
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
+from personas.code_reviewer.move_detection import split_move_hunks
 from personas.code_reviewer.precedent import (
     ClassPrecision, class_precision, match_precedent, mute_note,
     muted_classes, render_precedent_note,
@@ -461,12 +462,15 @@ def _split_copied_hunks(
     hunks: tuple[DiffHunk, ...], diff_text: str, installation_id: int,
     owner: str, repo_name: str, pull_number: int, head_sha: str,
 ) -> tuple[tuple[DiffHunk, ...], tuple[tuple[str, str], ...]]:
-    """Drop byte-identical whole-file copies before cohort planning (#813).
+    """Drop byte-identical relocations before cohort planning.
 
-    First against the head tree (a copy of a file already in the repo -
-    #813's six copied modules), then within the diff itself (one
-    file added under two paths). The tree is fetched only when the diff
-    adds a file big enough to be a candidate, so most PRs pay nothing."""
+    Three categories of relocations are handled:
+    - Whole-file copies from the HEAD tree (files already in the repo)
+    - Byte-identical copies within the same diff (one file added twice)
+    - Whole-file deletions plus identical additions in the same diff
+
+    Each exclusion is named in the summary so it is never silent.
+    The tree is fetched only when needed, so most PRs pay nothing."""
     blob_ids = new_file_blob_ids(diff_text)
     tree_copies: tuple[tuple[str, str], ...] = ()
     if any(is_tree_copy_candidate(h, blob_ids) for h in hunks):
@@ -475,7 +479,8 @@ def _split_copied_hunks(
         )
         hunks, tree_copies = split_tree_copy_hunks(hunks, blob_ids, head_blobs)
     hunks, same_diff = split_duplicate_hunks(hunks)
-    return hunks, tree_copies + same_diff
+    hunks, moves = split_move_hunks(hunks, diff_text)
+    return hunks, tree_copies + same_diff + moves
 
 
 def _load_repo_config(
@@ -1017,6 +1022,7 @@ def _review_transparency(
     excluded_paths: tuple[str, ...],
     oversized_paths: tuple[str, ...] = (),
     duplicate_paths: tuple[tuple[str, str], ...] = (),
+    move_paths: tuple[tuple[str, str], ...] = (),
 ) -> str:
     lines = (
         f"\n\nGrug held back {suppressed_count} weak finding(s) his judge doubted."
@@ -1071,6 +1077,18 @@ def _review_transparency(
             f"already in the repo at this head: {shown}{more}. Any change "
             f"this diff makes to the original is still reviewed."
         )
+    if move_paths:
+        # Named as PAIRS: the exclusion must say WHICH file was deleted and
+        # WHICH was added, not just that they were moved.
+        shown = ", ".join(
+            f"`{deleted.replace(chr(96), '')}` → `{added.replace(chr(96), '')}`"
+            for deleted, added in move_paths[:10]
+        )
+        more = _path_tail(move_paths)
+        lines += (
+            f"\n\nGrug excluded {len(move_paths)} moved file(s) - a whole file was "
+            f"deleted and an identical file added in this diff: {shown}{more}."
+        )
     return lines
 
 
@@ -1079,6 +1097,7 @@ def _clean_review_scope(
     excluded_paths: tuple[str, ...],
     oversized_paths: tuple[str, ...] = (),
     duplicate_paths: tuple[tuple[str, str], ...] = (),
+    move_paths: tuple[tuple[str, str], ...] = (),
 ) -> str:
     if living_range:
         return (
@@ -1086,7 +1105,7 @@ def _clean_review_scope(
             "runtime signal when mapped). No markings survived the judge. "
             "Code walk steady."
         )
-    if excluded_paths or oversized_paths or duplicate_paths:
+    if excluded_paths or oversized_paths or duplicate_paths or move_paths:
         return (
             "Elder walked the reviewable diff (full file + cross-file + "
             "Omen when mapped), skipping data/generated paths listed "
@@ -1249,6 +1268,7 @@ def _summary_markdown(
     excluded_paths: tuple[str, ...] = (),
     oversized_paths: tuple[str, ...] = (),
     duplicate_paths: tuple[tuple[str, str], ...] = (),
+    move_paths: tuple[tuple[str, str], ...] = (),
     living_range: str = "",
     living_baseline_rejected: str = "",
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
@@ -1277,7 +1297,7 @@ def _summary_markdown(
     """
     held = _review_transparency(
         evaluation, suppressed_count, excluded_paths, oversized_paths,
-        duplicate_paths,
+        duplicate_paths, move_paths,
     )
     defensive_note = _defensive_drop_note(defensive_dropped_count)
     tier_note = _tier_served_note(
@@ -3679,7 +3699,7 @@ def dispatch_code_review(
         # entirely. Drop it HERE, before cohort planning, named against the
         # path it duplicates, so the budget goes to content nobody has
         # looked at yet.
-        hunks, duplicate_paths = _split_copied_hunks(
+        hunks, duplicate_paths, move_paths = _split_copied_hunks(
             hunks, diff_text, installation_id, owner, repo_name,
             pull_number, head_sha,
         )
@@ -4272,6 +4292,7 @@ def dispatch_code_review(
         excluded_paths=excluded_paths,
         oversized_paths=oversized_paths,
         duplicate_paths=duplicate_paths,
+        move_paths=move_paths,
         living_range=living_range,
         living_baseline_rejected=living_baseline_rejected,
         review_phase=tier1_phase,
@@ -6173,6 +6194,7 @@ def _async_deep_append_if_needed(
         review_phase="deep",
         blocking=blocking,
         muted=_muted_classes_for(f"{owner}/{repo_name}", repo_config),
+        move_paths=(),  # Deep arm is an independent pass, already handled in Tier-1
     )
     summary = _intent_paragraph(pr_context) + summary
     summary += config_note
