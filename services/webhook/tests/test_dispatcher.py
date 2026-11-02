@@ -821,8 +821,11 @@ def test_review_reply_with_no_reason_cannot_teach():
     mock_enq.assert_not_called()
 
 
-def test_review_reply_enqueues_for_a_maintainer_who_did_not_write_the_pr():
-    # A write collaborator on someone else's PR teaches: enqueued, teacher threaded.
+def test_review_reply_enqueues_for_write_author():
+    # The reply's author has write perm -> enqueued, the reply author threaded
+    # as the teacher. Since #1571 that author must not have written the PR, so
+    # the sender is a maintainer on someone else's PR (the PR author's own
+    # reply is refused: test_review_reply_pr_author_cannot_teach_even_with_admin).
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher._pr_commit_logins", return_value=frozenset({"lane-app[bot]"})), \
