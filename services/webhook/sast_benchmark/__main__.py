@@ -4,6 +4,9 @@
     python -m sast_benchmark --record    # ... and (over)write baseline.json
     python -m sast_benchmark --check      # ... and exit 1 on a regression vs baseline
 
+Any backend with an errored sample (transport failure or unparsed response) is
+not scored: the run exits 2, and `--record` writes no baseline (#1565).
+
 `--record`/`--check`/default all make REAL backend calls (whichever backends
 `configured_backends()` finds in the env). They are NOT run in the per-PR CI
 suite — only from the on-demand `benchmark.sast.yml` job or a manual run with
@@ -58,13 +61,14 @@ def main(argv: list[str] | None = None) -> int:
     broken = []
     for backend in backends:
         run = run_backend(backend, corpus)
-        if run.all_errored:
-            # Every call failed (bad key/URL/unreachable Cave). Recording its
-            # all-zero recall as a baseline would be a fabricated "Elder detects
-            # nothing" — refuse it instead.
+        if run.errors:
+            # An errored sample (transport failure or unparsed response) scores
+            # as a miss, so any errored sample biases recall down. Scoring or
+            # recording it would publish a fabricated "Elder detects less"
+            # (#1565); refuse the backend instead.
             print(
-                f"\n!! backend {backend.name}: ALL {run.total} samples errored "
-                "- not a valid run (check key/URL/reachability); skipping.",
+                f"\n!! backend {backend.name}: {run.errors}/{run.total} samples errored "
+                "- not a valid run (check key/URL/reachability); not scored.",
                 file=sys.stderr,
             )
             broken.append(backend.name)
@@ -76,7 +80,17 @@ def main(argv: list[str] | None = None) -> int:
         print("\nNo backend produced a valid run.", file=sys.stderr)
         return 2
 
+    if broken:
+        print(
+            f"\nINVALID: {len(broken)} backend(s) did not complete: {', '.join(broken)}",
+            file=sys.stderr,
+        )
+
     if args.record:
+        if broken:
+            # A baseline missing a backend would silently drop its entry.
+            print("baseline NOT written: every backend must complete.", file=sys.stderr)
+            return 2
         out = {name: to_baseline_dict(rep, backend=name) for name, rep in reports.items()}
         with open(_BASELINE_PATH, "w") as f:
             json.dump({"backends": out}, f, indent=2, sort_keys=True)
@@ -100,9 +114,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  [{name}] {r.kind}: {r.subject} (baseline={r.baseline} current={r.current})")
             return 1
         print("\nno regressions vs baseline")
-        return 0
 
-    return 0
+    # Report/check: a backend that did not complete makes the run invalid,
+    # so the job goes red instead of printing a partial score as success.
+    return 2 if broken else 0
 
 
 if __name__ == "__main__":
