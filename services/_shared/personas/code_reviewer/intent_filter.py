@@ -28,6 +28,7 @@ import dataclasses
 import re
 from collections.abc import Iterable
 
+from personas.code_reviewer.criteria_coverage import is_future_post_merge_observation
 from personas.code_reviewer.persona import Finding
 
 INTENT_MISMATCH = "intent-mismatch"
@@ -226,6 +227,13 @@ _ADVISORY_NOTE = (
 )
 
 
+_DEFERRED_NOTE = (
+    " This box observes a CI run that happens only after the merge, so no "
+    "pre-merge diff or PR body can meet it: the finding is advisory, and the "
+    "box stays outstanding until that run is checked."
+)
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class _BoxScope:
     """What the scope knows about one PR's linked boxes."""
@@ -272,6 +280,12 @@ def _scoped(finding: Finding, scope: _BoxScope) -> tuple[Finding | None, str]:
     # block, even on the PR that closes the ticket, but stays visible.
     if all(b[2] == "delivered" for b in matched):
         return _advisory(finding, matched), "lowered"
+    # A future post-merge CI run is deferred verification, not a missing
+    # hunk, even on the PR that closes the ticket (#1509).
+    if blocking and all(is_future_post_merge_observation(b[3]) for b in matched):
+        return dataclasses.replace(
+            _annotated(finding, matched, _DEFERRED_NOTE), severity="medium",
+        ), "lowered"
     if any(b[0] in scope.closed for b in matched):
         return _annotated(finding, matched), "kept"
     if all(b[2] == "ticked" for b in matched):
