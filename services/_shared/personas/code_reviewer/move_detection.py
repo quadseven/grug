@@ -109,7 +109,7 @@ def _subtree_pairs(
             tree = split_trees.get(imp.split_sha, {})
             source = tree.get(path[len(prefix):]) if path.startswith(prefix) else None
             if source and _same_blob(blob, source):
-                pairs.append((f"{imp.split_sha[:7]}:{path[len(prefix):]}", path))
+                pairs.append((f"subtree {imp.split_sha[:7]}:{path[len(prefix):]}", path))
                 break
     return pairs
 
@@ -121,6 +121,8 @@ def find_moves(
 ) -> tuple[tuple[str, str], ...]:
     """`((source, destination), ...)` for every provable relocation in the
     diff, in the order: 100% renames, delete+add pairs, subtree imports.
+    A subtree source reads `subtree <short sha>:<path>`: a path in the split
+    commit's tree, not a path in this repo.
     `split_trees` is `{split sha: {path: blob sha}}`; a split commit absent
     from it proves nothing. Pure."""
     renames = _pure_renames(diff_text)

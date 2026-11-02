@@ -1122,7 +1122,9 @@ def _move_note(move_paths: tuple[tuple[str, str], ...]) -> str:
     """The one summary line naming relocated files (#772), or empty.
 
     Names each as `source -> destination` so the claim "unchanged" can be
-    checked. A moved file's edits are not here: they stay in review."""
+    checked; a subtree source says `subtree <sha>:<path>`, the commit tree
+    it came from, because that path does not exist in this repo. A moved
+    file's edits are not here: they stay in review."""
     if not move_paths:
         return ""
     shown = ", ".join(

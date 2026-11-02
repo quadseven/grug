@@ -128,8 +128,7 @@ def test_subtree_add_pure_adds_excluded_but_edited_file_reviewed() -> None:
     )
     assert [h.file_path for h in kept] == ["vendor-dir/edited.py"]
     assert len(moves) == 2
-    assert moves[0][1] == "vendor-dir/a.py"
-    assert moves[0][0].endswith("a.py")
+    assert moves[0] == ("subtree ccccccc:a.py", "vendor-dir/a.py")
 
 
 def test_missing_split_tree_falls_back_to_full_review() -> None:
