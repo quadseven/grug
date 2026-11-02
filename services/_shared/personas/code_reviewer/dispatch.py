@@ -666,16 +666,34 @@ def steering_base_ref(
     push to. The head is resolved once, so every file in a pass reads one
     commit; a failed lookup falls back to the default branch name, which the
     contents API resolves itself, never to the author-writable base.
+
+    A payload that names the base branch but not the default branch asks
+    GitHub for it; if that fails too the result is "", so the pass runs with
+    no steering files rather than ones its author may have written.
     """
     base = pr.get("base") or {}
     own_base = str(base.get("sha") or base.get("ref") or "")
+    base_ref = str(base.get("ref") or "")
+    if not base_ref:
+        return own_base
     default = str(
         (repository or {}).get("default_branch")
         or (base.get("repo") or {}).get("default_branch")
         or ""
     )
-    base_ref = str(base.get("ref") or "")
-    if not default or not base_ref or base_ref == default:
+    if not default:
+        try:
+            default = with_install_token_retry(
+                installation_id,
+                lambda token: _repo_default_branch(token, owner, repo_name),
+            )
+        except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+            log.info("steering_default_branch_unknown", extra={
+                "repo": f"{owner}/{repo_name}", "base_ref": base_ref,
+                "kind": type(e).__name__,
+            })
+            return ""
+    if base_ref == default:
         return own_base
     try:
         sha = with_install_token_retry(
@@ -693,6 +711,24 @@ def steering_base_ref(
         "default_branch": default,
     })
     return sha
+
+
+def _repo_default_branch(token: str, owner: str, repo_name: str) -> str:
+    """The repo's default branch name, via the repos API."""
+    resp = httpx.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=DIFF_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    name = str(resp.json()["default_branch"])
+    if not name:
+        raise ValueError("empty default branch")
+    return name
 
 
 def _default_branch_head(
@@ -721,23 +757,31 @@ def _default_branch_head(
 def _load_pr_repo_config(
     pr: dict[str, Any], installation_id: int, owner: str, repo_name: str,
     *, steering_ref: str | None = None,
+    repository: dict[str, Any] | None = None,
 ) -> RepoConfig:
     """`.grug.yaml` at the PR's steering ref (`steering_base_ref`), never the
     head and never the living-hunt baseline. `steering_ref`, when given, is
-    the one already resolved for this pass."""
+    the one already resolved for this pass; otherwise it is resolved from the
+    PR and the webhook `repository`."""
     if steering_ref is None:
-        steering_ref = steering_base_ref(pr, None, installation_id, owner, repo_name)
+        steering_ref = steering_base_ref(
+            pr, repository, installation_id, owner, repo_name,
+        )
     return _load_repo_config(installation_id, owner, repo_name, steering_ref)
 
 
 def pr_skip_rule(
     pr: dict[str, Any], installation_id: int, owner: str, repo_name: str,
     config: RepoConfig | None = None,
+    repository: dict[str, Any] | None = None,
 ) -> str | None:
     """The base-ref `.grug.yaml` `skip_prs` rule this PR matches, or None
-    (grug#1439). Shared by Elder and Teller; Chief and Guard never call it."""
+    (grug#1439). Shared by Elder and Teller; Chief and Guard never call it.
+    `repository` is the webhook's, which names the default branch (#1578)."""
     if config is None:
-        config = _load_pr_repo_config(pr, installation_id, owner, repo_name)
+        config = _load_pr_repo_config(
+            pr, installation_id, owner, repo_name, repository=repository,
+        )
     return skip_pr_rule(
         config,
         author=str((pr.get("user") or {}).get("login") or ""),
