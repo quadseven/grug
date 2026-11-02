@@ -34,19 +34,22 @@ meet an operating-system boundary.
 
 | Source | Reaches | Read from | State |
 | --- | --- | --- | --- |
-| `.grug.yaml` | Skip rules, ignores, path instructions | Base commit | Base only |
-| Ruff policy, `.semgrepignore` | Which findings survive | Base commit | Base only |
-| Guideline files (`CLAUDE.md`, `AGENTS.md` and the like) | System prompt | Base commit since #1574 | Base only |
-| `CONTEXT.md`, `docs/adr/` | Review context, as the repo's source of truth | Base commit since #1574 | Base only |
+| `.grug.yaml` | Skip rules, ignores, path instructions | Base commit, default branch head since #1578 for other targets | Base only |
+| Ruff policy, `.semgrepignore` | Which findings survive | Base commit, default branch head since #1578 for other targets | Base only |
+| Guideline files (`CLAUDE.md`, `AGENTS.md` and the like) | System prompt | Base commit since #1574, default branch head since #1578 for other targets | Base only |
+| `CONTEXT.md`, `docs/adr/` | Review context, as the repo's source of truth | Base commit since #1574, default branch head since #1578 for other targets | Base only |
 | Reply-mined learnings | System prompt | Stored, write access required | Gated by the author's access |
 | `/grug` commands | Reruns, `/grug fix`, removal acceptance | Comment | Gated by the commenter's access |
 | Diff, changed files, PR title and body, linked issues | Prompt, labeled as untrusted data | Head | Data, and #1569 quarantines metadata on sensitive paths |
 | CI check-run names | Prompt, labeled as data | Head | Data |
 | Inline suppression comments | Which analyzer findings exist | Head | Open, #1579 |
 
-"Base commit" is the PR's own base on every pass, kept apart from a Living
-Hunt's diff start, which is a PR commit. It is not always the default branch: see
-#1578.
+"Base commit" is the PR's own base on every pass when the PR targets the
+default branch, kept apart from a Living Hunt's diff start, which is a PR
+commit. A PR into any other branch reads every steering file above from the
+default branch head instead, resolved once per pass, because its base can be a
+branch the PR's author may push to (#1578). A failed lookup falls back to the
+default branch name, never to that base.
 
 Review models have no tools. They read text and return structured findings, and
 the only effect of an instruction hidden in a diff is on what a review says.

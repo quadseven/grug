@@ -653,26 +653,135 @@ def _load_repo_ruff_policy(installation_id: int, owner: str, repo_name: str, bas
     return parse_repo_ruff_policy(next((fetched[path] for path in _RUFF_POLICY_PATHS if path in fetched), None))
 
 
+def steering_base_ref(
+    pr: dict[str, Any], repository: dict[str, Any] | None,
+    installation_id: int, owner: str, repo_name: str,
+) -> str:
+    """The ref every steering file is read at: `.grug.yaml`, guideline files,
+    repo docs, Ruff policy and the ignore list (grug#1578).
+
+    A PR into the default branch uses its own base commit, the protected,
+    maintainer-reviewed state. A PR into any other branch uses the default
+    branch head instead, since its base may be a branch the PR's author can
+    push to. The head is resolved once, so every file in a pass reads one
+    commit; a failed lookup falls back to the default branch name, which the
+    contents API resolves itself, never to the author-writable base.
+
+    A payload that names the base branch but not the default branch asks
+    GitHub for it; if that fails too the result is "", so the pass runs with
+    no steering files rather than ones its author may have written.
+    """
+    base = pr.get("base") or {}
+    own_base = str(base.get("sha") or base.get("ref") or "")
+    base_ref = str(base.get("ref") or "")
+    if not base_ref:
+        return own_base
+    default = str(
+        (repository or {}).get("default_branch")
+        or (base.get("repo") or {}).get("default_branch")
+        or ""
+    )
+    if not default:
+        try:
+            default = with_install_token_retry(
+                installation_id,
+                lambda token: _repo_default_branch(token, owner, repo_name),
+            )
+        except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+            log.info("steering_default_branch_unknown", extra={
+                "repo": f"{owner}/{repo_name}", "base_ref": base_ref,
+                "kind": type(e).__name__,
+            })
+            return ""
+    if base_ref == default:
+        return own_base
+    try:
+        sha = with_install_token_retry(
+            installation_id,
+            lambda token: _default_branch_head(token, owner, repo_name, default),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError, KeyError, TypeError, ValueError) as e:
+        log.info("steering_ref_lookup_failed", extra={
+            "repo": f"{owner}/{repo_name}", "base_ref": base_ref,
+            "default_branch": default, "kind": type(e).__name__,
+        })
+        return default
+    log.info("steering_ref_default_branch", extra={
+        "repo": f"{owner}/{repo_name}", "base_ref": base_ref,
+        "default_branch": default,
+    })
+    return sha
+
+
+def _repo_default_branch(token: str, owner: str, repo_name: str) -> str:
+    """The repo's default branch name, via the repos API."""
+    resp = httpx.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=DIFF_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    name = str(resp.json()["default_branch"])
+    if not name:
+        raise ValueError("empty default branch")
+    return name
+
+
+def _default_branch_head(
+    token: str, owner: str, repo_name: str, branch: str,
+) -> str:
+    """The commit `branch` points at, via the refs API."""
+    from urllib.parse import quote
+
+    resp = httpx.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/git/ref/heads/"
+        f"{quote(branch, safe='/')}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=DIFF_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    sha = str(resp.json()["object"]["sha"])
+    if not sha:
+        raise ValueError("empty sha")
+    return sha
+
+
 def _load_pr_repo_config(
     pr: dict[str, Any], installation_id: int, owner: str, repo_name: str,
+    *, steering_ref: str | None = None,
+    repository: dict[str, Any] | None = None,
 ) -> RepoConfig:
-    """`.grug.yaml` at the PR's own base commit (falling back to the base
-    branch name), never the head and never the living-hunt baseline."""
-    base = pr.get("base") or {}
-    return _load_repo_config(
-        installation_id, owner, repo_name,
-        str(base.get("sha") or base.get("ref") or ""),
-    )
+    """`.grug.yaml` at the PR's steering ref (`steering_base_ref`), never the
+    head and never the living-hunt baseline. `steering_ref`, when given, is
+    the one already resolved for this pass; otherwise it is resolved from the
+    PR and the webhook `repository`."""
+    if steering_ref is None:
+        steering_ref = steering_base_ref(
+            pr, repository, installation_id, owner, repo_name,
+        )
+    return _load_repo_config(installation_id, owner, repo_name, steering_ref)
 
 
 def pr_skip_rule(
     pr: dict[str, Any], installation_id: int, owner: str, repo_name: str,
     config: RepoConfig | None = None,
+    repository: dict[str, Any] | None = None,
 ) -> str | None:
     """The base-ref `.grug.yaml` `skip_prs` rule this PR matches, or None
-    (grug#1439). Shared by Elder and Teller; Chief and Guard never call it."""
+    (grug#1439). Shared by Elder and Teller; Chief and Guard never call it.
+    `repository` is the webhook's, which names the default branch (#1578)."""
     if config is None:
-        config = _load_pr_repo_config(pr, installation_id, owner, repo_name)
+        config = _load_pr_repo_config(
+            pr, installation_id, owner, repo_name, repository=repository,
+        )
     return skip_pr_rule(
         config,
         author=str((pr.get("user") or {}).get("login") or ""),
@@ -3615,13 +3724,16 @@ def dispatch_code_review(
     # Base-insensitive: every merge to the base branch used to change this
     # and cancel every in-flight review. See review_freshness_id.
     snapshot_id = review_freshness_id_from_pr(pr)
+    # grug#1578: steering files come from the default branch when the PR's
+    # base is another branch, one its author may be able to push to.
+    steering_ref = steering_base_ref(pr, repo, installation_id, owner, repo_name)
     pr_context: PrContext = {
         "installation_id": installation_id,
         "repo": f"{owner}/{repo_name}",
         "pr_number": pull_number,
         "head_sha": head_sha,
         "base_sha": base_sha,
-        "pr_base_sha": base_sha,
+        "pr_base_sha": steering_ref,
         "title": str(pr.get("title") or ""),
         "body": str(pr.get("body") or ""),
     }
@@ -3707,7 +3819,9 @@ def dispatch_code_review(
     # grug#1439: `.grug.yaml` `skip_prs`, read from the BASE ref so a PR
     # cannot opt itself out. Checked before the diff fetch so a skipped PR
     # spends nothing; the same config feeds `ignore` and friends below.
-    base_repo_config = _load_pr_repo_config(pr, installation_id, owner, repo_name)
+    base_repo_config = _load_pr_repo_config(
+        pr, installation_id, owner, repo_name, steering_ref=steering_ref,
+    )
     skip_rule = pr_skip_rule(
         pr, installation_id, owner, repo_name, config=base_repo_config,
     )

@@ -1981,6 +1981,8 @@ def _review_payload(
             "owner": {"login": owner},
             # grug#1269: Elder tells the spark-gateway whether it is public.
             "private": base_repo.get("private"),
+            # grug#1578: with base.ref, picks the steering source.
+            "default_branch": base_repo.get("default_branch"),
         },
         "pull_request": {
             "number": pr_number,
@@ -1996,7 +1998,7 @@ def _review_payload(
                 "sha": (pr.get("head") or {})["sha"],
                 "repo": _repo_id_only((pr.get("head") or {}).get("repo")),
             },
-            "base": {"sha": base.get("sha")},
+            "base": {"sha": base.get("sha"), "ref": base.get("ref")},
         },
     }
 

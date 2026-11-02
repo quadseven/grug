@@ -29,7 +29,7 @@ def _payload() -> dict:
         "installation": {"id": 11},
         "repository": {
             "id": 22, "name": "myrepo", "owner": {"login": "myorg"},
-            "full_name": "myorg/myrepo",
+            "full_name": "myorg/myrepo", "default_branch": "main",
         },
         "pull_request": {
             "number": 7,
@@ -105,3 +105,56 @@ def test_teller_posts_no_walkthrough_on_a_skipped_pr(monkeypatch):
     assert out["result"] == "skipped_config"
     assert out["skipped_by"] == "author `dependabot[bot]`"
     assert posts == []
+
+
+def test_teller_reads_skip_rules_for_a_stacked_pr_from_the_default_branch(monkeypatch):
+    """grug#1578: Teller's skip check passes the webhook repository through,
+    so a PR into `feature` reads `.grug.yaml` at the main head, not at a base
+    its author may have pushed a skip rule to."""
+    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda i, fn: fn("tok"))
+    monkeypatch.setattr(wt_dispatch, "with_install_token_retry", lambda i, fn: fn("tok"))
+    payload = _payload()
+    payload["pull_request"]["base"] = {"sha": _BASE, "ref": "feature"}
+    config_refs: list[str] = []
+
+    def get(url, **kw):
+        r = MagicMock(spec=httpx.Response)
+        r.status_code = 200
+        r.raise_for_status = MagicMock()
+        if url.endswith("/git/ref/heads/main"):
+            r.json = MagicMock(return_value={"object": {"sha": "mainhead9999"}})
+        elif url.endswith("/contents/.grug.yaml"):
+            config_refs.append(kw["params"]["ref"])
+            r.text = "" if kw["params"]["ref"] == "mainhead9999" else _SKIP
+        elif url.endswith("/files"):
+            r.json = MagicMock(return_value=[])
+        else:
+            r.text = _DIFF
+        return r
+
+    with patch("httpx.get", side_effect=get), \
+         patch("httpx.post", return_value=MagicMock()), \
+         patch("httpx.patch", return_value=MagicMock()):
+        out = wt_dispatch.dispatch_walkthrough_review(payload, blocking=False)
+    assert config_refs == ["mainhead9999"]
+    assert out.get("result") != "skipped_config"
+
+
+def test_steering_ref_fails_closed_when_the_default_branch_is_unknown(monkeypatch):
+    """A payload that names its base branch but not the default branch asks
+    GitHub; if that fails, no steering file is read at all."""
+    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda i, fn: fn("tok"))
+    pr = {"base": {"sha": _BASE, "ref": "feature"}}
+    with patch("httpx.get", side_effect=httpx.ConnectError("down")):
+        assert cr_dispatch.steering_base_ref(pr, None, 11, "myorg", "myrepo") == ""
+
+    def repo_get(url, **kw):
+        r = MagicMock(spec=httpx.Response)
+        r.raise_for_status = MagicMock()
+        body = ({"default_branch": "feature"} if url.endswith("/repos/myorg/myrepo")
+                else {})
+        r.json = MagicMock(return_value=body)
+        return r
+
+    with patch("httpx.get", side_effect=repo_get):
+        assert cr_dispatch.steering_base_ref(pr, None, 11, "myorg", "myrepo") == _BASE
