@@ -124,6 +124,12 @@ def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     if lc is not None:
         monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
         monkeypatch.setattr(lc, "_limit_refusals", {}, raising=False)
+        # Fixture replies name these models; the list itself has its own tests.
+        monkeypatch.setattr(
+            lc, "_TRUSTED_EMPTY_CAVE_MODELS",
+            lc._TRUSTED_EMPTY_CAVE_MODELS | {"test-model-id", "test-model", "served-model"},
+            raising=False,
+        )
 
 
 @pytest.fixture(autouse=True)

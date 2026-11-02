@@ -46,7 +46,11 @@ def _headers(config, pr_context):
 
 def _reply(body: str) -> httpx.Response:
     return httpx.Response(
-        200, json={"choices": [{"message": {"role": "assistant", "content": body}}]},
+        200,
+        json={
+            "choices": [{"message": {"role": "assistant", "content": body}}],
+            "model": "test-model",
+        },
     )
 
 

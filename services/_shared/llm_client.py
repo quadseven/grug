@@ -6911,6 +6911,52 @@ def _cloud_tier_success(
     )
 
 
+def _untrusted_empty_review(
+    backend: Backend, model: str, served: tuple[str, ...], span_context: Any, tier: str,
+    *, truncated: bool = False,
+) -> LlmReviewResponse:
+    """An empty answer kept only if nothing better comes. Holding one emits no
+    served-tier metric: a later rung may still serve the chunk."""
+    return LlmReviewResponse(
+        kind="reviewed",
+        backend_used=backend,
+        model_name=model,
+        review_span_context=span_context,
+        backends_used=(backend,),
+        models_used=served,
+        error=_truncation_error((backend,)) if truncated else (
+            f"{_LOW_CONFIDENCE_PREFIX}{backend.value} {model} answered no findings "
+            "and no later model answered"
+        ),
+        tier_served=tier,
+    )
+
+
+# The models whose empty answer the Cave path trusts. Everything else is
+# untrusted: the route spills to whatever is free while the Sparks are away,
+# and no name pattern can tell a spill from a resident model.
+_TRUSTED_EMPTY_CAVE_MODELS = frozenset({
+    _CAVE_REVIEW_CODER_DEFAULT_MODEL, _CAVE_REVIEW_REASONER_DEFAULT_MODEL,
+})
+
+
+def _trusted_empty_cave_models() -> frozenset[str]:
+    """`GRUG_CAVE_TRUSTED_EMPTY_MODELS` (comma-separated), else the defaults."""
+    raw = os.getenv("GRUG_CAVE_TRUSTED_EMPTY_MODELS", "")
+    named = frozenset(m.strip() for m in raw.split(",") if m.strip())
+    return named or _TRUSTED_EMPTY_CAVE_MODELS
+
+
+def _cave_empty_is_trusted(outcome: "_ArmOutcome") -> bool:
+    """A named, listed model that took a real look. A reply naming no model
+    fails closed."""
+    return (
+        not outcome.degenerate
+        and not outcome.model_unconfirmed
+        and outcome.model in _trusted_empty_cave_models()
+    )
+
+
 def _low_confidence_success(
     outcome: _ArmOutcome, hunks: list[Hunk], pr_context: PrContext | None,
 ) -> LlmReviewResponse:
@@ -6965,15 +7011,11 @@ def _empty_confirms_nothing(key: "tuple[Backend, str]") -> bool:
     return backend == Backend.FREE_POOL
 
 
-def _free_go_found_nothing(tier: BackendConfig, outcome: _ArmOutcome) -> bool:
-    """An empty answer from a free Go model is never a clean pass. The short-
+def _free_tier_found_nothing(tier: BackendConfig, outcome: _ArmOutcome) -> bool:
+    """An empty answer from a free tier is never a clean pass. The short-
     answer check misses it: Beam Free spent 1792 output tokens, all reasoning,
     on the empty answer above, and an answer with no usage is never flagged."""
-    return (
-        tier.backend == Backend.OPENCODE_GO
-        and _opencode_go_model_is_free(tier.model)
-        and not outcome.findings
-    )
+    return not outcome.findings and _empty_confirms_nothing((tier.backend, tier.model))
 
 
 def _empty_answers_agree(
@@ -7081,7 +7123,7 @@ def _try_cloud_primary(
             backend, messages, variant, pr_tags, cancel_event, config_override=tier,
         )
         if outcome.kind == "success" and (
-            outcome.degenerate or _free_go_found_nothing(tier, outcome)
+            outcome.degenerate or _free_tier_found_nothing(tier, outcome)
         ):
             last_error = f"{backend.value}: degenerate empty review"
             key = (backend, tier.model)
@@ -7279,13 +7321,23 @@ def _run_free_provider_fallback(
     hunks: list[Hunk],
     pr_context: Optional[PrContext],
     installation_id: int,
-) -> tuple[Optional[LlmReviewResponse], Optional[tuple[Backend, Optional[str], str]], str]:
+) -> tuple[
+    Optional[LlmReviewResponse],
+    Optional[tuple[Backend, Optional[str], str]],
+    str,
+    Optional[LlmReviewResponse],
+]:
     """Tier 2: Try free provider pool in fixed order (gateway free pool, then free SaaS).
+
+    An empty answer this tier cannot trust is a miss, the same rule
+    `_try_cloud_primary` applies: the walk goes on, and the first such answer
+    comes back last as a low-confidence review, never a clean pass.
 
     When every gateway call of this walk failed the way an outage does, the
     backends that do not route through the gateway go first and a gateway
     arm that already failed is not asked again (grug#1467)."""
     first_parse_fail: Optional[tuple[Backend, Optional[str], str]] = None
+    low_confidence: Optional[LlmReviewResponse] = None
     last_error = ""
     for config in _gateway_outage_order(_free_provider_fallback_configs()):
         backend = config.backend
@@ -7308,6 +7360,18 @@ def _run_free_provider_fallback(
         span_context = attempt.span_context
         if not err:
             resolved_model = model or config.model
+            untrusted_empty = not findings and (
+                _is_degenerate_empty_review(findings, attempt.usage_metrics)
+                or _empty_confirms_nothing((backend, config.model))
+            )
+            if untrusted_empty:
+                last_error = f"{backend.value}: untrusted empty review"
+                if low_confidence is None:
+                    low_confidence = _untrusted_empty_review(
+                        backend, resolved_model, _served_models(model), span_context,
+                        "free-pool",
+                    )
+                continue
             log.info(
                 "llm_saas_overload_fallback_used",
                 extra={"backend": backend.value, "installation_id": installation_id},
@@ -7346,6 +7410,7 @@ def _run_free_provider_fallback(
                 ),
                 first_parse_fail,
                 "",
+                None,
             )
         if resp.status_code == 200:
             log.warning(
@@ -7363,7 +7428,7 @@ def _run_free_provider_fallback(
             error_message=_backend_error_message(resp),
         )
         last_error = f"{backend.value}: {err}"
-    return None, first_parse_fail, last_error
+    return None, first_parse_fail, last_error, low_confidence
 
 
 def _run_subscription_fallback(
@@ -7574,6 +7639,7 @@ def _review_diff_dispatch_cave_primary(
     # than collapsing to `all_failed`.
     first_parse_fail = None
     successes: list[_SuccessfulReview] = []
+    cave_low_confidence: LlmReviewResponse | None = None
 
     # run_both: concurrent dual-arm before publish (`deep` only).
     # early_exit: return after first success (`fast` only).
@@ -7650,6 +7716,14 @@ def _review_diff_dispatch_cave_primary(
             # kinds leave it None.
             assert outcome.model is not None
             resolved_model = outcome.model
+            if not outcome.findings and not _cave_empty_is_trusted(outcome):
+                last_error = f"{backend.value}: untrusted empty review"
+                if cave_low_confidence is None:
+                    cave_low_confidence = _untrusted_empty_review(
+                        backend, resolved_model, outcome.served_models,
+                        outcome.span_context, "self-hosted", truncated=outcome.truncated,
+                    )
+                continue
             origin = _finding_origin(
                 backend=backend,
                 model=resolved_model,
@@ -7689,8 +7763,9 @@ def _review_diff_dispatch_cave_primary(
         # http_failed
         last_error = outcome.error_text
 
-    if not successes and first_parse_fail is None:
-        if cancel_event is not None and cancel_event.is_set():
+    cancelled = cancel_event is not None and cancel_event.is_set()
+    if not successes and (first_parse_fail is None or not cancelled):
+        if cancelled:
             # Superseded mid-flight (#635 follow-up): both Cave arms were
             # deliberately aborted because the review input moved, not
             # because the owned hardware is unavailable. Trying OpenRouter/
@@ -7707,9 +7782,10 @@ def _review_diff_dispatch_cave_primary(
                 error="cancelled: review input changed while the review was running",
             )
         # Tier 2: Free provider pool (grug#1269/#1276).
-        # Both Cave arms produced NO usable response at all. Try the free provider
-        # pool in fixed order (gateway free pool, then free SaaS backends).
-        free_resp, free_parse_fail, free_err = _run_free_provider_fallback(
+        # No Cave arm gave a usable review, and a garbled answer is no review,
+        # so it walks on like an outage. Try the free provider pool in fixed
+        # order (gateway free pool, then free SaaS backends).
+        free_resp, free_parse_fail, free_err, free_low_confidence = _run_free_provider_fallback(
             messages=messages,
             variant=variant,
             pr_tags=pr_tags,
@@ -7736,8 +7812,16 @@ def _review_diff_dispatch_cave_primary(
             pr_context=pr_context,
             installation_id=installation_id,
         )
-        if sub_resp is not None:
+        # The lane's own failure outranks only a walk with nothing better to
+        # report; a parse failure stays the more specific answer below.
+        if sub_resp is not None and sub_resp.kind == "reviewed":
             return sub_resp
+        if first_parse_fail is None:
+            low_confidence = cave_low_confidence or free_low_confidence
+            if low_confidence is not None:
+                return low_confidence
+            if sub_resp is not None:
+                return sub_resp
 
     if successes:
         first = successes[0]
