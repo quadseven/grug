@@ -419,7 +419,10 @@ def _run_persona_rerun(
         enqueue = enqueue_rerun
     repo_full = f"{owner}/{repo}"
     elder_state = "idle"
-    extra: dict = {}
+    # The command comment rides the job, so the consumer can swap the eyes
+    # below for the outcome (grug#1620); for Elder it is also the command's
+    # queue identity (grug#1430).
+    extra = _command_job(comment_id)
     if verb == "improve":
         if defer_until:
             return _defer_elder_review(
@@ -440,7 +443,6 @@ def _run_persona_rerun(
         elder_state = _elder_review_state(
             token_fn=token_fn, owner=owner, repo=repo, head_sha=head_sha,
         )
-        extra = _command_job(comment_id)
     try:
         enqueue(install_id=install_id, repo=repo_full, pr_number=pr_number,
                 persona=persona, **extra)

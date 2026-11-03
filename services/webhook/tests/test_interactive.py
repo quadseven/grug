@@ -623,6 +623,9 @@ def test_test_gaps_accepted_posts_reaction_not_comment(monkeypatch):
     )
     assert res["status"] == "dispatched"
     assert enq[0]["persona"] == "smasher"
+    # grug#1620: the job carries the command comment, so the consumer can
+    # swap these eyes for the outcome.
+    assert enq[0]["comment_id"] == 102
     reactions = [c for c in fake.calls if c[0] == "post" and "/reactions" in c[1]]
     assert len(reactions) == 1
     assert reactions[0][2] == {"content": "eyes"}

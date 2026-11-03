@@ -2979,11 +2979,27 @@ def _command_fixture(
         "adapters.install_store.record_elder_command_run",
         lambda **k: recorded.append(k),
     )
+    _record_reactions(monkeypatch)
     dispatch = MagicMock()
     monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
     requeue = MagicMock()
     monkeypatch.setattr(rerun, "enqueue_rerun", requeue)
     return dispatch, requeue, recorded
+
+
+def _record_reactions(monkeypatch) -> list:
+    """Record the consumer's reaction POSTs and DELETEs on command comments
+    (grug#1620) instead of sending them; returns the call list. A POST
+    answers with the reaction's id, the way GitHub does."""
+    calls: list = []
+
+    def _post(_tok, url, body):
+        calls.append(("post", url, body))
+        return {"id": 7000 + len(calls)}
+
+    monkeypatch.setattr(rerun, "_gh_post", _post)
+    monkeypatch.setattr(rerun, "_gh_delete", lambda _tok, url: calls.append(("delete", url)))
+    return calls
 
 
 def test_command_jobs_get_a_dedup_id_per_comment(monkeypatch):
@@ -3552,3 +3568,118 @@ def test_run_one_ask_passes_the_command_comment_id(monkeypatch):
                        "comment_id": 5001, "question": "q", "reply_to_comment_id": 0})
     assert rerun._run_one(body) == "answered"
     assert seen["comment_id"] == 5001
+
+
+# --- grug#1620: a rerun command swaps its eyes for the outcome -------------
+
+_CMD_REACTIONS = "https://api.github.com/repos/myorg/myrepo/issues/comments/901/reactions"
+
+
+def _outcome(calls) -> list:
+    """The outcome reactions added, eyes re-reads left out."""
+    return [c[2]["content"] for c in calls
+            if c[0] == "post" and c[2]["content"] != "eyes"]
+
+
+@pytest.mark.parametrize("verdict", ["pass", "fail"])
+def test_an_elder_command_with_a_verdict_swaps_eyes_for_thumbs_up(monkeypatch, verdict):
+    """Criterion 2: a finished Elder re-run adds +1 to the command comment
+    and takes Grug's eyes off it."""
+    dispatch, _, _ = _command_fixture(monkeypatch)
+    calls = _record_reactions(monkeypatch)
+    dispatch.return_value = {"persona": "code_reviewer", "result": verdict}
+    assert rerun._run_one(_command_job(), message_id="r-1") == "dispatched"
+    assert _outcome(calls) == ["+1"]
+    eyes = [c for c in calls if c[0] == "post" and c[2] == {"content": "eyes"}]
+    assert len(eyes) == 1 and eyes[0][1] == _CMD_REACTIONS
+    eyes_id = calls.index(eyes[0]) + 1 + 7000
+    assert [c[1] for c in calls if c[0] == "delete"] == [f"{_CMD_REACTIONS}/{eyes_id}"]
+    assert all(c[1].startswith(_CMD_REACTIONS) for c in calls)
+
+
+@pytest.mark.parametrize("result", ["skipped", "publish_failed", "fail_open_x"])
+def test_an_elder_command_without_a_verdict_swaps_eyes_for_thumbs_down(monkeypatch, result):
+    dispatch, _, _ = _command_fixture(monkeypatch)
+    calls = _record_reactions(monkeypatch)
+    dispatch.return_value = {"persona": "code_reviewer", "result": result}
+    rerun._run_one(_command_job(), message_id="r-2")
+    assert _outcome(calls) == ["-1"]
+    assert len([c for c in calls if c[0] == "delete"]) == 1
+
+
+def _smasher_fixture(monkeypatch, result):
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get", lambda tok, url: _pr_data(head_sha="abc123"))
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    calls = _record_reactions(monkeypatch)
+    monkeypatch.setattr(
+        rerun, "dispatch_smasher_review",
+        lambda payload, blocking: {"persona": "smasher", "result": result},
+    )
+    return calls
+
+
+@pytest.mark.parametrize("result,want", [
+    ("pass", "+1"), ("fail", "+1"),
+    ("degraded", "-1"), ("disabled_global", "-1"),
+])
+def test_a_smasher_command_swaps_eyes_for_its_outcome(monkeypatch, result, want):
+    """Criterion 3: `/grug test-gaps` gets the same swap as `/grug improve`."""
+    calls = _smasher_fixture(monkeypatch, result)
+    status = rerun._run_one(_job(persona="smasher", comment_id=901, queued_at=1.0))
+    assert status == "dispatched"
+    assert _outcome(calls) == [want]
+    assert len([c for c in calls if c[0] == "delete"]) == 1
+    assert all(c[1].startswith(_CMD_REACTIONS) for c in calls)
+
+
+def test_a_coalesced_command_gets_thumbs_up(monkeypatch):
+    """Criterion 4: an earlier run of this head already served it."""
+    dispatch, _, _ = _command_fixture(
+        monkeypatch, last_run={"head_sha": "abc123", "started_at": 1_050.0},
+    )
+    calls = _record_reactions(monkeypatch)
+    assert rerun._run_one(_command_job(), message_id="r-3") == "rerun_coalesced"
+    dispatch.assert_not_called()
+    assert _outcome(calls) == ["+1"]
+
+
+def test_a_command_past_the_hold_cap_gets_thumbs_down(monkeypatch):
+    _command_fixture(monkeypatch, running=True)
+    calls = _record_reactions(monkeypatch)
+    started = 1_100.0 - rerun._COMMAND_HOLD_MAX_SECONDS
+    status = rerun._run_one(_command_job(hold_started_at=started), message_id="r-4")
+    assert status == "rerun_hold_cap_reached"
+    assert _outcome(calls) == ["-1"]
+
+
+def test_a_held_command_keeps_its_eyes(monkeypatch):
+    """Still waiting behind a review: no outcome yet, so no swap."""
+    _command_fixture(monkeypatch, running=True)
+    calls = _record_reactions(monkeypatch)
+    assert rerun._run_one(_command_job(), message_id="r-5") == "rerun_held_behind_review"
+    assert calls == []
+
+
+def test_a_job_with_no_command_comment_makes_no_reaction(monkeypatch):
+    """Criterion 5: self-recovery and API re-runs carry no comment id."""
+    dispatch, _, _ = _command_fixture(monkeypatch)
+    calls = _record_reactions(monkeypatch)
+    dispatch.return_value = {"persona": "code_reviewer", "result": "pass"}
+    assert rerun._run_one(_job(persona="code_reviewer"), message_id="r-6") == "dispatched"
+    assert calls == []
+    smasher_calls = _smasher_fixture(monkeypatch, "pass")
+    assert rerun._run_one(_job(persona="smasher")) == "dispatched"
+    assert smasher_calls == []
+
+
+def test_a_refused_reaction_never_fails_the_command(monkeypatch):
+    dispatch, _, _ = _command_fixture(monkeypatch)
+    dispatch.return_value = {"persona": "code_reviewer", "result": "pass"}
+
+    def _refuse(*_a):
+        raise httpx.ConnectError("reactions down")
+
+    monkeypatch.setattr(rerun, "_gh_post", _refuse)
+    monkeypatch.setattr(rerun, "_gh_delete", _refuse)
+    assert rerun._run_one(_command_job(), message_id="r-7") == "dispatched"

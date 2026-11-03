@@ -785,14 +785,16 @@ _ASK_PLACEHOLDER = (
 _ASK_TIRED = "Grug not know. The thinking-rock is tired - try again."
 
 
-def _ask_react(
+def _comment_react(
     install_id: int, base: str, comment_id: int, in_thread: bool, content: str,
 ) -> int:
-    """React to the asking comment; the new reaction's id, 0 when not set.
+    """React to a `/grug` comment; the reaction's id, 0 when not set.
 
-    A top-level ask is an issue comment and an in-thread ask (#822) is a
-    review comment, so the reaction lives under issues/ or pulls/.
-    Best-effort: the reaction is a signal, the answer is the work."""
+    A top-level command is an issue comment and an in-thread ask (#822) is
+    a review comment, so the reaction lives under issues/ or pulls/.
+    GitHub answers a reaction that already exists with that same reaction,
+    id included. Best-effort: the reaction is a signal, the command's work
+    is the answer."""
     if not comment_id:
         return 0
     kind = "pulls" if in_thread else "issues"
@@ -802,16 +804,16 @@ def _ask_react(
             install_id, lambda t: _gh_post(t, url, {"content": content}),
         )
     except (httpx.HTTPError, RuntimeError) as e:
-        log.warning("ask_reaction_failed", extra={
+        log.warning("comment_reaction_failed", extra={
             "comment_id": comment_id, "content": content, "kind": type(e).__name__})
         return 0
     return int((made or {}).get("id") or 0)
 
 
-def _ask_unreact(
+def _comment_unreact(
     install_id: int, base: str, comment_id: int, in_thread: bool, reaction_id: int,
 ) -> None:
-    """Take Grug's eyes off the asking comment once the answer is out."""
+    """Take Grug's eyes off a `/grug` comment once the work is over."""
     if not (comment_id and reaction_id):
         return
     kind = "pulls" if in_thread else "issues"
@@ -819,8 +821,40 @@ def _ask_unreact(
     try:
         with_install_token_retry(install_id, lambda t: _gh_delete(t, url))
     except (httpx.HTTPError, RuntimeError) as e:
-        log.warning("ask_unreact_failed", extra={
+        log.warning("comment_unreact_failed", extra={
             "comment_id": comment_id, "kind": type(e).__name__})
+
+
+# grug#1620: the results that count as a finished `/grug improve` or
+# `/grug test-gaps`. A verdict, passing or failing, is what the commenter
+# asked for; `review_rejected` still concluded the check with one. A
+# skipped, degraded, disabled or unpublished run is not a finished command.
+_COMMAND_DONE_RESULTS = frozenset({"pass", "fail", "review_rejected"})
+
+
+def _command_done(result: Any) -> bool:
+    """True when a persona dispatch result is a finished command."""
+    return isinstance(result, dict) and str(result.get("result", "")) in _COMMAND_DONE_RESULTS
+
+
+def _settle_command_reaction(
+    job: dict[str, Any], *, install_id: int, owner: str, repo_name: str,
+    done: bool,
+) -> None:
+    """Swap the eyes the webhook put on a command comment for the outcome
+    (grug#1620, criterion 2 of #695): +1 when done, -1 otherwise.
+
+    The job carries the comment id but not the eyes reaction's id, so the
+    eyes are POSTed again: GitHub answers with the reaction already there,
+    whose id the DELETE needs. A job with no comment id (self-recovery, an
+    API re-run) has no comment to react on. Never raises."""
+    comment_id = int(job.get("comment_id", 0) or 0)
+    if not comment_id:
+        return
+    base = f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
+    eyes_id = _comment_react(install_id, base, comment_id, False, "eyes")
+    _comment_react(install_id, base, comment_id, False, "+1" if done else "-1")
+    _comment_unreact(install_id, base, comment_id, False, eyes_id)
 
 
 def _run_ask(
@@ -866,7 +900,7 @@ def _run_ask(
         # text posted under Grug's authority.
         lead = f"> {neutralize_mentions(q[:280])}\n\n"
 
-    eyes_id = _ask_react(install_id, base, comment_id, in_thread, "eyes")
+    eyes_id = _comment_react(install_id, base, comment_id, in_thread, "eyes")
     placeholder = with_install_token_retry(
         install_id, lambda t: _gh_post(t, post_url, {"body": lead + _ASK_PLACEHOLDER}),
     )
@@ -951,11 +985,11 @@ def _run_ask(
                 exc_info=True,
             )
 
-    _ask_react(
+    _comment_react(
         install_id, base, comment_id, in_thread,
         "+1" if result == "answered" else "-1",
     )
-    _ask_unreact(install_id, base, comment_id, in_thread, eyes_id)
+    _comment_unreact(install_id, base, comment_id, in_thread, eyes_id)
     try:
         emit_gauge("grug.interactive.ask", 1)
     except Exception:  # noqa: BLE001
@@ -1477,7 +1511,11 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     elif persona in _SMASHER:
         # Smasher is advisory-only (no blocking flag); the global master switch
         # is re-checked inside dispatch_smasher_review.
-        dispatch_smasher_review(payload, blocking=False)
+        result = dispatch_smasher_review(payload, blocking=False)
+        _settle_command_reaction(
+            job, install_id=install_id, owner=owner, repo_name=repo_name,
+            done=_command_done(result),
+        )
     elif persona in _TELLER:
         # Teller has no blocking mode (comment-only, no blocking_flag).
         dispatch_walkthrough_review(payload, blocking=False)
@@ -1490,15 +1528,27 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
             pr_number=pr_number, head_sha=head_sha, message_id=message_id,
         )
         if queued:
+            # grug#1620: a coalesced command was served and one past the
+            # hold cap was not; a held one is still waiting, eyes and all.
+            if queued in _COMMAND_SETTLED_STATUSES:
+                _settle_command_reaction(
+                    job, install_id=install_id, owner=owner,
+                    repo_name=repo_name,
+                    done=_COMMAND_SETTLED_STATUSES[queued],
+                )
             return queued
         _record_command_run(
             job, install_id=install_id, repo_full=repo_full,
             pr_number=pr_number, head_sha=head_sha, started_at=_now(),
         )
         # Elder re-run: the `grug:reviewing` label rides it (grug#1270).
-        _dispatch_elder_rerun(
+        result = _dispatch_elder_rerun(
             payload, install_id=install_id, owner=owner, repo_name=repo_name,
             pr_number=pr_number, pr=pr, cfg=cfg,
+        )
+        _settle_command_reaction(
+            job, install_id=install_id, owner=owner, repo_name=repo_name,
+            done=_command_done(result),
         )
     log.info(
         "rerun_dispatched",
@@ -1894,6 +1944,14 @@ def _command_queue_status(
     return "rerun_held_behind_review"
 
 
+# grug#1620: the queue statuses that end a command without a fresh run,
+# and whether each one counts as done.
+_COMMAND_SETTLED_STATUSES = {
+    "rerun_coalesced": True,
+    "rerun_hold_cap_reached": False,
+}
+
+
 def _record_command_run(
     job: dict[str, Any], *, install_id: int, repo_full: str, pr_number: int,
     head_sha: str, started_at: float,
@@ -1954,9 +2012,9 @@ def _hold_or_requeue_deferred(
 def _dispatch_elder_rerun(
     payload: dict[str, Any], *, install_id: int, owner: str, repo_name: str,
     pr_number: int, pr: dict[str, Any], cfg: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     """Run Elder on the re-run, label the PR while it runs, and clear the
-    label when the Elder check concludes.
+    label when the Elder check concludes. Returns Elder's dispatch result.
 
     The `grug:reviewing` label goes on as the re-run STARTS, not only when
     it was queued: a command held back by the GitHub budget carries no sign
@@ -1972,7 +2030,7 @@ def _dispatch_elder_rerun(
         pr_number=pr_number,
     )
     try:
-        dispatch_code_review(
+        return dispatch_code_review(
             payload, blocking=bool(cfg.get("code_reviewer_blocking", False)),
         )
     finally:
