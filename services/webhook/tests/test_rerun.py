@@ -2141,7 +2141,7 @@ def test_run_ask_neutralizes_mention_in_posted_answer(monkeypatch):
 
     assert result == "answered"
     assert posted, "expected a comment to be posted"
-    body = posted[0]["body"]
+    body = posted[-1]["body"]
     assert "@cait" not in body
     assert f"@{_ZWSP}cait" in body
 
@@ -2162,7 +2162,7 @@ def test_run_ask_no_answer_falls_back_without_crashing_on_none(monkeypatch):
     result = rerun._run_ask(11, "o/r", 7, "who should review this?")
 
     assert result == "ask_no_answer"
-    assert "thinking-rock is tired" in posted[0]["body"]
+    assert "thinking-rock is tired" in posted[-1]["body"]
 
 
 # --- #716 follow-up: the staleness watch must not kill live work ------------
@@ -3310,10 +3310,10 @@ def test_run_ask_in_thread_replies_in_thread_with_hunk_context(monkeypatch):
     result = rerun._run_ask(11, "o/r", 7, "why did you flag this?", reply_to_comment_id=4000)
 
     assert result == "answered"
-    assert posted and "/pulls/7/comments/4000/replies" in posted[0][0]
+    assert posted and "/pulls/7/comments/4000/replies" in posted[-1][0]
     assert "lock.acquire()" in seen["diff"]  # the thread's hunk
     assert "held over a network call" in seen["diff"]  # the finding under discussion
-    assert "x.py" in posted[0][1]["body"]
+    assert "x.py" in posted[-1][1]["body"]
 
 
 def test_run_ask_top_level_quotes_the_question(monkeypatch):
@@ -3331,7 +3331,7 @@ def test_run_ask_top_level_quotes_the_question(monkeypatch):
 
     rerun._run_ask(11, "o/r", 7, "what does this add?")
 
-    assert posted[0][1]["body"].startswith("> what does this add?")
+    assert posted[-1][1]["body"].startswith("> what does this add?")
 
 
 def test_run_ask_thread_context_failure_is_disclosed(monkeypatch):
@@ -3354,5 +3354,201 @@ def test_run_ask_thread_context_failure_is_disclosed(monkeypatch):
 
     rerun._run_ask(11, "o/r", 7, "why did you flag this?", reply_to_comment_id=4000)
 
-    assert "/pulls/7/comments/4000/replies" in posted[0][0]
-    assert "could not load the thread" in posted[0][1]["body"]
+    assert "/pulls/7/comments/4000/replies" in posted[-1][0]
+    assert "could not load the thread" in posted[-1][1]["body"]
+
+
+# --- #695: /grug ask placeholder, update in place, reaction swap ------------
+
+class _FakeAskGitHub:
+    """Records every write `_run_ask` makes, in order, so a test can prove
+    the placeholder went out BEFORE the heavy work and the answer PATCHed
+    that same comment instead of posting a second one."""
+
+    def __init__(self, *, patch_fails: int = 0):
+        self.calls: list[tuple] = []
+        self._next_id = 9000
+        self._patch_fails = patch_fails
+
+    def post(self, _token, url, body):
+        self._next_id += 1
+        self.calls.append(("post", url, body, self._next_id))
+        return {"id": self._next_id}
+
+    def patch(self, _token, url, body):
+        if self._patch_fails:
+            self._patch_fails -= 1
+            self.calls.append(("patch_refused", url, body))
+            raise httpx.HTTPStatusError(
+                "422", request=httpx.Request("PATCH", url),
+                response=httpx.Response(422),
+            )
+        self.calls.append(("patch", url, body))
+
+    def delete(self, _token, url):
+        self.calls.append(("delete", url))
+
+    def install(self, monkeypatch, *, diff=lambda: "diff --git a b", answer="It adds a retry."):
+        monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+        monkeypatch.setattr(rerun, "_gh_post", self.post)
+        monkeypatch.setattr(rerun, "_gh_patch", self.patch)
+        monkeypatch.setattr(rerun, "_gh_delete", self.delete)
+
+        def _diff(_t, _u, accept=None):
+            self.calls.append(("diff",))
+            return diff()
+
+        def _answer(_q, _d, _iid, pr_context=None):
+            self.calls.append(("llm",))
+            return answer() if callable(answer) else answer
+
+        monkeypatch.setattr(rerun, "_gh_get_text", _diff)
+        monkeypatch.setattr(rerun, "_gh_get", lambda _t, _u: {"body": "finding", "path": "x.py"})
+        monkeypatch.setattr("llm_client.answer_pr_question", _answer)
+        monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
+
+    def comment_posts(self):
+        return [c for c in self.calls if c[0] == "post" and "/reactions" not in c[1]]
+
+    def reactions(self):
+        return [c[2]["content"] for c in self.calls
+                if c[0] == "post" and c[1].endswith("/reactions")]
+
+
+def test_run_ask_posts_placeholder_before_work_then_patches_same_comment(monkeypatch):
+    """#695 criterion 3: the placeholder is posted before the diff fetch
+    and the LLM call, and the answer PATCHes that same comment id - no
+    second comment."""
+    gh = _FakeAskGitHub()
+    gh.install(monkeypatch)
+
+    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert result == "answered"
+    kinds = [c[0] for c in gh.calls if c[0] in ("diff", "llm", "patch")
+             or (c[0] == "post" and "/reactions" not in c[1])]
+    assert kinds == ["post", "diff", "llm", "patch"]
+    placeholder = gh.comment_posts()[0]
+    assert placeholder[1].endswith("/issues/7/comments")
+    assert "Grug thinking" in placeholder[2]["body"]
+    patch = [c for c in gh.calls if c[0] == "patch"][0]
+    assert patch[1].endswith(f"/issues/comments/{placeholder[3]}")
+    assert "It adds a retry." in patch[2]["body"]
+    assert patch[2]["body"].startswith("> what does this add?")
+    assert len(gh.comment_posts()) == 1
+
+
+def test_run_ask_in_thread_placeholder_patches_the_review_reply(monkeypatch):
+    """#695 on the #822 target: an in-thread ask puts its placeholder in
+    the thread and PATCHes it through the review-comment endpoint."""
+    gh = _FakeAskGitHub()
+    gh.install(monkeypatch)
+
+    result = rerun._run_ask(
+        11, "o/r", 7, "why did you flag this?",
+        reply_to_comment_id=4000, comment_id=5002,
+    )
+
+    assert result == "answered"
+    placeholder = gh.comment_posts()[0]
+    assert "/pulls/7/comments/4000/replies" in placeholder[1]
+    patch = [c for c in gh.calls if c[0] == "patch"][0]
+    assert patch[1].endswith(f"/pulls/comments/{placeholder[3]}")
+    # The asking comment is a review comment: its reactions live under pulls.
+    react_urls = [c[1] for c in gh.calls if c[0] == "post" and c[1].endswith("/reactions")]
+    assert react_urls and all("/pulls/comments/5002/reactions" in u for u in react_urls)
+
+
+def test_run_ask_swaps_eyes_for_thumbs_up_when_answered(monkeypatch):
+    """#695 criterion 2: eyes on receipt, then eyes removed and +1 added."""
+    gh = _FakeAskGitHub()
+    gh.install(monkeypatch)
+
+    rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert gh.reactions() == ["eyes", "+1"]
+    eyes_id = [c for c in gh.calls if c[0] == "post" and c[2].get("content") == "eyes"][0][3]
+    deletes = [c[1] for c in gh.calls if c[0] == "delete"]
+    assert deletes == [f"https://api.github.com/repos/o/r/issues/comments/5001/reactions/{eyes_id}"]
+    # eyes comes before any heavy work
+    assert gh.calls[0][0] == "post" and gh.calls[0][2] == {"content": "eyes"}
+
+
+def test_run_ask_failure_resolves_placeholder_and_reacts_thumbs_down(monkeypatch):
+    """#695 criterion 5: a diff fetch that fails after the placeholder went
+    out resolves the placeholder to a real message, flips the reaction to
+    -1, and does not raise (a redelivery would post a second placeholder)."""
+    gh = _FakeAskGitHub()
+
+    def _boom():
+        raise httpx.ConnectError("github down")
+
+    gh.install(monkeypatch, diff=_boom)
+
+    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert result == "ask_failed"
+    patches = [c for c in gh.calls if c[0] == "patch"]
+    assert len(patches) == 1
+    assert "thinking-rock is tired" in patches[0][2]["body"]
+    assert "Grug thinking" not in patches[0][2]["body"]
+    assert gh.reactions() == ["eyes", "-1"]
+    assert len(gh.comment_posts()) == 1
+
+
+def test_run_ask_no_answer_resolves_placeholder_with_thumbs_down(monkeypatch):
+    """A degraded model (no answer) is a real message too, never the
+    placeholder left hanging."""
+    gh = _FakeAskGitHub()
+    gh.install(monkeypatch, answer=None)
+
+    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert result == "ask_no_answer"
+    patch = [c for c in gh.calls if c[0] == "patch"][0]
+    assert "thinking-rock is tired" in patch[2]["body"]
+    assert gh.reactions() == ["eyes", "-1"]
+
+
+def test_run_ask_refused_answer_patch_falls_back_to_real_message(monkeypatch):
+    """GitHub refusing the answer PATCH (say an over-long body) must not
+    leave the placeholder up: the tired message is written instead."""
+    gh = _FakeAskGitHub(patch_fails=1)
+    gh.install(monkeypatch)
+
+    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert result == "ask_publish_failed"
+    kinds = [c[0] for c in gh.calls if c[0] in ("patch", "patch_refused")]
+    assert kinds == ["patch_refused", "patch"]
+    assert "thinking-rock is tired" in [c for c in gh.calls if c[0] == "patch"][0][2]["body"]
+    assert gh.reactions() == ["eyes", "-1"]
+
+
+def test_run_ask_reaction_failure_does_not_block_the_answer(monkeypatch):
+    """Reactions are a signal, not the work: a refused reaction write must
+    not stop the placeholder and the answer."""
+    gh = _FakeAskGitHub()
+    gh.install(monkeypatch)
+    real_post = gh.post
+
+    def _post(token, url, body):
+        if url.endswith("/reactions"):
+            raise httpx.ConnectError("reactions down")
+        return real_post(token, url, body)
+
+    monkeypatch.setattr(rerun, "_gh_post", _post)
+
+    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert result == "answered"
+    assert [c[0] for c in gh.calls if c[0] == "patch"] == ["patch"]
+
+
+def test_run_one_ask_passes_the_command_comment_id(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(rerun, "_run_ask", lambda *a, **k: seen.update(k) or "answered")
+    body = json.dumps({"kind": "ask", "install_id": 11, "repo": "o/r", "pr_number": 7,
+                       "comment_id": 5001, "question": "q", "reply_to_comment_id": 0})
+    assert rerun._run_one(body) == "answered"
+    assert seen["comment_id"] == 5001
