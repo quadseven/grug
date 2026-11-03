@@ -285,7 +285,17 @@ def _status_error(code: int) -> httpx.HTTPStatusError:
     )
 
 
-def test_preview_maps_a_github_404_to_404_not_500(api, monkeypatch):
+@pytest.fixture()
+def bare_api():
+    """The preview route never touches the store when GitHub fails, so
+    these run without the Postgres fixture."""
+    import learnings
+
+    return learnings
+
+
+def test_preview_maps_a_github_404_to_404_not_500(bare_api, monkeypatch):
+    api = bare_api
     """An unknown install or ref comes back from the token retry as a
     permanent 4xx; it is the caller's input, not a server fault."""
     def _raise(*a):
@@ -297,7 +307,8 @@ def test_preview_maps_a_github_404_to_404_not_500(api, monkeypatch):
     assert e.value.status_code == 404
 
 
-def test_preview_maps_other_github_failures_to_502(api, monkeypatch):
+def test_preview_maps_other_github_failures_to_502(bare_api, monkeypatch):
+    api = bare_api
     def _raise(*a):
         raise _status_error(500)
     monkeypatch.setattr(api, "_fetch_repo_paths", _raise)

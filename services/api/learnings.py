@@ -301,7 +301,33 @@ def preview_learning_paths(
         # that could step out of the trees endpoint or add a query.
         if not _REF_RE.match(body.ref) or ".." in body.ref:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid ref")
-        paths = _fetch_repo_paths(body.install_id, _repo_or_400(body.repo), body.ref)
+        repo = _repo_or_400(body.repo)
+        try:
+            paths = _fetch_repo_paths(body.install_id, repo, body.ref)
+        except httpx.HTTPStatusError as e:
+            # A 404 is an unknown install, repo or ref: the caller's input.
+            # Anything else GitHub returns is an upstream fault, not ours.
+            gh_status = e.response.status_code
+            log.warning(
+                "preview_github_rejected",
+                extra={"repo": repo, "gh_status": gh_status},
+            )
+            if gh_status == 404:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND, detail="repository or ref not found",
+                ) from e
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                detail=f"GitHub rejected the tree listing ({gh_status})",
+            ) from e
+        except httpx.RequestError as e:
+            log.warning(
+                "preview_github_unreachable",
+                extra={"repo": repo, "kind": type(e).__name__},
+            )
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, detail="GitHub unreachable",
+            ) from e
     else:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, detail="pass paths, or repo and install_id",
