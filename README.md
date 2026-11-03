@@ -36,7 +36,7 @@ the bot is `grug-tribe[bot]`, and the at-sign handle belongs to someone else.
 |---|---|
 | `/grug improve` | Elder reviews the PR again and re-posts its findings. |
 | `/grug recheck` | Chief re-runs the Hunt Plan checks. |
-| `/grug ask <question>` | Answers a question about the diff as a reply. |
+| `/grug ask <question>` | Answers a question about the diff as a reply. A placeholder reply goes up first and turns into the answer in place; the eyes reaction on the question flips to +1 (answered) or -1 (no answer). |
 | `/grug fix` | Applies every unresolved suggested fix as one commit. |
 | `/grug review` | One Elder review now, even while Elder is paused. |
 | `/grug resume` | Lifts the auto-pause (five pushes in ten minutes) and reviews what changed. |
