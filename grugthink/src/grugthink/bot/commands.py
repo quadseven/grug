@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import discord
 from discord import app_commands
 
-from .. import config
+from .. import config_legacy as config
 from ..bot.prompts import is_rate_limited, query_model
 from ..logging_config import get_logger
 

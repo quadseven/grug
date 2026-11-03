@@ -81,14 +81,21 @@ _NEW_FILE_RE = re.compile(r"^\+\+\+ (?:b/)?(.+)$")
 _DIFF_GIT_RE = re.compile(r"^diff --git a/(.+) b/(.+)$")
 # `@@ -<old>,<n> +<new>,<m> @@` — captures the new-side start + count.
 # Count is optional (defaults to 1 when absent per the diff spec).
-_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # `Binary files a/... and b/... differ` — skip these entirely.
 _BINARY_RE = re.compile(r"^Binary files .+ and .+ differ$")
 
 # Prefixes that end one hunk's body and start the next file / hunk /
-# header section. Tuple so a single `startswith(_BOUNDARY)` call covers all four.
+# header section. Tuple so a single `startswith(_BOUNDARY)` call covers all.
+# File headers (`--- a/x`, `+++ b/x`) always follow a `diff --git ` line, so
+# they are not boundaries here: inside a hunk body a line that starts with
+# `--- ` is a REMOVED line whose content starts with `-- ` (a SQL, Lua or
+# Haskell comment) and `+++ ` an ADDED line starting with `++ ` (`++i;`).
+# Treating them as headers cut the hunk short and silently dropped every
+# later added line from review. The hunk header's own line counts say
+# where the body ends.
 _HUNK_BOUNDARY_PREFIXES: tuple[str, ...] = (
-    "diff --git ", "@@", "+++ ", "--- ",
+    "diff --git ", "@@",
 )
 
 
@@ -532,13 +539,17 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
                 raise DiffParseError(
                     f"malformed `@@` hunk header at line {i + 1}: {line!r}"
                 )
-            new_start = int(m.group(1))
+            new_start = int(m.group(2))
+            # The header's line counts (a missing count means 1) say where
+            # the body ends; inlined because parse_diff is attested pure.
+            old_remaining = int(m.group(1)) if m.group(1) is not None else 1
+            new_remaining = int(m.group(3)) if m.group(3) is not None else 1
             if new_start == 0:
                 # A zero START is only legal with a zero COUNT: `+0,0`.
                 # `+0,N` / a bare `+0` (implied count 1) are malformed -
                 # fall through to fail loudly rather than silently
                 # swallowing hunks (FLINT PR #580).
-                if m.group(2) != "0":
+                if m.group(3) != "0":
                     raise DiffParseError(
                         f"malformed zero-start hunk header at line {i + 1}: {line!r}"
                     )
@@ -553,6 +564,10 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
                     hline = lines[i]
                     if hline.startswith(_HUNK_BOUNDARY_PREFIXES):
                         break
+                    if old_remaining <= 0 and hline.startswith(("--- ", "+++ ")):
+                        break  # the body is spent: a file header follows
+                    if hline.startswith(("-", " ")) or hline == "":
+                        old_remaining -= 1
                     i += 1
                 continue
             # Walk the hunk body collecting added + context-with-removed
@@ -566,12 +581,20 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
                 hline = lines[i]
                 if hline.startswith(_HUNK_BOUNDARY_PREFIXES):
                     break
+                if (
+                    old_remaining <= 0 and new_remaining <= 0
+                    and hline.startswith(("--- ", "+++ "))
+                ):
+                    # Both sides are spent, so this is a file header of a
+                    # diff with no `diff --git ` line, not hunk content.
+                    break
                 body_lines.append(hline)
-                if hline.startswith("+") and not hline.startswith("+++"):
+                if hline.startswith("+"):
                     new_lines_set.add(new_cursor)
                     new_cursor += 1
-                elif hline.startswith("-") and not hline.startswith("---"):
-                    pass  # removed — no new-side advance
+                    new_remaining -= 1
+                elif hline.startswith("-"):
+                    old_remaining -= 1  # removed — no new-side advance
                 elif hline.startswith("\\"):
                     # `\ No newline at end of file` — a unified-diff
                     # annotation, NOT a content line. Including it in
@@ -583,6 +606,8 @@ def parse_diff(unified_diff: str) -> tuple[DiffHunk, ...]:
                     # Context line. Advance the new cursor; don't mark
                     # as reviewable since it wasn't changed.
                     new_cursor += 1
+                    old_remaining -= 1
+                    new_remaining -= 1
                 i += 1
             hunks.append(
                 DiffHunk(

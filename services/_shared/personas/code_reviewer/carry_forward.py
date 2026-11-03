@@ -271,12 +271,6 @@ def _thread_is_dismissed(thread: dict) -> bool:
     return living_review.parse_state(first.get("body") or "") == living_review.DISMISSED
 
 
-def _thread_is_resolved_or_dismissed(thread: dict) -> bool:
-    """True when the thread is resolved (by a person) or dismissed (living review)."""
-    if _thread_is_resolved(thread):
-        return True
-    return _thread_is_dismissed(thread)
-
 
 def _elder_thread_rule_and_line(thread: dict) -> tuple[str, str, int] | None:
     """`(rule, path, line)` of an Elder-initiated thread, regardless of human replies."""

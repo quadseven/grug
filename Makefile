@@ -147,7 +147,8 @@ smoke:
 docker-build-webhook:
 	docker buildx build --platform linux/arm64 \
 		--tag grug-webhook:local \
-		-f services/webhook/Dockerfile services
+		--build-arg SERVICE=webhook \
+		-f services/Dockerfile services
 
 # SAST benchmark / eval harness (#399, ADR-0006). Measures Elder's vuln
 # recall+precision per backend over the committed corpus. Makes REAL backend

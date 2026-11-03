@@ -26,6 +26,7 @@ import pytest
 import yaml
 
 import dispatcher as d
+from grug_commands import parse_command
 import personas.tpm.persona as tpm_persona
 
 _K8S = Path(__file__).resolve().parents[3] / "k8s"
@@ -64,16 +65,21 @@ def _no_install_lookups(monkeypatch):
     monkeypatch.setattr(d, "is_persona_enabled", lambda *_: True)
 
 
+def _is_recheck(body: str) -> bool:
+    cmd = parse_command(body)
+    return cmd is not None and cmd.verb == "recheck"
+
+
 def test_recheck_pattern_matches_case_insensitive():
-    assert d._RECHECK_PAT.search("/grug recheck")
-    assert d._RECHECK_PAT.search("/Grug Recheck")
-    assert d._RECHECK_PAT.search("  /grug   recheck please  ")
+    assert _is_recheck("/grug recheck")
+    assert _is_recheck("/Grug Recheck")
+    assert _is_recheck("  /grug   recheck please  ")
 
 
 def test_recheck_pattern_rejects_other_commands():
-    assert not d._RECHECK_PAT.search("/grug status")
-    assert not d._RECHECK_PAT.search("grug recheck")  # missing /
-    assert not d._RECHECK_PAT.search("nope")
+    assert not _is_recheck("/grug status")
+    assert not _is_recheck("grug recheck")  # missing /
+    assert not _is_recheck("nope")
 
 
 def test_no_trigger_text_no_ops(_no_install_lookups):

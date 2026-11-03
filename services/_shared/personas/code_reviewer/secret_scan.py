@@ -33,7 +33,7 @@ import math
 import re
 from dataclasses import dataclass
 
-from .diff_parser import DiffHunk
+from .diff_parser import added_lines, DiffHunk
 from .sast import EXPOSED_SECRET, Candidate
 from .test_paths import is_test_file
 
@@ -184,21 +184,11 @@ class _Secret:
 
 
 def _added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
-    """[(new_side_line_number, added_text)] for added lines in a hunk. New-side
-    number advances on added/context lines, not on removed lines."""
-    out: list[tuple[int, str]] = []
-    lineno = hunk.new_start
-    for raw in hunk.body.splitlines():
-        if raw.startswith("@@") or raw.startswith("+++") or raw.startswith("---"):
-            continue
-        if raw.startswith("+"):
-            out.append((lineno, raw[1:]))
-            lineno += 1
-        elif raw.startswith("-"):
-            continue
-        else:
-            lineno += 1
-    return out
+    """[(new_side_line_number, added_text)] for each ADDED line in a hunk:
+    the one walk in `diff_parser.added_lines`, so an added line whose
+    content starts with `++` is neither dropped nor shifts the numbering of
+    everything after it."""
+    return added_lines(hunk)
 
 
 def _shannon_entropy(s: str) -> float:

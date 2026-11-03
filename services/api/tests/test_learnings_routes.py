@@ -5,6 +5,7 @@ same way test_admin.py drives the admin router."""
 
 from __future__ import annotations
 
+import httpx
 import pytest
 from fastapi import HTTPException
 
@@ -275,3 +276,50 @@ def test_fired_audit_keeps_a_rule_deleted_since_the_review(api, store):
     store.delete_learning("o/r", fired)
     out = api.fired_learnings(repo="o/r", pr=9, head_sha="abc", user=_admin())
     assert out["fired"] == [{"id": fired, "text": "", "deleted": True}]
+
+
+def _status_error(code: int) -> httpx.HTTPStatusError:
+    req = httpx.Request("GET", "https://api.github.com/x")
+    return httpx.HTTPStatusError(
+        "boom", request=req, response=httpx.Response(code, request=req),
+    )
+
+
+@pytest.fixture()
+def bare_api():
+    """The preview route never touches the store when GitHub fails, so
+    these run without the Postgres fixture."""
+    import learnings
+
+    return learnings
+
+
+def test_preview_maps_a_github_404_to_404_not_500(bare_api, monkeypatch):
+    api = bare_api
+    """An unknown install or ref comes back from the token retry as a
+    permanent 4xx; it is the caller's input, not a server fault."""
+    def _raise(*a):
+        raise _status_error(404)
+    monkeypatch.setattr(api, "_fetch_repo_paths", _raise)
+    body = api.PreviewRequest(scope_path="*.py", repo="o/r", install_id=5)
+    with pytest.raises(HTTPException) as e:
+        api.preview_learning_paths(body, user=_admin())
+    assert e.value.status_code == 404
+
+
+def test_preview_maps_other_github_failures_to_502(bare_api, monkeypatch):
+    api = bare_api
+    def _raise(*a):
+        raise _status_error(500)
+    monkeypatch.setattr(api, "_fetch_repo_paths", _raise)
+    body = api.PreviewRequest(scope_path="*.py", repo="o/r", install_id=5)
+    with pytest.raises(HTTPException) as e:
+        api.preview_learning_paths(body, user=_admin())
+    assert e.value.status_code == 502
+
+    def _transport(*a):
+        raise httpx.ConnectError("down", request=httpx.Request("GET", "https://x"))
+    monkeypatch.setattr(api, "_fetch_repo_paths", _transport)
+    with pytest.raises(HTTPException) as e:
+        api.preview_learning_paths(body, user=_admin())
+    assert e.value.status_code == 502

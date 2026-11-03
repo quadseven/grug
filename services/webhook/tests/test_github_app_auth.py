@@ -319,3 +319,27 @@ def test_app_id_strips_whitespace_from_the_raw_ssm_value(monkeypatch):
         "secrets_loader._get_ssm_secure_string", lambda name: "12345\n"
     )
     assert gh.get_app_id() == "12345"
+
+
+def test_token_refresh_rereads_the_installation_permissions(_stub_secrets):
+    """A permission the operator grants after the pod booted stops being
+    reported as missing on the next forced token refresh (the path a
+    401/403 already takes), not only after a restart."""
+    import github_app_auth as gh
+
+    short = {"token": "T1", "permissions": {
+        "pull_requests": "write", "issues": "write", "checks": "write",
+        "metadata": "read", "contents": "read",
+    }}
+    full = {"token": "T2", "permissions": {
+        name: level for name, (level, _) in gh.REQUIRED_APP_PERMISSIONS.items()
+    }}
+    fake = MagicMock()
+    fake.raise_for_status = MagicMock()
+    fake.json = MagicMock(side_effect=[short, full])
+    with patch("httpx.post", return_value=fake):
+        gh.get_install_token(321)
+        assert gh.missing_install_permissions(321) == ("contents",)
+        gh.get_install_token(321, force_refresh=True)
+    assert gh.missing_install_permissions(321) == ()
+    assert gh.installation_permission_summary_note(321) == ""

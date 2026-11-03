@@ -241,7 +241,7 @@ def test_single_line_hunk_without_count_parses() -> None:
     assert 1 in hunks[0].new_lines
 
 
-def test_no_newline_marker_does_not_shift_line_numbers() -> None:
+def test_malformed_hunk_header_raises_diff_parse_error() -> None:
     """A garbled @@ header is more likely a fetcher bug or GitHub
     format drift than a real hunk we should partially extract. Silent
     skip would let evaluate_diff return a clean "success" verdict —

@@ -475,3 +475,21 @@ def test_provider_formats_are_flagged_in_test_files_too():
 def test_test_file_detection_is_by_path_component_not_substring():
     assert len(_scan("src/contests/x.py", 'TOKEN = "fake-token-for-tests-1234"')) == 1
     assert len(_scan("src/latest.py", 'TOKEN = "fake-token-for-tests-1234"')) == 1
+
+
+def test_added_line_starting_with_two_pluses_does_not_shift_later_line_numbers():
+    """`++count;` is an added line. The scanner's private walk used to skip
+    it as a file header, so every candidate after it was anchored one line
+    too low and dropped by the hallucination filter (or posted on the
+    wrong line). The walk is now the parser's own."""
+    diff = (
+        "diff --git a/a.js b/a.js\n--- a/a.js\n+++ b/a.js\n"
+        "@@ -1,1 +1,3 @@\n let n;\n+++n;\n"
+        f"+const token = \"{_GH_TOKEN}\";\n"
+    )
+    hunk = parse_diff(diff)[0]
+    assert secret_scan._added_lines(hunk) == [
+        (2, "++n;"), (3, f'const token = "{_GH_TOKEN}";'),
+    ]
+    found = scan_secrets((hunk,))
+    assert [f.line for f in found] == [3]

@@ -83,8 +83,6 @@ def test_snapshot_includes_base_sha():
 
 
 def test_freshness_excludes_base_sha():
-    a = review_freshness_id(head_sha="h", title="t", body="b")
-    b = review_freshness_id(head_sha="h", title="t", body="b", base_sha="ignored") if False else None
     # freshness_id has no base_sha param; the point is two PRs with the same
     # head/title/body but different base_sha get the same freshness_id
     pr_a = {"base": {"sha": "base_before"}, "head": {"sha": "h"}, "title": "t", "body": "b"}

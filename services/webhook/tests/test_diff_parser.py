@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from personas.code_reviewer.diff_parser import DiffHunk, DiffParseError, parse_diff
+from personas.code_reviewer.diff_parser import DiffHunk, DiffParseError, added_lines, parse_diff
 
 
 _SIMPLE_DIFF = """diff --git a/src/x.py b/src/x.py
@@ -241,7 +241,7 @@ def test_single_line_hunk_without_count_parses() -> None:
     assert 1 in hunks[0].new_lines
 
 
-def test_no_newline_marker_does_not_shift_line_numbers() -> None:
+def test_malformed_hunk_header_raises_diff_parse_error() -> None:
     """A garbled @@ header is more likely a fetcher bug or GitHub
     format drift than a real hunk we should partially extract. Silent
     skip would let evaluate_diff return a clean "success" verdict —
@@ -694,3 +694,69 @@ class TestTreeCopyHunkSplit:
             {"m/b.py": self._FULL, "m/a.py": self._FULL, "z/copy.py": self._FULL},
         )
         assert copies == (("z/copy.py", "m/a.py"),)
+
+
+def test_removed_line_starting_with_two_dashes_is_hunk_content() -> None:
+    """A removed SQL/Lua/Haskell comment renders as `--- old comment`, which
+    looked like a file header and ended the hunk early: every later added
+    line vanished from the body and from `new_lines`, so the model never
+    saw it and a finding on it was rejected as outside the diff."""
+    diff = """diff --git a/q.sql b/q.sql
+--- a/q.sql
++++ b/q.sql
+@@ -1,4 +1,4 @@
+ SELECT 1;
+--- old comment
++-- new comment
++SELECT password FROM t;
+ SELECT 2;
+diff --git a/r.sql b/r.sql
+--- a/r.sql
++++ b/r.sql
+@@ -1 +1 @@
+-x
++y
+"""
+    hunks = parse_diff(diff)
+    assert [h.file_path for h in hunks] == ["q.sql", "r.sql"]
+    assert "+SELECT password FROM t;" in hunks[0].body
+    assert "--- old comment" in hunks[0].body
+    assert hunks[0].new_lines == frozenset({2, 3})
+    assert hunks[1].new_lines == frozenset({1})
+
+
+def test_added_line_starting_with_two_pluses_counts_and_numbers_as_added() -> None:
+    """`++i;` is an added line, exactly as `added_lines` reads it: it is in
+    `new_lines` and the lines after it keep their numbers."""
+    diff = """diff --git a/a.c b/a.c
+--- a/a.c
++++ b/a.c
+@@ -1,2 +1,4 @@
+ int i;
++++i;
++x = 1;
+ int j;
+"""
+    hunks = parse_diff(diff)
+    assert hunks[0].new_lines == frozenset({2, 3})
+    assert added_lines(hunks[0]) == [(2, "++i;"), (3, "x = 1;")]
+
+
+def test_file_header_after_a_spent_hunk_still_ends_it_without_a_git_line() -> None:
+    """A diff without `diff --git` lines (plain unified) still ends a hunk at
+    the next file header once the header's line counts are used up."""
+    diff = """diff --git a/a.py b/a.py
+--- a/a.py
++++ b/a.py
+@@ -1 +1 @@
+-x
++y
+--- a/b.py
++++ b/b.py
+@@ -1 +1 @@
+-p
++q
+"""
+    hunks = parse_diff(diff)
+    assert hunks[0].body == "@@ -1 +1 @@\n-x\n+y"
+    assert hunks[0].new_lines == frozenset({1})

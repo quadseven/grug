@@ -13,6 +13,7 @@ from __future__ import annotations
 import shutil
 from unittest.mock import patch
 
+import os
 import pytest
 
 from llm_client import FindingJudgement
@@ -652,6 +653,7 @@ def test_opengrep_home_falls_back_to_scan_dir_when_cache_unset(tmp_path, monkeyp
     assert env["XDG_CACHE_HOME"].startswith(str(scan))
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="chmod 0o500 does not bind root")
 def test_opengrep_home_falls_back_when_cache_dir_is_not_writable(tmp_path, monkeypatch):
     """Configured-but-unusable must degrade to the working path, not crash.
     'Configured' is not 'working' - that gap is why the ruff evidence layer

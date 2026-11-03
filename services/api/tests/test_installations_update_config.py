@@ -405,3 +405,14 @@ def test_reconcile_helper_is_best_effort(caplog):
     assert any(
         r.getMessage() == "enforcement_reconcile_failed" for r in caplog.records
     )
+
+
+def test_pulse_delivery_is_validated_at_the_edge():
+    """The store raises ValueError for any other value, which the route
+    surfaced as a 500; the payload model rejects it as a request error."""
+    from pydantic import ValidationError
+
+    assert inst.RepoConfigPayload(pulse_delivery="label").pulse_delivery == "label"
+    assert inst.RepoConfigPayload(pulse_delivery="comment").pulse_delivery == "comment"
+    with pytest.raises(ValidationError):
+        inst.RepoConfigPayload(pulse_delivery="x")

@@ -30,7 +30,7 @@ from llm_client import _cave_judge_config, FindingJudgement, Hunk, JudgeFindingR
 from review_evidence import assemble_evidence, without_author_text
 
 from .analyzer_sandbox import read_only_tree, sandbox_env, without_engine_config
-from .diff_parser import DiffHunk
+from .diff_parser import added_lines, DiffHunk
 from .persona import Finding
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.sast")
@@ -81,25 +81,11 @@ class Candidate:
 
 
 def _added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
-    """Walk a hunk body -> [(new_side_line_number, added_text)] for each ADDED
-    line. New-side number starts at `new_start` and advances on added/context
-    lines, not on removed lines (unified-diff semantics). The first body line
-    is the `@@` header (skipped)."""
-    out: list[tuple[int, str]] = []
-    lineno = hunk.new_start
-    for raw in hunk.body.splitlines():
-        if raw.startswith("@@"):
-            continue
-        if raw.startswith("+++") or raw.startswith("---"):
-            continue
-        if raw.startswith("+"):
-            out.append((lineno, raw[1:]))
-            lineno += 1
-        elif raw.startswith("-"):
-            continue  # removed line: no new-side advance
-        else:
-            lineno += 1  # context line
-    return out
+    """[(new_side_line_number, added_text)] for each ADDED line in a hunk:
+    the one walk in `diff_parser.added_lines`, so an added line whose
+    content starts with `++` is neither dropped nor shifts the numbering of
+    everything after it."""
+    return added_lines(hunk)
 
 
 def _is_cleartext_secret_log(text: str) -> bool:
