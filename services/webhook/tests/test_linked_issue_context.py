@@ -4,7 +4,8 @@ Load-bearing contracts:
 - the PR body's same-repo closing keywords (Chief's parser, reused) plus
   `Refs`/`Part of`/`Relates to #N` name the issues to read; code spans,
   foreign-repo refs and `Blocked by` do not;
-- only the issue's `## Acceptance criteria` bullets become criteria;
+- only the bullets under the issue's `## Acceptance criteria` (else `## Acceptance`)
+  heading become criteria;
 - the rendered block is bounded and sanitized (mentions, fences, headings,
   control chars) and labelled as data, never instructions;
 - any fetch failure, a missing section, or no link degrades to None
@@ -19,7 +20,10 @@ import re
 import httpx
 import pytest
 from llm_client import Hunk, _build_messages
+from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer import linked_issue
+from personas.code_reviewer.diff_parser import parse_diff
+from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.linked_issue import (
     build_linked_issue_context,
     extract_criteria,
@@ -106,6 +110,37 @@ def test_extract_criteria_reads_only_the_acceptance_section():
 def test_extract_criteria_none_without_section():
     assert extract_criteria("## Why\n\n- [ ] not under acceptance\n") == []
     assert extract_criteria("") == []
+
+
+def test_extract_criteria_reads_a_plain_acceptance_heading():
+    # grug#1617: Loom tickets head the list `## Acceptance`.
+    body = "## Why\nx\n\n## Acceptance\n- A held finding still blocks.\n- Old test flips.\n\n## Size\nS\n"
+    assert [text for _, text in extract_criteria(body)] == [
+        "A held finding still blocks.", "Old test flips."]
+
+
+@pytest.mark.parametrize("heading", [
+    "## acceptance criteria", "## ACCEPTANCE CRITERIA (from the epic)",
+    "## Acceptance criteria - first slice", "## ACCEPTANCE",
+])
+def test_extract_criteria_reads_heading_variants(heading):
+    body = f"## Why\nx\n\n{heading}\n- The one criterion.\n\n## Size\nS\n"
+    assert extract_criteria(body) == [("open", "The one criterion.")]
+
+
+def test_extract_criteria_prefers_acceptance_criteria_over_acceptance():
+    body = "## Acceptance\n- plain\n\n## Acceptance criteria\n- canonical\n"
+    assert extract_criteria(body) == [("open", "canonical")]
+
+
+def test_extract_criteria_ignores_acceptance_outside_a_heading():
+    body = (
+        "## Why\nAcceptance\n- not a criterion\n\n"
+        "**Acceptance**\n- nor this\n\nAcceptance criteria:\n- nor this\n\n"
+        "### Acceptance\n- nor a deeper heading\n\n"
+        "## Acceptances\n- nor a longer word\n"
+    )
+    assert extract_criteria(body) == []
 
 
 def test_extract_criteria_skips_fenced_bullets():
@@ -441,3 +476,79 @@ def test_rendered_criteria_round_trips_the_block():
         (904, 3, "Third criterion without a box"),
     ]
     assert linked_issue.rendered_criteria("") == []
+
+
+# --- grug#1617: a plain `## Acceptance` heading reaches the review ---------
+
+_LOOM_ISSUE = """## Problem
+
+The held-answer exemption fails open.
+
+## Acceptance
+
+- A held finding still blocks the merge. The tests that pinned the old expectation (`test_a_token_is_never_logged`, `test_a_missing_token_fails_the_deploy`) flip to expect a block.
+- The full suite passes.
+
+## Size
+
+S
+"""
+
+_REMOVES_TWO = (
+    "diff --git a/tests/test_tokens.py b/tests/test_tokens.py\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/tests/test_tokens.py\n+++ b/tests/test_tokens.py\n"
+    "@@ -10,11 +10,3 @@\n"
+    "-import tokens\n"
+    "+import tokens  # the merge gate reads the token now\n"
+    "-def test_a_token_is_never_logged():\n"
+    "-    assert 'secret' not in tokens.log_line()\n"
+    "-\n-\n"
+    "-def test_a_missing_token_fails_the_deploy():\n"
+    "-    assert tokens.deploy(token=None) == 1\n"
+    "-\n-\n"
+    " def test_kept():\n"
+    "     assert tokens.ok()\n"
+)
+
+# Refs-only, so the body claims the box by number (criteria_in_scope, #1364).
+_REFS_BODY = "Meets #2519 criterion 1.\n\nRefs acme/widgets" "#2519\n"  # joined at parse time: keeps a literal cross-repo ref out of the source
+
+
+def _weakened(issue_body: str):
+    block = build_linked_issue_context(
+        _REFS_BODY, fetch_issue=lambda n: issue_body, owner="acme", repo="widgets",
+    ) or ""
+    found = lane_work_findings(
+        diff_text=_REMOVES_TWO, hunks=parse_diff(_REMOVES_TWO),
+        file_contents={}, base_line_counts={},
+        boxes=linked_issue.rendered_criteria_with_state(block),
+        pr_title="Tighten the merge gate", pr_body=_REFS_BODY,
+    )
+    return [f for f in found if f.rule_name == "weakened-test"]
+
+
+def test_weakened_test_reads_a_refs_linked_plain_acceptance_heading():
+    (finding,) = _weakened(_LOOM_ISSUE)
+    assert finding.severity == "medium"
+
+
+def test_weakened_test_still_high_when_the_acceptance_bullet_names_no_test():
+    unnamed = _LOOM_ISSUE.replace(
+        "The tests that pinned the old expectation (`test_a_token_is_never_logged`, "
+        "`test_a_missing_token_fails_the_deploy`) flip to expect a block.",
+        "",
+    )
+    assert "test_a_token" not in unnamed
+    (finding,) = _weakened(unnamed)
+    assert finding.severity == "high"
+
+
+def test_intent_says_criteria_were_checked_with_only_a_plain_acceptance_heading():
+    linked = build_linked_issue_context(
+        _REFS_BODY, fetch_issue=lambda n: _LOOM_ISSUE, owner="acme", repo="widgets",
+    )
+    paragraph = cr_dispatch._intent_paragraph(
+        {"title": "Tighten the merge gate", "linked_issue_context": linked},
+    )
+    assert "Linked acceptance criteria were checked" in paragraph

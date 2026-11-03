@@ -3,9 +3,9 @@
 Chief's gate checks whether a linked issue's boxes are ticked. Nothing told
 Elder what the issue's criteria SAY, so "does this diff do what #N asked
 for" went unasked. This module reads the issue(s) a PR links (same repo
-only), pulls the `## Acceptance criteria` bullets, and renders one bounded,
-sanitized `### LINKED ISSUE ACCEPTANCE CRITERIA` block that rides the user
-prompt next to the other context blocks.
+only), pulls the `## Acceptance criteria` (or `## Acceptance`) bullets, and
+renders one bounded, sanitized `### LINKED ISSUE ACCEPTANCE CRITERIA` block
+that rides the user prompt next to the other context blocks.
 
 Reuse, not re-implementation: closing-keyword parsing and code-span
 stripping come from Chief (`ticket_compliance.closes_refs` /
@@ -126,11 +126,13 @@ def linked_issue_numbers(
 
 
 def extract_criteria(issue_body: str) -> list[Criterion]:
-    """Bullets under the issue's `## Acceptance criteria` section, in order.
+    """Bullets under the issue's `## Acceptance criteria` section, in order;
+    a plain `## Acceptance` heading, the shape Loom tickets use, counts when
+    no `## Acceptance criteria` section exists (#1617).
 
     Ticked boxes are kept (marked) because a ticked box is the author's claim,
     not proof; bullets inside fences are skipped. No section => empty."""
-    text = section_text(issue_body or "", "Acceptance criteria")
+    text = section_text(issue_body or "", "Acceptance criteria", "Acceptance")
     if not text:
         return []
     out: list[Criterion] = []
