@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
@@ -34,6 +35,7 @@ from github_app_auth import with_install_token_retry
 from github_checks_client import CheckRunResult, post_check_run
 from github_reviews_client import post_review
 from llm_client import _JUDGE_MAX_FINDINGS
+from markdown_safety import neutralize_mentions
 from personas.code_reviewer.diff_parser import DiffParseError, parse_diff
 from personas.code_reviewer.dispatch import build_review_result
 from personas.code_reviewer.iac_scan import scan_iac
@@ -53,6 +55,25 @@ from personas.tribe import CHECK_GUARD
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.guard")
 
 _CHECK_NAME = CHECK_GUARD
+
+
+def _md_code_span(text: str) -> str:
+    """A path or rule name for a single backtick-wrapped table cell: no
+    backtick may end the span early and no newline may add a row."""
+    cleaned = (text or "").replace("`", "").replace("\r", " ").replace("\n", " ")
+    return re.sub(r" +", " ", cleaned).strip() or "?"
+
+
+def _md_table_cell(text: str) -> str:
+    """Finding prose for a table cell. A finding message carries judge
+    prose and the raw PR line, so a `|` would split the row, a newline
+    would add one, an unterminated fence would swallow the rest of the
+    summary, and a mention would notify a real account under the App's
+    authority. Elder's Markings table applies the same rules."""
+    cleaned = re.sub(r"`{3,}", "``", text or "")
+    cleaned = neutralize_mentions(re.sub(r"~{3,}", "~~", cleaned))
+    cleaned = cleaned.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    return re.sub(r" +", " ", cleaned).strip()
 
 
 def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
@@ -83,8 +104,8 @@ def _summary_markdown(evaluation: CodeReviewEvaluation) -> tuple[str, str]:
     rows = ["| Severity | File | Line | Rule | Message |", "|---|---|---|---|---|"]
     for f in evaluation.findings:
         rows.append(
-            f"| {severity_chip(f.severity)} | `{f.file}` | {f.line} | "
-            f"`{f.rule_name}` | {f.message} |"
+            f"| {severity_chip(f.severity)} | `{_md_code_span(f.file)}` | {f.line} | "
+            f"`{_md_code_span(f.rule_name)}` | {_md_table_cell(f.message)} |"
         )
     return title, "\n".join(rows)
 

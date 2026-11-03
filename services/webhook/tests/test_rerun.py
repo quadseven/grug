@@ -3683,3 +3683,38 @@ def test_a_refused_reaction_never_fails_the_command(monkeypatch):
     monkeypatch.setattr(rerun, "_gh_post", _refuse)
     monkeypatch.setattr(rerun, "_gh_delete", _refuse)
     assert rerun._run_one(_command_job(), message_id="r-7") == "dispatched"
+
+
+def test_a_plain_rerun_with_a_long_repo_name_keeps_its_dedup_id_within_sqs_limits(monkeypatch):
+    """SQS refuses a MessageDeduplicationId over 128 chars. A long owner/repo
+    pushed the plain content id past it, so the send failed and the rerun
+    was logged and lost. Past the limit the id is a digest of the same
+    content, so equal jobs still collapse."""
+    sent = {}
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/jobs.fifo")
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs))
+    repo = "o" * 39 + "/" + "r" * 100
+    rerun.enqueue_rerun(install_id=11, repo=repo, pr_number=7, persona="elder")
+    first = sent["MessageDeduplicationId"]
+    assert len(first) <= 128 and first.startswith("rerun:")
+    rerun.enqueue_rerun(install_id=11, repo=repo, pr_number=7, persona="elder")
+    assert sent["MessageDeduplicationId"] == first
+
+
+def test_an_ask_with_a_long_repo_name_keeps_its_dedup_id_within_sqs_limits(monkeypatch):
+    sent = {}
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/jobs.fifo")
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs))
+    repo = "o" * 39 + "/" + "r" * 100
+    rerun.enqueue_ask(
+        install_id=11, repo=repo, pr_number=7, comment_id=5, question="why?",
+        reply_to_comment_id=5,
+    )
+    assert len(sent["MessageDeduplicationId"]) <= 128
+    short = {}
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kwargs: short.update(kwargs))
+    rerun.enqueue_ask(
+        install_id=11, repo="o/r", pr_number=7, comment_id=5, question="why?",
+        reply_to_comment_id=5,
+    )
+    assert short["MessageDeduplicationId"] == "11:o/r:7:ask:5"

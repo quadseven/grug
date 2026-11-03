@@ -233,7 +233,16 @@ def callback(
             extra={"err": str(e), "kind": type(e).__name__},
         )
         raise HTTPException(status_code=502, detail="oauth_upstream_failed") from e
-    token_payload = token_resp.json()
+    try:
+        token_payload = token_resp.json()
+    except ValueError as e:
+        # A 200 that is not JSON (an interstitial page, a gateway error
+        # body) is an upstream failure, not a 500 of ours.
+        log.warning("oauth_token_endpoint_not_json", extra={"kind": type(e).__name__})
+        raise HTTPException(status_code=502, detail="oauth_upstream_failed") from e
+    if not isinstance(token_payload, dict):
+        log.warning("oauth_token_endpoint_not_json", extra={"kind": type(token_payload).__name__})
+        raise HTTPException(status_code=502, detail="oauth_upstream_failed")
     access_token = token_payload.get("access_token")
     refresh_token = token_payload.get("refresh_token")
     if not access_token:

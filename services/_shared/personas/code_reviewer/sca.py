@@ -29,7 +29,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from .diff_parser import DiffHunk
+from .diff_parser import added_lines, DiffHunk
 from .sast import Candidate
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.sca")
@@ -62,20 +62,11 @@ class ChangedDep:
 
 
 def _added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
-    """[(new_side_line_number, added_text)] for added lines in a hunk."""
-    out: list[tuple[int, str]] = []
-    lineno = hunk.new_start
-    for raw in hunk.body.splitlines():
-        if raw.startswith("@@") or raw.startswith("+++") or raw.startswith("---"):
-            continue
-        if raw.startswith("+"):
-            out.append((lineno, raw[1:]))
-            lineno += 1
-        elif raw.startswith("-"):
-            continue
-        else:
-            lineno += 1
-    return out
+    """[(new_side_line_number, added_text)] for each ADDED line in a hunk:
+    the one walk in `diff_parser.added_lines`, so an added line whose
+    content starts with `++` is neither dropped nor shifts the numbering of
+    everything after it."""
+    return added_lines(hunk)
 
 
 def extract_changed_deps(hunks: tuple[DiffHunk, ...]) -> tuple[ChangedDep, ...]:

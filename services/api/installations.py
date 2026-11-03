@@ -84,7 +84,9 @@ class RepoConfigPayload(BaseModel):
     warder_gate_blocking: bool | None = Field(default=None)
     sentinel_enabled: bool | None = Field(default=None)
     pulse_enabled: bool | None = Field(default=None)
-    pulse_delivery: str | None = Field(default=None)
+    # The store rejects anything else with ValueError, which the route
+    # would surface as a 500; validate at the edge instead.
+    pulse_delivery: str | None = Field(default=None, pattern=r"^(label|comment)$")
     pulse_comment_nudge_enabled: bool | None = Field(default=None)
     smasher_enabled: bool | None = Field(default=None)
     walkthrough_enabled: bool | None = Field(default=None)

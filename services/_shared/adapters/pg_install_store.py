@@ -1500,32 +1500,6 @@ def put_learning(
         )
 
 
-def increment_learning_usage(repo: str, digest: str) -> None:
-    """Mark one learning as used: bump usage_count and stamp last_used_at.
-    Called when a learning is rendered into a review or /grug ask prompt.
-    Best-effort: never blocks a review. TTL and reinforced_at are untouched
-    (re-teaching is what refreshes relevance)."""
-    now = datetime.now(timezone.utc).isoformat()
-    try:
-        with get_pool().connection() as conn:
-            conn.execute(
-                """
-                UPDATE grug_kv
-                SET data = jsonb_set(
-                    jsonb_set(data, '{usage_count}',
-                        to_jsonb(COALESCE((data->>'usage_count')::int, 0) + 1)),
-                    '{last_used_at}', to_jsonb(%(now)s)
-                )
-                WHERE pk = %(pk)s AND sk = %(sk)s AND {TTL_LIVE}
-                """,
-                {"now": now, "pk": _learning_pk(repo), "sk": _learning_sk(digest)},
-            )
-    except Exception as e:  # noqa: BLE001 - usage tracking must not fail a review
-        log.warning(
-            "learning_increment_usage_failed",
-            extra={"repo": repo, "digest": digest, "kind": type(e).__name__},
-        )
-
 
 def delete_learning(repo: str, digest: str) -> bool:
     """Delete one learning by (repo, text-digest). Returns True if a row

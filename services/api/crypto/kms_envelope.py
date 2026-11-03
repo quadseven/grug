@@ -30,12 +30,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import TYPE_CHECKING
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-if TYPE_CHECKING:
-    from types_aiobotocore_kms.client import KMSClient
 
 log = logging.getLogger("grug.api.kms_envelope")
 
@@ -60,13 +56,6 @@ class CredentialBlobCorrupt(Exception):
     """
 
 
-class UserStateCorrupt(Exception):
-    """Raised when a persisted UserState row cannot be decoded.
-
-    Caller maps to HTTP 503 so the UI does not silently overwrite a
-    corrupt row with a fresh empty UserState.
-    """
-
 
 def _encryption_context(user_id: str, item_type: str) -> dict[str, str]:
     """Build the EncryptionContext map. Both fields are mandatory per DL-016."""
@@ -89,81 +78,8 @@ def build_aad(user_id: str, item_type: str) -> bytes:
     ).encode("utf-8")
 
 
-async def generate_user_dek(
-    kms_client: KMSClient,
-    user_id: str,
-    item_type: str,
-    *,
-    cmk_arn: str | None = None,
-) -> tuple[bytes, bytes]:
-    """Mint a per-user DEK via ``kms.GenerateDataKey``.
-
-    Returns ``(plaintext_dek, ciphertext_blob)``. The caller MUST encrypt
-    the target blob with the plaintext key and then drop it; the
-    ciphertext_blob is what persists in DDB at SK=``creds`` alongside the
-    AES-GCM nonce + ciphertext (DL-024).
-    """
-    arn = cmk_arn or KMS_CMK_ARN
-    if not arn:
-        raise RuntimeError("KMS_CMK_ARN is required (DL-017)")
-    resp = await kms_client.generate_data_key(
-        KeyId=arn,
-        KeySpec="AES_256",
-        EncryptionContext=_encryption_context(user_id, item_type),
-    )
-    return resp["Plaintext"], resp["CiphertextBlob"]
 
 
-async def decrypt_user_dek(
-    kms_client: KMSClient,
-    user_id: str,
-    item_type: str,
-    ciphertext_blob: bytes,
-) -> bytes:
-    """Unwrap a per-user DEK via ``kms.Decrypt``.
-
-    A mismatched ``EncryptionContext`` (e.g. swapping user_id) raises
-    ``InvalidCiphertextException`` at the KMS API layer — the caller
-    propagates it. Plaintext DEK is returned for immediate AES-GCM use
-    and MUST be dropped immediately after.
-    """
-    resp = await kms_client.decrypt(
-        CiphertextBlob=ciphertext_blob,
-        EncryptionContext=_encryption_context(user_id, item_type),
-    )
-    return resp["Plaintext"]
-
-
-def encrypt_blob(plaintext_dict: dict, dek: bytes, aad: bytes) -> tuple[bytes, bytes]:
-    """AES-GCM encrypt a JSON-serialisable dict.
-
-    ``aad`` is bound as ``associated_data`` so a (nonce, ciphertext)
-    tuple from one user/item cannot be transplanted onto another row.
-    Returns ``(nonce, ciphertext)`` for separate DDB storage. JSON
-    serialisation uses ``sort_keys=True`` so the ciphertext is
-    deterministic given the same input dict + DEK + nonce.
-    """
-    if len(dek) != _DEK_BYTES:
-        raise ValueError(f"dek must be {_DEK_BYTES} bytes (got {len(dek)})")
-    nonce = os.urandom(_NONCE_LEN)
-    aesgcm = AESGCM(dek)
-    serialised = json.dumps(plaintext_dict, sort_keys=True).encode("utf-8")
-    ciphertext = aesgcm.encrypt(nonce, serialised, associated_data=aad)
-    return nonce, ciphertext
-
-
-def decrypt_blob(ciphertext: bytes, nonce: bytes, dek: bytes, aad: bytes) -> dict:
-    """Inverse of ``encrypt_blob``.
-
-    Raises whatever ``cryptography`` raises (typically
-    ``InvalidTag``) on tamper / wrong DEK / truncation / AAD mismatch.
-    Caller catches and maps to ``CredentialBlobCorrupt``.
-    """
-    if len(dek) != _DEK_BYTES:
-        raise ValueError(f"dek must be {_DEK_BYTES} bytes (got {len(dek)})")
-    aesgcm = AESGCM(dek)
-    serialised = aesgcm.decrypt(nonce, ciphertext, associated_data=aad)
-    return json.loads(serialised.decode("utf-8"))
 
 
 # ─── grug-specific synchronous wrappers (PRD #21) ─────────────────────

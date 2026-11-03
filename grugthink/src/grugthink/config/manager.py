@@ -162,7 +162,7 @@ class ConfigManager:
         if env_value is not None:
             log.debug(
                 f"get_env_var: Found {key} in os.environ",
-                extra={"key": key, "value": env_value, "source": "os.environ"},
+                extra={"key": key, "source": "os.environ"},
             )
             return env_value
 

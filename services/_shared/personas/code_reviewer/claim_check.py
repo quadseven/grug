@@ -17,7 +17,6 @@ Fail-open: any parse glitch yields no finding rather than aborting review.
 from __future__ import annotations
 
 import re
-from collections import Counter
 from dataclasses import dataclass
 from typing import Literal
 

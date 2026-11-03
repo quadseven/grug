@@ -541,10 +541,8 @@ def _handle_pull_request(
 # the trigger phrase re-fire DoR check without requiring an empty commit.
 # Trigger surface is `issue_comment` event (PR comments arrive there too,
 # distinguished by `issue.pull_request` truthy). Author-or-collaborator
-# auth check stops drive-by spam.
-import re as _re  # noqa: E402
-
-_RECHECK_PAT = _re.compile(r"^\s*/grug\s+recheck\b", _re.IGNORECASE | _re.MULTILINE)
+# auth check stops drive-by spam. The verb is parsed by
+# `grug_commands.parse_command`.
 # Author-only roles that satisfy the auth gate. PR author is implicit
 # (sender.login == pr.user.login). Collaborator perms come from
 # `permission` field on `GET /repos/{o}/{r}/collaborators/{u}/permission`.

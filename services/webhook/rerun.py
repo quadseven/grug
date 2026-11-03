@@ -178,6 +178,18 @@ _SELF_COMPLETING_SKIP_REASONS = frozenset({
 })
 
 
+_SQS_DEDUP_ID_MAX_LEN = 128
+
+
+def _bounded_dedup_id(plain: str) -> str:
+    """`plain` as the FIFO dedup id while it fits SQS's 128-char limit;
+    past it (a long owner/repo name) a digest of the same content, so the
+    send never fails validation and equal content still collapses."""
+    if len(plain) <= _SQS_DEDUP_ID_MAX_LEN:
+        return plain
+    return "rerun:" + hashlib.sha256(plain.encode("utf-8")).hexdigest()
+
+
 def _review_dedup_id(
     install_id: int, repo: str, pr_number: int, requested_snapshot_id: str,
 ) -> str:
@@ -259,6 +271,8 @@ def enqueue_rerun(
     elif dedup_key:
         material = f"{dedup_id}\x1fkey{dedup_key}"
         dedup_id = "rerun:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+    else:
+        dedup_id = _bounded_dedup_id(dedup_id)
     _sqs.send_message(
         QueueUrl=_RERUN_QUEUE_URL,
         MessageBody=json.dumps(job),
@@ -631,7 +645,9 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
             "reply_to_comment_id": reply_to_comment_id,
         }),
         MessageGroupId=_ask_group_id(install_id, repo, pr_number),
-        MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:ask:{comment_id}",
+        MessageDeduplicationId=_bounded_dedup_id(
+            f"{install_id}:{repo}:{pr_number}:ask:{comment_id}",
+        ),
     )
     log.info("ask_enqueued", extra={"install_id": install_id, "repo": repo,
                                     "pr": pr_number, "comment_id": comment_id})

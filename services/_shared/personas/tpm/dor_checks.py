@@ -388,10 +388,6 @@ def _scan_checklist(
     return open_items, total
 
 
-def _scan_unchecked_items(issue_body: str) -> list[str]:
-    """The unchecked non-exempt items only (see `_scan_checklist`)."""
-    return _scan_checklist(issue_body)[0]
-
 
 def _met_by_siblings(
     number: int, open_items: list[str], issue_body: str,

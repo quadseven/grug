@@ -167,6 +167,13 @@ def bench(tmp_path, monkeypatch):
 
 _OPENGREP_EMPTY = json.dumps({"results": [], "errors": [], "paths": {"scanned": []}})
 
+# The read-only tree is enforced by file mode, which root bypasses: as uid 0
+# every file reads as writable and the "nothing to obey" claim cannot be
+# measured. CI runs unprivileged, so the claim is still held there.
+_needs_unprivileged_user = pytest.mark.skipif(
+    os.geteuid() == 0, reason="file-mode boundaries do not bind root",
+)
+
 
 def _assert_clean(bench: _Bench, runs: int) -> None:
     recorded = bench.runs()
@@ -177,6 +184,7 @@ def _assert_clean(bench: _Bench, runs: int) -> None:
     assert not bench.sentinel.exists()
 
 
+@_needs_unprivileged_user
 def test_the_security_scan_gives_a_hostile_pr_nothing_to_obey_or_steal(bench):
     bench.stand_in("opengrep", _OPENGREP_EMPTY)
     tree = _hostile_tree(bench.port, bench.sentinel)
@@ -186,6 +194,7 @@ def test_the_security_scan_gives_a_hostile_pr_nothing_to_obey_or_steal(bench):
     _assert_clean(bench, runs=1)
 
 
+@_needs_unprivileged_user
 def test_the_analyzers_give_a_hostile_pr_nothing_to_obey_or_steal(bench):
     bench.stand_in("opengrep", _OPENGREP_EMPTY)
     bench.stand_in("ruff", "[]")

@@ -163,3 +163,19 @@ def test_login_via_test_client(_oauth_mod):
         c.startswith("grug_oauth_state=")
         for c in r.headers.get_list("set-cookie")
     )
+
+
+def test_callback_non_json_token_response_is_502_not_500(_oauth_mod, monkeypatch):
+    """A 200 from the token endpoint that is not JSON (an interstitial or
+    gateway page) is an upstream failure; `.json()` used to raise out of
+    the handler as a 500 with no log line."""
+    from unittest.mock import MagicMock
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(_oauth_mod, "_verify_state", lambda s: True)
+    fake = MagicMock()
+    fake.raise_for_status = MagicMock()
+    fake.json = MagicMock(side_effect=ValueError("not json"))
+    with patch("httpx.post", return_value=fake), pytest.raises(HTTPException) as e:
+        _oauth_mod.callback(code="c", state="s", grug_oauth_state="s")
+    assert e.value.status_code == 502
