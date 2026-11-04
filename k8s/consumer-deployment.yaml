@@ -283,6 +283,10 @@ spec:
             - {name: GRUG_SUBSCRIPTION_MODEL, value: subscription-lane}
             - {name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "3000"}
             - {name: GRUG_SUBSCRIPTION_TOKEN_SSM, value: /grug/subscription-lane-token}
+            # grug#1569: a second, code-only security pass on PRs that touch sensitive
+            # paths. It reviews without author text and runs on the same subscription
+            # lane and cap as the normal review, so it costs quota, not money.
+            - {name: GRUG_QUARANTINED_SECURITY_PASS, value: "1"}
             # infra#2451/#2454 precedent: the second GPU host's vLLM resident is not a
             # fixed identity (infra#2452 swapped poolside/Laguna-S-2.1-NVFP4 ->
             # Qwen/Qwen3.8-27B-FP8 same-day). spark_gateway.py's `spark:warm-any`
