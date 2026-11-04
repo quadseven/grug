@@ -93,12 +93,13 @@ def _finding() -> httpx.Response:
     })
 
 
-def _review(http: _Http, reserve: object, pr_context: dict | None = None):
+def _review(
+    http: _Http, reserve: object, pr_context: dict | None = None,
+    body: str = "@@ -1 +1 @@\n-foo\n+bar",
+):
     with patch.object(httpx, "post", side_effect=http), patch(_RESERVE, side_effect=reserve):
         return review_diff(
-            assemble_evidence(
-                [Hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar")], pr_context=pr_context,
-            ),
+            assemble_evidence([Hunk(path="src/x.py", body=body)], pr_context=pr_context),
             installation_id=1,
         )
 
@@ -204,7 +205,9 @@ def test_a_free_go_empty_answer_cannot_agree_with_the_paid_model() -> None:
             "choices": [{"message": {"content": '{"findings": []}', "role": "assistant"}}],
             "usage": {"prompt_tokens": 15_000, "completion_tokens": 7},
         })
-    out = _review(_Http({_PAID: empty(), _FREE_GO: empty()}), _Counter())
+    # A diff past the small-diff bound, where an empty answer is a skim (grug#1642).
+    large = "@@ -1 +1 @@\n+" + "y" * lc._DEGENERATE_MIN_DIFF_CHARS
+    out = _review(_Http({_PAID: empty(), _FREE_GO: empty()}), _Counter(), body=large)
     assert (out.error or "").startswith(lc._LOW_CONFIDENCE_PREFIX)
 
 

@@ -5305,10 +5305,11 @@ def _review_reasoner_diff_once(
     )
     pr_tags = _llmobs_tags(pr_context)
     arm = deep_shadow.resolve_deep_arm()
-    response = _deep_response(
-        hunks, messages, variant, pr_tags, installation_id, pr_context,
-        cancel_event, arm,
-    )
+    with _reviewed_diff_scope(hunks):
+        response = _deep_response(
+            hunks, messages, variant, pr_tags, installation_id, pr_context,
+            cancel_event, arm,
+        )
     cancelled = cancel_event is not None and cancel_event.is_set()
     if arm is not None and arm.mode == "shadow" and not cancelled:
         deep_shadow.submit(
@@ -6048,6 +6049,19 @@ class _ArmOutcome:
 # calls in 3 hours on 2026-09-26, each published as a clean pass).
 _DEGENERATE_MAX_OUTPUT_TOKENS = 50
 _DEGENERATE_MIN_INPUT_TOKENS = 2_000
+# grug#1642: input tokens count the whole prompt, and the fixed review context
+# alone is about 20,000 tokens, so every short empty answer cleared the 2,000
+# bar however small the diff. The bar was meant for the diff: 2,000 tokens at
+# about 4 characters per token is 8,000 characters. A diff under that is small
+# enough that an empty answer is a real clean review.
+_DEGENERATE_MIN_DIFF_CHARS = _DEGENERATE_MIN_INPUT_TOKENS * 4
+# The character count of the diff the current review call is reviewing (the
+# sum of its hunk bodies, as `ReviewCohort.diff_chars` counts it). Set by each
+# review entry through `_reviewed_diff_scope`; None outside one, where the
+# rule falls back to prompt tokens alone.
+_REVIEWED_DIFF_CHARS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "grug_reviewed_diff_chars", default=None,
+)
 
 # grug#1097: the `error` prefix of a review whose only answer was a short empty
 # one. Some of those are real clean reviews, so when every later tier also
@@ -6061,9 +6075,14 @@ _LOW_CONFIDENCE_PREFIX = "low confidence: "
 def _is_degenerate_empty_review(
     findings: Sequence["Finding"], usage: dict[str, int | float],
 ) -> bool:
-    """No findings, under 50 output tokens, over 2k input tokens. Missing
-    usage counts is not evidence either way, so it never flags."""
+    """No findings, under 50 output tokens, over 2k input tokens, on a diff
+    of at least `_DEGENERATE_MIN_DIFF_CHARS` (grug#1642). Missing usage
+    counts is not evidence either way, so it never flags. An unknown diff
+    size keeps the token rule alone."""
     if findings:
+        return False
+    diff_chars = _REVIEWED_DIFF_CHARS.get()
+    if diff_chars is not None and diff_chars < _DEGENERATE_MIN_DIFF_CHARS:
         return False
     output_tokens = usage.get("output_tokens")
     input_tokens = usage.get("input_tokens")
@@ -6073,6 +6092,17 @@ def _is_degenerate_empty_review(
         output_tokens < _DEGENERATE_MAX_OUTPUT_TOKENS
         and input_tokens > _DEGENERATE_MIN_INPUT_TOKENS
     )
+
+
+@contextlib.contextmanager
+def _reviewed_diff_scope(hunks: Sequence[Hunk]) -> Iterator[None]:
+    """Name the diff every review call inside this block reviews, for
+    `_is_degenerate_empty_review`."""
+    token = _REVIEWED_DIFF_CHARS.set(sum(len(hunk.body) for hunk in hunks))
+    try:
+        yield
+    finally:
+        _REVIEWED_DIFF_CHARS.reset(token)
 
 
 def _record_degenerate_review(backend: "Backend", model: str, usage: dict) -> None:
@@ -7299,9 +7329,10 @@ def _review_diff_dispatch(
         calls_token = _WALK_GATEWAY_CALLS.set([])
         lane_token = _LANE_ASKED.set(False)
         try:
-            return _walk_review_ladder(
-                evidence, installation_id, voice, cancel_event, review_map,
-            )
+            with _reviewed_diff_scope(evidence.hunks):
+                return _walk_review_ladder(
+                    evidence, installation_id, voice, cancel_event, review_map,
+                )
         finally:
             _LANE_ASKED.reset(lane_token)
             _WALK_GATEWAY_CALLS.reset(calls_token)
@@ -7716,10 +7747,11 @@ def review_second_lineage(
     messages = _build_messages(evidence, "v2")
     token = _FAMILY_GATE.set((avoid, False)) if avoid else None
     try:
-        response = _run_subscription_fallback(
-            messages, "v2", _llmobs_tags(pr_context), list(evidence.hunks),
-            pr_context, installation_id,
-        )
+        with _reviewed_diff_scope(evidence.hunks):
+            response = _run_subscription_fallback(
+                messages, "v2", _llmobs_tags(pr_context), list(evidence.hunks),
+                pr_context, installation_id,
+            )
     finally:
         if token is not None:
             _FAMILY_GATE.reset(token)

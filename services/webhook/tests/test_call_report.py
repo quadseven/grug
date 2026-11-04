@@ -67,6 +67,11 @@ def _hunk() -> Hunk:
     return Hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar")
 
 
+def _large_hunk() -> Hunk:
+    """Past `_DEGENERATE_MIN_DIFF_CHARS`: a short empty answer is a skim."""
+    return Hunk(path="src/x.py", body="@@ -1 +1 @@\n+" + "y" * lc._DEGENERATE_MIN_DIFF_CHARS)
+
+
 def test_outcomes_match_the_ledger() -> None:
     assert call_report.outcome_for(None, 200, False) == ("ok", None)
     assert call_report.outcome_for(None, 200, True) == ("error", "degenerate_empty")
@@ -122,11 +127,24 @@ def test_a_lazy_empty_answer_is_reported_as_an_error(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", _FREE)
     responses = [_ok('{"findings": []}', completion_tokens=7), _ok(_FINDING)]
     with patch.object(httpx, "post", side_effect=responses):
-        review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
     rows = list(call_report._queue)
     assert [(r["target"], r["outcome"], r.get("reason")) for r in rows] == [
         ("openrouter", "error", "degenerate_empty"),
     ]
+
+
+def test_a_short_empty_answer_on_a_small_diff_is_reported_ok(monkeypatch) -> None:
+    """grug#1642: on a diff this small an empty answer is a real review."""
+    monkeypatch.setenv("GRUG_CALL_REPORT", "true")
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_DISABLED_BACKENDS", "opencode-go,openrouter:paid,poolside")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", _FREE)
+    responses = [_ok('{"findings": []}', completion_tokens=7), _ok(_FINDING)]
+    with patch.object(httpx, "post", side_effect=responses):
+        review_diff(assemble_evidence([_hunk()]), installation_id=1)
+    rows = list(call_report._queue)
+    assert [(r["target"], r["outcome"]) for r in rows[:1]] == [("openrouter", "ok")]
 
 
 def test_flush_posts_batches_and_drops_a_failed_one(monkeypatch) -> None:

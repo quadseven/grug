@@ -73,6 +73,11 @@ def _hunk() -> Hunk:
     return Hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar")
 
 
+def _large_hunk() -> Hunk:
+    """Past `_DEGENERATE_MIN_DIFF_CHARS`: a short empty answer is a skim (grug#1642)."""
+    return Hunk(path="src/x.py", body="@@ -1 +1 @@\n+" + "y" * lc._DEGENERATE_MIN_DIFF_CHARS)
+
+
 class _Recorder:
     """Stands in for `httpx.post`: records every URL, answers per host."""
 
@@ -247,7 +252,7 @@ def test_free_tier_empties_never_pass_a_pr_the_sparks_review_it(monkeypatch) -> 
         _CAVE_URL: _finding_response(),
     })
     with patch.object(httpx, "post", side_effect=fake):
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
     assert len(out.findings) == 1
