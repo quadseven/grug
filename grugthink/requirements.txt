@@ -1,6 +1,8 @@
 # Core dependencies (most stable, cache-friendly)
 requests>=2.31.0
-numpy>=1.24,<2
+# numpy: upper bound dropped (<2) because 3.13 has no cp313 wheel below 2.1;
+# consumers in this file (faiss-cpu, psycopg[binary], pgvector) are checked.
+numpy>=1.24
 setuptools>=78.1.1
 python-dotenv>=1.0.0
 pyyaml>=6.0.1
@@ -12,7 +14,9 @@ discord.py>=2.3.0
 # sentence-transformers + torch are dropped. When GRUGTHINK_DATABASE_URL is set,
 # memory lives in Postgres+pgvector instead (see docs/pgvector-memory.md) and
 # faiss is unused; it is kept for the no-database (dev/test) fallback backend.
-faiss-cpu==1.8.0
+# faiss-cpu>=1.9.0.post1 is the first release with a cp313 wheel (1.8.0 has
+# none), so this floor is what lets the check job run on Python 3.13.
+faiss-cpu>=1.9.0.post1
 
 # Postgres + pgvector backend for long-term memory. Reuses the CloudNativePG
 # cluster grug already runs; one row per fact holds text + a vector(768), so
