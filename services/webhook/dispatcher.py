@@ -1303,7 +1303,8 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             else:
                 has_write = _actor_has_write(
                     int(installation_id), owner, repo_name, sender_login,
-                    allow_author=True, pr_author_login=pr_author_login,
+                    allow_author=(cmd.verb != "learnings"),
+                    pr_author_login=pr_author_login,
                 )
     except httpx.RequestError as e:
         if accepting:
@@ -1331,7 +1332,16 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 verb=cmd.verb,
             )
         return {"status": "skip", "reason": "perm_lookup_failed"}
-    if not has_write:
+    learning_list = cmd.verb == "learnings" and cmd.arg.strip().lower() == "list"
+    if not has_write and cmd.verb == "learnings" and not learning_list:
+        from interactive import _reply  # type: ignore
+        _reply(
+            lambda fn: with_install_token_retry(int(installation_id), fn),
+            owner, repo_name, int(pr_number),
+            "Grug refused `/grug learnings` mutation: write access to this repo is required.",
+        )
+        return {"status": "no_op", "reason": "learnings mutation requires write access"}
+    if not has_write and not learning_list:
         if accepting:
             _refuse_accept(
                 "not_admin", installation_id=int(installation_id), owner=owner,
@@ -1447,6 +1457,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             comment_id=int(comment_id) if comment_id is not None else 0,
             token_fn=lambda fn: with_install_token_retry(int(installation_id), fn),
             head_sha=head_sha, actor=sender_login if accepting else "",
+            reveal_learning_authors=bool(has_write),
         )
 
     # Final guard (FLINT on #575): main.py forwards dispatch()

@@ -38,7 +38,7 @@ meet an operating-system boundary.
 | Ruff policy, `.semgrepignore` | Which findings survive | Base commit, default branch head since #1578 for other targets | Base only |
 | Guideline files (`CLAUDE.md`, `AGENTS.md` and the like) | System prompt | Base commit since #1574, default branch head since #1578 for other targets | Base only |
 | `CONTEXT.md`, `docs/adr/` | Review context, as the repo's source of truth | Base commit since #1574, default branch head since #1578 for other targets | Base only |
-| Reply-mined learnings | System prompt | Stored, write access required | Gated by the author's access |
+| Reply-mined learnings | System prompt | Stored, write access required | Gated by the author's access; learnings mutations require repository write access, and list hides teacher logins below write access |
 | `/grug` commands | Reruns, `/grug fix`, removal acceptance | Comment | Gated by the commenter's access |
 | Diff, changed files, PR title and body, linked issues | Prompt, labeled as untrusted data | Head | Data, and #1569 quarantines metadata on sensitive paths |
 | CI check-run names | Prompt, labeled as data | Head | Data |

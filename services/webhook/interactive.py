@@ -544,6 +544,7 @@ def run_command(
     pr_number: int, comment_id: int, token_fn, enqueue=None, enqueue_ask=None,
     claim=None, resume=None, is_paused=None, head_sha: str = "",
     defer_until: float = 0.0, actor: str = "",
+    reveal_learning_authors: bool = True,
 ) -> dict[str, str]:
     """Execute a gated command. All heavy work is ASYNC via the rerun lane -
     the webhook only enqueues (fast) so the delivery ACK never blocks on an
@@ -646,11 +647,14 @@ def run_command(
                 digest = _learning_digest(text)
                 scope = str(row.get("scope_path", "")).strip()
                 scope_txt = f", scoped to `{_escape_html(scope)}`" if scope else ""
-                lines.append(
-                    f"- `{digest}`: {_escape_html(text)}{scope_txt} | "
-                    f"taught by `{_escape_html(str(row.get('author', '')))}` on PR #{row.get('source_pr', 0)} | "
+                line = f"- `{digest}`: {_escape_html(text)}{scope_txt} | "
+                if reveal_learning_authors:
+                    line += f"taught by `{_escape_html(str(row.get('author', '')))}` | "
+                line += (
+                    f"on PR #{row.get('source_pr', 0)} | "
                     f"used {int(row.get('usage_count', 0) or 0)}"
                 )
+                lines.append(line)
             if not rows:
                 lines.append("(none)")
             lines.append("")
