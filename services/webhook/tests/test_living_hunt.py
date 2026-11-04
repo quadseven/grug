@@ -720,3 +720,114 @@ def test_a_delta_review_still_reports_a_criterion_no_commit_meets(monkeypatch):
     calls = _lane_work_on_delta(monkeypatch, delta=delta, full=full)
     assert len(calls) == 1
     assert ("intent-mismatch", "high") in calls[0][1]
+
+
+# --- #1644: an empty delta reviews the whole PR on the current head ----------
+
+_ONE_HUNK = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n"
+
+
+def _review_after_push(monkeypatch, *, delta: str, full: str) -> dict:
+    """Run a synchronize review with a stored last Elder head and return what
+    the model saw, which diffs were fetched, and every published check."""
+    from github_checks_client import CheckRunResult
+    from llm_client import Backend, LlmReviewResponse
+
+    llm = LlmReviewResponse(
+        kind="reviewed", findings=(), backend_used=Backend.CAVE, model_name="coder",
+    )
+    seen: dict = {"scoped": [], "full": [], "reviewed": [], "checks": []}
+
+    def _scoped(*_a, **k):
+        seen["scoped"].append(k)
+        return (delta, True, False)
+
+    def _full(*_a, **k):
+        seen["full"].append((k.get("base_sha"), k.get("head_sha")))
+        return full
+
+    def _review(evidence, *_a, **_k):
+        # As the real review_diff does: no hunks, no model call.
+        if not evidence.hunks:
+            return LlmReviewResponse(kind="no_diff")
+        seen["reviewed"].append({h.path for h in evidence.hunks})
+        return llm
+
+    def _check(*a, **k):
+        result = k.get("result") or next(x for x in a if isinstance(x, CheckRunResult))
+        seen["checks"].append(result)
+        return {"id": 1}
+
+    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda _i, fn: fn("t"))
+    monkeypatch.setattr(review_publish, "with_install_token_retry", lambda _i, fn: fn("t"))
+    monkeypatch.setattr(cr_dispatch, "review_diff", _review)
+    monkeypatch.setattr(cr_dispatch, "post_check_run", _check)
+    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 2})
+    monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
+    monkeypatch.setattr(cr_dispatch, "fetch_pr_diff_with_scope", _scoped)
+    monkeypatch.setattr(cr_dispatch, "fetch_pr_diff", _full)
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_current_review_snapshot",
+        lambda *a, **k: ("base5678ijkl", "abcd1234efgh", "t", "b"),
+    )
+    with patch(
+        "adapters.install_store.get_elder_last_reviewed", return_value="prior0001head",
+    ), patch("adapters.install_store.put_elder_last_reviewed", lambda **k: None):
+        seen["out"] = cr_dispatch.dispatch_code_review(
+            {
+                "action": "synchronize",
+                "installation": {"id": 11},
+                "repository": {"id": 22, "name": "myrepo", "owner": {"login": "myorg"}},
+                "pull_request": {
+                    "number": 7,
+                    "head": {"sha": "abcd1234efgh"},
+                    "base": {"sha": "base5678ijkl"},
+                    "title": "t",
+                    "body": "b",
+                    "user": {"login": "alice"},
+                },
+            },
+            blocking=True,
+        )
+    return seen
+
+
+def test_an_empty_commit_since_the_last_elder_head_reviews_the_full_pr(monkeypatch):
+    """grug#1644 criteria 1 and 4: the only change since the last completed
+    Elder head is an empty commit, so the delta has no hunks. Elder reviews
+    the whole PR diff on the current head, as `/grug improve` would, and
+    says why in the summary, instead of publishing neutral no_diff."""
+    seen = _review_after_push(monkeypatch, delta="", full=_ONE_HUNK)
+
+    assert seen["reviewed"] == [{"x.py"}]
+    assert ("base5678ijkl", "abcd1234efgh") in seen["full"]
+    final = seen["checks"][-1]
+    assert final.conclusion == "success"
+    assert "no_diff" not in final.title
+    assert not final.title.startswith("Living Hunt")
+    assert (
+        "no file changed in `prior000..abcd1234` since the last completed "
+        "Elder pass, so Elder reviewed the full PR diff on this head"
+    ) in final.summary
+
+
+def test_an_empty_pr_diff_still_concludes_no_diff(monkeypatch):
+    """grug#1644 criterion 2: when the whole PR diff is empty too, the
+    review still concludes no_diff, as today."""
+    seen = _review_after_push(monkeypatch, delta="", full="")
+
+    assert seen["reviewed"] == []
+    final = seen["checks"][-1]
+    assert final.conclusion == "neutral"
+    assert "no_diff" in final.title
+
+
+def test_a_non_empty_delta_still_reviews_only_the_delta(monkeypatch):
+    """grug#1644 criterion 3: a delta with hunks is reviewed alone, as today."""
+    full = _ONE_HUNK + _added("earlier.py", ["a = 1"])
+    seen = _review_after_push(monkeypatch, delta=_ONE_HUNK, full=full)
+
+    assert seen["reviewed"] == [{"x.py"}]
+    final = seen["checks"][-1]
+    assert final.title.startswith("Living Hunt prior000..abcd1234")
+    assert "reviewed the full PR diff on this head" not in final.summary

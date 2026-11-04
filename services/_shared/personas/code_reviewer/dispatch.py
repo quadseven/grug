@@ -1457,7 +1457,10 @@ def _hunt_title(title: str, living_range: str) -> str:
     return f"Living Hunt {living_range} - {title}" if living_range else title
 
 
-def _hunt_section(living_range: str, living_baseline_rejected: str = "") -> str:
+def _hunt_section(
+    living_range: str, living_baseline_rejected: str = "",
+    living_delta_empty: str = "",
+) -> str:
     hunt = (
         (
             "\n\nLiving Hunt: reviewing `"
@@ -1478,6 +1481,14 @@ def _hunt_section(living_range: str, living_baseline_rejected: str = "") -> str:
             "merge commit (history was rewritten or merged into) - Elder reviewed the full PR diff instead of the "
             "delta since the last pass."
         )
+    if living_delta_empty:
+        # grug#1644: an empty delta reviewed as the whole PR, not no_diff.
+        hunt += (
+            "\n\nLiving Hunt: no file changed in `"
+            + living_delta_empty
+            + "` since the last completed Elder pass, so Elder reviewed the "
+            "full PR diff on this head instead of an empty delta."
+        )
     return hunt
 
 
@@ -1491,6 +1502,7 @@ def _summary_markdown(
     move_paths: tuple[tuple[str, str], ...] = (),
     living_range: str = "",
     living_baseline_rejected: str = "",
+    living_delta_empty: str = "",
     review_phase: Literal["tier1", "deep", "dual"] = "dual",
     defensive_dropped_count: int = 0,
     blocking: bool = False,
@@ -1509,6 +1521,8 @@ def _summary_markdown(
     that turned out not to be an ancestor of head (rewritten history) -
     the delta was rejected and the full PR diff reviewed instead. Surfaced
     as a summary note so the fallback is visible, not silent.
+    `living_delta_empty` (#1644) when set is a delta range that held no
+    change, so the full PR diff was reviewed instead of publishing no_diff.
     `review_phase` (#646): tier1 = coder-only legend; deep = append legend;
     dual = both arms before publish (deep depth / rollback).
     `blocking` (grug#1212) is the repo's Elder mode. It only changes what a
@@ -1524,7 +1538,9 @@ def _summary_markdown(
         getattr(evaluation, "tier_served", None),
         getattr(evaluation, "models_used", ()),
     ) + _family_note(getattr(evaluation, "families", None))
-    hunt = _hunt_section(living_range, living_baseline_rejected)
+    hunt = _hunt_section(
+        living_range, living_baseline_rejected, living_delta_empty,
+    )
 
     if is_partial_coverage(evaluation.degraded_reason):
         # Reached the PR again only after grug#806: this branch existed but
@@ -3756,6 +3772,9 @@ def dispatch_code_review(
     # of head (rewritten history) - the delta was rejected and the full PR
     # diff reviewed instead. Reported in the check-run summary, not silent.
     living_baseline_rejected = ""
+    # grug#1644: set to the delta range when that delta held no change and
+    # the full PR diff was reviewed instead. Named in the check summary.
+    living_delta_empty = ""
     try:
         from adapters.install_store import get_elder_last_reviewed
 
@@ -3871,6 +3890,30 @@ def dispatch_code_review(
                 living_baseline_rejected = living_prior_sha[:8]
             living_prior_sha = ""
             living_range = ""
+        if (
+            living_prior_sha
+            and not parse_diff(diff_text)
+            and not removed_paths(diff_text)
+        ):
+            # grug#1644: nothing changed since the last completed Elder head
+            # (an empty commit). The delta would publish neutral no_diff,
+            # which never clears a blocking gate, so review the full PR diff
+            # on this head: the same review `/grug improve` runs. A
+            # deletion-only delta keeps its own path (#1401).
+            living_delta_empty = living_range
+            living_prior_sha = ""
+            living_range = ""
+            diff_text = with_install_token_retry(
+                installation_id,
+                lambda token: fetch_pr_diff(
+                    token,
+                    owner,
+                    repo_name,
+                    pull_number,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                ),
+            )
         pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
         # The lane-work checks (#1179, #1363) judge the WHOLE diff, so they
@@ -4527,6 +4570,7 @@ def dispatch_code_review(
         move_paths=move_paths,
         living_range=living_range,
         living_baseline_rejected=living_baseline_rejected,
+        living_delta_empty=living_delta_empty,
         review_phase=tier1_phase,
         defensive_dropped_count=defensive_dropped_count,
         blocking=blocking,
@@ -4886,6 +4930,7 @@ def dispatch_code_review(
             voice=voice,
             living_range=living_range,
             living_baseline_rejected=living_baseline_rejected,
+            living_delta_empty=living_delta_empty,
             evaluation=evaluation,
             prior_keys=prior_keys,
             check_publish_failed=check_publish_failed,
@@ -6269,6 +6314,7 @@ def _async_deep_append_if_needed(
     living_range: str,
     living_baseline_rejected: str,
     evaluation: CodeReviewEvaluation,
+    living_delta_empty: str = "",
     prior_keys: frozenset[str],
     check_publish_failed: bool,
     cancel_event: threading.Event | None,
@@ -6423,6 +6469,7 @@ def _async_deep_append_if_needed(
         suppressed_count=deep_suppressed_count,
         living_range=living_range,
         living_baseline_rejected=living_baseline_rejected,
+        living_delta_empty=living_delta_empty,
         review_phase="deep",
         blocking=blocking,
         muted=_muted_classes_for(f"{owner}/{repo_name}", repo_config),
