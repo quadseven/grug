@@ -89,6 +89,15 @@ spec:
             matchLabels: {app: spark-gateway}  # the Service's own selector
       ports:
         - {protocol: TCP, port: 8080}
+    # Elder's subscription lane (#1276, #1546): the in-cluster forwarder to the
+    # operator's plans. Scoped the same way as the spark-gateway rule above.
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: subscription-lane}
+          podSelector:
+            matchLabels: {app: forward}
+      ports:
+        - {protocol: TCP, port: 8080}
     # Node-local Datadog agent: DogStatsD (UDP 8125) + APM trace intake
     # (TCP 8126). Restricting these would silently kill observability.
     - ports:

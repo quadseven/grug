@@ -226,7 +226,7 @@ def create_bot_env(config_manager, template_id: str, discord_token: str, **overr
             "env_keys": sorted(env.keys()),
             "OLLAMA_URLS": env.get("OLLAMA_URLS"),
             "OLLAMA_MODELS": env.get("OLLAMA_MODELS"),
-            "overrides": overrides,
+            "override_keys": sorted(overrides.keys()),
         },
     )
 

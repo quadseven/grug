@@ -17,7 +17,7 @@
 
 .PHONY: test webhook-test api-test pg-test pulumi-preview pulumi-up \
         tear-down rebuild smoke docker-build-webhook sast-benchmark \
-        review-latency elder-eval scripts-test chief-check
+        review-latency elder-eval elder-eval-column scripts-test chief-check
 
 # Admin seed values — the row (re)installed after a tear-down so the
 # allowlist gate works on the first PR after rebuild. NO DEFAULTS on
@@ -147,7 +147,8 @@ smoke:
 docker-build-webhook:
 	docker buildx build --platform linux/arm64 \
 		--tag grug-webhook:local \
-		-f services/webhook/Dockerfile services
+		--build-arg SERVICE=webhook \
+		-f services/Dockerfile services
 
 # SAST benchmark / eval harness (#399, ADR-0006). Measures Elder's vuln
 # recall+precision per backend over the committed corpus. Makes REAL backend
@@ -185,3 +186,13 @@ elder-eval:
 	cd services/webhook && PYTHONPATH=../_shared uv run --with httpx --with pyjwt --with cryptography \
 		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
 		--with 'datadog-lambda>=6.107,<7' python -m elder_eval $(ARGS)
+
+# Elder integer-column/datetime fixture (#1493). Replays the synthetic
+# reviewed head through Elder's shipped prompt on demand; the pure core is
+# covered by `make webhook-test` (no LLM). Makes REAL backend calls - set
+# GRUG_BENCH_{OPENROUTER,POOLSIDE}_KEY and/or GRUG_BENCH_CAVE_URL+MODEL.
+#   make elder-eval-column
+elder-eval-column:
+	cd services/webhook && PYTHONPATH=../_shared uv run --with httpx --with pyjwt --with cryptography \
+		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
+		--with 'datadog-lambda>=6.107,<7' python -m elder_eval.column_type_mismatch $(ARGS)

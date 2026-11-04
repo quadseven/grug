@@ -8,6 +8,10 @@ prompt - so a prompt change FAILS CI until `python -m elder_eval --record`
 is re-run and the refreshed baseline lands in the same PR. Deterministic,
 no LLM in CI; the honest cost is that recording needs a configured bench
 backend (see `sast_benchmark.backends`).
+
+grug#1511: each backend entry also records `measured_prompt_sha`, the sha its
+scores were measured at, written only by `--record`. The top-level sha alone
+can be bumped by hand, so the suite also runs `measured_sha_failures`.
 """
 
 from __future__ import annotations
@@ -60,6 +64,24 @@ def merge_baseline(existing: dict, fresh: dict) -> tuple[dict, list[str]]:
         return merged, []
     dropped = sorted(set(existing.get("backends", {})) - set(fresh["backends"]))
     return dict(fresh), dropped
+
+
+def measured_sha_failures(baseline: dict) -> list[str]:
+    """One message per backend whose scores do not belong to the top-level
+    `prompt_sha`; empty means every entry does.
+
+    `carried_prompt_sha` names the one top-level sha an entry was accepted at
+    with older scores (the grug#1511 migration, which had no way to re-measure).
+    It is not a standing exemption: the next prompt change fails here, and
+    `--record` rebuilds the entry without it."""
+    prompt_sha = baseline["prompt_sha"]
+    return [
+        f"baseline entry {name!r} was measured at "
+        f"{entry.get('measured_prompt_sha') or 'an unknown prompt'}, not {prompt_sha} - "
+        f"re-record it with `python -m elder_eval --backend {name} --record`"
+        for name, entry in baseline.get("backends", {}).items()
+        if prompt_sha not in (entry.get("measured_prompt_sha"), entry.get("carried_prompt_sha"))
+    ]
 
 
 def deep_cutover_regressions(baseline: dict, model: str) -> list[str]:

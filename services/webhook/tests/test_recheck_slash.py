@@ -26,6 +26,7 @@ import pytest
 import yaml
 
 import dispatcher as d
+from grug_commands import parse_command
 import personas.tpm.persona as tpm_persona
 
 _K8S = Path(__file__).resolve().parents[3] / "k8s"
@@ -64,16 +65,21 @@ def _no_install_lookups(monkeypatch):
     monkeypatch.setattr(d, "is_persona_enabled", lambda *_: True)
 
 
+def _is_recheck(body: str) -> bool:
+    cmd = parse_command(body)
+    return cmd is not None and cmd.verb == "recheck"
+
+
 def test_recheck_pattern_matches_case_insensitive():
-    assert d._RECHECK_PAT.search("/grug recheck")
-    assert d._RECHECK_PAT.search("/Grug Recheck")
-    assert d._RECHECK_PAT.search("  /grug   recheck please  ")
+    assert _is_recheck("/grug recheck")
+    assert _is_recheck("/Grug Recheck")
+    assert _is_recheck("  /grug   recheck please  ")
 
 
 def test_recheck_pattern_rejects_other_commands():
-    assert not d._RECHECK_PAT.search("/grug status")
-    assert not d._RECHECK_PAT.search("grug recheck")  # missing /
-    assert not d._RECHECK_PAT.search("nope")
+    assert not _is_recheck("/grug status")
+    assert not _is_recheck("grug recheck")  # missing /
+    assert not _is_recheck("nope")
 
 
 def test_no_trigger_text_no_ops(_no_install_lookups):
@@ -122,6 +128,42 @@ def test_pr_author_authorized_path_dispatches(_no_install_lookups):
     pub_kwargs = _pub_mock.call_args.kwargs
     assert pub_kwargs["head_sha"] == "abc123"
     assert pub_kwargs["pr_number"] == 42
+
+
+def test_author_only_cannot_delete_learnings(_no_install_lookups, monkeypatch):
+    payload = _comment_payload(body="/grug learnings delete abc123")
+    payload["comment"]["id"] = 91
+    monkeypatch.setattr(d, "_actor_permission", lambda *_: "read")
+    deleted = []
+    monkeypatch.setattr("interactive._wake_learnings_delete", lambda repo, digest: deleted.append(digest))
+    replies = []
+    monkeypatch.setattr("interactive._reply", lambda token_fn, owner, repo, number, body: replies.append(body))
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get") as get_mock:
+        get_mock.return_value.raise_for_status = lambda: None
+        get_mock.return_value.json.return_value = {"head": {"sha": "abc123"}, "body": ""}
+        out = d.dispatch("issue_comment", payload)
+    assert out["status"] == "no_op"
+    assert "write access" in replies[0]
+    assert deleted == []
+
+
+def test_author_only_learnings_list_hides_author_login(_no_install_lookups, monkeypatch):
+    payload = _comment_payload(body="/grug learnings list")
+    payload["comment"]["id"] = 92
+    monkeypatch.setattr(d, "_actor_permission", lambda *_: "read")
+    monkeypatch.setattr("interactive._wake_learnings_list", lambda _repo: [
+        {"text": "keep tests", "author": "teacher-login", "source_pr": 3, "usage_count": 0},
+    ])
+    replies = []
+    monkeypatch.setattr("interactive._post_reply", lambda token, owner, repo, number, body: replies.append(body))
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get") as get_mock:
+        get_mock.return_value.raise_for_status = lambda: None
+        get_mock.return_value.json.return_value = {"head": {"sha": "abc123"}, "body": ""}
+        out = d.dispatch("issue_comment", payload)
+    assert out["status"] == "dispatched"
+    assert "teacher-login" not in replies[0]
 
 
 def test_non_author_with_write_perm_authorized(_no_install_lookups):
@@ -523,11 +565,13 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     seen = {}
     monkeypatch.setattr(fetchers, "build_issue_fetcher", lambda **kw: "F")
     monkeypatch.setattr(fetchers, "build_issue_facts_fetcher", lambda **kw: "FF")
+    monkeypatch.setattr(fetchers, "build_merged_siblings_fetcher", lambda **kw: "S")
 
     def _eval(body, fetch_issue=None, fetch_issue_facts=None, author_trusted=False,
-              fetch_changed_files=None, advisory_checks=None):
+              fetch_changed_files=None, advisory_checks=None, fetch_siblings=None):
         seen["eval"] = (body, fetch_issue, fetch_issue_facts, fetch_changed_files,
                         advisory_checks)
+        seen["siblings"] = fetch_siblings
         seen["trusted"] = author_trusted
         return "EVAL"
 
@@ -542,7 +586,7 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     )
     assert evaluation == "EVAL" and result_map["result"] == "pass"
     body, fi, ff, fcf, ac = seen["eval"]
-    assert body == "B" and fi == "F" and ff == "FF"
+    assert body == "B" and fi == "F" and ff == "FF" and seen["siblings"] == "S"
     assert callable(fcf)  # the shared changed-files fetcher is wired through
     assert "in-scope" in ac  # advisory set passed through
     assert seen["trusted"] is False  # default keeps the pre-#1251 skip
@@ -560,9 +604,11 @@ class _InteractiveHttp:
 
     def __init__(self) -> None:
         self.posts: list[dict] = []
+        self.urls: list[str] = []
 
     def post(self, url: str, **kw: object):
         self.posts.append(kw.get("json") or {})
+        self.urls.append(url)
         return _Ok()
 
     def get(self, url: str, **kw: object):
@@ -809,8 +855,12 @@ def test_allowed_app_bot_queues_improve_with_no_collaborator_record(
     assert enqueued[0]["persona"] == "code_reviewer"
     assert enqueued[0]["repo"] == "myorg/myrepo"
     # Only the PR fetch is made - the collaborator lookup is short circuited.
-    assert len(http.posts) == 1
-    assert "Elder is re-reviewing this PR" in str(http.posts[0].get("body", ""))
+    # The command is an `issue_comment`, so the reaction goes to issues/comments
+    # and is the only post: no reply comment (grug#1433).
+    assert http.urls == [
+        "https://api.github.com/repos/myorg/myrepo/issues/comments/777/reactions",
+    ]
+    assert http.posts == [{"content": "eyes"}]
 
 
 def test_unknown_app_bot_is_refused_with_a_reply(
@@ -857,5 +907,8 @@ def test_deployed_allowed_app_bot_logins_is_not_empty():
     value = env.get("GRUG_ALLOWED_APP_BOT_LOGINS", "")
     assert value, "GRUG_ALLOWED_APP_BOT_LOGINS must be set on the webhook container"
     logins = {name.lower() for name in value.replace(",", " ").split()}
-    assert {"loom-brain[bot]", "loom-station[bot]", "loom-lanes[bot]"} <= logins
+    assert {"loom-brain[bot]", "loom-station[bot]", "loom-lanes[bot]",
+            "agent-anthropic-claude-code[bot]", "agent-meta-muse[bot]",
+            "agent-openai-dot[bot]", "agent-openai-codex-luna[bot]",
+            "agent-google-gemini[bot]"} <= logins
 

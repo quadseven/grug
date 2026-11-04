@@ -59,6 +59,17 @@ USAGE = (
 )
 _HEX = frozenset("0123456789abcdef")
 
+_ACCEPTANCE_REACTION_CONTENT = "eyes"
+
+
+def _post_acceptance_reaction(token_fn, owner: str, repo: str, comment_id: int) -> None:
+    """React to the acceptance command comment. The acceptance is recorded
+    and Elder queued by now, so `_react` keeps a refused reaction from
+    raising out of the command."""
+    from interactive import _react  # type: ignore
+
+    _react(token_fn, owner, repo, comment_id, _ACCEPTANCE_REACTION_CONTENT)
+
 
 def removal_path(arg: str) -> str:
     """The path the command names: the backticked text when it starts with
@@ -343,7 +354,6 @@ def run_accept_removal(
         mark_reviewing()
     except Exception as e:  # noqa: BLE001 - the sign is cosmetic; the check is the truth
         log.warning("accept_removal_label_failed", extra={**coords, "kind": type(e).__name__})
-    say(f"Grug recorded `{actor}` accepting the removal of `{path}` on "
-        f"`{head_sha[:8]}`. Elder is re-reviewing this PR. A new push needs "
-        "a new acceptance. So speaks Grug.")
+    # Post a reaction to the acceptance command comment instead of a reply comment
+    _post_acceptance_reaction(token_fn, owner, repo, comment_id)
     return {**out, "status": "dispatched", "persona": "code_reviewer"}

@@ -34,12 +34,15 @@ the bot is `grug-tribe[bot]`, and the at-sign handle belongs to someone else.
 
 | Command | What it does |
 |---|---|
-| `/grug improve` | Elder reviews the PR again and re-posts its findings. |
+| `/grug improve` | Elder reviews the PR again and re-posts its findings. The eyes reaction on the command flips to +1 once Elder posts a verdict, or -1 when the review degraded or was not run. |
 | `/grug recheck` | Chief re-runs the Hunt Plan checks. |
-| `/grug ask <question>` | Answers a question about the diff as a reply. |
+| `/grug ask <question>` | Answers a question about the diff as a reply. A placeholder reply goes up first and turns into the answer in place; the eyes reaction on the question flips to +1 (answered) or -1 (no answer). |
 | `/grug fix` | Applies every unresolved suggested fix as one commit. |
 | `/grug review` | One Elder review now, even while Elder is paused. |
 | `/grug resume` | Lifts the auto-pause (five pushes in ten minutes) and reviews what changed. |
+
+`/grug review`, `/grug resume` and `/grug test-gaps` (Smasher) also end
+with +1 on the command for a verdict, or -1 when none was posted.
 
 The full list, including `test-gaps`, `learnings` and `accept-removal`, is
 at the top of
@@ -160,6 +163,7 @@ reads it from the PR's base commit, so a PR cannot loosen its own review.
 | `ignore` | Path globs Elder never reviews |
 | `path_instructions` | Extra review instructions for files matching a path |
 | `min_inline_severity` | Findings below this level stay in the summary, with no inline comment |
+| `elder_mute_min_labeled`, `elder_mute_below_precision`, `elder_mute_locked_classes` | A finding class with enough labeled history (default 20) and a fixed-rate below the threshold (default 0.2) stops posting inline and shows on the board and summary as muted; high and critical findings and locked classes still post inline |
 | `skip_prs` | Skip Elder and Teller for PRs matching `authors`, `labels` or `title_patterns` |
 
 ```yaml

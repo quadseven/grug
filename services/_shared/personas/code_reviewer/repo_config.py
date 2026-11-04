@@ -1,6 +1,6 @@
 """Optional in-repo `.grug.yaml` review configuration.
 
-Four keys, all optional:
+Ten keys, all optional:
 
   ignore               list of path globs that are never reviewed
   path_instructions    list of {path: glob, instructions: text}; the text is
@@ -15,6 +15,20 @@ Four keys, all optional:
                        (case-insensitive); a title pattern is a glob where
                        only `*` and `?` are special, matched against the
                        whole title, case-insensitive.
+  elder_mute_min_labeled     integer, default 20; labeled ledger rows a finding
+                       class needs before it can be muted
+  elder_mute_below_precision number 0..1, default 0.2; a class with at least
+                       that many labeled rows and a lower fixed-rate is muted:
+                       no inline comment, board and summary only (a high or
+                       critical finding still posts inline)
+  elder_mute_locked_classes  list of finding classes that stay inline whatever
+                       their precision
+  elder_blocking_cap   integer, default 5; blocking markings per PR with an
+                       inline comment, 0 for no cap
+  elder_drip_feed      boolean, default true; drop new findings below critical
+                       on unchanged lines in a second or later round
+  security_review_paths  list of path globs that replaces the default
+                       sensitive-path list of the quarantined security pass
 
 The caller reads the file from the PR BASE ref (never the head), so a PR
 cannot loosen its own review. This module is pure: it takes text and returns
@@ -35,9 +49,17 @@ import yaml
 CONFIG_PATH = ".grug.yaml"
 
 _KNOWN_KEYS = frozenset(
-    {"ignore", "path_instructions", "min_inline_severity", "skip_prs"},
+    {
+        "ignore", "path_instructions", "min_inline_severity", "skip_prs",
+        "elder_mute_min_labeled", "elder_mute_below_precision",
+        "elder_mute_locked_classes", "security_review_paths",
+        "elder_blocking_cap", "elder_drip_feed",
+    },
 )
 _SKIP_PRS_KEYS = ("authors", "labels", "title_patterns")
+DEFAULT_MUTE_MIN_LABELED = 20
+DEFAULT_BLOCKING_CAP = 5
+DEFAULT_MUTE_BELOW_PRECISION = 0.2
 _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 # Bounds so one file cannot blow the prompt budget.
 _MAX_INSTRUCTIONS = 20
@@ -64,6 +86,13 @@ class RepoConfig:
     min_inline_severity: str | None = None
     problems: tuple[str, ...] = ()
     skip_prs: SkipPrs = field(default_factory=SkipPrs)
+    elder_mute_min_labeled: int = DEFAULT_MUTE_MIN_LABELED
+    elder_mute_below_precision: float = DEFAULT_MUTE_BELOW_PRECISION
+    elder_mute_locked_classes: tuple[str, ...] = ()
+    # None keeps the default list; an empty list turns the pass off here.
+    security_review_paths: tuple[str, ...] | None = None
+    elder_blocking_cap: int = DEFAULT_BLOCKING_CAP
+    elder_drip_feed: bool = True
 
 
 def _string_list(value: object, key: str, problems: list[str]) -> tuple[str, ...]:
@@ -128,6 +157,60 @@ def _skip_prs(value: object, problems: list[str]) -> SkipPrs:
     return SkipPrs(**lists)
 
 
+def _mute_settings(
+    data: dict, problems: list[str],
+) -> tuple[int, float, tuple[str, ...]]:
+    """The three `elder_mute_*` keys; a bad value keeps its default."""
+    min_labeled = DEFAULT_MUTE_MIN_LABELED
+    below = DEFAULT_MUTE_BELOW_PRECISION
+    locked: tuple[str, ...] = ()
+    if "elder_mute_min_labeled" in data:
+        raw = data["elder_mute_min_labeled"]
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
+            min_labeled = raw
+        else:
+            problems.append("`elder_mute_min_labeled` must be an integer >= 1")
+    if "elder_mute_below_precision" in data:
+        raw = data["elder_mute_below_precision"]
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and 0 <= raw <= 1:
+            below = float(raw)
+        else:
+            problems.append("`elder_mute_below_precision` must be a number from 0 to 1")
+    if "elder_mute_locked_classes" in data:
+        locked = _string_list(
+            data["elder_mute_locked_classes"], "elder_mute_locked_classes", problems,
+        )
+    return min_labeled, below, locked
+
+
+def _blocking_cap(data: dict, problems: list[str]) -> int:
+    raw = data.get("elder_blocking_cap", DEFAULT_BLOCKING_CAP)
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    problems.append("`elder_blocking_cap` must be a non-negative integer")
+    return DEFAULT_BLOCKING_CAP
+
+
+def _drip_feed(data: dict, problems: list[str]) -> bool:
+    raw = data.get("elder_drip_feed", True)
+    if isinstance(raw, bool):
+        return raw
+    problems.append("`elder_drip_feed` must be true or false")
+    return True
+
+
+def _security_paths(
+    data: dict, problems: list[str],
+) -> tuple[str, ...] | None:
+    """A malformed list keeps the default list: a typo must not end a
+    security control the way a deliberate empty list does."""
+    if "security_review_paths" not in data:
+        return None
+    before = len(problems)
+    paths = _string_list(data["security_review_paths"], "security_review_paths", problems)
+    return None if len(problems) > before else paths
+
+
 def parse_repo_config(text: str | None) -> RepoConfig:
     """Parse `.grug.yaml` text. Never raises."""
     if text is None or not text.strip():
@@ -166,7 +249,15 @@ def parse_repo_config(text: str | None) -> RepoConfig:
                 "`min_inline_severity` must be one of low, medium, high, critical"
             )
     skip = _skip_prs(data["skip_prs"], problems) if "skip_prs" in data else SkipPrs()
-    return RepoConfig(ignore, instructions, floor, tuple(problems), skip)
+    min_labeled, below, locked = _mute_settings(data, problems)
+    security_paths = _security_paths(data, problems)
+    blocking_cap = _blocking_cap(data, problems)
+    drip_feed = _drip_feed(data, problems)
+    return RepoConfig(
+        ignore, instructions, floor, tuple(problems), skip,
+        min_labeled, below, locked, security_paths,
+        blocking_cap, drip_feed,
+    )
 
 
 @lru_cache(maxsize=256)
@@ -265,8 +356,8 @@ def instructions_block(paths: Iterable[str], config: RepoConfig) -> str | None:
         "Apply each instruction only to the files it names. For those files "
         "an instruction here OUTRANKS the repo's agent-guideline files "
         "(TRIBE'S OWN CARVINGS: CLAUDE.md, AGENTS.md and the like) on "
-        "conflict - it is read from the base branch, they are read from the "
-        "PR head (#674 precedence, #1131).\n\n"
+        "conflict, because it is the narrower rule (#674 precedence, "
+        "#1131).\n\n"
         + "\n\n".join(sections)
     )
 

@@ -33,7 +33,10 @@ def _payload() -> dict:
     return {
         "action": "opened",
         "installation": {"id": 11},
-        "repository": {"id": 22, "name": "myrepo", "owner": {"login": "myorg"}},
+        "repository": {
+            "id": 22, "name": "myrepo", "owner": {"login": "myorg"},
+            "default_branch": "main",
+        },
         "pull_request": {
             "number": 7,
             "head": {"sha": _HEAD},

@@ -1,9 +1,15 @@
-"""grug#1397: Elder does not publish a finding its own text withdraws.
+"""grug#1397 and grug#1529: Elder does not publish a finding its own text
+withdraws, by ending in "No finding." or in an exact omit form.
 
 The four withdrawn texts below are the shape seen on one real 4-file review:
 each ended in "No finding." and each still became a reply-required thread.
 """
 from __future__ import annotations
+
+import logging
+import re
+
+import pytest
 
 import llm_client as lc
 from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse
@@ -135,3 +141,151 @@ def test_merge_keeps_the_live_finding_when_one_model_withdrew_it() -> None:
             (live.message, "medium"),
         ]
         assert not lc.is_withdrawn_finding(merged[0])
+
+
+# grug#1529: the two critical markings that blocked a pull request, and a dash variant.
+_OMIT_TEXTS = (
+    "Grug see nothing. No GITHUB_ENV writes here. Omit.",
+    "The reason is a code the operator chose. Omit - not a secret.",
+    "The value is a path. Omit \u2014 not a secret.",
+)
+_LIVE_OMIT_TEXTS = (
+    "The token reaches the log. It must be omitted.",
+    "The header carries the key. Omit this.",
+    "The key is committed here. Omit - not a hardcoded secret.",
+    "The token reaches the log line. Omit the token from the log.",
+    "Omit. That is what the old comment says, but the key still reaches the log.",
+    "The token reaches the log line. Omit",
+    "The value is a token. Omit - not a secret",
+)
+
+
+def test_omit_text_is_only_recognized_in_its_exact_forms() -> None:
+    for text in _OMIT_TEXTS:
+        assert lc.concludes_omit(_llm(2, text)), text
+    for text in _LIVE_OMIT_TEXTS:
+        assert not lc.concludes_omit(_llm(2, text)), text
+
+
+@pytest.mark.parametrize("severity", ["critical", "high", "medium", "low"])
+def test_omit_text_drops_the_marking_and_it_does_not_count(severity: str) -> None:
+    evaluation = _evaluate(_llm(2, _OMIT_TEXTS[0], severity=severity, rule="some-rule"))
+    assert evaluation.findings == ()
+    assert evaluation.conclusion == "success"
+    assert evaluation.dropped_withdrawn == 1
+    assert evaluation.omit_dropped_rules == ("some-rule",)
+
+
+def test_the_two_blocking_omit_criticals_no_longer_fail_the_check() -> None:
+    evaluation = _evaluate(
+        _llm(2, _OMIT_TEXTS[0], severity="critical", rule="secret-in-env"),
+        _llm(3, _OMIT_TEXTS[1], severity="critical", rule="hardcoded-secret"),
+        _llm(4, "The key reaches the log.", severity="high"),
+    )
+    assert [f.message for f in evaluation.findings] == ["The key reaches the log."]
+    assert evaluation.omit_dropped_rules == ("secret-in-env", "hardcoded-secret")
+    assert evaluation.dropped_withdrawn == 2
+
+
+def test_a_real_finding_that_mentions_omit_still_publishes() -> None:
+    # The diff adds lines 2 to 7, so the anchors wrap inside it.
+    evaluation = _evaluate(*(
+        _llm(2 + i % 6, text, severity="critical")
+        for i, text in enumerate(_LIVE_OMIT_TEXTS)
+    ))
+    assert [f.message for f in evaluation.findings] == list(_LIVE_OMIT_TEXTS)
+    assert [f.severity for f in evaluation.findings] == ["critical"] * len(_LIVE_OMIT_TEXTS)
+    assert evaluation.omit_dropped_rules == ()
+    assert evaluation.dropped_withdrawn == 0
+
+
+def test_the_structured_verdict_removes_an_omit_marking_and_it_is_logged() -> None:
+    evaluation = _evaluate(_llm(2, _OMIT_TEXTS[0], severity="critical", withdrawn=True))
+    assert evaluation.findings == ()
+    assert evaluation.conclusion == "success"
+    assert evaluation.omit_dropped_rules == ("logic-error",)
+
+
+def test_merge_keeps_the_live_finding_when_one_model_says_omit() -> None:
+    omit = _llm(2, _OMIT_TEXTS[0], severity="critical")
+    live = _llm(2, "The key reaches the log.", severity="high")
+    for order in ((omit, live), (live, omit)):
+        merged = lc._merge_review_findings([
+            lc._SuccessfulReview(
+                backend=Backend.POOLSIDE, model=f"m{i}", findings=(f,),
+                review_span_context=None,
+            )
+            for i, f in enumerate(order)
+        ])
+        assert [(f.severity, f.message) for f in merged] == [("high", live.message)]
+        assert not lc.is_withdrawn_finding(merged[0])
+
+
+def test_merge_of_two_omit_candidates_stays_withdrawn() -> None:
+    first = _llm(2, _OMIT_TEXTS[0], severity="critical")
+    second = _llm(2, _OMIT_TEXTS[1], severity="high")
+    for order in ((first, second), (second, first)):
+        merged = lc._merge_review_findings([
+            lc._SuccessfulReview(
+                backend=Backend.POOLSIDE, model=f"m{i}", findings=(f,),
+                review_span_context=None,
+            )
+            for i, f in enumerate(order)
+        ])
+        assert lc.is_withdrawn_finding(merged[0])
+        evaluation = _evaluate(*merged)
+        assert evaluation.findings == ()
+        assert evaluation.omit_dropped_rules == ("logic-error",)
+
+
+def test_merge_of_two_withdrawn_candidates_stays_withdrawn() -> None:
+    by_text = _llm(2, _WITHDRAWN_TEXTS[0], severity="medium")
+    by_flag = _llm(2, "Fine as written, after a closer read.", severity="high", withdrawn=True)
+    for order in ((by_text, by_flag), (by_flag, by_text)):
+        merged = lc._merge_review_findings([
+            lc._SuccessfulReview(
+                backend=Backend.POOLSIDE, model=f"m{i}", findings=(f,),
+                review_span_context=None,
+            )
+            for i, f in enumerate(order)
+        ])
+        assert lc.is_withdrawn_finding(merged[0])
+
+
+def test_a_dropped_omit_marking_is_logged_with_its_rule_and_head(caplog) -> None:
+    evaluation = _evaluate(_llm(2, _OMIT_TEXTS[0], rule="some-rule"))
+    assert evaluation.findings == ()
+    with caplog.at_level(logging.INFO):
+        cr_dispatch._log_omit_markings(evaluation, pr="pr-7", head_sha="abcdef0123456789")
+    lines = [r for r in caplog.records if r.getMessage() == "code_review_omit_marking_dropped"]
+    assert [(r.rule, r.head_sha, r.pr) for r in lines] == [("some-rule", "abcdef01", "pr-7")]
+
+
+def _rule_of(rule: str) -> str:
+    finding, reason = lc._coerce_finding(
+        {"path": "a.py", "line": 1, "rule": rule, "severity": "high", "message": "m"},
+    )
+    assert finding is not None and reason == ""
+    return finding.rule
+
+
+@pytest.mark.parametrize("rule", ["bad rule\nforged=1", "a/b", "", "xxx\x00"])
+def test_a_rule_that_is_not_a_rule_name_becomes_a_safe_placeholder(rule: str) -> None:
+    placeholder = _rule_of(rule)
+    assert re.fullmatch(r"unknown-rule-[0-9a-f]{12}", placeholder)
+    assert _rule_of(rule) == placeholder
+
+
+def test_distinct_invalid_rules_stay_distinct_in_the_merge() -> None:
+    assert _rule_of("a/b") != _rule_of("a/c")
+    assert _rule_of("sql-injection_2") == "sql-injection_2"
+    findings = tuple(
+        _llm(2, "The key reaches the log.", rule=_rule_of(r)) for r in ("a/b", "a/c")
+    )
+    merged = lc._merge_review_findings([
+        lc._SuccessfulReview(
+            backend=Backend.POOLSIDE, model="m", findings=findings,
+            review_span_context=None,
+        ),
+    ])
+    assert len(merged) == 2

@@ -567,9 +567,11 @@ trusts only users with `write` or `admin` access. A changed verdict:
 3. recomputes the bounded practice and few-shot caches used by later reviews.
 
 A thumbs-up becomes positive practice/few-shot evidence. A thumbs-down records a
-false positive, removes it from positive examples, and creates bounded `AVOID
-FALSE POSITIVE` guidance requiring materially new evidence before Elder repeats
-the pattern. Reactions by users without write access do not annotate or train.
+false positive and removes it from positive examples, but never creates a
+suppression (ADR-0026): a rule that quiets Elder comes only from a reasoned reply
+by a person who did not write the PR, and it lapses after 90 days unless
+re-affirmed. Reactions by Apps or by users without write access do not annotate
+or train.
 Legacy records without capture metadata remain observable under the old DD-only
 behavior and never auto-train.
 
@@ -1029,9 +1031,16 @@ comma-separated names (`opencode-go`, `openrouter`, `poolside`), each
 optionally narrowed to one pool (`openrouter:free`, `openrouter:paid`). The
 review chain, the overload fallback, the judge and Teller / ask / learn all
 skip a listed backend. To re-enable one, delete its entry from that line and
-let the deploy roll it out. Since 2026-10-17 the deployed value is
-`opencode-go,openrouter` (grug#1225). An entry that names no known backend or
-pool logs `grug_disabled_backends_unknown_entry` and disables nothing.
+let the deploy roll it out. Since 2026-11-01 the deployed value is
+`openrouter:paid`; OpenCode Go is back on (grug#1575, after grug#1225). An
+entry that names no known backend or pool logs
+`grug_disabled_backends_unknown_entry` and disables nothing.
+
+`GRUG_OPENCODE_GO_DAILY_CAP` bounds paid OpenCode Go calls per UTC day across
+every pod, counted in `grug_kv`. At the cap grug logs
+`opencode_go_daily_cap_reached` and holds paid Go until the next UTC day, and
+the review moves to the next tier. Free Go models are not counted. Unset means
+no cap; a value that is not a number admits no paid call.
 
 Without the switch, the provider breaker limits the waste. A 401, a 402, or a
 refusal whose body says a limit is spent (`total limit`, credits,

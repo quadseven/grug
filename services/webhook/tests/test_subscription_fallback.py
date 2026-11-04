@@ -14,6 +14,8 @@ Acceptance criteria verified:
 from __future__ import annotations
 
 import json
+import threading
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -416,3 +418,534 @@ def test_attribution_in_metrics(monkeypatch) -> None:
 
     last_resort_metrics = [c for c in emitted_counts if c[0] == "grug.elder.last_resort_call"]
     assert any(tags.get("tier") == "subscription" for _, _, tags in last_resort_metrics)
+
+
+def test_the_subscription_timeout_leaves_room_for_a_queued_call(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
+    monkeypatch.delenv("GRUG_SUBSCRIPTION_TIMEOUT_S", raising=False)
+    assert lc._subscription_fallback_config().timeout_seconds == 120.0
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("90", 90.0), ("", 120.0), ("soon", 120.0), ("0", 120.0), ("-5", 120.0), ("nan", 120.0), ("inf", 120.0),
+])
+def test_the_subscription_timeout_env_is_read_and_a_bad_value_is_ignored(
+    monkeypatch, raw: str, expected: float,
+) -> None:
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_TIMEOUT_S", raw)
+    assert lc._subscription_fallback_config().timeout_seconds == expected
+
+
+def test_the_lane_bearer_comes_from_ssm_when_a_path_is_set(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
+    monkeypatch.setattr(lc, "get_subscription_lane_token", lambda: "lane-token")
+    cfg = lc._subscription_fallback_config()
+    assert lc._merged_headers(cfg, cfg.key_loader())["Authorization"] == "Bearer lane-token"
+
+
+def test_the_author_family_reaches_the_lane_only_inside_a_gated_walk(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
+    cfg = lc._subscription_fallback_config()
+    assert "X-Review-Author-Family" not in lc._merged_headers(cfg, "k")
+    token = lc._FAMILY_GATE.set(("gpt", False))
+    try:
+        assert lc._merged_headers(cfg, "k")["X-Review-Author-Family"] == "gpt"
+    finally:
+        lc._FAMILY_GATE.reset(token)
+
+
+def test_a_lane_named_for_no_family_is_not_gated_off_a_reviewed_family(monkeypatch) -> None:
+    token = lc._FAMILY_GATE.set(("gpt", False))
+    try:
+        assert not lc._family_gated("subscription-lane")
+    finally:
+        lc._FAMILY_GATE.reset(token)
+
+
+def test_the_egress_policy_opens_the_lane_the_manifests_name() -> None:
+    """A manifest URL means nothing if the namespace's egress fence drops it:
+    the first rollout timed out on every call this way (#1546)."""
+    from pathlib import Path
+    from urllib.parse import urlsplit
+
+    k8s = Path(__file__).resolve().parents[3] / "k8s"
+    policy = (k8s / "networkpolicy.yaml").read_text()
+    consumer = (k8s / "consumer-deployment.yaml").read_text()
+    url_line = next(line for line in consumer.splitlines() if "GRUG_SUBSCRIPTION_URL" in line)
+    url = url_line.split("value:")[1].strip(" }")
+    assert urlsplit(url).hostname == "forward.subscription-lane.svc"
+    assert "kubernetes.io/metadata.name: subscription-lane" in policy
+    assert "matchLabels: {app: forward}" in policy
+
+
+def _subscription_reply(served_model: str | None) -> str:
+    body = json.loads(_finding_body())
+    if served_model is None:
+        del body["model"]
+    else:
+        body["model"] = served_model
+    return json.dumps(body)
+
+
+def _review_through_subscription(reply: str) -> lc.LlmReviewResponse:
+    recorder = _Recorder({
+        _CAVE_URL: httpx.ConnectTimeout("cave down"),
+        _FREE_GATEWAY_URL: httpx.ConnectTimeout("free gateway down"),
+        _POOLSIDE_URL: httpx.ConnectTimeout("poolside down"),
+        _OPENROUTER_URL: httpx.ConnectTimeout("openrouter down"),
+        _SUBSCRIPTION_URL: reply,
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        return review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+
+@pytest.mark.parametrize("served", ["gpt-6-luna", "claude-haiku-5-5"])
+def test_models_used_is_the_model_the_lane_replied_with(monkeypatch, served) -> None:
+    """The lane picks its model per call, so the request names neither."""
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_MODEL", "subscription-lane")
+    resp = _review_through_subscription(_subscription_reply(served))
+
+    assert resp.models_used == (served,)
+    evaluation = cr_persona.evaluate_diff((), resp)
+    assert evaluation.models_used == (served,)
+    _, summary = cr_dispatch._summary_markdown(evaluation)
+    assert f"Tier served: `subscription` (`{served}`)." in summary
+
+
+def test_a_reply_naming_no_model_never_reports_the_requested_one(monkeypatch) -> None:
+    """A wrong name is worse than none: the configured name is a request."""
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_MODEL", "subscription-lane")
+    resp = _review_through_subscription(_subscription_reply(None))
+
+    assert resp.kind == "reviewed"
+    assert resp.model_name == "subscription-lane"
+    assert resp.models_used == ()
+    _, summary = cr_dispatch._summary_markdown(
+        cr_persona.evaluate_diff((), resp),
+    )
+    assert "Tier served: `subscription`." in summary
+    assert "subscription-lane" not in summary
+
+
+def test_a_cloud_arm_reply_naming_no_model_reports_none(monkeypatch) -> None:
+    """The same rule on the free tier, which reaches models_used through an arm."""
+    recorder = _Recorder({
+        _CAVE_URL: httpx.ConnectTimeout("cave down"),
+        _FREE_GATEWAY_URL: _subscription_reply(None),
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert resp.tier_served == "free-pool"
+    assert resp.model_name
+    assert resp.models_used == ()
+
+
+def test_summary_and_detail_name_the_served_models() -> None:
+    clean = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="success", tier_served="subscription",
+        models_used=("gpt-6-luna", "claude-haiku-5-5"),
+    )
+    _, summary = cr_dispatch._summary_markdown(clean)
+    assert "Tier served: `subscription` (`gpt-6-luna`, `claude-haiku-5-5`)." in summary
+
+    detail = cr_dispatch._stack_detail_lines(
+        review_phase="tier1", living_range="", suppressed_count=0,
+        tier_served="subscription", models_used=("gpt-6-luna",),
+    )
+    assert "- Tier served: `subscription` (`gpt-6-luna`)" in detail
+
+
+def test_a_backend_supplied_model_name_cannot_break_the_code_span() -> None:
+    clean = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="success", tier_served="free-pool",
+        models_used=("bad`name",),
+    )
+    _, summary = cr_dispatch._summary_markdown(clean)
+    assert "`bad`name`" not in summary
+
+
+def test_every_rebuild_keeps_the_models_with_their_tier() -> None:
+    finding = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="success",
+        tier_served="subscription", models_used=("gpt-6-luna",),
+    )
+    assert cr_persona.with_extra_findings(
+        finding, (lc.Finding(path="a.py", line=1, severity="low", rule="r", message="m"),),
+    ).models_used == ("gpt-6-luna",)
+    assert cr_persona.with_findings(finding, ()).models_used == ("gpt-6-luna",)
+
+    other = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="neutral", degraded_reason="partial_review",
+        tier_served="free-pool", models_used=("other-model",),
+    )
+    assert cr_persona.with_degradation(finding, other).models_used == ("gpt-6-luna",)
+
+
+def test_a_degradation_takes_the_models_only_with_their_tier() -> None:
+    """The name must never sit beside another pass's tier."""
+    other = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="neutral", degraded_reason="partial_review",
+        tier_served="free-pool", models_used=("other-model",),
+    )
+    untiered = cr_persona.CodeReviewEvaluation(
+        findings=(), conclusion="success", models_used=("cave-model",),
+    )
+    merged = cr_persona.with_degradation(untiered, other)
+    assert merged.tier_served == "free-pool"
+    assert merged.models_used == ("other-model",)
+
+
+_GARBLED = json.dumps({
+    "choices": [{"message": {"content": "no json here, only prose", "role": "assistant"}}],
+    "model": "free-model",
+})
+
+
+def test_a_garbled_cave_answer_still_reaches_the_subscription_lane() -> None:
+    """A Cave parse failure is a miss, not the review's end. It kept every
+    public cohort off the lane while the Cave spilled to a free model that
+    spent its output on reasoning (2026-11-01)."""
+    recorder = _Recorder({
+        _CAVE_URL: _GARBLED,
+        _FREE_GATEWAY_URL: _GARBLED,
+        _POOLSIDE_URL: httpx.ConnectTimeout("poolside down"),
+        _OPENROUTER_URL: httpx.ConnectTimeout("openrouter down"),
+        _SUBSCRIPTION_URL: _finding_body(),
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = route_elder_model_call(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert resp.kind == "reviewed"
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert resp.tier_served == "subscription"
+    assert len(resp.findings) == 1
+
+
+def test_every_tier_garbled_or_down_stays_a_parse_failure() -> None:
+    """Fail-safe: with the lane down too, no tier reviewed, so the result
+    stays the specific parse failure and can never pass the check."""
+    recorder = _Recorder({
+        _CAVE_URL: _GARBLED,
+        _FREE_GATEWAY_URL: httpx.ConnectTimeout("gateway free down"),
+        _POOLSIDE_URL: httpx.ConnectTimeout("poolside down"),
+        _OPENROUTER_URL: httpx.ConnectTimeout("openrouter down"),
+        _SUBSCRIPTION_URL: httpx.ConnectTimeout("lane down"),
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = route_elder_model_call(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert resp.kind == "parse_failed"
+    assert resp.backend_used == Backend.CAVE
+
+
+def test_a_cancelled_review_after_a_garbled_cave_answer_asks_no_one_else() -> None:
+    """A superseded review spends nothing on a snapshot about to be dropped."""
+    cancel = threading.Event()
+
+    def garble_and_cancel(url: str, **kwargs):
+        cancel.set()
+        return httpx.Response(200, text=_GARBLED)
+
+    recorder = _Recorder({_CAVE_URL: garble_and_cancel})
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = route_elder_model_call(
+            assemble_evidence([_hunk()]), installation_id=1, cancel_event=cancel,
+        )
+
+    assert recorder.called_urls == [_CAVE_URL]
+    assert resp.kind == "all_failed"
+    assert resp.error.startswith("cancelled:")
+
+
+_EMPTY_SHORT = json.dumps({
+    "choices": [{"message": {"content": '{"findings": []}', "role": "assistant"}}],
+    "model": "free-model",
+    "usage": {"prompt_tokens": 30_000, "completion_tokens": 6},
+})
+_EMPTY_LONG = json.dumps({
+    "choices": [{"message": {"content": '{"findings": []}', "role": "assistant"}}],
+    "model": "free-model",
+    "usage": {"prompt_tokens": 30_000, "completion_tokens": 900},
+})
+
+
+def _walk_to_free_pool(free_answer: str, cave: object = _GARBLED, lane: object = None):
+    recorder = _Recorder({
+        _CAVE_URL: cave,
+        _FREE_GATEWAY_URL: free_answer,
+        _POOLSIDE_URL: httpx.ConnectTimeout("poolside down"),
+        _OPENROUTER_URL: httpx.ConnectTimeout("openrouter down"),
+        _SUBSCRIPTION_URL: lane or httpx.ConnectTimeout("lane down"),
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        return route_elder_model_call(assemble_evidence([_hunk()]), installation_id=1)
+
+
+@pytest.mark.parametrize("empty", [_EMPTY_SHORT, _EMPTY_LONG])
+def test_a_free_pool_empty_after_a_garbled_cave_is_not_a_clean_pass(empty) -> None:
+    """The free pool's empty answer proves nothing, whatever its length, so
+    it cannot pass a review the Cave garbled."""
+    resp = _walk_to_free_pool(empty)
+
+    assert resp.kind == "parse_failed"
+    assert cr_persona.evaluate_diff((), resp).degraded_reason is not None
+
+
+def test_a_free_pool_empty_with_the_cave_down_is_low_confidence() -> None:
+    resp = _walk_to_free_pool(_EMPTY_LONG, cave=httpx.ConnectTimeout("cave down"))
+
+    assert resp.kind == "reviewed"
+    assert resp.error.startswith(lc._LOW_CONFIDENCE_PREFIX)
+    assert cr_persona.evaluate_diff((), resp).degraded_reason == "low_confidence_review"
+
+
+def test_a_free_pool_empty_walks_on_to_the_lane() -> None:
+    resp = _walk_to_free_pool(_EMPTY_SHORT, lane=_finding_body())
+
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert len(resp.findings) == 1
+
+
+def test_a_free_pool_finding_is_still_a_review() -> None:
+    resp = _walk_to_free_pool(_finding_body())
+
+    assert resp.backend_used == Backend.FREE_POOL
+    assert len(resp.findings) == 1
+    assert resp.error == ""
+
+
+def _cave_answer(model: str, completion_tokens: int) -> str:
+    return json.dumps({
+        "choices": [{"message": {"content": '{"findings": []}', "role": "assistant"}}],
+        "model": model,
+        "usage": {"prompt_tokens": 30_000, "completion_tokens": completion_tokens},
+    })
+
+
+@pytest.mark.parametrize(
+    ("model", "tokens"),
+    [
+        ("nvidia/spilled-model:free", 900),
+        ("spilled-model-free", 900),
+        ("free-pool", 900),
+        ("an-unlisted-model", 900),
+        ("", 900),
+        (lc._CAVE_REVIEW_CODER_DEFAULT_MODEL, 6),
+    ],
+)
+def test_an_untrusted_cave_empty_walks_on_to_the_lane(model, tokens) -> None:
+    """With the Sparks away the Cave route spills to free models, and a free
+    model's empty answer proves nothing, whatever its length."""
+    resp = _walk_to_free_pool(
+        _EMPTY_LONG, cave=_cave_answer(model, tokens), lane=_finding_body(),
+    )
+
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert len(resp.findings) == 1
+
+
+def test_an_untrusted_cave_empty_with_nothing_after_it_is_low_confidence() -> None:
+    resp = _walk_to_free_pool(_EMPTY_LONG, cave=_cave_answer("nvidia/spilled-model:free", 900))
+
+    assert resp.error.startswith(lc._LOW_CONFIDENCE_PREFIX)
+    assert cr_persona.evaluate_diff((), resp).degraded_reason == "low_confidence_review"
+
+
+def test_the_cave_trusts_an_empty_only_from_its_own_models() -> None:
+    assert {lc._CAVE_REVIEW_CODER_DEFAULT_MODEL, lc._CAVE_REVIEW_REASONER_DEFAULT_MODEL} <= (
+        lc._TRUSTED_EMPTY_CAVE_MODELS
+    )
+    assert not lc._cave_empty_is_trusted(
+        lc._ArmOutcome(backend=Backend.CAVE, kind="success", model="gemma4:31b"),
+    )
+
+
+def test_a_cave_low_confidence_answer_names_its_own_tier() -> None:
+    resp = _walk_to_free_pool(_EMPTY_LONG, cave=_cave_answer("nvidia/spilled-model:free", 900))
+
+    assert resp.tier_served == "self-hosted"
+
+
+def test_a_long_free_pool_empty_in_the_cloud_chain_is_not_a_clean_pass(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    recorder = _Recorder({
+        _FREE_GATEWAY_URL: _EMPTY_LONG,
+        _CAVE_URL: httpx.ConnectTimeout("cave down"),
+        "subscription": httpx.ConnectTimeout("lane down"),
+    })
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = lc._walk_review_ladder(assemble_evidence([_hunk()]), 1, "caveman", None)
+
+    assert resp.error.startswith(lc._LOW_CONFIDENCE_PREFIX)
+    assert cr_persona.evaluate_diff((), resp).degraded_reason == "low_confidence_review"
+
+
+def test_a_listed_resident_empty_of_real_length_stays_a_clean_review() -> None:
+    resp = _walk_to_free_pool(
+        _EMPTY_SHORT, cave=_cave_answer(lc._CAVE_REVIEW_CODER_DEFAULT_MODEL, 900),
+    )
+
+    assert resp.backend_used == Backend.CAVE
+    assert not resp.error
+
+
+def test_a_token_capped_cave_empty_keeps_its_truncation_error() -> None:
+    capped = json.dumps({
+        "choices": [{
+            "message": {"content": '{"findings": []}', "role": "assistant"},
+            "finish_reason": "length",
+        }],
+        "model": "nvidia/spilled-model:free",
+    })
+    resp = _walk_to_free_pool(_EMPTY_LONG, cave=capped)
+
+    assert resp.error.startswith("partial review:")
+    assert resp.tier_served == "self-hosted"
+
+
+def test_the_trusted_empty_list_comes_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CAVE_TRUSTED_EMPTY_MODELS", " resident-a , resident-b ")
+    outcome = lc._ArmOutcome(backend=Backend.CAVE, kind="success", model="resident-b")
+    assert lc._cave_empty_is_trusted(outcome)
+    assert not lc._cave_empty_is_trusted(
+        lc._ArmOutcome(backend=Backend.CAVE, kind="success", model=lc._CAVE_REVIEW_CODER_DEFAULT_MODEL),
+    )
+
+
+def test_the_workloads_ship_the_model_the_sparks_serve() -> None:
+    """`spark:warm-any` hides the served name, so the code defaults never match
+    a reply; an empty list would mark every honest Cave empty untrusted."""
+    root = Path(__file__).resolve().parents[3] / "k8s"
+    for manifest in ("consumer-deployment.yaml", "webhook-deployment.yaml"):
+        assert (
+            'name: GRUG_CAVE_TRUSTED_EMPTY_MODELS, value: "nemotron-3.5-super-vl"'
+            in (root / manifest).read_text()
+        )
+
+
+_PUBLIC_PR = {"repo": "quadseven/grug", "pr_number": 7, "repo_private": False}
+
+
+def _lane_first(monkeypatch, responses: dict[str, object], *, pr=_PUBLIC_PR, gate=None):
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "subscription")
+    recorder = _Recorder(responses)
+    token = lc._FAMILY_GATE.set(gate)
+    try:
+        with patch.object(httpx, "post", side_effect=recorder), lc._spark_job_scope(pr):
+            resp = lc._walk_review_ladder(assemble_evidence([_hunk()]), 1, "caveman", None)
+    finally:
+        lc._FAMILY_GATE.reset(token)
+    return resp, recorder
+
+
+def _lane_answer(content: str, model: str = "gpt-6-luna", completion_tokens: int = 500) -> str:
+    return json.dumps({
+        "choices": [{"message": {"content": content, "role": "assistant"}}],
+        "model": model,
+        "usage": {"prompt_tokens": 30_000, "completion_tokens": completion_tokens},
+    })
+
+
+_NO_FINDINGS = '{"findings": []}'
+
+
+def test_a_short_lane_empty_is_not_a_clean_review_on_its_own(monkeypatch) -> None:
+    resp, _ = _lane_first(monkeypatch, {"subscription": _lane_answer(_NO_FINDINGS, completion_tokens=9)})
+
+    assert resp.error.startswith(lc._LOW_CONFIDENCE_PREFIX)
+    assert resp.backend_used == Backend.SUBSCRIPTION
+
+
+def test_a_second_model_confirms_a_short_lane_empty(monkeypatch) -> None:
+    resp, _ = _lane_first(monkeypatch, {
+        "subscription": _lane_answer(_NO_FINDINGS, completion_tokens=9),
+        "opencode": _lane_answer(_NO_FINDINGS, "deepseek-v4.1-flash", 7),
+    })
+
+    assert resp.kind == "reviewed"
+    assert not resp.error
+
+
+def test_a_lane_empty_of_real_length_is_a_clean_review(monkeypatch) -> None:
+    resp, recorder = _lane_first(monkeypatch, {"subscription": _lane_answer(_NO_FINDINGS)})
+
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert not resp.error
+    assert len(recorder.called_urls) == 1
+
+
+def test_a_private_repo_is_not_reviewed_lane_first(monkeypatch) -> None:
+    private = dict(_PUBLIC_PR, repo_private=True)
+    resp, recorder = _lane_first(
+        monkeypatch,
+        {"subscription": _finding_body(), "opencode": _finding_body()},
+        pr=private,
+    )
+
+    assert resp.backend_used == Backend.OPENCODE_GO
+    assert not any("subscription" in url for url in recorder.called_urls)
+
+
+def test_the_lane_hears_the_data_class(monkeypatch) -> None:
+    _, recorder = _lane_first(monkeypatch, {"subscription": _finding_body()})
+
+    assert recorder.call_headers[0]["X-Spark-Data-Class"] == "public"
+
+
+def test_a_lane_answer_from_the_authors_family_is_a_miss(monkeypatch) -> None:
+    monkeypatch.setattr(lc, "model_family", lambda model: "openai" if "gpt" in model else "other")
+    resp, _ = _lane_first(
+        monkeypatch,
+        {"subscription": _lane_answer(json.loads(_finding_body())["choices"][0]["message"]["content"]),
+         "opencode": _finding_body()},
+        gate=("openai", False),
+    )
+
+    assert resp.backend_used == Backend.OPENCODE_GO
+
+
+@pytest.mark.parametrize("priority", ["cloud", "subscription"])
+def test_the_cloud_chain_is_on_for_both_priorities(monkeypatch, priority) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", priority)
+    assert lc._cloud_chain_enabled()
+
+
+def test_the_cloud_chain_is_off_for_the_cave_priority(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cave")
+    assert not lc._cloud_chain_enabled()
+
+
+def test_the_lane_reviews_first_when_it_is_the_priority(monkeypatch) -> None:
+    resp, recorder = _lane_first(monkeypatch, {"subscription": _finding_body()})
+
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert len(recorder.called_urls) == 1
+
+
+def test_a_refusing_lane_hands_on_to_go_and_is_not_asked_twice(monkeypatch) -> None:
+    resp, recorder = _lane_first(monkeypatch, {
+        "subscription": httpx.Response(429, json={"error": {"message": "limit"}}),
+        "opencode": _finding_body(),
+    })
+
+    assert resp.backend_used == Backend.OPENCODE_GO
+    assert sum("subscription" in url for url in recorder.called_urls) == 1
+
+
+def test_a_lane_failure_with_every_rung_down_passes_nothing(monkeypatch) -> None:
+    resp, recorder = _lane_first(monkeypatch, {
+        "subscription": httpx.ConnectTimeout("lane down"),
+    })
+
+    assert resp.kind != "reviewed"
+    assert sum("subscription" in url for url in recorder.called_urls) == 1
+
+
+def test_the_workloads_ship_the_lane_first_within_its_cap() -> None:
+    root = Path(__file__).resolve().parents[3] / "k8s"
+    for manifest in ("consumer-deployment.yaml", "webhook-deployment.yaml"):
+        text = (root / manifest).read_text()
+        assert "name: GRUG_REVIEW_BACKEND_PRIORITY, value: subscription" in text
+        assert 'name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "3000"' in text

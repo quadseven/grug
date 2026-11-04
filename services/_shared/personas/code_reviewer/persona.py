@@ -28,7 +28,10 @@ from typing import get_args
 
 from code_review_prompt import COMPLEXITY_CORRECTNESS_MARKER
 from github_checks_client import CheckConclusion
-from llm_client import FindingOrigin, LlmReviewResponse, is_withdrawn_finding
+from llm_client import (
+    FindingOrigin, LlmReviewResponse, concludes_omit, is_withdrawn_finding,
+)
+from model_family import ReviewFamilies
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.line_refs import align_line_refs, repair_where_refs
 from review_types import DEFAULT_CATEGORY, Category, Effort, Severity  # single source (#250)
@@ -203,13 +206,23 @@ class CodeReviewEvaluation:
     dropped_hallucinations: int = 0
     degraded_reason: str | None = None
     coverage: ReviewCoverage | None = None
-    # grug#1397: candidates the reviewer itself withdrew (`is_finding: false`
-    # or a message ending "No finding."). Never published, never counted
-    # toward the verdict, but counted here so recall stays measurable.
+    # grug#1397: candidates the reviewer itself withdrew (`is_finding: false`,
+    # a message ending "No finding.", or grug#1529's exact omit forms). Never
+    # published, never counted toward the verdict, but counted here so recall
+    # stays measurable.
     dropped_withdrawn: int = 0
+    # grug#1529: the rules of dropped candidates whose own text ends in an
+    # exact omit form. `evaluate_diff` is pure, so dispatch logs them with
+    # the head.
+    omit_dropped_rules: tuple[str, ...] = ()
     tier_served: str | None = None
+    # The models that answered, as their replies named them. Empty when no
+    # reply did. Travels with `tier_served`, which it qualifies.
+    models_used: tuple[str, ...] = ()
     reviewability_note: str = ""
     reviewability_blocking: bool = False
+    # grug#1437: who wrote and who reviewed this pull request, as model families.
+    families: ReviewFamilies | None = None
 
     @property
     def passed(self) -> bool:
@@ -261,9 +274,12 @@ def with_extra_findings(
         conclusion=_derive_conclusion(combined, evaluation.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
         dropped_withdrawn=evaluation.dropped_withdrawn,
+        omit_dropped_rules=evaluation.omit_dropped_rules,
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
         tier_served=evaluation.tier_served,
+        models_used=evaluation.models_used,
+        families=evaluation.families,
     )
 
 
@@ -281,9 +297,12 @@ def with_findings(
         conclusion=_derive_conclusion(findings, evaluation.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
         dropped_withdrawn=evaluation.dropped_withdrawn,
+        omit_dropped_rules=evaluation.omit_dropped_rules,
         degraded_reason=evaluation.degraded_reason,
         coverage=evaluation.coverage,
         tier_served=evaluation.tier_served,
+        models_used=evaluation.models_used,
+        families=evaluation.families,
     )
 
 
@@ -321,14 +340,18 @@ def with_degradation(
     no IO."""
     if evaluation.degraded_reason or not other.degraded_reason:
         return evaluation
+    served = evaluation if evaluation.tier_served else other
     return CodeReviewEvaluation(
         findings=evaluation.findings,
         conclusion=_derive_conclusion(evaluation.findings, other.degraded_reason),
         dropped_hallucinations=evaluation.dropped_hallucinations,
         dropped_withdrawn=evaluation.dropped_withdrawn,
+        omit_dropped_rules=evaluation.omit_dropped_rules,
         degraded_reason=other.degraded_reason,
         coverage=other.coverage,
-        tier_served=evaluation.tier_served or other.tier_served,
+        tier_served=served.tier_served,
+        models_used=served.models_used,
+        families=evaluation.families or other.families,
     )
 
 
@@ -374,17 +397,23 @@ def evaluate_diff(
             degraded_reason=llm_response.kind,
             coverage=llm_response.coverage,
             tier_served=llm_response.tier_served,
+            models_used=llm_response.models_used,
         )
 
     line_index = _hunk_line_index(hunks)
     kept: list[Finding] = []
     dropped = 0
     withdrawn = 0
+    omit_dropped: list[str] = []
     for raw in llm_response.findings:
         # grug#1397: the reviewer ruled this candidate out itself. It must
         # not become a thread or move the verdict; count it and move on.
         if is_withdrawn_finding(raw):
             withdrawn += 1
+            # A merge of two omit candidates carries the flag, so the text
+            # decides the log, not the flag.
+            if concludes_omit(raw):
+                omit_dropped.append(raw.rule)
             continue
         allowed_lines = line_index.get(raw.path)
         outside_diff = allowed_lines is None or raw.line not in allowed_lines
@@ -417,11 +446,12 @@ def evaluate_diff(
         )
         if outside_diff:
             message = f"OUTSIDE DIFF (advisory): {outside_reason} {message}"
+        severity = "medium" if outside_diff else _capped_severity(raw.rule, raw.severity, message)
         kept.append(
             Finding(
                 file=raw.path,
                 line=raw.line,
-                severity=("medium" if outside_diff else _capped_severity(raw.rule, raw.severity, message)),
+                severity=severity,
                 rule_name=raw.rule,
                 message=message,
                 # #553: wire fields carry through; the anti-hallucination
@@ -461,9 +491,12 @@ def evaluate_diff(
         ),
         dropped_hallucinations=dropped,
         dropped_withdrawn=withdrawn,
+        omit_dropped_rules=tuple(omit_dropped),
         degraded_reason=degraded_reason,
         coverage=llm_response.coverage,
         tier_served=llm_response.tier_served,
+        models_used=llm_response.models_used,
         reviewability_note=llm_response.reviewability_note,
         reviewability_blocking=llm_response.reviewability_blocking,
+        families=llm_response.families,
     )

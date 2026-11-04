@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from ledger import (
     LedgerRow,
@@ -249,8 +250,60 @@ def test_ledger_cli_main_outputs_metrics(capsys):
     assert "classes:" in captured.out
 
 
+def test_ledger_cli_tiers_prints_one_addressed_line_per_tier(capsys):
+    """#1570: the weekly report prints only the per-tier addressed rate."""
+    from pathlib import Path
+    p = str(Path(__file__).resolve().parents[3] / "logs" / "review-ledger.jsonl")
+    ret = ledger_main(["--tiers", p])
+    assert ret == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines, "the tier report printed nothing"
+    assert all(re.fullmatch(r"[A-Z]+: \d+/\d+ addressed", line) for line in lines), lines
+    assert len({line.split(":")[0] for line in lines}) == len(lines)
+
+
+def test_ledger_cli_tiers_fails_on_a_ledger_with_no_tier_data(tmp_path, capsys):
+    """An empty report must fail the weekly run, not post a blank summary."""
+    empty = tmp_path / "ledger.jsonl"
+    empty.write_text("", encoding="utf-8")
+    assert ledger_main(["--tiers", str(empty)]) == 1
+    assert "no tier data" in capsys.readouterr().out
+
+
 def test_ledger_cli_main_file_not_found(capsys):
     ret = ledger_main(["nonexistent-file.jsonl"])
     assert ret == 1
     captured = capsys.readouterr()
     assert "ledger: file not found" in captured.out
+
+
+_TABLE = """## Findings Ledger
+
+| reviewer | severity | class | finding | verdict | evidence |
+|---|---|---|---|---|---|
+| codex | high | silent-failure | swallows the error in `f` | fixed | a.py:3 |
+| spec-agent | MEDIUM | test-gap | uses a \\| pipe in text | declined(bounded: later) | |
+| broken row with too few cells |
+"""
+
+
+def test_parse_comment_table_maps_cells_and_stamps_repo_pr():
+    from ledger import parse_comment_table
+
+    rows = parse_comment_table(_TABLE, repo="o/r", pr=9)
+    assert [r["reviewer"] for r in rows] == ["codex", "spec-agent"]
+    assert rows[0] == {
+        "repo": "o/r", "pr": 9, "reviewer": "codex", "severity": "high",
+        "class": "silent-failure", "finding": "swallows the error in `f`",
+        "verdict": "fixed", "evidence": "a.py:3",
+    }
+    assert rows[1]["finding"] == "uses a | pipe in text"
+    # the shared validity gate accepts what the table parser emits
+    assert all(parse_row(r) is not None for r in rows)
+
+
+def test_parse_comment_table_without_ledger_header_is_empty():
+    from ledger import parse_comment_table
+
+    assert parse_comment_table("| a | b |\n|---|---|\n| 1 | 2 |", "o/r", 1) == []
+    assert parse_comment_table("no table at all", "o/r", 1) == []

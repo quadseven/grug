@@ -27,9 +27,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from llm_client import _cave_judge_config, FindingJudgement, Hunk, JudgeFindingRepr, PrContext, judge_findings
-from review_evidence import assemble_evidence
+from review_evidence import assemble_evidence, without_author_text
 
-from .diff_parser import DiffHunk
+from .analyzer_sandbox import read_only_tree, sandbox_env, without_engine_config
+from .diff_parser import added_lines, DiffHunk
 from .persona import Finding
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.sast")
@@ -80,25 +81,11 @@ class Candidate:
 
 
 def _added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
-    """Walk a hunk body -> [(new_side_line_number, added_text)] for each ADDED
-    line. New-side number starts at `new_start` and advances on added/context
-    lines, not on removed lines (unified-diff semantics). The first body line
-    is the `@@` header (skipped)."""
-    out: list[tuple[int, str]] = []
-    lineno = hunk.new_start
-    for raw in hunk.body.splitlines():
-        if raw.startswith("@@"):
-            continue
-        if raw.startswith("+++") or raw.startswith("---"):
-            continue
-        if raw.startswith("+"):
-            out.append((lineno, raw[1:]))
-            lineno += 1
-        elif raw.startswith("-"):
-            continue  # removed line: no new-side advance
-        else:
-            lineno += 1  # context line
-    return out
+    """[(new_side_line_number, added_text)] for each ADDED line in a hunk:
+    the one walk in `diff_parser.added_lines`, so an added line whose
+    content starts with `++` is neither dropped nor shifts the numbering of
+    everything after it."""
+    return added_lines(hunk)
 
 
 def _is_cleartext_secret_log(text: str) -> bool:
@@ -208,8 +195,8 @@ def _opengrep_home_env(scan_tmp: str) -> dict[str, str]:
     instead of once per scan, outside both the scanned tree and the
     size-capped `tmp` volume.
 
-    Returns the scan dir instead when that path is unset or not writable.
-    That is the pre-#865 behaviour: correct but wasteful, and it keeps a
+    Returns `scan_tmp` instead when that path is unset or not writable, which
+    the caller keeps beside the scanned tree: wasteful, but it keeps a
     self-hosted deploy that has not added the volume working rather than
     crashing on an unwritable HOME (the 2026-07-13 zero-findings regression).
     """
@@ -245,7 +232,7 @@ def scan_opengrep(
     """
     if not file_contents:
         return ()
-    kept_files, skipped = _budget_files(file_contents)
+    kept_files, skipped = _budget_files(without_engine_config(file_contents))
     if skipped:
         log.info("sast_opengrep_files_skipped_over_budget", extra={"skipped": len(skipped)})
     if not kept_files:
@@ -261,7 +248,9 @@ def scan_opengrep(
     added = _added_lines_by_file(hunks)
     try:
         with tempfile.TemporaryDirectory(prefix="grug-sast-") as tmp:
-            _write_scan_files(tmp, kept_files)
+            scan_root = os.path.join(tmp, "scan")
+            os.makedirs(scan_root)
+            _write_scan_files(scan_root, kept_files)
             # Opengrep initializes settings/cache under $HOME at
             # startup. The pods run as uid 10001 created with --no-create-home
             # on a readOnlyRootFilesystem, so that mkdir crashed semgrep with
@@ -281,19 +270,26 @@ def scan_opengrep(
             # A dedicated cache volume fixes all three: extract once per pod,
             # never inside the scanned tree, never against the tmp cap.
             #
-            # Falls back to the old scan-dir behaviour when the cache dir is
-            # unset or not writable, so a self-hosted deploy without the extra
+            # Falls back to a per-run home when the cache dir is unset or not
+            # writable, so a self-hosted deploy without the extra
             # volume still scans (degraded to re-extracting, never broken).
-            scan_env = {**os.environ, **_opengrep_home_env(tmp)}
-            proc = subprocess.run(
-                ["opengrep", "scan", "--config", _RULES_DIR, "--json", "--quiet",
-                 "--disable-version-check", "--no-rewrite-rule-ids", tmp],
-                capture_output=True, text=True, timeout=_OPENGREP_TIMEOUT_S,
-                env=scan_env,
-                # We inspect returncode ourselves below (a non-zero exit with
-                # parseable JSON is a real degrade path, #77), so never raise.
-                check=False,
-            )
+            #
+            # The sandbox rules every analyzer follows (#1254) apply here too
+            # (#1574): the pod's environment holds the App key and the
+            # database URL, so the child gets the allowlist and a read-only
+            # tree. The home sits beside the scanned tree, never in it.
+            home = _opengrep_home_env(os.path.join(tmp, "home"))
+            os.makedirs(home["HOME"], exist_ok=True)
+            with read_only_tree(scan_root):
+                proc = subprocess.run(
+                    ["opengrep", "scan", "--config", _RULES_DIR, "--json", "--quiet",
+                     "--disable-version-check", "--no-rewrite-rule-ids", scan_root],
+                    capture_output=True, text=True, timeout=_OPENGREP_TIMEOUT_S,
+                    env=sandbox_env(home["HOME"], home),
+                    # We inspect returncode ourselves below (a non-zero exit with
+                    # parseable JSON is a real degrade path, #77), so never raise.
+                    check=False,
+                )
             if proc.returncode != 0:
                 # Version-dependent, opengrep can exit non-zero AND emit
                 # parseable-but-empty JSON - without this check that
@@ -311,7 +307,7 @@ def scan_opengrep(
                 )
                 return ()
             data = json.loads(proc.stdout)
-            tmp_prefix = tmp.rstrip("/") + "/"
+            tmp_prefix = scan_root.rstrip("/") + "/"
             # A per-file parse failure lands in `errors` while the process
             # still exits 0 with a well-formed `results` array. Reading only
             # `results` turns "could not scan this file" into "scanned it and
@@ -571,9 +567,10 @@ def _judge_batch(
     if not candidates:
         return (), True
     reprs = [_candidate_to_repr(c) for c in candidates]
+    # grug#1569: author prose must never talk the judge out of a detection.
     evidence = assemble_evidence(
         (Hunk(path=h.file_path, body=h.body) for h in hunks),
-        pr_context=pr_context, file_contents=file_contents,
+        pr_context=without_author_text(pr_context), file_contents=file_contents,
     )
     try:
         judgements = judge_findings(

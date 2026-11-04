@@ -239,6 +239,44 @@ def test_an_adjective_is_not_a_removal_ticket():
     assert f.severity == "high"
 
 
+def test_weakened_test_reads_pr_title_at_review_time_via_callable():
+    """#1457: scan_weakened_verification reads pr_title at review time via callable;
+    a removal it names is medium (not blocking)."""
+    (f_high,) = _scan(_DELETED_TWO, title=lambda: "Normal feature addition")
+    assert f_high.severity == "high"
+
+    (f_med,) = _scan(_DELETED_TWO, title=lambda: "Retire the reaction-only acknowledgment")
+    assert f_med.severity == "medium"
+
+
+def test_weakened_test_reads_criteria_at_review_time_via_callable():
+    """#1457: scan_weakened_verification reads criteria at review time via callable;
+    a removal they name is medium (not blocking)."""
+    crit_normal = (LinkedCriterion(9, 1, "Feature works normally"),)
+    (f_high,) = _scan(_DELETED_TWO, title="Feature title", criteria=lambda: crit_normal)
+    assert f_high.severity == "high"
+
+    crit_removal = (LinkedCriterion(9, 1, "Remove the reaction-only acknowledgment"),)
+    (f_med,) = _scan(_DELETED_TWO, title="Feature title", criteria=lambda: crit_removal)
+    assert f_med.severity == "medium"
+
+
+def test_lane_work_findings_evaluates_title_and_criteria_at_review_time():
+    """#1457: lane_work_findings evaluates review-time title and criteria callables."""
+    found = lane_work_findings(
+        diff_text=_DELETED_TWO,
+        hunks=parse_diff(_DELETED_TWO),
+        file_contents={},
+        base_line_counts={},
+        boxes=lambda: [(9, 1, "open", "Remove the reaction-only acknowledgment")],
+        pr_title=lambda: "Update tests",
+        pr_body="Closes #9",
+    )
+    wv_findings = [f for f in found if f.rule_name == "weakened-test"]
+    assert len(wv_findings) == 1
+    assert wv_findings[0].severity == "medium"
+
+
 def test_a_renamed_test_whose_body_stays_is_not_deleted():
     diff = _diff("tests/test_station.py", ("", [
         "-    def test_build_work_comes_first(self):",
@@ -257,6 +295,100 @@ def test_a_close_rename_with_a_reworded_assertion_is_not_deleted():
         '+        self.assertEqual(used, routes - {"/api/frame", "/api/watch"})',
     ]))
     assert _scan(diff) == ()
+
+
+# A test the ticket changes on purpose, replaced in the same change run by
+# a test of the new contract (#1564). Recorded shape: a fault on one repo
+# used to end a status run; the ticket makes it name the repo and exit 3.
+_FAULT_TITLE = "A fault on one repo is named as failed and status exits 3"
+_OLD_FAULT = [
+    "-    def test_a_fault_still_ends_status(self):",
+    "-        routes = fault_routes()",
+    "-        with self.assertRaises(GitHubError):",
+    "-            status(routes)",
+    "-",
+]
+
+
+def _fault_diff(new_test):
+    return _diff("tests/test_status_skip.py", ("", [
+        "         self.assertIn(\"## Lane status\", out)",
+        " ",
+        *_OLD_FAULT,
+        *new_test,
+        " ",
+        " if __name__ == \"__main__\":",
+    ]))
+
+
+_NEW_FAULT = [
+    "+    def test_a_fault_is_named_as_failed_and_status_is_partial(self):",
+    "+        out = status(fault_routes())",
+    "+        self.assertIn(\"read failed\", out)",
+    "+        self.assertEqual(\"status partial\", out.splitlines()[-1])",
+    "+",
+]
+
+
+def test_a_deleted_test_the_ticket_changes_replaced_by_its_new_contract_is_not_flagged():
+    assert _scan(_fault_diff(_NEW_FAULT), title=_FAULT_TITLE) == ()
+
+
+def test_a_replacement_the_ticket_names_excuses_the_test_it_replaces():
+    # The ticket names the new contract, not the old test.
+    title = "Status names a failed repo and is partial"
+    assert _scan(_fault_diff(_NEW_FAULT), title=title) == ()
+
+
+def test_a_replaced_test_the_ticket_does_not_mention_is_still_flagged():
+    (f,) = _scan(_fault_diff(_NEW_FAULT))
+    assert (f.rule_name, f.severity) == ("weakened-test", "medium")
+    assert "`test_a_fault_still_ends_status`" in f.message
+
+
+def test_a_replacement_with_no_assertion_does_not_excuse():
+    new = [
+        "+    def test_a_fault_is_named_as_failed_and_status_is_partial(self):",
+        "+        status(fault_routes())",
+        "+",
+    ]
+    (f,) = _scan(_fault_diff(new), title=_FAULT_TITLE)
+    assert "`test_a_fault_still_ends_status`" in f.message
+
+
+def test_a_replacement_with_fewer_assertions_does_not_excuse():
+    old_two = [
+        "-    def test_a_fault_still_ends_status(self):",
+        "-        with self.assertRaises(GitHubError):",
+        "-            status(fault_routes())",
+        "-        self.assertEqual([], posted)",
+        "-",
+    ]
+    new_one = [
+        "+    def test_a_fault_is_named_as_failed_and_status_is_partial(self):",
+        "+        self.assertIn(\"read failed\", status(fault_routes()))",
+        "+",
+    ]
+    diff = _diff("tests/test_status_skip.py", ("", [" ", *old_two, *new_one, " "]))
+    (f,) = _scan(diff, title=_FAULT_TITLE)
+    assert "`test_a_fault_still_ends_status`" in f.message
+
+
+def test_a_skipped_replacement_does_not_excuse():
+    new = ["+    @unittest.skip(\"later\")", *_NEW_FAULT]
+    (f,) = _scan(_fault_diff(new), title=_FAULT_TITLE)
+    assert "`test_a_fault_still_ends_status`" in f.message
+
+
+def test_a_replacement_of_only_mock_checks_does_not_excuse():
+    new = [
+        "+    def test_a_fault_is_named_as_failed_and_status_is_partial(self):",
+        "+        status(fault_routes())",
+        "+        printer.assert_called_once()",
+        "+",
+    ]
+    (f,) = _scan(_fault_diff(new), title=_FAULT_TITLE)
+    assert "`test_a_fault_still_ends_status`" in f.message
 
 
 # Tests moved between files in one diff (#1496). A split test file removes

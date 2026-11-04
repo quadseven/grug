@@ -72,18 +72,27 @@ def installation_permission_summary_note(installation_id: int) -> str:
     )
 
 
-def _record_install_permissions(installation_id: int, payload: dict) -> None:
+def _record_install_permissions(
+    installation_id: int, payload: dict, *, force: bool = False,
+) -> None:
+    """Record which required permissions the installation lacks. Checked
+    once per process per installation; `force` (a token refresh after a
+    401/403) re-reads the grant, so a permission the operator added after
+    boot stops being reported as missing without a restart."""
     with _permission_lock:
-        if installation_id in _checked_install_permissions:
+        if installation_id in _checked_install_permissions and not force:
             return
         granted = payload.get("permissions") or {}
         missing = tuple(
             name for name, (level, _) in REQUIRED_APP_PERMISSIONS.items()
             if _permission_rank(granted.get(name)) < _permission_rank(level)
         )
+        previous = _missing_install_permissions.get(installation_id)
         _checked_install_permissions.add(installation_id)
         _missing_install_permissions[installation_id] = missing
-    if missing:
+    # Reported once per distinct gap, not on every refresh of an unchanged
+    # grant.
+    if missing and missing != previous:
         log.warning(
             "app_permissions_missing",
             extra={
@@ -187,7 +196,7 @@ def get_install_token(installation_id: int, *, force_refresh: bool = False) -> s
             "GitHub returned a 200 without a usable installation token "
             f"(installation {installation_id}): {type(e).__name__}"
         ) from e
-    _record_install_permissions(installation_id, payload)
+    _record_install_permissions(installation_id, payload, force=force_refresh)
     # GitHub returns expires_at ISO; default 1hr from creation.
     _cache.put(key, token, ttl_seconds=55 * 60)
     return token

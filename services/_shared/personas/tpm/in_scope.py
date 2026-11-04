@@ -16,8 +16,12 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from personas.tpm.ticket_compliance import strip_code_spans
+
+if TYPE_CHECKING:  # annotations only: dor_checks imports this module
+    from personas.tpm.dor_checks import CheckResult, IssueFetcher
 
 
 log = logging.getLogger("grug.persona.tpm.in_scope")

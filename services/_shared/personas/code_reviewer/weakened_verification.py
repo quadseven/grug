@@ -28,6 +28,13 @@ Two rules, each one finding per file, anchored on a new-side line:
   `FLIPS_HIGH` or more assertions none of whose strings or names the
   ticket mentions. Medium otherwise: the ticket names the test, asks to
   remove or retire something, or the PR flips fewer assertions.
+  Not a deletion (#1564): a test that the same change run replaces with a
+  runnable test of the same kind (async or sync) that keeps at least as
+  many assertion lines, not all of them mock call checks unless the
+  deleted test's were, when the ticket mentions the deleted test or its
+  replacement. That is a behavior the ticket changes on purpose, with its
+  new contract pinned in place of the old: in one week of merged work the
+  rule's findings were declined 14 times out of 19, nearly all this shape.
 - `removed-verification-layer` (high): a CI workflow loses a line of a
   security or verification layer (a deny-list, leak or secret scan,
   signature or attestation check, a code scanner) that the diff does not
@@ -45,7 +52,7 @@ Pure: file changes, hunks and PR text in; findings out.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from personas.code_reviewer.criteria_coverage import LinkedCriterion
@@ -371,6 +378,23 @@ def _deleted_tests(tf: _TestFile) -> list[_Deleted]:
     ]
 
 
+def _replaced_for_ticket(tf: _TestFile, d: _Deleted, ticket_stems: frozenset[str]) -> bool:
+    """The change run that removed the test adds one in its place that can
+    run, is the same kind and keeps at least as many assertion lines, and
+    the ticket mentions the old test or the new one (#1564): the new
+    contract replaces the old one, so nothing is left unpinned."""
+    new = tf.replaced_by.get(d.name)
+    if new is None or not (_mentioned(d.name, ticket_stems) or _mentioned(new, ticket_stems)):
+        return False
+    return any(
+        a.name == new and a.candidate and not a.skipped
+        and a.is_async == d.is_async
+        and a.total >= max(1, d.total)
+        and (a.mock < a.total or d.mock == d.total)
+        for a in tf.tests_seen
+    )
+
+
 def _removed_code_stems(by_file: dict[str, list[DiffHunk]]) -> frozenset[str]:
     """Word stems of the lines the diff deletes from non-test, non-doc
     files: the guards, constants, comments and docstrings that go."""
@@ -503,7 +527,9 @@ def _test_file_finding(
     removed_stems: frozenset[str] = frozenset(),
 ) -> Finding | None:
     """The `weakened-test` finding for one test file, or None."""
-    deleted = _deleted_tests(tf)
+    deleted = [
+        d for d in _deleted_tests(tf) if not _replaced_for_ticket(tf, d, ticket.stems)
+    ]
     # A lone flip with nothing deleted most often follows a behavior the
     # ticket changed on purpose: on the lane corpus it was as common in
     # good work as in damaging work, so it is left to the model.
@@ -658,12 +684,18 @@ def scan_weakened_verification(
     changes: Iterable[FileChange],
     hunks: tuple[DiffHunk, ...],
     *,
-    criteria: tuple[LinkedCriterion, ...],
-    pr_title: str,
+    criteria: tuple[LinkedCriterion, ...] | Callable[[], tuple[LinkedCriterion, ...]],
+    pr_title: str | Callable[[], str],
 ) -> tuple[Finding, ...]:
     """`weakened-test` and `removed-verification-layer` findings, or none
-    when the diff is past `MAX_DIFF_LINES` (not evaluated)."""
-    ticket = "\n".join([pr_title or "", *(c.text for c in criteria)])
+    when the diff is past `MAX_DIFF_LINES` (not evaluated).
+
+    Reads `pr_title` and `criteria` at review time (invoking callables if
+    provided) to avoid relying on stale cached values (#1457).
+    """
+    resolved_title = pr_title() if callable(pr_title) else pr_title
+    resolved_criteria = criteria() if callable(criteria) else criteria
+    ticket = "\n".join([resolved_title or "", *(c.text for c in resolved_criteria)])
     by_file: dict[str, list[DiffHunk]] = {}
     for hunk in hunks:
         by_file.setdefault(hunk.file_path, []).append(hunk)

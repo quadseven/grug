@@ -237,7 +237,9 @@ def dispatch_walkthrough_review(
     from personas.code_reviewer.dispatch import pr_skip_rule
 
     try:
-        skip_rule = pr_skip_rule(pr, installation_id, owner, repo_name)
+        skip_rule = pr_skip_rule(
+            pr, installation_id, owner, repo_name, repository=repo,
+        )
     except RuntimeError:
         # Token exchange failed; the diff fetch below hits the same wall and
         # takes the established fetch_failed path.

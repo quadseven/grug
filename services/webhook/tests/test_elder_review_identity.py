@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from personas.code_reviewer.snapshot import (
+from personas.code_reviewer.elder_review import (
     adaptive_elder_settle_seconds,
     normalize_intent_text,
     review_freshness_id_from_pr,

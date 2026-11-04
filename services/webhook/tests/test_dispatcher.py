@@ -205,14 +205,17 @@ def test_ensure_enforcement_on_pr_store_outage_skips_silently():
     mock_retry.assert_not_called()
 
 
-def _full_pr_payload():
+def _full_pr_payload(with_walkthrough_label: bool = False):
+    pr = {
+        "number": 42,
+        "body": "## Why\nbecause we need it badly\n## Acceptance criteria\n- a\n- b\n- c\n## Out of scope\nx\nSize: S\ncloses #1",
+        "head": {"sha": "abc123def456"},
+    }
+    if with_walkthrough_label:
+        pr["labels"] = [{"name": "grug:walkthrough"}]
     return {
         "action": "opened",
-        "pull_request": {
-            "number": 42,
-            "body": "## Why\nbecause we need it badly\n## Acceptance criteria\n- a\n- b\n- c\n## Out of scope\nx\nSize: S\ncloses #1",
-            "head": {"sha": "abc123def456"},
-        },
+        "pull_request": pr,
         "repository": {"id": 7777, "name": "infra", "owner": {"login": "quadseven"}, "full_name": "quadseven/infra"},
         "installation": {"id": 999},
     }
@@ -342,12 +345,12 @@ def test_pull_request_dispatches_all_personas_independently():
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
                return_value={"persona": "tpm", "result": "pass"}), \
-         patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq, \
-         patch("async_dispatch.enqueue_guard_review", return_value=True) as mock_guard_enq, \
-         patch("async_dispatch.enqueue_smasher_review", return_value=True) as mock_smasher_enq, \
-         patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
+patch("async_dispatch.enqueue_elder_review", return_value=True) as mock_enq, \
+          patch("async_dispatch.enqueue_guard_review", return_value=True) as mock_guard_enq, \
+          patch("async_dispatch.enqueue_smasher_review", return_value=True) as mock_smasher_enq, \
+          patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
         mock_eval.return_value = type("R", (), {"passed": True})()
-        out = dispatch("pull_request", _full_pr_payload())
+        out = dispatch("pull_request", _full_pr_payload(with_walkthrough_label=True))
 
     assert out["status"] == "dispatched"
     assert len(out["personas"]) == 5
@@ -361,6 +364,34 @@ def test_pull_request_dispatches_all_personas_independently():
     mock_guard_enq.assert_called_once()
     mock_teller_enq.assert_called_once()
     mock_smasher_enq.assert_called_once()
+
+
+def test_pull_request_walkthrough_opt_in_required_without_label():
+    """Walkthrough requires the grug:walkthrough label on the PR.
+    Without it, the persona returns opt_in_required instead of queued."""
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher.get_repo_config", return_value={"code_reviewer_blocking": False}), \
+         patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
+         patch("personas.tpm.persona.publish_tpm_evaluation",
+               return_value={"persona": "tpm", "result": "pass"}), \
+         patch("async_dispatch.enqueue_elder_review", return_value=True), \
+         patch("async_dispatch.enqueue_guard_review", return_value=True), \
+         patch("async_dispatch.enqueue_smasher_review", return_value=True), \
+         patch("async_dispatch.enqueue_walkthrough_review", return_value=True) as mock_teller_enq:
+        mock_eval.return_value = type("R", (), {"passed": True})()
+        # No label = opt_in_required
+        out = dispatch("pull_request", _full_pr_payload(with_walkthrough_label=False))
+
+    assert out["status"] == "dispatched"
+    # TPM runs, Elder/Guard/Smasher run, but walkthrough requires opt-in
+    assert out["personas"][0]["persona"] == "tpm"
+    assert out["personas"][1] == {"persona": "code_reviewer", "result": "queued"}
+    assert out["personas"][2] == {"persona": "guard", "result": "queued"}
+    assert out["personas"][3] == {"persona": "smasher", "result": "queued"}
+    assert out["personas"][4] == {"persona": "walkthrough", "result": "opt_in_required"}
+    # enqueue_walkthrough_review should NOT have been called
+    mock_teller_enq.assert_not_called()
 
 
 def test_pull_request_tpm_failure_does_not_skip_elder_enqueue():
@@ -734,18 +765,81 @@ def _review_reply_payload(**over):
     return p
 
 
-def test_review_reply_enqueues_for_write_author():
-    # The PR author teaches, AND has write perm -> enqueued, author threaded.
+def _maintainer_reply(payload, commits=frozenset({"lane-app[bot]"})):
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher._actor_permission", return_value="admin"), \
+         patch("dispatcher._pr_commit_logins", return_value=commits), \
+         patch("rerun.enqueue_learn") as mock_enq:
+        out = dispatch("pull_request_review_comment", payload)
+    return out, mock_enq
+
+
+def test_review_reply_pr_author_cannot_teach_even_with_admin():
+    # #1571: the reviewed must not teach the reviewer, whatever their role.
+    out, mock_enq = _maintainer_reply(_review_reply_payload())
+    assert out["status"] == "no_op" and "wrote this PR" in out["reason"]
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_pr_author_check_ignores_login_case():
+    out, mock_enq = _maintainer_reply(_review_reply_payload(sender={"login": "DEV"}))
+    assert out["status"] == "no_op"
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_commit_author_cannot_teach():
+    out, mock_enq = _maintainer_reply(
+        _review_reply_payload(sender={"login": "pusher"}),
+        commits=frozenset({"pusher"}),
+    )
+    assert out["status"] == "no_op" and "wrote this PR" in out["reason"]
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_is_refused_when_the_commits_cannot_be_read():
+    out, mock_enq = _maintainer_reply(
+        _review_reply_payload(sender={"login": "teammate"}), commits=None,
+    )
+    assert out == {"status": "skip", "reason": "pr_commits_unreadable"}
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_app_sender_cannot_teach():
+    out, mock_enq = _maintainer_reply(
+        _review_reply_payload(sender={"login": "lane-app[bot]", "type": "Bot"}),
+    )
+    assert out == {"status": "no_op", "reason": "reply author is a bot"}
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_with_no_reason_cannot_teach():
+    out, mock_enq = _maintainer_reply(_review_reply_payload(
+        sender={"login": "teammate"}, comment={"body": "not a bug"},
+    ))
+    assert out == {"status": "no_op", "reason": "reply gives no reason"}
+    mock_enq.assert_not_called()
+
+
+def test_review_reply_enqueues_for_write_author():
+    # The reply's author has write perm -> enqueued, the reply author threaded
+    # as the teacher. Since #1571 that author must not have written the PR, so
+    # the sender is a maintainer on someone else's PR (the PR author's own
+    # reply is refused: test_review_reply_pr_author_cannot_teach_even_with_admin).
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher._pr_commit_logins", return_value=frozenset({"lane-app[bot]"})), \
          patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "admin"), \
          patch("rerun.enqueue_learn") as mock_enq:
-        out = dispatch("pull_request_review_comment", _review_reply_payload())
+        out = dispatch(
+            "pull_request_review_comment",
+            _review_reply_payload(sender={"login": "teammate"}),
+        )
     assert out == {"status": "enqueued", "kind": "learn"}
     kw = mock_enq.call_args.kwargs
     assert kw["repo"] == "quadseven/infra" and kw["parent_comment_id"] == 4000
     assert kw["comment_id"] == 5001 and kw["pr_number"] == 42
-    assert kw["author"] == "dev"  # the reply sender is the teacher
+    assert kw["author"] == "teammate"  # the reply sender is the teacher
 
 
 def test_review_reply_fork_author_without_write_is_blocked():
@@ -806,6 +900,7 @@ def test_review_reply_write_collaborator_enqueues():
     payload = _review_reply_payload(sender={"login": "teammate"})
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher._pr_commit_logins", return_value=frozenset()), \
          patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "write"), \
          patch("rerun.enqueue_learn") as mock_enq:
         out = dispatch("pull_request_review_comment", payload)
@@ -821,9 +916,13 @@ def test_review_reply_enqueue_sqs_failure_is_skip_not_500():
         raise _Boom("sqs unavailable")
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher._pr_commit_logins", return_value=frozenset()), \
          patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "write"), \
          patch("rerun.enqueue_learn", side_effect=_raise_enqueue):
-        out = dispatch("pull_request_review_comment", _review_reply_payload())
+        out = dispatch(
+            "pull_request_review_comment",
+            _review_reply_payload(sender={"login": "teammate"}),
+        )
     assert out["status"] == "skip" and out["reason"] == "enqueue_failed"
 
 

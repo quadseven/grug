@@ -37,7 +37,7 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
         from personas.publish_check import PUBLISH_FAILED  # type: ignore
         from personas.tpm.issue_fetcher import (  # type: ignore
             build_changed_files_fetcher, build_issue_facts_fetcher,
-            build_issue_fetcher,
+            build_issue_fetcher, build_merged_siblings_fetcher,
         )
         from personas.tpm.persona import (  # type: ignore
             _ADVISORY_CHECKS, evaluate_pull_request, is_trusted_operator,
@@ -91,6 +91,10 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
             fetch_issue=fetcher,
             fetch_issue_facts=facts_fetcher,
             fetch_changed_files=fetch_changed_files,
+            fetch_siblings=build_merged_siblings_fetcher(
+                installation_id=ctx.installation_id,
+                owner=ctx.owner, repo=ctx.repo_name, pr_number=ctx.pr_number,
+            ),
             author_trusted=is_trusted_operator(
                 (ctx.payload or {}).get("pull_request"),
             ),

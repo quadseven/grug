@@ -16,6 +16,7 @@ import httpx
 import pytest
 
 import rerun
+from personas.code_reviewer import elder_review
 
 
 def _job(**over) -> str:
@@ -81,8 +82,8 @@ def test_review_claim_heartbeat_renews_until_stopped(monkeypatch):
         return True
 
     monkeypatch.setattr("adapters.install_store.renew_review_claim", renew)
-    monkeypatch.setattr(rerun, "_REVIEW_CLAIM_HEARTBEAT_SECONDS", 0.001)
-    heartbeat = rerun._start_review_claim_heartbeat({
+    monkeypatch.setattr(elder_review, "_REVIEW_CLAIM_HEARTBEAT_SECONDS", 0.001)
+    heartbeat = elder_review.start_review_claim_heartbeat({
         "install_id": 11,
         "repo": "myorg/myrepo",
         "pr_number": 7,
@@ -92,7 +93,7 @@ def test_review_claim_heartbeat_renews_until_stopped(monkeypatch):
     })
 
     assert renewed.wait(1.0)
-    assert rerun._stop_review_claim_heartbeat(heartbeat) is True
+    assert elder_review.stop_review_claim_heartbeat(heartbeat) is True
 
 
 def test_review_claim_heartbeat_surfaces_lost_ownership(monkeypatch):
@@ -103,8 +104,8 @@ def test_review_claim_heartbeat_surfaces_lost_ownership(monkeypatch):
         return False
 
     monkeypatch.setattr("adapters.install_store.renew_review_claim", renew)
-    monkeypatch.setattr(rerun, "_REVIEW_CLAIM_HEARTBEAT_SECONDS", 0.001)
-    heartbeat = rerun._start_review_claim_heartbeat({
+    monkeypatch.setattr(elder_review, "_REVIEW_CLAIM_HEARTBEAT_SECONDS", 0.001)
+    heartbeat = elder_review.start_review_claim_heartbeat({
         "install_id": 11,
         "repo": "myorg/myrepo",
         "pr_number": 7,
@@ -115,7 +116,7 @@ def test_review_claim_heartbeat_surfaces_lost_ownership(monkeypatch):
 
     assert attempted.wait(1.0)
     heartbeat.thread.join(timeout=1.0)
-    assert rerun._stop_review_claim_heartbeat(heartbeat) is False
+    assert elder_review.stop_review_claim_heartbeat(heartbeat) is False
 
 
 def test_enqueue_review_is_snapshot_scoped_and_carries_quiet_window(monkeypatch):
@@ -382,7 +383,7 @@ def test_hot_review_settles_then_dispatches_same_current_snapshot(monkeypatch):
         persona="code_reviewer",
         head_sha=rerun.review_snapshot_id_from_pr(_pr_data(head_sha="latest")),
         owner_token=ANY,
-        lease_seconds=rerun._REVIEW_CLAIM_LEASE_SECONDS,
+        lease_seconds=elder_review._REVIEW_CLAIM_LEASE_SECONDS,
     )
     owner_token = acquire.call_args.kwargs["owner_token"]
     assert owner_token
@@ -478,7 +479,7 @@ def test_hot_review_gives_up_at_entry_once_the_redrive_cap_is_exhausted(monkeypa
 
     status = rerun._run_one(_job(
         kind="review", requested_head_sha="same-head", settle_seconds=90,
-        redrive_count=rerun._MAX_INTENT_DRIFT_REDRIVES,
+        redrive_count=elder_review._MAX_INTENT_DRIFT_REDRIVES,
     ))
 
     assert status == "intent_drift_exhausted"
@@ -510,7 +511,7 @@ def test_hot_review_new_head_resets_the_redrive_count(monkeypatch):
 
     status = rerun._run_one(_job(
         kind="review", requested_head_sha="same-head", settle_seconds=90,
-        redrive_count=rerun._MAX_INTENT_DRIFT_REDRIVES,
+        redrive_count=elder_review._MAX_INTENT_DRIFT_REDRIVES,
     ))
 
     assert status == "stale_snapshot"
@@ -680,6 +681,41 @@ def test_hot_review_requeues_latest_when_dispatch_detects_stale(monkeypatch):
     complete.assert_not_called()
 
 
+def test_hot_review_pr_read_403_completes_check_without_redrive(monkeypatch):
+    response = httpx.Response(
+        403,
+        request=httpx.Request(
+            "GET", "https://api.github.com/repos/myorg/myrepo/pulls/7",
+        ),
+    )
+
+    attempts = []
+
+    def denied_then_post(iid, fn):
+        attempts.append(iid)
+        if len(attempts) == 1:
+            raise httpx.HTTPStatusError("Forbidden", request=response.request, response=response)
+        return fn("token")
+
+    posted = []
+    monkeypatch.setattr(rerun, "with_install_token_retry", denied_then_post)
+    monkeypatch.setattr(
+        rerun, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: posted.append(result) or {"id": 1},
+    )
+
+    status = rerun._run_one(_job(
+        kind="review", requested_head_sha="head-that-was-queued",
+    ))
+
+    assert status == "pr_read_forbidden"
+    assert len(posted) == 1
+    assert posted[0].title == "Grug cannot read this pull request: 403 from GitHub"
+    assert posted[0].head_sha == "head-that-was-queued"
+    assert posted[0].conclusion == "failure"
+    assert len(attempts) == 2
+
+
 def test_hot_review_gives_up_mid_flight_once_the_redrive_cap_is_exhausted(monkeypatch):
     """grug#773 AC3's other call site: the EXPENSIVE mid-flight staleness
     path (a real dispatch already ran) must also stop redriving once the
@@ -718,7 +754,7 @@ def test_hot_review_gives_up_mid_flight_once_the_redrive_cap_is_exhausted(monkey
 
     status = rerun._run_one(_job(
         kind="review", settle_seconds=0,
-        redrive_count=rerun._MAX_INTENT_DRIFT_REDRIVES,
+        redrive_count=elder_review._MAX_INTENT_DRIFT_REDRIVES,
     ))
 
     assert status == "intent_drift_exhausted"
@@ -1237,12 +1273,12 @@ def test_shutdown_release_frees_claims_orphaned_by_a_killed_review(monkeypatch):
         "install_id": 11, "repo": "o/r", "pr_number": 7,
         "persona": "code_reviewer", "head_sha": "snap", "owner_token": "tok-1",
     }
-    rerun._register_active_review_claim("tok-1", args)
+    elder_review.register_active_review_claim("tok-1", args)
 
-    assert rerun.release_active_review_claims() == 1
+    assert elder_review.release_active_review_claims() == 1
     release.assert_called_once_with(**args)
     # Registry drained: a second sweep has nothing to do.
-    assert rerun.release_active_review_claims() == 0
+    assert elder_review.release_active_review_claims() == 0
 
 
 def test_shutdown_release_is_best_effort_per_claim(monkeypatch):
@@ -1259,10 +1295,10 @@ def test_shutdown_release_is_best_effort_per_claim(monkeypatch):
     monkeypatch.setattr("adapters.install_store.release_review_claim", _release)
     base = {"install_id": 1, "repo": "o/r", "pr_number": 1,
             "persona": "code_reviewer", "head_sha": "s"}
-    rerun._register_active_review_claim("tok-a", {**base, "owner_token": "tok-a"})
-    rerun._register_active_review_claim("tok-b", {**base, "owner_token": "tok-b"})
+    elder_review.register_active_review_claim("tok-a", {**base, "owner_token": "tok-a"})
+    elder_review.register_active_review_claim("tok-b", {**base, "owner_token": "tok-b"})
 
-    assert rerun.release_active_review_claims() == 1  # tok-b released
+    assert elder_review.release_active_review_claims() == 1  # tok-b released
     assert set(calls) == {"tok-a", "tok-b"}
 
 
@@ -1286,7 +1322,7 @@ def test_in_process_exits_unregister_so_shutdown_sweep_sees_nothing(monkeypatch)
     with pytest.raises(RuntimeError, match="review crashed"):
         rerun._run_one(_job(kind="review", settle_seconds=0))
 
-    assert rerun.release_active_review_claims() == 0
+    assert elder_review.release_active_review_claims() == 0
 
 
 def test_hot_review_publish_failure_releases_claim_and_raises_for_redrive(monkeypatch):
@@ -1748,6 +1784,74 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     assert comments and "Markings remembered" in comments[0] and "prefer early returns" in comments[0]
 
 
+def _learn_on(monkeypatch, tags, learning="prefer early returns"):
+    put_calls: list[dict] = []
+    posted: list[tuple] = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment", lambda repo, cid: None,
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": tags},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning",
+                        lambda **kw: put_calls.append(kw))
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
+    monkeypatch.setattr(
+        "llm_client.classify_learning",
+        lambda *a, **k: {"durable": True, "learning": learning, "scope_path": ""},
+    )
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    monkeypatch.setattr(rerun, "_org_learning_approval_delay", lambda i, r: 0)
+    monkeypatch.setattr(rerun, "_sync_living_review", lambda *a, **k: None)
+    reply = "this is safe because the caller already checks it"
+    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, reply, "teammate")
+    return result, put_calls, posted
+
+
+def test_run_learn_redelivery_does_not_restart_the_rule(monkeypatch):
+    puts: list[dict] = []
+    monkeypatch.setattr(
+        "adapters.install_store.get_learning_by_source_comment",
+        lambda repo, cid: {"text": "prefer early returns", "scope_path": ""},
+    )
+    monkeypatch.setattr(
+        "adapters.install_store.get_comment_record",
+        lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}},
+    )
+    monkeypatch.setattr("adapters.install_store.put_learning", lambda **kw: puts.append(kw))
+    monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
+    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "a reason", "teammate") == "learn_duplicate"
+    assert puts == []
+
+
+def test_run_learn_stores_the_reason_and_the_finding_class(monkeypatch):
+    result, puts, _ = _learn_on(
+        monkeypatch, {"rule_name": "null-deref", "category": "correctness"},
+    )
+    assert result == "learned"
+    assert puts[0]["reason"] == "this is safe because the caller already checks it"
+    assert puts[0]["finding_class"] == "null-deref"
+    assert puts[0]["finding_category"] == "correctness"
+
+
+@pytest.mark.parametrize(
+    ("tags", "learning"),
+    [
+        ({"rule_name": "sql-injection", "category": "general"}, "prefer early returns"),
+        ({"rule_name": "whatever", "category": "security"}, "prefer early returns"),
+        ({"rule_name": "style", "category": "general"}, "do not flag sql injection here"),
+    ],
+)
+def test_run_learn_refuses_a_rule_that_touches_security(monkeypatch, tags, learning):
+    result, puts, posted = _learn_on(monkeypatch, tags, learning)
+    assert result == "learn_refused_protected"
+    assert puts == []
+    bodies = [b.get("body", "") for (_u, b) in posted]
+    assert any("security" in body for body in bodies)
+
+
 def test_run_learn_one_off_declines_without_storing(monkeypatch):
     put_calls = []
     posted = []
@@ -2037,7 +2141,7 @@ def test_run_ask_neutralizes_mention_in_posted_answer(monkeypatch):
 
     assert result == "answered"
     assert posted, "expected a comment to be posted"
-    body = posted[0]["body"]
+    body = posted[-1]["body"]
     assert "@cait" not in body
     assert f"@{_ZWSP}cait" in body
 
@@ -2058,7 +2162,7 @@ def test_run_ask_no_answer_falls_back_without_crashing_on_none(monkeypatch):
     result = rerun._run_ask(11, "o/r", 7, "who should review this?")
 
     assert result == "ask_no_answer"
-    assert "thinking-rock is tired" in posted[0]["body"]
+    assert "thinking-rock is tired" in posted[-1]["body"]
 
 
 # --- #716 follow-up: the staleness watch must not kill live work ------------
@@ -2089,19 +2193,17 @@ def _run_watch_once(monkeypatch, current_pr, expected_pr):
     """Drive exactly one poll of the staleness loop and report cancellation."""
     import threading
 
-    monkeypatch.setattr(rerun, "_STALENESS_WATCH_INTERVAL_S", 0.001)
+    monkeypatch.setattr(elder_review, "_STALENESS_WATCH_INTERVAL_S", 0.001)
     stop, cancel = threading.Event(), threading.Event()
 
     def _fetch(*_a, **_kw):
         stop.set()  # one iteration only
-        return current_pr
+        return current_pr, "etag"
 
-    monkeypatch.setattr(rerun, "_fetch_current_pr", _fetch)
-    rerun._review_staleness_watch_loop(
+    elder_review._review_staleness_watch_loop(
         1, "o", "r", 7,
-        rerun.review_freshness_id_from_pr(expected_pr),
         str((expected_pr.get("head") or {}).get("sha") or ""),
-        stop, cancel,
+        stop, cancel, _fetch,
     )
     return cancel.is_set()
 
@@ -2111,8 +2213,8 @@ def test_staleness_watch_does_not_cancel_on_an_intent_only_edit(monkeypatch):
     byte of it, so a running review is still producing a valid answer."""
     before = _pr("aaaa1111", body="original why")
     after = _pr("aaaa1111", body="rewritten why, same code")
-    assert rerun.review_freshness_id_from_pr(after) != \
-        rerun.review_freshness_id_from_pr(before), "fixture must move the id"
+    assert elder_review.review_freshness_id_from_pr(after) != \
+        elder_review.review_freshness_id_from_pr(before), "fixture must move the id"
 
     assert _run_watch_once(monkeypatch, after, before) is False, (
         "an intent-only edit must not cancel a running review - that is what "
@@ -2133,20 +2235,68 @@ def test_staleness_watch_ignores_a_transient_fetch_failure(monkeypatch):
     """A GitHub hiccup must never cancel a genuinely current review."""
     import threading
 
-    monkeypatch.setattr(rerun, "_STALENESS_WATCH_INTERVAL_S", 0.001)
+    monkeypatch.setattr(elder_review, "_STALENESS_WATCH_INTERVAL_S", 0.001)
     stop, cancel = threading.Event(), threading.Event()
 
     def _boom(*_a, **_kw):
         stop.set()
         raise RuntimeError("GitHub 502")
 
-    monkeypatch.setattr(rerun, "_fetch_current_pr", _boom)
-    rerun._review_staleness_watch_loop(
-        1, "o", "r", 7,
-        rerun.review_freshness_id_from_pr(_pr("aaaa1111")),
-        "aaaa1111", stop, cancel,
+    elder_review._review_staleness_watch_loop(
+        1, "o", "r", 7, "aaaa1111", stop, cancel, _boom,
     )
     assert cancel.is_set() is False
+
+
+def _watch_github(monkeypatch, answers):
+    """Run the real staleness loop against scripted GitHub answers and return
+    each request's If-None-Match plus whether the review was cancelled."""
+    import threading
+
+    monkeypatch.setattr(elder_review, "_STALENESS_WATCH_INTERVAL_S", 0.001)
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _i, fn: fn("tok"))
+    stop, cancel = threading.Event(), threading.Event()
+    sent, pending = [], list(answers)
+
+    def _get(_url, headers=None, timeout=None):
+        sent.append(headers.get("If-None-Match", ""))
+        if len(pending) == 1:
+            stop.set()
+        return pending.pop(0)
+
+    monkeypatch.setattr(rerun.httpx, "get", _get)
+    elder_review._review_staleness_watch_loop(
+        1, "o", "r", 7, "aaaa1111", stop, cancel, rerun._fetch_pr_if_changed,
+    )
+    return sent, cancel.is_set()
+
+
+def _pr_answer(head_sha, etag):
+    request = httpx.Request("GET", "https://api.github.com/repos/o/r/pulls/7")
+    return httpx.Response(
+        200, json=_pr(head_sha), headers={"ETag": etag}, request=request,
+    )
+
+
+def test_staleness_watch_pays_once_for_an_unchanged_pull_request(monkeypatch):
+    """Only the first poll is a full read. Every later one sends the ETag and
+    a 304 keeps the review running, which costs no rate limit."""
+    request = httpx.Request("GET", "https://api.github.com/repos/o/r/pulls/7")
+    unchanged = [httpx.Response(304, request=request) for _ in range(3)]
+    sent, cancelled = _watch_github(
+        monkeypatch, [_pr_answer("aaaa1111", 'W/"one"'), *unchanged],
+    )
+    assert sent == ["", 'W/"one"', 'W/"one"', 'W/"one"']
+    assert cancelled is False
+
+
+def test_staleness_watch_still_cancels_when_the_etag_moves(monkeypatch):
+    sent, cancelled = _watch_github(monkeypatch, [
+        _pr_answer("aaaa1111", 'W/"one"'),
+        _pr_answer("bbbb2222", 'W/"two"'),
+    ])
+    assert sent == ["", 'W/"one"']
+    assert cancelled is True
 
 
 def test_diff_too_large_completes_instead_of_redriving(monkeypatch):
@@ -2561,6 +2711,19 @@ def test_review_payload_keeps_the_head_repo_for_the_fork_check():
     )["pull_request"]["head"] == {"sha": "h", "repo": None}
 
 
+def test_review_payload_keeps_the_steering_source_fields():
+    """grug#1578: a rerun must still tell a PR into a non-default branch
+    apart, so the fetched base ref and default branch survive."""
+    pr = {"head": {"sha": "h", "repo": {"id": 99}},
+          "base": {"sha": "b", "ref": "feature",
+                   "repo": {"id": 7, "default_branch": "main"}}}
+    payload = rerun._review_payload(
+        install_id=1, owner="o", repo_name="r", pr_number=2, pr=pr,
+    )
+    assert payload["pull_request"]["base"] == {"sha": "b", "ref": "feature"}
+    assert payload["repository"]["default_branch"] == "main"
+
+
 # --- grug#1270: the `grug:reviewing` label, and the deferred re-run --------
 
 
@@ -2816,11 +2979,27 @@ def _command_fixture(
         "adapters.install_store.record_elder_command_run",
         lambda **k: recorded.append(k),
     )
+    _record_reactions(monkeypatch)
     dispatch = MagicMock()
     monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
     requeue = MagicMock()
     monkeypatch.setattr(rerun, "enqueue_rerun", requeue)
     return dispatch, requeue, recorded
+
+
+def _record_reactions(monkeypatch) -> list:
+    """Record the consumer's reaction POSTs and DELETEs on command comments
+    (grug#1620) instead of sending them; returns the call list. A POST
+    answers with the reaction's id, the way GitHub does."""
+    calls: list = []
+
+    def _post(_tok, url, body):
+        calls.append(("post", url, body))
+        return {"id": 7000 + len(calls)}
+
+    monkeypatch.setattr(rerun, "_gh_post", _post)
+    monkeypatch.setattr(rerun, "_gh_delete", lambda _tok, url: calls.append(("delete", url)))
+    return calls
 
 
 def test_command_jobs_get_a_dedup_id_per_comment(monkeypatch):
@@ -3147,10 +3326,10 @@ def test_run_ask_in_thread_replies_in_thread_with_hunk_context(monkeypatch):
     result = rerun._run_ask(11, "o/r", 7, "why did you flag this?", reply_to_comment_id=4000)
 
     assert result == "answered"
-    assert posted and "/pulls/7/comments/4000/replies" in posted[0][0]
+    assert posted and "/pulls/7/comments/4000/replies" in posted[-1][0]
     assert "lock.acquire()" in seen["diff"]  # the thread's hunk
     assert "held over a network call" in seen["diff"]  # the finding under discussion
-    assert "x.py" in posted[0][1]["body"]
+    assert "x.py" in posted[-1][1]["body"]
 
 
 def test_run_ask_top_level_quotes_the_question(monkeypatch):
@@ -3168,7 +3347,7 @@ def test_run_ask_top_level_quotes_the_question(monkeypatch):
 
     rerun._run_ask(11, "o/r", 7, "what does this add?")
 
-    assert posted[0][1]["body"].startswith("> what does this add?")
+    assert posted[-1][1]["body"].startswith("> what does this add?")
 
 
 def test_run_ask_thread_context_failure_is_disclosed(monkeypatch):
@@ -3191,5 +3370,351 @@ def test_run_ask_thread_context_failure_is_disclosed(monkeypatch):
 
     rerun._run_ask(11, "o/r", 7, "why did you flag this?", reply_to_comment_id=4000)
 
-    assert "/pulls/7/comments/4000/replies" in posted[0][0]
-    assert "could not load the thread" in posted[0][1]["body"]
+    assert "/pulls/7/comments/4000/replies" in posted[-1][0]
+    assert "could not load the thread" in posted[-1][1]["body"]
+
+
+# --- #695: /grug ask placeholder, update in place, reaction swap ------------
+
+class _FakeAskGitHub:
+    """Records every write `_run_ask` makes, in order, so a test can prove
+    the placeholder went out BEFORE the heavy work and the answer PATCHed
+    that same comment instead of posting a second one."""
+
+    def __init__(self, *, patch_fails: int = 0):
+        self.calls: list[tuple] = []
+        self._next_id = 9000
+        self._patch_fails = patch_fails
+
+    def post(self, _token, url, body):
+        self._next_id += 1
+        self.calls.append(("post", url, body, self._next_id))
+        return {"id": self._next_id}
+
+    def patch(self, _token, url, body):
+        if self._patch_fails:
+            self._patch_fails -= 1
+            self.calls.append(("patch_refused", url, body))
+            raise httpx.HTTPStatusError(
+                "422", request=httpx.Request("PATCH", url),
+                response=httpx.Response(422),
+            )
+        self.calls.append(("patch", url, body))
+
+    def delete(self, _token, url):
+        self.calls.append(("delete", url))
+
+    def install(self, monkeypatch, *, diff=lambda: "diff --git a b", answer="It adds a retry."):
+        monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+        monkeypatch.setattr(rerun, "_gh_post", self.post)
+        monkeypatch.setattr(rerun, "_gh_patch", self.patch)
+        monkeypatch.setattr(rerun, "_gh_delete", self.delete)
+
+        def _diff(_t, _u, accept=None):
+            self.calls.append(("diff",))
+            return diff()
+
+        def _answer(_q, _d, _iid, pr_context=None):
+            self.calls.append(("llm",))
+            return answer() if callable(answer) else answer
+
+        monkeypatch.setattr(rerun, "_gh_get_text", _diff)
+        monkeypatch.setattr(rerun, "_gh_get", lambda _t, _u: {"body": "finding", "path": "x.py"})
+        monkeypatch.setattr("llm_client.answer_pr_question", _answer)
+        monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
+
+    def comment_posts(self):
+        return [c for c in self.calls if c[0] == "post" and "/reactions" not in c[1]]
+
+    def reactions(self):
+        return [c[2]["content"] for c in self.calls
+                if c[0] == "post" and c[1].endswith("/reactions")]
+
+
+def test_run_ask_posts_placeholder_before_work_then_patches_same_comment(monkeypatch):
+    """#695 criterion 3: the placeholder is posted before the diff fetch
+    and the LLM call, and the answer PATCHes that same comment id - no
+    second comment."""
+    gh = _FakeAskGitHub()
+    gh.install(monkeypatch)
+
+    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert result == "answered"
+    kinds = [c[0] for c in gh.calls if c[0] in ("diff", "llm", "patch")
+             or (c[0] == "post" and "/reactions" not in c[1])]
+    assert kinds == ["post", "diff", "llm", "patch"]
+    placeholder = gh.comment_posts()[0]
+    assert placeholder[1].endswith("/issues/7/comments")
+    assert "Grug thinking" in placeholder[2]["body"]
+    patch = [c for c in gh.calls if c[0] == "patch"][0]
+    assert patch[1].endswith(f"/issues/comments/{placeholder[3]}")
+    assert "It adds a retry." in patch[2]["body"]
+    assert patch[2]["body"].startswith("> what does this add?")
+    assert len(gh.comment_posts()) == 1
+
+
+def test_run_ask_in_thread_placeholder_patches_the_review_reply(monkeypatch):
+    """#695 on the #822 target: an in-thread ask puts its placeholder in
+    the thread and PATCHes it through the review-comment endpoint."""
+    gh = _FakeAskGitHub()
+    gh.install(monkeypatch)
+
+    result = rerun._run_ask(
+        11, "o/r", 7, "why did you flag this?",
+        reply_to_comment_id=4000, comment_id=5002,
+    )
+
+    assert result == "answered"
+    placeholder = gh.comment_posts()[0]
+    assert "/pulls/7/comments/4000/replies" in placeholder[1]
+    patch = [c for c in gh.calls if c[0] == "patch"][0]
+    assert patch[1].endswith(f"/pulls/comments/{placeholder[3]}")
+    # The asking comment is a review comment: its reactions live under pulls.
+    react_urls = [c[1] for c in gh.calls if c[0] == "post" and c[1].endswith("/reactions")]
+    assert react_urls and all("/pulls/comments/5002/reactions" in u for u in react_urls)
+
+
+def test_run_ask_swaps_eyes_for_thumbs_up_when_answered(monkeypatch):
+    """#695 criterion 2: eyes on receipt, then eyes removed and +1 added."""
+    gh = _FakeAskGitHub()
+    gh.install(monkeypatch)
+
+    rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert gh.reactions() == ["eyes", "+1"]
+    eyes_id = [c for c in gh.calls if c[0] == "post" and c[2].get("content") == "eyes"][0][3]
+    deletes = [c[1] for c in gh.calls if c[0] == "delete"]
+    assert deletes == [f"https://api.github.com/repos/o/r/issues/comments/5001/reactions/{eyes_id}"]
+    # eyes comes before any heavy work
+    assert gh.calls[0][0] == "post" and gh.calls[0][2] == {"content": "eyes"}
+
+
+def test_run_ask_failure_resolves_placeholder_and_reacts_thumbs_down(monkeypatch):
+    """#695 criterion 5: a diff fetch that fails after the placeholder went
+    out resolves the placeholder to a real message, flips the reaction to
+    -1, and does not raise (a redelivery would post a second placeholder)."""
+    gh = _FakeAskGitHub()
+
+    def _boom():
+        raise httpx.ConnectError("github down")
+
+    gh.install(monkeypatch, diff=_boom)
+
+    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert result == "ask_failed"
+    patches = [c for c in gh.calls if c[0] == "patch"]
+    assert len(patches) == 1
+    assert "thinking-rock is tired" in patches[0][2]["body"]
+    assert "Grug thinking" not in patches[0][2]["body"]
+    assert gh.reactions() == ["eyes", "-1"]
+    assert len(gh.comment_posts()) == 1
+
+
+def test_run_ask_no_answer_resolves_placeholder_with_thumbs_down(monkeypatch):
+    """A degraded model (no answer) is a real message too, never the
+    placeholder left hanging."""
+    gh = _FakeAskGitHub()
+    gh.install(monkeypatch, answer=None)
+
+    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert result == "ask_no_answer"
+    patch = [c for c in gh.calls if c[0] == "patch"][0]
+    assert "thinking-rock is tired" in patch[2]["body"]
+    assert gh.reactions() == ["eyes", "-1"]
+
+
+def test_run_ask_refused_answer_patch_falls_back_to_real_message(monkeypatch):
+    """GitHub refusing the answer PATCH (say an over-long body) must not
+    leave the placeholder up: the tired message is written instead."""
+    gh = _FakeAskGitHub(patch_fails=1)
+    gh.install(monkeypatch)
+
+    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert result == "ask_publish_failed"
+    kinds = [c[0] for c in gh.calls if c[0] in ("patch", "patch_refused")]
+    assert kinds == ["patch_refused", "patch"]
+    assert "thinking-rock is tired" in [c for c in gh.calls if c[0] == "patch"][0][2]["body"]
+    assert gh.reactions() == ["eyes", "-1"]
+
+
+def test_run_ask_reaction_failure_does_not_block_the_answer(monkeypatch):
+    """Reactions are a signal, not the work: a refused reaction write must
+    not stop the placeholder and the answer."""
+    gh = _FakeAskGitHub()
+    gh.install(monkeypatch)
+    real_post = gh.post
+
+    def _post(token, url, body):
+        if url.endswith("/reactions"):
+            raise httpx.ConnectError("reactions down")
+        return real_post(token, url, body)
+
+    monkeypatch.setattr(rerun, "_gh_post", _post)
+
+    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+
+    assert result == "answered"
+    assert [c[0] for c in gh.calls if c[0] == "patch"] == ["patch"]
+
+
+def test_run_one_ask_passes_the_command_comment_id(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(rerun, "_run_ask", lambda *a, **k: seen.update(k) or "answered")
+    body = json.dumps({"kind": "ask", "install_id": 11, "repo": "o/r", "pr_number": 7,
+                       "comment_id": 5001, "question": "q", "reply_to_comment_id": 0})
+    assert rerun._run_one(body) == "answered"
+    assert seen["comment_id"] == 5001
+
+
+# --- grug#1620: a rerun command swaps its eyes for the outcome -------------
+
+_CMD_REACTIONS = "https://api.github.com/repos/myorg/myrepo/issues/comments/901/reactions"
+
+
+def _outcome(calls) -> list:
+    """The outcome reactions added, eyes re-reads left out."""
+    return [c[2]["content"] for c in calls
+            if c[0] == "post" and c[2]["content"] != "eyes"]
+
+
+@pytest.mark.parametrize("verdict", ["pass", "fail"])
+def test_an_elder_command_with_a_verdict_swaps_eyes_for_thumbs_up(monkeypatch, verdict):
+    """Criterion 2: a finished Elder re-run adds +1 to the command comment
+    and takes Grug's eyes off it."""
+    dispatch, _, _ = _command_fixture(monkeypatch)
+    calls = _record_reactions(monkeypatch)
+    dispatch.return_value = {"persona": "code_reviewer", "result": verdict}
+    assert rerun._run_one(_command_job(), message_id="r-1") == "dispatched"
+    assert _outcome(calls) == ["+1"]
+    eyes = [c for c in calls if c[0] == "post" and c[2] == {"content": "eyes"}]
+    assert len(eyes) == 1 and eyes[0][1] == _CMD_REACTIONS
+    eyes_id = calls.index(eyes[0]) + 1 + 7000
+    assert [c[1] for c in calls if c[0] == "delete"] == [f"{_CMD_REACTIONS}/{eyes_id}"]
+    assert all(c[1].startswith(_CMD_REACTIONS) for c in calls)
+
+
+@pytest.mark.parametrize("result", ["skipped", "publish_failed", "fail_open_x"])
+def test_an_elder_command_without_a_verdict_swaps_eyes_for_thumbs_down(monkeypatch, result):
+    dispatch, _, _ = _command_fixture(monkeypatch)
+    calls = _record_reactions(monkeypatch)
+    dispatch.return_value = {"persona": "code_reviewer", "result": result}
+    rerun._run_one(_command_job(), message_id="r-2")
+    assert _outcome(calls) == ["-1"]
+    assert len([c for c in calls if c[0] == "delete"]) == 1
+
+
+def _smasher_fixture(monkeypatch, result):
+    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(rerun, "_gh_get", lambda tok, url: _pr_data(head_sha="abc123"))
+    monkeypatch.setattr(rerun, "get_repo_config", lambda iid, rid: {})
+    calls = _record_reactions(monkeypatch)
+    monkeypatch.setattr(
+        rerun, "dispatch_smasher_review",
+        lambda payload, blocking: {"persona": "smasher", "result": result},
+    )
+    return calls
+
+
+@pytest.mark.parametrize("result,want", [
+    ("pass", "+1"), ("fail", "+1"),
+    ("degraded", "-1"), ("disabled_global", "-1"),
+])
+def test_a_smasher_command_swaps_eyes_for_its_outcome(monkeypatch, result, want):
+    """Criterion 3: `/grug test-gaps` gets the same swap as `/grug improve`."""
+    calls = _smasher_fixture(monkeypatch, result)
+    status = rerun._run_one(_job(persona="smasher", comment_id=901, queued_at=1.0))
+    assert status == "dispatched"
+    assert _outcome(calls) == [want]
+    assert len([c for c in calls if c[0] == "delete"]) == 1
+    assert all(c[1].startswith(_CMD_REACTIONS) for c in calls)
+
+
+def test_a_coalesced_command_gets_thumbs_up(monkeypatch):
+    """Criterion 4: an earlier run of this head already served it."""
+    dispatch, _, _ = _command_fixture(
+        monkeypatch, last_run={"head_sha": "abc123", "started_at": 1_050.0},
+    )
+    calls = _record_reactions(monkeypatch)
+    assert rerun._run_one(_command_job(), message_id="r-3") == "rerun_coalesced"
+    dispatch.assert_not_called()
+    assert _outcome(calls) == ["+1"]
+
+
+def test_a_command_past_the_hold_cap_gets_thumbs_down(monkeypatch):
+    _command_fixture(monkeypatch, running=True)
+    calls = _record_reactions(monkeypatch)
+    started = 1_100.0 - rerun._COMMAND_HOLD_MAX_SECONDS
+    status = rerun._run_one(_command_job(hold_started_at=started), message_id="r-4")
+    assert status == "rerun_hold_cap_reached"
+    assert _outcome(calls) == ["-1"]
+
+
+def test_a_held_command_keeps_its_eyes(monkeypatch):
+    """Still waiting behind a review: no outcome yet, so no swap."""
+    _command_fixture(monkeypatch, running=True)
+    calls = _record_reactions(monkeypatch)
+    assert rerun._run_one(_command_job(), message_id="r-5") == "rerun_held_behind_review"
+    assert calls == []
+
+
+def test_a_job_with_no_command_comment_makes_no_reaction(monkeypatch):
+    """Criterion 5: self-recovery and API re-runs carry no comment id."""
+    dispatch, _, _ = _command_fixture(monkeypatch)
+    calls = _record_reactions(monkeypatch)
+    dispatch.return_value = {"persona": "code_reviewer", "result": "pass"}
+    assert rerun._run_one(_job(persona="code_reviewer"), message_id="r-6") == "dispatched"
+    assert calls == []
+    smasher_calls = _smasher_fixture(monkeypatch, "pass")
+    assert rerun._run_one(_job(persona="smasher")) == "dispatched"
+    assert smasher_calls == []
+
+
+def test_a_refused_reaction_never_fails_the_command(monkeypatch):
+    dispatch, _, _ = _command_fixture(monkeypatch)
+    dispatch.return_value = {"persona": "code_reviewer", "result": "pass"}
+
+    def _refuse(*_a):
+        raise httpx.ConnectError("reactions down")
+
+    monkeypatch.setattr(rerun, "_gh_post", _refuse)
+    monkeypatch.setattr(rerun, "_gh_delete", _refuse)
+    assert rerun._run_one(_command_job(), message_id="r-7") == "dispatched"
+
+
+def test_a_plain_rerun_with_a_long_repo_name_keeps_its_dedup_id_within_sqs_limits(monkeypatch):
+    """SQS refuses a MessageDeduplicationId over 128 chars. A long owner/repo
+    pushed the plain content id past it, so the send failed and the rerun
+    was logged and lost. Past the limit the id is a digest of the same
+    content, so equal jobs still collapse."""
+    sent = {}
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/jobs.fifo")
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs))
+    repo = "o" * 39 + "/" + "r" * 100
+    rerun.enqueue_rerun(install_id=11, repo=repo, pr_number=7, persona="elder")
+    first = sent["MessageDeduplicationId"]
+    assert len(first) <= 128 and first.startswith("rerun:")
+    rerun.enqueue_rerun(install_id=11, repo=repo, pr_number=7, persona="elder")
+    assert sent["MessageDeduplicationId"] == first
+
+
+def test_an_ask_with_a_long_repo_name_keeps_its_dedup_id_within_sqs_limits(monkeypatch):
+    sent = {}
+    monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/jobs.fifo")
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kwargs: sent.update(kwargs))
+    repo = "o" * 39 + "/" + "r" * 100
+    rerun.enqueue_ask(
+        install_id=11, repo=repo, pr_number=7, comment_id=5, question="why?",
+        reply_to_comment_id=5,
+    )
+    assert len(sent["MessageDeduplicationId"]) <= 128
+    short = {}
+    monkeypatch.setattr(rerun._sqs, "send_message", lambda **kwargs: short.update(kwargs))
+    rerun.enqueue_ask(
+        install_id=11, repo="o/r", pr_number=7, comment_id=5, question="why?",
+        reply_to_comment_id=5,
+    )
+    assert short["MessageDeduplicationId"] == "11:o/r:7:ask:5"

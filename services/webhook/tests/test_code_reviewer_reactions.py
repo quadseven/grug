@@ -10,6 +10,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import httpx
+import psycopg
 import pytest
 
 from personas.code_reviewer import reactions as cr_reactions
@@ -48,7 +49,7 @@ def _learning_record(comment_id=1):
     record.update({
         "finding_text": "Optional value is dereferenced without a guard.",
         "head_sha": "abc123",
-        "author_login": "alice",
+        "author_login": "pr-author",
         "trust_reactors": True,
     })
     record["finding_tags"]["severity"] = "high"
@@ -186,6 +187,123 @@ def test_poll_uses_write_collaborator_reaction_and_ignores_outsider(
     learned.assert_called_once_with(_learning_record(comment_id=5), "confirmed")
 
 
+def test_an_app_bot_reaction_is_not_trusted_even_with_write_access(
+    monkeypatch, _patch_store, dismissals,
+):
+    """#1571: an agent's App holds write access, so permission alone cannot
+    tell it from a maintainer."""
+    submitted = _patch_annotate(monkeypatch)
+    monkeypatch.setattr(
+        cr_reactions, "_has_write_permission", lambda *a: True,
+    )
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=[
+        {"content": "-1", "user": {"login": "lane-app[bot]", "type": "Bot"}},
+        {"content": "-1", "user": {"login": "other-app[bot]"}},
+    ])
+    with patch("httpx.get", return_value=response):
+        n = cr_reactions.poll_and_annotate(
+            [_learning_record(comment_id=5)], install_id=1, fetch_token=lambda: "tok",
+        )
+    assert n == 0 and submitted == [] and dismissals == []
+
+
+@pytest.fixture(autouse=True)
+def _no_commit_lookup(monkeypatch):
+    monkeypatch.setattr(cr_reactions, "pr_commit_logins", lambda *a: frozenset())
+
+
+def _one_reaction(login):
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=[
+        {"content": "-1", "user": {"login": login, "type": "User"}},
+    ])
+    return response
+
+
+def _poll_one(monkeypatch, record, login="maintainer"):
+    submitted = _patch_annotate(monkeypatch)
+    monkeypatch.setattr(cr_reactions, "_record_reaction_learning", lambda *a: True)
+    monkeypatch.setattr(cr_reactions, "_has_write_permission", lambda *a: True)
+    with patch("httpx.get", return_value=_one_reaction(login)):
+        n = cr_reactions.poll_and_annotate([record], install_id=1, fetch_token=lambda: "tok")
+    return n, submitted
+
+
+def test_a_pr_committer_cannot_label_the_finding(monkeypatch, _patch_store, dismissals):
+    monkeypatch.setattr(cr_reactions, "pr_commit_logins", lambda *a: frozenset({"pusher"}))
+    n, submitted = _poll_one(monkeypatch, _learning_record(comment_id=5), login="Pusher")
+    assert n == 0 and submitted == [] and dismissals == []
+
+
+def test_an_unreadable_commit_list_trusts_nobody(monkeypatch, _patch_store, dismissals):
+    monkeypatch.setattr(cr_reactions, "pr_commit_logins", lambda *a: None)
+    n, submitted = _poll_one(monkeypatch, _learning_record(comment_id=5))
+    assert n == 0 and submitted == [] and dismissals == []
+
+
+def test_a_record_with_no_known_author_trusts_nobody(monkeypatch, _patch_store, dismissals):
+    record = _learning_record(comment_id=5)
+    del record["author_login"]
+    n, submitted = _poll_one(monkeypatch, record)
+    assert n == 0 and submitted == [] and dismissals == []
+
+
+def test_a_maintainer_who_did_not_write_the_pr_is_trusted(
+    monkeypatch, _patch_store, dismissals,
+):
+    n, submitted = _poll_one(monkeypatch, _learning_record(comment_id=5))
+    assert n == 1 and submitted[0]["verdict"] == "false_positive"
+
+
+def test_the_commit_list_is_read_once_per_pr_in_a_cycle(monkeypatch, _patch_store, dismissals):
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        cr_reactions, "pr_commit_logins",
+        lambda *a: calls.append(a) or frozenset(),
+    )
+    _patch_annotate(monkeypatch)
+    monkeypatch.setattr(cr_reactions, "_record_reaction_learning", lambda *a: True)
+    monkeypatch.setattr(cr_reactions, "_has_write_permission", lambda *a: True)
+    records = [_learning_record(comment_id=5), _learning_record(comment_id=6)]
+    with patch("httpx.get", return_value=_one_reaction("maintainer")):
+        cr_reactions.poll_and_annotate(records, install_id=1, fetch_token=lambda: "tok")
+    assert len(calls) == 1
+
+
+def test_a_verdict_already_recorded_spends_no_commit_lookup(
+    monkeypatch, _patch_store, dismissals,
+):
+    """The poller re-reads every record each cycle, so the lookup waits for a
+    verdict that would change something."""
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        cr_reactions, "pr_commit_logins",
+        lambda *a: calls.append(a) or frozenset(),
+    )
+    record = {**_learning_record(comment_id=5), "last_verdict": "false_positive"}
+    _poll_one(monkeypatch, record)
+    assert calls == []
+
+
+def test_the_pr_author_cannot_label_its_own_finding(
+    monkeypatch, _patch_store, dismissals,
+):
+    submitted = _patch_annotate(monkeypatch)
+    monkeypatch.setattr(cr_reactions, "_has_write_permission", lambda *a: True)
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=[
+        {"content": "-1", "user": {"login": "PR-Author", "type": "User"}},
+    ])
+    record = {**_learning_record(comment_id=5), "author_login": "pr-author"}
+    with patch("httpx.get", return_value=response):
+        n = cr_reactions.poll_and_annotate([record], install_id=1, fetch_token=lambda: "tok")
+    assert n == 0 and submitted == [] and dismissals == []
+
+
 def test_trusted_reaction_refreshes_ledger_practices_and_examples(monkeypatch):
     from adapters import install_store
 
@@ -264,10 +382,9 @@ def test_ensemble_verdict_writes_one_ledger_row_per_model(monkeypatch):
     assert prec["grug-elder/poolside/laguna-m.1"].accepted == 1
 
 
-def test_false_positive_reaction_refreshes_negative_prompt_guidance(monkeypatch):
-    """A trusted thumbs-down must change later behavior, not only precision
-    telemetry. It creates an AVOID practice while remaining excluded from the
-    positive few-shot examples."""
+def test_a_thumbs_down_alone_creates_no_suppression(monkeypatch):
+    """#1571: a thumbs-down is precision telemetry and leaves positive
+    examples, but an emoji alone never teaches Elder to stay quiet."""
     from adapters import install_store
 
     rows: list[dict] = []
@@ -295,10 +412,7 @@ def test_false_positive_reaction_refreshes_negative_prompt_guidance(monkeypatch)
     ) is True
 
     assert rows[0]["verdict"] == "false-positive"
-    assert practices[0][0]["disposition"] == "avoid"
-    assert practices[0][0]["rule"] == (
-        "Optional value is dereferenced without a guard."
-    )
+    assert practices == [[]]
     assert exemplars == [[]]
 
 
@@ -599,6 +713,90 @@ def test_poll_and_annotate_propagates_programmer_error(monkeypatch):
         cr_reactions.poll_and_annotate(
             [_record(comment_id=1)], install_id=1, fetch_token=lambda: "tok",
         )
+
+
+def _trusted_thumbs_up_response():
+    response = _reactions_response(["+1"])
+    response.json.return_value[0]["user"] = {"login": "alice"}
+    return response
+
+
+def _poll_two_learning_records(monkeypatch, *, put_ledger_row, update_baseline):
+    """Poll two trusted records against a stubbed store and return the count."""
+    from adapters import install_store
+
+    monkeypatch.setattr(install_store, "put_ledger_row", put_ledger_row)
+    monkeypatch.setattr(install_store, "list_ledger_rows", lambda repo: [])
+    monkeypatch.setattr(install_store, "put_repo_practices", lambda repo, data: None)
+    monkeypatch.setattr(install_store, "put_repo_exemplars", lambda repo, data: None)
+    monkeypatch.setattr(cr_reactions, "_has_write_permission", lambda *args: True)
+    monkeypatch.setattr(cr_reactions, "update_comment_record_reaction", update_baseline)
+    _patch_annotate(monkeypatch)
+    with patch("httpx.get", return_value=_trusted_thumbs_up_response()):
+        return cr_reactions.poll_and_annotate(
+            [_learning_record(comment_id=1), _learning_record(comment_id=2)],
+            install_id=1, fetch_token=lambda: "tok",
+        )
+
+
+def test_database_failure_on_learning_write_does_not_abort_batch(monkeypatch, caplog):
+    """#1491: psycopg.OperationalError is not an OSError. A database failure
+    on one record's learning write must leave the next record processed."""
+    put_ledger_row = MagicMock(
+        side_effect=[psycopg.OperationalError("connection lost"), None],
+    )
+    update_baseline = MagicMock()
+    with caplog.at_level("WARNING"):
+        n = _poll_two_learning_records(
+            monkeypatch,
+            put_ledger_row=put_ledger_row,
+            update_baseline=update_baseline,
+        )
+    assert n == 1
+    assert put_ledger_row.call_count == 2
+    # Record 1 never reaches the baseline write, so the next cycle retries it.
+    update_baseline.assert_called_once_with(
+        install_id=1, comment_id=2, verdict="confirmed",
+    )
+    failures = [
+        r for r in caplog.records if r.message == "reaction_submit_or_persist_failed"
+    ]
+    assert [r.comment_id for r in failures] == [1]
+    assert failures[0].kind == "OperationalError"
+
+
+def test_database_failure_on_baseline_write_does_not_abort_batch(monkeypatch, caplog):
+    """#1491: same boundary for the baseline write. Record 1 stays uncounted
+    and unadvanced; record 2 still advances."""
+    update_baseline = MagicMock(
+        side_effect=[psycopg.OperationalError("connection lost"), None],
+    )
+    with caplog.at_level("WARNING"):
+        n = _poll_two_learning_records(
+            monkeypatch,
+            put_ledger_row=MagicMock(),
+            update_baseline=update_baseline,
+        )
+    assert n == 1
+    assert [c.kwargs["comment_id"] for c in update_baseline.call_args_list] == [1, 2]
+    failures = [
+        r for r in caplog.records if r.message == "reaction_submit_or_persist_failed"
+    ]
+    assert [r.comment_id for r in failures] == [1]
+    assert failures[0].kind == "OperationalError"
+
+
+@pytest.mark.parametrize("error", [KeyError("bogus_key"), TypeError("bad row")])
+def test_programmer_error_on_learning_write_propagates(monkeypatch, error):
+    """#1491: the database catch stays narrow, so a bug still fails the poll."""
+    update_baseline = MagicMock()
+    with pytest.raises(type(error)):
+        _poll_two_learning_records(
+            monkeypatch,
+            put_ledger_row=MagicMock(side_effect=error),
+            update_baseline=update_baseline,
+        )
+    update_baseline.assert_not_called()
 
 
 def test_poll_and_annotate_logs_mixed_signal(monkeypatch, _patch_store, caplog):

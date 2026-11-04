@@ -36,6 +36,7 @@ Elder reuse it without a database.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from review_types import DEFAULT_CATEGORY, category_or_default
@@ -44,6 +45,16 @@ from review_types import DEFAULT_CATEGORY, category_or_default
 # vs the one verdict that means the reviewer was wrong.
 _ACCEPTED = frozenset({"fixed", "declined"})
 _REJECTED = frozenset({"false-positive"})
+
+# Verifier rows (#1567) carry `refuted`, `doubted`, `confirmed`, or
+# `unavailable`: a model's verdict, not ground truth, so they count as neither
+# accepted nor false-positive and never become eval cases.
+VERIFIER_REVIEWER = "elder-verifier"
+# The same for the second-lineage pass (#1573): `second-only` per blocking
+# finding only it raised, `second-lineage-run` per run, `single-lineage` per
+# high-risk PR that got one lineage.
+SECOND_LINEAGE_REVIEWER = "elder-second-lineage"
+TELEMETRY_REVIEWERS = frozenset({VERIFIER_REVIEWER, SECOND_LINEAGE_REVIEWER})
 
 # CRITICAL first; unknown labels sort last (consumers use .get(sev, 4)).
 # The ONE severity-ranking convention - few_shot (and any future consumer)
@@ -76,6 +87,8 @@ class LedgerRow:
     # #683: taxonomy category (review_types.CATEGORIES) so precedent and
     # precision can be sliced per category. Absent or invalid -> "general".
     category: str = DEFAULT_CATEGORY
+    # Model calls one second-lineage row spent (#1573).
+    model_calls: int = 0
 
     @property
     def accepted(self) -> bool:
@@ -110,6 +123,7 @@ def parse_row(d: dict) -> LedgerRow | None:
             commit=d.get("commit"),
             head_sha=d.get("head_sha"),
             category=category_or_default(d.get("category")),
+            model_calls=int(d.get("model_calls") or 0),
         )
     except (KeyError, ValueError, TypeError):
         return None
@@ -129,6 +143,47 @@ def parse_jsonl(text: str) -> list[LedgerRow]:
         row = parse_row(d)
         if row is not None:
             rows.append(row)
+    return rows
+
+
+# Column order of the Findings Ledger table the operator's pipeline posts on a
+# PR (#361): the same fields as a JSONL row, minus repo/pr (the comment's own
+# coordinates supply those).
+_TABLE_COLUMNS = ("reviewer", "severity", "class", "finding", "verdict", "evidence")
+
+
+def _split_table_row(line: str) -> list[str]:
+    """Split one markdown table line on unescaped pipes; `\\|` is a literal."""
+    body = line.strip().strip("|")
+    cells = re.split(r"(?<!\\)\|", body)
+    return [c.replace("\\|", "|").strip() for c in cells]
+
+
+def parse_comment_table(text: str, repo: str, pr: int | None) -> list[dict]:
+    """Findings Ledger markdown table (a PR comment body) -> raw row dicts
+    in the JSONL shape, stamped with the comment's `repo` and `pr`.
+
+    Rows start after a header whose first cells are `reviewer | severity |
+    class | finding | verdict`; a line with fewer cells than the required
+    five is skipped, and text without that header yields []. Output feeds
+    the same `parse_row` gate and `put_ledger_row` store as the JSONL source."""
+    rows: list[dict] = []
+    in_table = False
+    for line in text.splitlines():
+        if not line.strip().startswith("|"):
+            in_table = False
+            continue
+        cells = _split_table_row(line)
+        if [c.lower() for c in cells[:5]] == list(_TABLE_COLUMNS[:5]):
+            in_table = True
+            continue
+        if not in_table or set(line.strip()) <= set("|-: "):
+            continue
+        if len(cells) < 5:
+            continue
+        cells = (cells + [""] * len(_TABLE_COLUMNS))[: len(_TABLE_COLUMNS)]
+        fields = dict(zip(_TABLE_COLUMNS, cells, strict=True))
+        rows.append({"repo": repo, "pr": pr, **fields})
     return rows
 
 
@@ -233,6 +288,33 @@ def learning_metrics(rows: list[LedgerRow]) -> dict[str, object]:
     }
 
 
+def second_lineage_yield(rows: list[LedgerRow]) -> dict[str, float]:
+    """What the second pass cost and found (#1573), for the four-week review
+    of its path list."""
+    own = [r for r in rows if r.reviewer == SECOND_LINEAGE_REVIEWER]
+    second_only = sum(1 for r in own if r.verdict == "second-only")
+    calls = sum(r.model_calls for r in own)
+    return {
+        "runs": sum(1 for r in own if r.verdict == "second-lineage-run"),
+        "second_only_blocking": second_only,
+        "single_lineage": sum(1 for r in own if r.verdict == "single-lineage"),
+        "model_calls": calls,
+        "calls_per_finding": calls / second_only if second_only else 0.0,
+    }
+
+
+def tier_rates(rows: list[LedgerRow]) -> dict[str, tuple[int, int]]:
+    """{severity: (addressed, labeled)}: the data for tuning the comment
+    budget and checking that the top tier earns its place (#1570)."""
+    cells: dict[str, list[int]] = {}
+    for r in rows:
+        if r.accepted or r.false_positive:
+            cell = cells.setdefault(r.severity, [0, 0])
+            cell[0] += int(r.accepted)
+            cell[1] += 1
+    return {tier: (a, n) for tier, (a, n) in cells.items()}
+
+
 def format_metrics(rows: list[LedgerRow]) -> str:
     """Human-readable string representation of the ledger metrics (#539)."""
     m = learning_metrics(rows)
@@ -247,12 +329,39 @@ def format_metrics(rows: list[LedgerRow]) -> str:
     classes = m["classes"]  # type: ignore[assignment]
     for cls, c in sorted(classes.items()):
         lines.append(f"  {cls}: {c['accepted']}/{c['total']} accepted (precision {c['precision']:.2f})")
+    lines.append("tiers:")
+    rates = tier_rates(rows)
+    for tier in sorted(rates, key=lambda t: SEVERITY_ORDER.get(t, 4)):
+        addressed, labeled = rates[tier]
+        lines.append(f"  {tier}: {addressed}/{labeled} addressed")
+    second = second_lineage_yield(rows)
+    if second["runs"] or second["single_lineage"]:
+        lines.append(
+            f"second lineage: {second['runs']} runs, "
+            f"{second['second_only_blocking']} second-only blocking, "
+            f"{second['single_lineage']} single-lineage, "
+            f"{second['model_calls']} calls, "
+            f"{second['calls_per_finding']:.1f} calls per finding"
+        )
     return "\n".join(lines)
+
+
+def format_tier_report(rows: list[LedgerRow]) -> str:
+    """One `TIER: addressed/labeled addressed` line per severity tier, top
+    tier first: the weekly report the comment budget is tuned from (#1570)."""
+    rates = tier_rates(rows)
+    return "\n".join(
+        f"{tier}: {rates[tier][0]}/{rates[tier][1]} addressed"
+        for tier in sorted(rates, key=lambda t: SEVERITY_ORDER.get(t, 4))
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
     import sys
-    args = sys.argv[1:] if argv is None else argv
+    args = list(sys.argv[1:] if argv is None else argv)
+    tiers_only = "--tiers" in args
+    if tiers_only:
+        args.remove("--tiers")
     path = args[0] if args else "logs/review-ledger.jsonl"
     try:
         with open(path, encoding="utf-8") as f:
@@ -260,6 +369,14 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError:
         print(f"ledger: file not found: {path}")
         return 1
+    if tiers_only:
+        report = format_tier_report(rows)
+        if not report:
+            # A blank weekly summary would read as "nothing to tune".
+            print(f"ledger: no tier data in {path}")
+            return 1
+        print(report)
+        return 0
     print(format_metrics(rows))
     return 0
 

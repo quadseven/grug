@@ -32,7 +32,7 @@ def _full_gh_payload(body=""):
         "pull_request": {
             "number": 7,
             "head": {"sha": "abc123"},
-            "base": {"sha": "base123"},
+            "base": {"sha": "base123", "ref": "feature", "label": "x:feature"},
             "title": "Improve the reviewer",
             "body": body,
             "draft": False,
@@ -42,6 +42,7 @@ def _full_gh_payload(body=""):
             "owner": {"login": "quadseven", "id": 999, "url": "https://x"},
             "name": "grug",
             "private": False,
+            "default_branch": "main",
             "description": "x" * 1000,  # bulky — must be dropped
         },
         "installation": {"id": 555},
@@ -58,7 +59,8 @@ def test_slim_payload_keeps_bounded_review_context():
         "pull_request": {
             "number": 7,
             "head": {"sha": "abc123"},
-            "base": {"sha": "base123"},
+            # grug#1578: base.ref and default_branch pick the steering source.
+            "base": {"sha": "base123", "ref": "feature"},
             "title": "Improve the reviewer",
             "body": "m" * 5000,
             "draft": False,
@@ -66,6 +68,7 @@ def test_slim_payload_keeps_bounded_review_context():
         },
         "repository": {
             "owner": {"login": "quadseven"}, "name": "grug", "private": False,
+            "default_branch": "main",
         },
         "installation": {"id": 555},
     }
@@ -121,7 +124,7 @@ def test_enqueue_k8s_runtime_runs_in_process_thread(monkeypatch):
     assert seen["payload"]["pull_request"] == {
         "number": 7,
         "head": {"sha": "abc123"},
-        "base": {"sha": "base123"},
+        "base": {"sha": "base123", "ref": "feature"},
         "title": "Improve the reviewer",
         "body": "m" * 5000,
         "draft": False,
@@ -205,7 +208,7 @@ def test_enqueue_hashes_snapshot_from_full_body_not_slimmed(monkeypatch):
     """LORE #585: the claim_review snapshot must hash the FULL PR body, not the
     _slim_payload-truncated one - else a body edit past _MAX_PR_BODY_CHARS is
     invisible to idempotency. The enqueued job must carry the full-body hash."""
-    from personas.code_reviewer.snapshot import review_snapshot_id_from_pr
+    from personas.code_reviewer.elder_review import review_snapshot_id_from_pr
 
     long_body = "x" * (ad._MAX_PR_BODY_CHARS + 500)
     payload = _full_gh_payload(body=long_body)

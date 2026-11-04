@@ -215,7 +215,7 @@ _EXTRA_REPO_FLAGS = frozenset(
 # Repo-level flags whose value is a STRING, not a bool (the persona flags and
 # _EXTRA_REPO_FLAGS are all bool). elder_voice (#288/#578) is "caveman" | "sage".
 # These are exempt from the bool-only value check and validated per-flag below.
-_STR_REPO_FLAGS = frozenset({"elder_voice"})
+_STR_REPO_FLAGS = frozenset({"elder_voice", "pulse_delivery"})
 
 # Repo-level flags whose value is a list of strings. guard_hygiene_dead_ref_
 # patterns (#778) is per-install infrastructure data (decommissioned host/
@@ -318,6 +318,7 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     # Elder voice pack (#288/#578): stored only for entitled installs that
     # opted in; every other repo reads the caveman free default.
     cfg["elder_voice"] = str(item.get("elder_voice") or "caveman")
+    cfg["pulse_delivery"] = str(item.get("pulse_delivery") or "label")
     # Guard hygiene-watch dead-ref patterns (#778): absent row/field reads
     # back as (), the same "unconfigured, not clean" shape scan_dead_refs
     # already treats as a no-op - the visibility fix is the caller logging
@@ -363,9 +364,7 @@ def _validate_str_repo_flags(persona_flags: dict[str, Any], install_id: int) -> 
     paid pack gated on the install allowlist. Runs AFTER the caller has
     already confirmed the flag is known (it is in _STR_REPO_FLAGS)."""
     voice = persona_flags.get("elder_voice")
-    if voice is None:
-        return
-    if voice not in ("caveman", "sage"):
+    if voice is not None and voice not in ("caveman", "sage"):
         raise ValueError(
             f"elder_voice must be one of ('caveman', 'sage'), got {voice!r}"
         )
@@ -374,6 +373,9 @@ def _validate_str_repo_flags(persona_flags: dict[str, Any], install_id: int) -> 
             f"elder_voice='sage' requires an allowlisted (paid) "
             f"installation; install {install_id} is not entitled"
         )
+    delivery = persona_flags.get("pulse_delivery")
+    if delivery is not None and delivery not in ("label", "comment"):
+        raise ValueError("pulse_delivery must be 'label' or 'comment'")
 
 
 def _validate_list_repo_flags(persona_flags: dict[str, Any]) -> None:
@@ -648,6 +650,8 @@ class CheckVerdictRecord(TypedDict):
     verdict: str
     created_at: str
     degraded_reason: NotRequired[Optional[str]]
+    author_family: NotRequired[str]
+    reviewer_family: NotRequired[str]
 
 
 _CHECK_VERDICT_TTL_DAYS = 90
@@ -670,6 +674,8 @@ def put_check_verdict(
     blocking: bool,
     created_at: str,
     degraded_reason: Optional[str] = None,
+    author_family: Optional[str] = None,
+    reviewer_family: Optional[str] = None,
 ) -> None:
     """Upsert a Check verdict; the denormalized `verdict` badge is DERIVED
     via review_types.verdict (never a parameter) - ADR-0003 invariant
@@ -694,6 +700,10 @@ def put_check_verdict(
     }
     if degraded_reason:
         attrs["degraded_reason"] = degraded_reason
+    if author_family:
+        attrs["author_family"] = author_family
+    if reviewer_family:
+        attrs["reviewer_family"] = reviewer_family
     with get_pool().connection() as conn:
         conn.execute(
             """
@@ -760,6 +770,9 @@ def list_check_verdicts(
         }
         if "degraded_reason" in item:
             rec["degraded_reason"] = item["degraded_reason"]
+        for family_key in ("author_family", "reviewer_family"):
+            if family_key in item:
+                rec[family_key] = str(item[family_key])
         out.append(rec)
     return out if limit is None else out[:limit]
 
@@ -1240,23 +1253,32 @@ def put_ledger_row(row: dict[str, Any]) -> None:
         )
 
 
-def list_ledger_rows(repo: str, limit: int | None = None) -> list[dict[str, Any]]:
+def list_ledger_rows(
+    repo: str,
+    limit: int | None = None,
+    verdict: str | None = None,
+) -> list[dict[str, Any]]:
     """Every ledger finding for a repo (the corpus #527 / few-shot read),
-    class-ordered. Same prefix-scan shape as list_check_verdicts."""
+    class-ordered. Same prefix-scan shape as list_check_verdicts. `verdict`
+    filters in the query, so `limit` counts matches rather than scanned rows."""
+    verdict_sql = "" if verdict is None else "AND data->>'verdict' = %(verdict)s"
+    limit_sql = "" if limit is None else "LIMIT %(limit)s"
+    params = {"pk": _ledger_pk(repo), "verdict": verdict, "limit": limit}
     with get_pool().connection() as conn:
         rows = conn.execute(
             f"""
             SELECT pk, sk, data FROM grug_kv
-            WHERE pk = %s AND sk NOT IN ('PRACTICES', 'EXEMPLARS') AND {TTL_LIVE}
+            WHERE pk = %(pk)s AND sk NOT IN ('PRACTICES', 'EXEMPLARS') AND {TTL_LIVE}
+            {verdict_sql}
             -- keep the NOT IN list in lockstep with every derived-cache sk
             -- (PRACTICES #527, EXEMPLARS #538): a cached derivation leaking
             -- into the corpus scan feeds Elder its own output as ground truth
             ORDER BY sk COLLATE "C" ASC
+            {limit_sql}
             """,
-            (_ledger_pk(repo),),
+            params,
         ).fetchall()
-    out = [decode_item(pk, sk, data) for pk, sk, data in rows]
-    return out if limit is None else out[:limit]
+    return [decode_item(pk, sk, data) for pk, sk, data in rows]
 
 
 def put_repo_practices(repo: str, practices: list[dict[str, Any]]) -> None:
@@ -1339,6 +1361,10 @@ class Learning(TypedDict):
     approved_by: NotRequired[str]
     approved_at: NotRequired[str]
     last_used_review: NotRequired[str]
+    # Governance (#1571): the taught reason and the finding it answered.
+    reason: NotRequired[str]
+    finding_class: NotRequired[str]
+    finding_category: NotRequired[str]
 
 
 def _learning_pk(repo: str) -> str:
@@ -1376,6 +1402,8 @@ def _normalize_utc_iso(stamp: str) -> str:
 # refreshing the TTL; a now-wrong rule ages out on its own. This bounds the
 # blast radius of a stale rule in slice 1, which ships no delete command yet
 # (the sibling PRACTICES/EXEMPLARS caches that ride the same prompt also expire).
+# The row outlives the rule on purpose: `cave_drawings.EXPIRY_DAYS` stops it
+# firing at read time, and the TTL purges it once nobody re-affirmed it.
 _LEARNING_TTL_DAYS = 180
 
 
@@ -1390,6 +1418,9 @@ def put_learning(
     created_at: str = "",
     approval_delay_seconds: int = 0,
     active: bool | None = None,
+    reason: str = "",
+    finding_class: str = "",
+    finding_category: str = "",
 ) -> None:
     """Upsert one durable learning under LEARN#<repo>. Keyed by the rule
     text's content digest. A re-teach of the same text REFRESHES the mutable
@@ -1455,6 +1486,9 @@ def put_learning(
                         "author": author,
                         "created_at": now,
                         "reinforced_at": now,
+                        "reason": reason,
+                        "finding_class": finding_class,
+                        "finding_category": finding_category,
                         "active": is_active,
                         "approval_delay_seconds": delay,
                         "activated_at": activated_at,
@@ -1465,32 +1499,6 @@ def put_learning(
             },
         )
 
-
-def increment_learning_usage(repo: str, digest: str) -> None:
-    """Mark one learning as used: bump usage_count and stamp last_used_at.
-    Called when a learning is rendered into a review or /grug ask prompt.
-    Best-effort: never blocks a review. TTL and reinforced_at are untouched
-    (re-teaching is what refreshes relevance)."""
-    now = datetime.now(timezone.utc).isoformat()
-    try:
-        with get_pool().connection() as conn:
-            conn.execute(
-                """
-                UPDATE grug_kv
-                SET data = jsonb_set(
-                    jsonb_set(data, '{usage_count}',
-                        to_jsonb(COALESCE((data->>'usage_count')::int, 0) + 1)),
-                    '{last_used_at}', to_jsonb(%(now)s)
-                )
-                WHERE pk = %(pk)s AND sk = %(sk)s AND {TTL_LIVE}
-                """,
-                {"now": now, "pk": _learning_pk(repo), "sk": _learning_sk(digest)},
-            )
-    except Exception as e:  # noqa: BLE001 - usage tracking must not fail a review
-        log.warning(
-            "learning_increment_usage_failed",
-            extra={"repo": repo, "digest": digest, "kind": type(e).__name__},
-        )
 
 
 def delete_learning(repo: str, digest: str) -> bool:
@@ -1620,9 +1628,14 @@ def _lock_learning(conn: Any, repo: str, learning_id: str) -> Optional[Learning]
 
 
 def _write_learning(conn: Any, repo: str, learning_id: str, row: Mapping[str, Any]) -> None:
+    """Persist an operator's change. The TTL moves with it, so a rule
+    re-affirmed late in its row's life is not purged inside its new 90 days."""
     conn.execute(
-        "UPDATE grug_kv SET data = %s WHERE pk = %s AND sk = %s",
-        (encode_attrs(_learning_data(row)), _learning_pk(repo), _learning_sk(learning_id)),
+        "UPDATE grug_kv SET data = %s, ttl = %s WHERE pk = %s AND sk = %s",
+        (
+            encode_attrs(_learning_data(row)), _learning_ttl(),
+            _learning_pk(repo), _learning_sk(learning_id),
+        ),
     )
 
 
@@ -1654,8 +1667,9 @@ def list_learning_repos() -> list[str]:
 def set_learning_status(
     repo: str, learning_id: str, status: str, *, actor: str,
 ) -> Learning:
-    """Approve (-> active) or disable a learning. A superseded learning is
-    history: it cannot be switched back on (edit the successor instead).
+    """Approve (-> active) or disable a learning. Approving a learning that
+    is already active re-affirms it, which restarts its 90 days. A superseded
+    learning is history: it cannot be switched back on (edit the successor).
     Raises LookupError when missing, ValueError on an illegal transition."""
     from cave_drawings import (
         STATUS_ACTIVE, STATUS_DISABLED, STATUS_SUPERSEDED, effective_status,
@@ -1670,14 +1684,16 @@ def set_learning_status(
         current = effective_status(cast("dict[str, Any]", row))
         if current == STATUS_SUPERSEDED:
             raise ValueError("a superseded learning cannot change status")
-        if current == status:
+        if current == status == STATUS_DISABLED:
             return row
         out: dict[str, Any] = dict(row)
         out["status"] = status
         # Keep the approval-delay flag in step, so a reader of either field
         # sees the operator's decision.
         out["active"] = status == STATUS_ACTIVE
-        action = "approved" if status == STATUS_ACTIVE else "disabled"
+        action = "reaffirmed" if current == status else (
+            "approved" if status == STATUS_ACTIVE else "disabled"
+        )
         if status == STATUS_ACTIVE:
             out["approved_by"] = actor
             out["approved_at"] = out["activated_at"] = _now_iso()
@@ -1736,20 +1752,25 @@ def _supersede_learning(
 ) -> dict[str, Any]:
     """Insert the successor of `row` carrying `new_text`, and retire `row`
     as superseded. Both rows keep the full history."""
-    from cave_drawings import STATUS_SUPERSEDED, effective_status, learning_id as _lid
+    from cave_drawings import (
+        STATUS_ACTIVE, STATUS_EXPIRED, STATUS_SUPERSEDED, effective_status,
+        learning_id as _lid,
+    )
 
     old_id = str(row.get("id", ""))
     new_id = _lid(new_text)
     if _lock_learning(conn, repo, new_id) is not None:
         raise ValueError("a learning with that text already exists")
     history = list(row.get("history") or [])
+    prior = effective_status(cast("dict[str, Any]", row))
     successor: dict[str, Any] = {
         **_learning_data(edited),
         "text": new_text,
         # The successor keeps the predecessor's state: editing a pending
         # rule does not approve it, editing a disabled one does not switch
-        # it back on.
-        "status": effective_status(cast("dict[str, Any]", row)),
+        # it back on. An edit is a human affirmation, so an expired rule
+        # comes back: `expired` is derived and is never stored.
+        "status": STATUS_ACTIVE if prior == STATUS_EXPIRED else prior,
         "version": int(row.get("version") or 1) + 1,
         "supersedes": old_id,
         "reinforced_at": _now_iso(),
@@ -1812,6 +1833,7 @@ def edit_learning(
             out["history"] = [
                 *(row.get("history") or []), _history_entry("edited", actor, changes=changes),
             ]
+            out["reinforced_at"] = _now_iso()  # an edit is a human affirmation
             _write_learning(conn, repo, learning_id, out)
     return cast("Learning", out)
 
@@ -1848,6 +1870,9 @@ def import_learnings(
                     "reinforced_at": now,
                     "usage_count": 0,
                     "last_used_at": "",
+                    "reason": str(item.get("reason", "") or ""),
+                    "finding_class": str(item.get("finding_class", "") or ""),
+                    "finding_category": str(item.get("finding_category", "") or ""),
                     "status": STATUS_PENDING,
                     "active": False,
                     "version": 1,
@@ -1866,16 +1891,52 @@ def import_learnings(
     return ids
 
 
+def _learning_fired_pk(repo: str) -> str:
+    return f"LEARNFIRED#{repo}"
+
+
+def _learning_fired_sk(review_key: str) -> str:
+    return f"REVIEW#{review_key}"
+
+
+def get_review_fired_learnings(repo: str, review_key: str) -> list[str]:
+    """The sorted ids of every learned rule supplied to one review (PR number
+    and head sha), [] when none fired. Outlives a rule deleted since."""
+    item = _get_item(_learning_fired_pk(repo), _learning_fired_sk(review_key))
+    return sorted(str(i) for i in (item or {}).get("rule_ids") or [])
+
+
 def record_learning_usage(
     repo: str, learning_ids: list[str], *, review_key: str,
 ) -> int:
     """Count one use of each learning actually supplied to a review.
     Idempotent per `review_key` (PR number and head sha): the several prompt
     builds of one review (chunks, the judge, a backend fallback) count once.
-    Returns how many rows were incremented."""
+    Also records the rule ids on the review itself (#1571), since a later
+    prompt of that review can supply rules the first one did not. Returns how
+    many rows were incremented."""
     if not (repo and learning_ids and review_key):
         return 0
-    with get_pool().connection() as conn:
+    with get_pool().connection() as conn, conn.transaction():
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE SET data = jsonb_set(
+                grug_kv.data, '{rule_ids}', (
+                    SELECT jsonb_agg(DISTINCT rule_id)
+                    FROM jsonb_array_elements_text(
+                        (grug_kv.data->'rule_ids') || (EXCLUDED.data->'rule_ids')
+                    ) AS rule_id
+                ))
+            """,
+            {
+                "pk": _learning_fired_pk(repo),
+                "sk": _learning_fired_sk(review_key),
+                "data": encode_attrs({"rule_ids": sorted(set(learning_ids)), "at": _now_iso()}),
+                "ttl": _learning_ttl(),
+            },
+        )
         cur = conn.execute(
             f"""
             UPDATE grug_kv
@@ -2046,7 +2107,55 @@ def list_hygiene_watch_repos(install_id: int) -> list[dict[str, Any]]:
     return _list_flag_enabled_repos(install_id, "guard_hygiene_watch_enabled")
 
 
+_ENFORCEMENT_CHECKS_TTL_DAYS = 30
 _HYGIENE_WATCH_TTL_DAYS = 7
+
+
+def claim_budget_alert(install_id: int, reset_epoch: int) -> bool:
+    """Win-once claim for the low-budget alert of one rate-limit window. The
+    window's reset time is its name, so the next window claims afresh."""
+    pg_base.maybe_purge_expired()
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO NOTHING
+            RETURNING pk
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": f"BUDGETALERT#{int(reset_epoch)}",
+                "data": Jsonb({}),
+                "ttl": int(reset_epoch) + 3600,
+            },
+        ).fetchone()
+    return row is not None
+
+
+def get_enforcement_checks(install_id: int) -> dict[str, float]:
+    """Repo id to the epoch second of its last good enforcement check."""
+    item = _get_item(_inst_pk(install_id), "ENFORCEMENTCHECKS") or {}
+    return {str(k): float(v) for k, v in (item.get("checks") or {}).items()}
+
+
+def put_enforcement_checks(install_id: int, checks: Mapping[str, float]) -> None:
+    ttl = int(datetime.now(timezone.utc).timestamp() + _ENFORCEMENT_CHECKS_TTL_DAYS * 86400)
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": "ENFORCEMENTCHECKS",
+                "data": encode_attrs({"checks": dict(checks)}),
+                "ttl": ttl,
+            },
+        )
 
 
 def claim_hygiene_watch_report(install_id: int, repo: str) -> bool:

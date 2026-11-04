@@ -73,3 +73,10 @@ def test_malformed_hex_returns_false() -> None:
 )
 def test_malformed_header_shapes_return_false(header: str) -> None:
     assert verify_signature(SECRET, BODY, header) is False
+
+
+def test_non_ascii_signature_returns_false() -> None:
+    """A header with non-ASCII bytes (Starlette decodes headers as latin-1)
+    must read as no match. `hmac.compare_digest` raises TypeError on such
+    input, which turned a forged header into a 500 instead of a 401."""
+    assert verify_signature(SECRET, BODY, "sha256=\xe9" + "a" * 63) is False

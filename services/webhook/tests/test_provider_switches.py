@@ -30,6 +30,13 @@ def _env(monkeypatch):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
+    # Retired names stand in as chain tiers here; test_opencode_go_return.py
+    # covers the real data-terms gate.
+    monkeypatch.setattr(
+        lc, "_OPENCODE_GO_PRIVATE_SAFE_MODELS",
+        lc._OPENCODE_GO_PRIVATE_SAFE_MODELS
+        | {"space-bunny-free", "longcat-2.5-preview-free", "mimo-v2.5"},
+    )
     monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
     monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
@@ -64,6 +71,11 @@ def _finding_response() -> httpx.Response:
 
 def _hunk() -> Hunk:
     return Hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar")
+
+
+def _large_hunk() -> Hunk:
+    """Past `_DEGENERATE_MIN_DIFF_CHARS`: a short empty answer is a skim (grug#1642)."""
+    return Hunk(path="src/x.py", body="@@ -1 +1 @@\n+" + "y" * lc._DEGENERATE_MIN_DIFF_CHARS)
 
 
 class _Recorder:
@@ -131,19 +143,26 @@ def _shipped_env(name: str) -> str:
     return found.pop()
 
 
-def test_the_shipped_chain_is_free_cloud_tiers_only_then_the_cave(monkeypatch) -> None:
-    """grug#1269: the operator wants the free cloud models used first.
-    OpenRouter's free pool leads, then Poolside, then the gateway's free
-    provider pool, and only then the Cave. Nothing paid can be called:
-    OpenCode Go is off and OpenRouter's paid pool is off."""
+def test_the_shipped_chain_leads_with_go_then_the_free_cloud_tiers(monkeypatch) -> None:
+    """grug#1575: OpenCode Go leads again, then the free cloud tiers, and only
+    then the Cave. OpenRouter's paid pool stays off, Poolside is off while it
+    answers 400, and the OpenRouter free tier is not shipped: its model left
+    the catalogue."""
+    assert not any(
+        "GRUG_CLOUD_FREE_TIER_MODEL" in (Path(__file__).resolve().parents[3] / "k8s" / name).read_text()
+        for name in ("consumer-deployment.yaml", "webhook-deployment.yaml", "poller-cronjob.yaml")
+    )
+    monkeypatch.delenv("GRUG_CLOUD_FREE_TIER_MODEL", raising=False)
     monkeypatch.setenv("GRUG_DISABLED_BACKENDS", _shipped_env("GRUG_DISABLED_BACKENDS"))
     monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", _shipped_env("GRUG_CLOUD_FREE_POOL"))
+    monkeypatch.setenv(
+        "GRUG_OPENCODE_GO_FALLBACK_MODEL", _shipped_env("GRUG_OPENCODE_GO_FALLBACK_MODEL"),
+    )
+    monkeypatch.delenv("GRUG_OPENCODE_GO_SECOND_MODEL")
     assert [(t.backend, t.model) for t in lc._cloud_chain_tiers()] == [
-        (Backend.OPENROUTER, _FREE),
-        (Backend.POOLSIDE, lc._POOLSIDE_MODEL),
-        (Backend.FREE_POOL, "free-pool"),
+        (Backend.OPENCODE_GO, "deepseek-v4.1-flash"),
+        (Backend.OPENCODE_GO, "beam-free"),
     ]
-    assert not lc._backend_enabled(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
     assert not lc._backend_enabled(Backend.OPENROUTER, "anthropic/claude-opus-4.7")
     assert lc._backend_enabled(Backend.OPENROUTER, _FREE)
 
@@ -233,7 +252,7 @@ def test_free_tier_empties_never_pass_a_pr_the_sparks_review_it(monkeypatch) -> 
         _CAVE_URL: _finding_response(),
     })
     with patch.object(httpx, "post", side_effect=fake):
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE
     assert len(out.findings) == 1
@@ -403,7 +422,6 @@ def test_the_free_per_day_cap_blocks_the_free_tier_and_is_not_retried() -> None:
 
 @pytest.mark.parametrize("resp", [
     # Poolside's short-lived throttle (live 2026-10-17, no Retry-After).
-    _err(429, "usage limit exceeded"),
     _err(429, "quota exceeded, try again shortly"),
     _err(429, "Rate limit exceeded: free-models-per-min."),
     _err(429, "slow down"),
@@ -494,8 +512,80 @@ def test_a_poolside_usage_limit_429_keeps_poolside_in_the_chain() -> None:
     assert Backend.POOLSIDE in [t.backend for t in lc._cloud_chain_tiers()]
 
 
+def _poolside_call(resp: httpx.Response) -> None:
+    cfg = lc.replace(lc._BACKEND_CONFIGS[Backend.POOLSIDE], retry_attempts=1)
+    with patch.object(httpx, "post", return_value=resp):
+        lc._call_backend(cfg, _MESSAGES)
+
+
+def test_repeated_limit_refusals_skip_poolside_then_it_is_asked_again(monkeypatch) -> None:
+    """The second refusal in five minutes holds Poolside for five minutes
+    (#1546), so the review reaches a tier that can answer, and Poolside
+    comes back on its own."""
+    now = 1_000_000.0
+    monkeypatch.setattr(lc.time, "time", lambda: now)
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    _poolside_call(limited)
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert Backend.POOLSIDE not in lc._usable_saas_fallback_backends()
+    assert Backend.POOLSIDE not in [t.backend for t in lc._cloud_chain_tiers()]
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL, now + 301)
+
+
+def test_repeated_capacity_refusals_skip_the_free_pool(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
+    pool = lc._free_pool_chain_config()
+    limited = _err(429, "free pool capacity is reserved for higher-priority callers: openrouter (daily)")
+    with patch.object(httpx, "post", return_value=limited):
+        lc._call_backend(pool, _MESSAGES)
+        lc._call_backend(pool, _MESSAGES)
+    assert lc._free_provider_fallback_configs()[0].backend != Backend.FREE_POOL
+    assert Backend.FREE_POOL not in [t.backend for t in lc._cloud_chain_tiers()]
+
+
+def test_a_success_between_limit_refusals_starts_the_count_over() -> None:
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    _poolside_call(_ok())
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+
+
+def test_limit_refusals_spread_past_the_window_never_hold(monkeypatch) -> None:
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(lc.time, "time", lambda: now["t"])
+    limited = _err(429, "usage limit exceeded")
+    _poolside_call(limited)
+    now["t"] += 301
+    _poolside_call(limited)
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+
+
 def test_opencode_go_monthly_usage_limit_still_trips_the_breaker() -> None:
     body = {"error": {"type": "GoUsageLimitError", "message": "Go usage limit exceeded"}}
     with patch.object(httpx, "post", return_value=httpx.Response(429, json=body)):
         lc._call_backend(_go("longcat-2.5-preview-free"), _MESSAGES)
     assert not lc._provider_available(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
+
+
+def test_a_secret_candidate_survives_the_shipped_switches(monkeypatch) -> None:
+    """Secrets are judged only on the Cave. With the Cave switched off,
+    `judge_candidates` suppresses them, so a detection would vanish."""
+    from personas.code_reviewer.sast import EXPOSED_SECRET, Candidate, judge_candidates
+    from personas.code_reviewer.diff_parser import DiffHunk
+
+    monkeypatch.setenv("GRUG_DISABLED_BACKENDS", _shipped_env("GRUG_DISABLED_BACKENDS"))
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    monkeypatch.setenv("GRUG_CAVE_JUDGE_MODEL", _shipped_env("GRUG_CAVE_JUDGE_MODEL"))
+    verdict = '{"verdicts": [{"index": 0, "is_real_bug": true, "confidence": 0.9, "reasoning": "r"}]}'
+    body = {"choices": [{"message": {"role": "assistant", "content": verdict}}], "model": "m"}
+    candidate = Candidate(file="src/x.py", line=1, vuln_class=EXPOSED_SECRET, snippet="k=<redacted>")
+
+    with patch.object(httpx, "post", return_value=httpx.Response(200, json=body)):
+        kept = judge_candidates(
+            (candidate,), (DiffHunk(file_path="src/x.py", new_start=1, new_lines=frozenset({1}), body="@@ -1 +1 @@\n+k=v"),), 1,
+        )
+
+    assert [f.rule_name for f in kept] == [EXPOSED_SECRET]

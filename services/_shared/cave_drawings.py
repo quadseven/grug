@@ -8,8 +8,13 @@ unit-testable without a store or a network:
   same key the store uses (`LEARNING#<id>`).
 - lifecycle: `active` (injected), `pending` (waiting for an explicit
   approval, e.g. after an import), `disabled` (switched off by an operator),
-  `superseded` (replaced by an edited version, kept for history). A row
-  written before #1203 has no status and reads as `active`.
+  `superseded` (replaced by an edited version, kept for history),
+  `expired` (not re-affirmed within 90 days; never stored, derived at read
+  time, #1571). A row written before #1203 has no status and reads as
+  `active` until it expires.
+- governance (#1571): a learned rule can silence Elder, so it never touches
+  a security or SAST class, needs a human's stated reason, and lapses unless
+  re-affirmed. See ADR-0026.
 - deterministic path matching: one matcher, case-sensitive on every host,
   shared by the path preview and the classifier's scope check.
 - prompt selection: only active rows, and never both sides of a declared
@@ -24,7 +29,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatchcase
 from typing import Any, Iterable
 
@@ -32,7 +37,39 @@ STATUS_ACTIVE = "active"
 STATUS_PENDING = "pending"
 STATUS_DISABLED = "disabled"
 STATUS_SUPERSEDED = "superseded"
-STATUSES = (STATUS_ACTIVE, STATUS_PENDING, STATUS_DISABLED, STATUS_SUPERSEDED)
+STATUS_EXPIRED = "expired"
+STATUSES = (
+    STATUS_ACTIVE, STATUS_PENDING, STATUS_DISABLED, STATUS_SUPERSEDED, STATUS_EXPIRED,
+)
+
+# A rule stops firing this long after its last human affirmation: taught,
+# re-taught, approved or edited. Shorter than the row TTL on purpose, so an
+# expired rule stays visible and can be re-affirmed before it is purged.
+EXPIRY_DAYS = 90
+
+# Every class the SAST lane emits. `is_protected_finding` also matches the
+# vocabulary below, so an LLM's own rule name for the same thing is covered;
+# test_every_shipped_sast_rule_class_is_protected pins this list to the rules.
+SAST_CLASSES = frozenset({
+    "cleartext-secret-log", "command-injection", "exposed-secret",
+    "hardcoded-credential", "iac-misconfig", "path-traversal", "sql-injection",
+    "ssrf", "template-injection", "unsafe-deserialization", "weak-crypto", "xxe",
+})
+
+# Deliberately broad. A false match costs one preference; a miss costs a
+# silenced security finding.
+_SECURITY_TERMS = re.compile(
+    r"secur|vulnerab|exploit|semgrep|opengrep|injection|traversal|deserializ"
+    r"|privilege|permission|secret|credential|password|crypto|encrypt|sanitiz"
+    r"|auth(?!or(?!i[sz]))"  # auth, authz, unauthorized; not author
+    r"|sqli(?![a-z])"  # nosqli too
+    r"|(?<![a-z])(cve|sast|csrf|xss|ssrf|xxe|md5)(?![a-z])"
+    r"|api[\W_]?key|(access|bearer|session|jwt|api|leaked)[\W_]?tokens?",
+    re.IGNORECASE,
+)
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z])(?=[A-Z])")
+
+_MIN_REASON_WORDS = 4
 
 EXPORT_FORMAT = "grug-cave-drawings"
 EXPORT_VERSION = 1
@@ -42,6 +79,7 @@ EXPORT_VERSION = 1
 _PORTABLE_FIELDS = (
     "text", "repo", "scope_path", "source_pr", "source_comment_id", "author",
     "created_at", "supersedes", "conflicts_with",
+    "reason", "finding_class", "finding_category",
 )
 
 MAX_TEXT_CHARS = 1000
@@ -56,9 +94,16 @@ def learning_id(text: str) -> str:
 
 
 def effective_status(row: dict[str, Any], now: datetime | None = None) -> str:
-    """The one lifecycle rule every reader uses.
+    """The one lifecycle rule every reader uses: a rule that would be active
+    but is past its expiry is expired, so it stops firing with no cleanup."""
+    status = _lifecycle_status(row, now)
+    if status == STATUS_ACTIVE and _past_expiry(row, now):
+        return STATUS_EXPIRED
+    return status
 
-    An operator's explicit `status` wins. Otherwise the reply-mined
+
+def _lifecycle_status(row: dict[str, Any], now: datetime | None) -> str:
+    """An operator's explicit `status` wins. Otherwise the reply-mined
     approval delay decides: a row taught with `active: false` is pending
     until `created_at + approval_delay_seconds` has passed. A row with
     neither field predates both features, when every stored learning was
@@ -83,6 +128,74 @@ def _delay_elapsed(row: dict[str, Any], now: datetime | None) -> bool:
         started = started.replace(tzinfo=timezone.utc)
     current = now or datetime.now(timezone.utc)
     return started.timestamp() + delay <= current.timestamp()
+
+
+def _last_affirmed(row: dict[str, Any]) -> datetime | None:
+    """When a human last stood behind this rule, or None if no date parses."""
+    stamps: list[datetime] = []
+    for key in ("created_at", "reinforced_at", "approved_at"):
+        try:
+            stamp = datetime.fromisoformat(str(row.get(key) or ""))
+        except ValueError:
+            continue
+        stamps.append(stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc))
+    return max(stamps) if stamps else None
+
+
+def expires_at(row: dict[str, Any]) -> str:
+    """The ISO instant this rule stops firing, or "" when it has no usable
+    date, which reads as already expired."""
+    last = _last_affirmed(row)
+    return (last + timedelta(days=EXPIRY_DAYS)).isoformat() if last else ""
+
+
+def _past_expiry(row: dict[str, Any], now: datetime | None) -> bool:
+    last = _last_affirmed(row)
+    if last is None:
+        return True
+    return (now or datetime.now(timezone.utc)) >= last + timedelta(days=EXPIRY_DAYS)
+
+
+def _mentions_security(text: str) -> bool:
+    """Match on a camelCase-split copy, so `storedXss` reads as two words."""
+    return bool(_SECURITY_TERMS.search(_CAMEL_BOUNDARY.sub(" ", text or "")))
+
+
+def is_protected_finding(rule_name: str, category: str | None = "") -> bool:
+    """Whether a finding class is out of reach of every learned rule."""
+    return (
+        category == "security"
+        or rule_name in SAST_CLASSES
+        or _mentions_security(rule_name)
+    )
+
+
+def names_protected_class(text: str) -> bool:
+    """Whether a rule's own words reach into security or SAST territory,
+    whatever finding it was taught on."""
+    return _mentions_security(text)
+
+
+def touches_protected(row: dict[str, Any]) -> bool:
+    return is_protected_finding(
+        str(row.get("finding_class") or ""), str(row.get("finding_category") or ""),
+    ) or names_protected_class(str(row.get("text") or ""))
+
+
+def fired_review_key(pr: int | str, head_sha: str) -> str:
+    """The one identity of a review in the usage counters and the fired audit."""
+    return f"{pr}@{head_sha}"
+
+
+def is_reasoned_dismissal(reply: str) -> bool:
+    """A reaction, an emoji or a bare "not a bug" states no reason."""
+    return len(re.findall(r"[^\W\d_]{2,}", reply or "")) >= _MIN_REASON_WORDS
+
+
+def is_app_actor(login: str, actor_type: str = "") -> bool:
+    """An App acts under `name[bot]` with `type: Bot`. Either mark disqualifies:
+    an App can hold write access, so permission cannot tell it from a person."""
+    return actor_type == "Bot" or (login or "").lower().endswith("[bot]")
 
 
 def is_valid_repo(repo: str) -> bool:
@@ -164,14 +277,21 @@ def _recency(row: dict[str, Any]) -> str:
 def select_for_prompt(rows: list[dict[str, Any]]) -> Selection:
     """The learnings a review may be given, in the input order.
 
-    Only active rows. When two active rows are linked by `supersedes` the
-    successor wins; when linked by `conflicts_with` (declared on either
-    side) the more recently taught one wins. Every row dropped for a link is
-    listed in `suppressed`, so the caller logs it instead of injecting two
-    contradictory rules or dropping one silently."""
+    Only active rows, and never one that touches a security or SAST class:
+    this check runs at read time, so a row an operator edited, imported or
+    approved cannot get past it. When two active rows are linked by
+    `supersedes` the successor wins; when linked by `conflicts_with`
+    (declared on either side) the more recently taught one wins. Every row
+    dropped here is listed in `suppressed`, so the caller logs it instead of
+    injecting two contradictory rules or dropping one silently."""
     active = [r for r in rows if effective_status(r) == STATUS_ACTIVE]
     by_id = {_row_id(r): r for r in active}
-    drop = _supersede_drops(active, by_id)
+    drop = {
+        _row_id(r): {"id": _row_id(r), "reason": "protected-class", "kept": ""}
+        for r in active if touches_protected(r)
+    }
+    for lose_id, entry in _supersede_drops(active, by_id).items():
+        drop.setdefault(lose_id, entry)
     for lose_id, entry in _conflict_drops(active, by_id).items():
         drop.setdefault(lose_id, entry)
     selected = [r for r in active if _row_id(r) not in drop]
@@ -217,6 +337,7 @@ def export_document(rows: list[dict[str, Any]]) -> dict[str, Any]:
     for row in rows:
         item = {k: row[k] for k in _PORTABLE_FIELDS if row.get(k) not in (None, "", [])}
         item["status"] = effective_status(row)
+        item["expires_at"] = expires_at(row)
         items.append(item)
     return {
         "format": EXPORT_FORMAT,
@@ -329,6 +450,9 @@ def _portable_learning(raw: dict[str, Any], repo: str) -> dict[str, Any]:
         "author": str(raw.get("author", "") or ""),
         "created_at": str(raw.get("created_at", "") or ""),
         "supersedes": str(raw.get("supersedes", "") or ""),
+        "reason": str(raw.get("reason", "") or ""),
+        "finding_class": str(raw.get("finding_class", "") or ""),
+        "finding_category": str(raw.get("finding_category", "") or ""),
         "conflicts_with": [c for c in conflicts if isinstance(c, str)]
         if isinstance(conflicts, list) else [],
     }

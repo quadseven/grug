@@ -81,18 +81,28 @@ spec:
                 # Elder canary (personas/code_reviewer/canary.py): the hourly
                 # review-quality check must run the SAME chain production
                 # reviews use, so these mirror consumer-deployment.yaml.
-                - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: cloud}
+                # The lane reviews public repos first. Private repos start at Go: both lane plans
+                # are consumer plans, whose training terms turn on an account setting no code here
+                # can read (ChatGPT "Improve the model for everyone"; Claude "Model Improvement").
+                - {name: GRUG_REVIEW_BACKEND_PRIORITY, value: subscription}
                 - {name: GRUG_OPENCODE_GO_API_KEY_SSM, value: /infra/llm/opencode_go_api_key}
-                - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "longcat-2.5-preview-free"}
-                - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
-                # grug#1225: switched off 2026-10-17, the OpenCode Go allowance and
-                # the OpenRouter credit are spent and not being refilled (36 Go 401s,
-                # 11 OpenRouter paid refusals, 139 free per-day 429s over 402 Elder
-                # runs). A listed backend is never called. Re-enable one by deleting
+                # Published terms read 2026-11-01: prompts are not used for training, data is
+                # retained 30 days for safety. _OPENCODE_GO_PRIVATE_SAFE_MODELS gates private code.
+                - {name: GRUG_OPENCODE_GO_FALLBACK_MODEL, value: "beam-free"}
+                # grug#1225: a listed backend is never called. Re-enable one by deleting
                 # its entry; `openrouter:free` or `openrouter:paid` narrows to one pool.
-                # grug#1269: OpenRouter's free pool is back on 2026-10-19 (the operator
-                # wants the free tiers used up first); its paid pool stays off.
-                - {name: GRUG_DISABLED_BACKENDS, value: "opencode-go,openrouter:paid"}
+                # grug#1269: OpenRouter's paid pool stays off. grug#1575: OpenCode Go is back
+                # on 2026-11-01, its allowance renewed.
+                # The cap counts paid Go calls per UTC day across every pod. 200 calls at
+                # 40k tokens is about 78% of the plan over 27 days (doc prices, 2026-11-01);
+                # the shared key keeps the rest. Identical on all three Elder workloads.
+                - {name: GRUG_OPENCODE_GO_DAILY_CAP, value: "200"}
+                # Poolside stays off while it answers 400 on review calls: 3 of 1112 calls
+                # succeeded over 24h on 2026-11-01. The OpenRouter free chain tier is unset: its
+                # model left the catalogue, and that tier has no private-code data-terms gate.
+                # The free pool stays off until the Elder walk trusts its empties; it times out or
+                # garbles while the Sparks are away. The Cave stays on: secrets are judged there.
+                - {name: GRUG_DISABLED_BACKENDS, value: "openrouter:paid,poolside,free-pool"}
                 # grug#1269: the gateway's free provider pool is a cloud tier after
                 # Poolside, ahead of the Sparks (free cloud models first).
                 - {name: GRUG_CLOUD_FREE_POOL, value: "true"}
@@ -102,6 +112,11 @@ spec:
                 - {name: GRUG_SHARED_BENCHES, value: "true"}
                 - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
                 - {name: GRUG_REVIEW_DEPTH, value: tiered}
+                # grug#1553: GitHub App logins whose PRs carry an author family, as
+                # `login:family` pairs split by `;` (e.g. `lane-app[bot]:claude`). Exact
+                # login match only; family must be in model_family.py's table. Empty =
+                # no App gets a family (Elder keeps its usual arm order for App PRs).
+                - {name: GRUG_APP_AUTHOR_FAMILIES, value: ""}
                 - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
                 - {name: GRUG_FALLBACK_ENABLED_SSM, value: /grug/elder-fallback-enabled}
                 - {name: DD_SITE, value: datadoghq.com}

@@ -37,5 +37,9 @@ def verify_signature(secret: str, body: bytes, signature_header: str) -> bool:
         digestmod=hashlib.sha256,
     ).hexdigest()
     provided = signature_header.removeprefix("sha256=")
+    if not provided.isascii():
+        # `compare_digest` raises TypeError on non-ASCII str input; a
+        # forged header must read as "no match", never as a 500.
+        return False
 
     return hmac.compare_digest(expected, provided)

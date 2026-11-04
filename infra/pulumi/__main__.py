@@ -383,7 +383,7 @@ _rerun_jobs_queue = aws.sqs.Queue(
 # The stack's CF token verifies active but 10000s on every grug.lol
 # DNS-records call (kept Workers perms, lost zone DNS), which wedged the
 # retirement up twice (a failed update replays forever). The record
-# (id 04a6530d7067a563ffd2eb23962946ef) lives on in the zone - content
+# lives on in the zone - content
 # hand-PATCHed to the tunnel origin with the infra-zone token - and was
 # `pulumi state delete`d from this stack 2026-06-12. The infra stack
 # adopts BOTH grug.lol records (webhook + api) at the zone migration

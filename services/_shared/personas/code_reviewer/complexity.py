@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 from dataclasses import dataclass
 
 from personas.code_reviewer.diff_parser import DiffHunk
@@ -178,6 +179,29 @@ def _score_functions(source: str) -> dict[str, tuple[int, int]]:
                 max(prev[0], cur[0]), max(prev[1], cur[1])
             )
     return out
+
+
+_RECORDED_FUNCTION_RE = re.compile(r"^Function `([A-Za-z0-9_]+)` too tangled -- ")
+_RECORDED_SCORE_RE = re.compile(r"\b(cyclomatic|cognitive) (\d+) \(cap \d+\)")
+
+
+def recorded_score_is_current(message: str, source: str) -> bool:
+    """Does the head's own `source` still give the function a complexity
+    finding's recorded score? A carried-forward finding must name the score
+    of the head under review, not of the review that first raised it, so a
+    function that is gone or scores differently there is no longer current.
+    A message that is not ours, or a source that does not parse, is left
+    standing (True): nothing was measured."""
+    named = _RECORDED_FUNCTION_RE.match(message)
+    recorded = {m.group(1): int(m.group(2)) for m in _RECORDED_SCORE_RE.finditer(message)}
+    scores = _score_functions(source)
+    if named is None or not recorded or not scores:
+        return True
+    head = scores.get(named.group(1))
+    if head is None:
+        return False
+    now = {"cyclomatic": head[0], "cognitive": head[1]}
+    return all(now[metric] == value for metric, value in recorded.items())
 
 
 def _is_material_complexity(

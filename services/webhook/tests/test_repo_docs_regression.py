@@ -66,10 +66,6 @@ def test_real_context_line_reaches_reviewer_prompt():
     assert CONTEXT_LINE in _prompt_text(_real_context_block())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="CONTEXT.md outgrew _MAX_CONTEXT_CHARS; the jargon rule is truncated away",
-)
 def test_jargon_rule_survives_the_context_cap():
     assert JARGON_LINE in _prompt_text(_real_context_block())
 

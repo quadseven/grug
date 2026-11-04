@@ -1,14 +1,14 @@
 # WEBHOOK-ONLY (NOT mirrored): the SQS consumer for operator-triggered re-runs
 # (#305, ADR-0004). The api service ENQUEUES (services/api/rerun.py); only the
 # webhook image carries the persona-dispatch + GitHub-App machinery, so the
-# consumer lives here — same split as the cave fallback (cave_fallback.py).
-"""Re-run consumer (#305, ADR-0004) — grug's backfill for a dropped/`errored`
+# consumer lives here - same split as the cave fallback (cave_fallback.py).
+"""Re-run consumer (#305, ADR-0004) - grug's backfill for a dropped/`errored`
 review.
 
 `consumer.py` long-polls `grug-rerun-jobs.fifo` and routes each batch here. For each job the
 consumer fetches the PR's **current** head + diff and re-runs the named persona
 via the unchanged `dispatch_code_review`, which posts the check-run and upserts
-the `CheckVerdictRecord` — healing the `errored` row in place if the head is
+the `CheckVerdictRecord` - healing the `errored` row in place if the head is
 unchanged, appending a fresh row if the PR moved on.
 
 Failure semantics differ from the cave result handler ON PURPOSE: a transient
@@ -28,7 +28,6 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
@@ -38,6 +37,7 @@ import httpx
 
 from adapters.install_store import get_repo_config, is_elder_paused  # type: ignore
 from github_app_auth import get_app_id, with_install_token_retry
+from github_budget import count_review_calls
 from check_run_reconciler import _STUCK_IN_PROGRESS_MAX_AGE_MINUTES
 from github_checks_client import (
     CheckRunResult,
@@ -59,10 +59,16 @@ from personas.code_reviewer.degraded_gate import (
     gate_sentence,
     lead_with_degraded_line,
 )
-from personas.code_reviewer.snapshot import (
-    review_freshness_id_from_pr,
+from personas.code_reviewer.elder_review import (
+    ReviewClaimLease,
+    Transition,
+    _MAX_ELDER_SETTLE_SECONDS,
+    decide_redrive,
+    review_eligible,
     review_snapshot_id,
     review_snapshot_id_from_pr,
+    start_staleness_watch,
+    stop_staleness_watch,
 )
 from personas.guard.dispatch import dispatch_guard_review
 from personas.smasher.dispatch import dispatch_smasher_review
@@ -92,19 +98,14 @@ _sqs = boto3.client("sqs")
 # local/dev/tests -> enqueue raises, surfaced as best-effort by the caller.
 _RERUN_QUEUE_URL = os.getenv("GRUG_RERUN_QUEUE_URL", "")
 SCHEMA_VERSION = 1
-_MAX_SETTLE_SECONDS = 300
-# grug#773 AC3: a review discarded and re-enqueued against the SAME head_sha
-# this many times running gives up with a terminal neutral check instead of
-# looping forever - the backstop for a PR whose title/body keeps changing
-# faster than Elder can finish reviewing it. A genuinely new commit always
-# resets this to 0; it only counts same-sha redrives.
-_MAX_INTENT_DRIFT_REDRIVES = 3
-
 # grug#1494: a review where every model failed (`all_failed`) raises, so the
-# queue redelivers it. Deliveries below this number leave a blocking repo's
-# Elder check pending; from this one on the failure is published, so a long
-# provider outage still ends in a red check instead of waiting forever. The
-# queue's own dead-letter limit stays the outer bound.
+# queue redelivers it. A partial or low-confidence review with nothing
+# blocking in it rides the same bound: dispatch leaves it pending and marks
+# the result `rerun_scheduled`, which raises below. Deliveries below this
+# number leave a blocking repo's Elder check pending; from this one on the
+# failure is published, so a long provider outage still ends in a red check
+# instead of waiting forever. The queue's own dead-letter limit stays the
+# outer bound.
 _ALL_FAILED_AUTO_RERUN_DELIVERIES = 3
 # A learn job whose classifier backends are all rate limited or down (the
 # OpenRouter key is free-tier only and refuses intermittently - operator
@@ -130,21 +131,8 @@ def _learn_defer_delay(defer_count: int) -> int:
         _LEARN_DEFER_MAX_SECONDS,
         _LEARN_DEFER_BASE_SECONDS * 2 ** min(max(defer_count, 0), 16),
     )
-# The lease matches the queue's fallback visibility timeout and is renewed on
-# the same cadence as the SQS visibility heartbeat while a review is active.
-_REVIEW_CLAIM_LEASE_SECONDS = 900
-_REVIEW_CLAIM_HEARTBEAT_SECONDS = 120.0
-# How often the mid-flight staleness watcher re-fetches the PR while Elder is
-# actually generating (#635 follow-up). Separate from the 120s claim-lease
-# heartbeat above, which exists to stop SQS redelivery, not to catch a
-# superseding commit quickly - a superseded review should die within roughly
-# this many seconds of the new commit landing, not run to its full budget.
-_STALENESS_WATCH_INTERVAL_S = 10.0
-# Must match personas/code_reviewer/dispatch.py:_CHECK_NAME — this is the
-# REQUIRED status-check context on grug-gated repos. Posting it as
-# in_progress at enqueue time is what stops GitHub rulesets from treating a
-# multi-minute durable review as "required check never ran" (BLOCKED).
-# Accept legacy "Grug - Code Review" when listing existing runs mid-cutover.
+# Lease, heartbeat, staleness-watch cadence and redrive-cap constants live in
+# `personas.code_reviewer.elder_review`, the one home for the Elder lifecycle.
 _ELDER_CHECK_NAME = CHECK_ELDER
 _ELDER_CHECK_NAMES = frozenset(acceptable_check_names(CHECK_ELDER))
 
@@ -190,18 +178,16 @@ _SELF_COMPLETING_SKIP_REASONS = frozenset({
 })
 
 
-@dataclass(frozen=True, slots=True)
-class _ReviewClaimHeartbeat:
-    stop: threading.Event
-    ownership_lost: threading.Event
-    thread: threading.Thread
+_SQS_DEDUP_ID_MAX_LEN = 128
 
 
-@dataclass(frozen=True, slots=True)
-class _StalenessWatch:
-    stop: threading.Event
-    cancel: threading.Event
-    thread: threading.Thread
+def _bounded_dedup_id(plain: str) -> str:
+    """`plain` as the FIFO dedup id while it fits SQS's 128-char limit;
+    past it (a long owner/repo name) a digest of the same content, so the
+    send never fails validation and equal content still collapses."""
+    if len(plain) <= _SQS_DEDUP_ID_MAX_LEN:
+        return plain
+    return "rerun:" + hashlib.sha256(plain.encode("utf-8")).hexdigest()
 
 
 def _review_dedup_id(
@@ -285,6 +271,8 @@ def enqueue_rerun(
     elif dedup_key:
         material = f"{dedup_id}\x1fkey{dedup_key}"
         dedup_id = "rerun:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+    else:
+        dedup_id = _bounded_dedup_id(dedup_id)
     _sqs.send_message(
         QueueUrl=_RERUN_QUEUE_URL,
         MessageBody=json.dumps(job),
@@ -453,7 +441,7 @@ def _post_elder_in_progress_check(
     Elder is durable + settle-windowed; a deep review routinely takes minutes
     and can be mid-flight-cancelled/re-enqueued when base/title/body moves.
     Without an in_progress check, GitHub required-status rulesets treat the
-    PR as BLOCKED ("check missing") for the entire queue+LLM window — the
+    PR as BLOCKED ("check missing") for the entire queue+LLM window - the
     failure mode agents keep reading as "Grug Code Review never ran".
 
     Failures here MUST NOT fail the enqueue: the durable SQS job is the
@@ -589,7 +577,7 @@ def enqueue_review(
         title=requested_title,
         body=requested_body,
     )
-    settle = min(_MAX_SETTLE_SECONDS, max(0, int(settle_seconds)))
+    settle = min(_MAX_ELDER_SETTLE_SECONDS, max(0, int(settle_seconds)))
     _sqs.send_message(
         QueueUrl=_RERUN_QUEUE_URL,
         MessageBody=json.dumps({
@@ -657,7 +645,9 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
             "reply_to_comment_id": reply_to_comment_id,
         }),
         MessageGroupId=_ask_group_id(install_id, repo, pr_number),
-        MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:ask:{comment_id}",
+        MessageDeduplicationId=_bounded_dedup_id(
+            f"{install_id}:{repo}:{pr_number}:ask:{comment_id}",
+        ),
     )
     log.info("ask_enqueued", extra={"install_id": install_id, "repo": repo,
                                     "pr": pr_number, "comment_id": comment_id})
@@ -736,9 +726,35 @@ def _gh_get_text(token: str, url: str, *, accept: str) -> str:
     return resp.text
 
 
-def _gh_post(token: str, url: str, json_body: dict[str, Any]) -> None:
+def _gh_post(token: str, url: str, json_body: dict[str, Any]) -> dict[str, Any]:
+    """POST and return the created object (a comment or reaction carries
+    the `id` a later PATCH or DELETE needs, #695). A body that is not a
+    JSON object reads as {}: the write itself already succeeded."""
     resp = httpx.post(
         url, json=json_body,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _gh_patch(token: str, url: str, json_body: dict[str, Any]) -> None:
+    resp = httpx.patch(
+        url, json=json_body,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=_FETCH_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+
+def _gh_delete(token: str, url: str) -> None:
+    resp = httpx.delete(
+        url,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
         timeout=_FETCH_TIMEOUT,
     )
@@ -775,37 +791,145 @@ def _thread_context(token: str, owner: str, repo_name: str, root_comment_id: int
     return "\n".join(parts) if len(parts) > 1 else ""
 
 
-def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str, reply_to_comment_id: int = 0) -> str:
-    """Answer a /grug ask question in the consumer (async, #528). Fetches the
-    diff, runs the JSON-constrained Q&A over the REDACTED question + diff, and
-    posts the answer as a reply. Records an activity row. Never raises past
-    the job (a bad answer degrades to a fallback reply).
+# #695: the comment a `/grug ask` answer will land in is posted FIRST, so
+# the asker sees Grug heard them, then PATCHed in place to the answer.
+_ASK_PLACEHOLDER = (
+    "Grug thinking on this. This comment turns into the answer when Grug "
+    "is done."
+)
+# Criterion 6 of #528's wording: the one real message for "no answer".
+_ASK_TIRED = "Grug not know. The thinking-rock is tired - try again."
+
+
+def _comment_react(
+    install_id: int, base: str, comment_id: int, in_thread: bool, content: str,
+) -> int:
+    """React to a `/grug` comment; the reaction's id, 0 when not set.
+
+    A top-level command is an issue comment and an in-thread ask (#822) is
+    a review comment, so the reaction lives under issues/ or pulls/.
+    GitHub answers a reaction that already exists with that same reaction,
+    id included. Best-effort: the reaction is a signal, the command's work
+    is the answer."""
+    if not comment_id:
+        return 0
+    kind = "pulls" if in_thread else "issues"
+    url = f"{base}/{kind}/comments/{comment_id}/reactions"
+    try:
+        made = with_install_token_retry(
+            install_id, lambda t: _gh_post(t, url, {"content": content}),
+        )
+    except (httpx.HTTPError, RuntimeError) as e:
+        log.warning("comment_reaction_failed", extra={
+            "comment_id": comment_id, "content": content, "kind": type(e).__name__})
+        return 0
+    return int((made or {}).get("id") or 0)
+
+
+def _comment_unreact(
+    install_id: int, base: str, comment_id: int, in_thread: bool, reaction_id: int,
+) -> None:
+    """Take Grug's eyes off a `/grug` comment once the work is over."""
+    if not (comment_id and reaction_id):
+        return
+    kind = "pulls" if in_thread else "issues"
+    url = f"{base}/{kind}/comments/{comment_id}/reactions/{reaction_id}"
+    try:
+        with_install_token_retry(install_id, lambda t: _gh_delete(t, url))
+    except (httpx.HTTPError, RuntimeError) as e:
+        log.warning("comment_unreact_failed", extra={
+            "comment_id": comment_id, "kind": type(e).__name__})
+
+
+# grug#1620: the results that count as a finished `/grug improve` or
+# `/grug test-gaps`. A verdict, passing or failing, is what the commenter
+# asked for; `review_rejected` still concluded the check with one. A
+# skipped, degraded, disabled or unpublished run is not a finished command.
+_COMMAND_DONE_RESULTS = frozenset({"pass", "fail", "review_rejected"})
+
+
+def _command_done(result: Any) -> bool:
+    """True when a persona dispatch result is a finished command."""
+    return isinstance(result, dict) and str(result.get("result", "")) in _COMMAND_DONE_RESULTS
+
+
+def _settle_command_reaction(
+    job: dict[str, Any], *, install_id: int, owner: str, repo_name: str,
+    done: bool,
+) -> None:
+    """Swap the eyes the webhook put on a command comment for the outcome
+    (grug#1620, criterion 2 of #695): +1 when done, -1 otherwise.
+
+    The job carries the comment id but not the eyes reaction's id, so the
+    eyes are POSTed again: GitHub answers with the reaction already there,
+    whose id the DELETE needs. A job with no comment id (self-recovery, an
+    API re-run) has no comment to react on. Never raises."""
+    comment_id = int(job.get("comment_id", 0) or 0)
+    if not comment_id:
+        return
+    base = f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
+    eyes_id = _comment_react(install_id, base, comment_id, False, "eyes")
+    _comment_react(install_id, base, comment_id, False, "+1" if done else "-1")
+    _comment_unreact(install_id, base, comment_id, False, eyes_id)
+
+
+def _run_ask(
+    install_id: int, repo_full: str, pr_number: int, question: str,
+    reply_to_comment_id: int = 0, comment_id: int = 0,
+) -> str:
+    """Answer a /grug ask question in the consumer (async, #528).
+
+    The comment is one evolving document (#695): an eyes reaction on the
+    asking comment and a placeholder go out BEFORE the diff fetch and the
+    LLM call, the answer PATCHes that same placeholder, and the eyes are
+    swapped for +1 (answered) or -1 (no answer, failure). Records a gauge.
 
     With `reply_to_comment_id` (#822) the question came from a review thread:
-    the answer posts as a reply IN that thread (the one notification GitHub
-    already sends for a thread reply - no extra email), with the thread's
-    finding + hunk ahead of the diff as context."""
-    from urllib.parse import quote as _q
+    the placeholder and the answer post IN that thread (the one notification
+    GitHub already sends for a thread reply - no extra email), with the
+    thread's finding + hunk ahead of the diff as context.
+
+    Once the placeholder is up, nothing after it raises past the job: a
+    redelivered job would post a SECOND placeholder and leave the first one
+    hanging. A failure resolves the placeholder to the tired message
+    instead, so the asker always reads a real answer and can ask again. A
+    failure to post the placeholder itself still raises (nothing is on the
+    PR yet, so the retry is clean)."""
     from llm_client import _redact_secrets, answer_pr_question  # type: ignore
     from markdown_safety import neutralize_mentions  # type: ignore
     from observability import emit_gauge  # type: ignore
     owner, _, repo_name = repo_full.partition("/")
     q = _redact_secrets(question)
+    base = f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
+    in_thread = bool(reply_to_comment_id)
+    if in_thread:
+        post_url = f"{base}/pulls/{pr_number}/comments/{reply_to_comment_id}/replies"
+        edit_base = f"{base}/pulls/comments"
+        footer = "*(Grug answered from the thread and the PR diff - may be wrong; verify.)*"
+        lead = ""
+    else:
+        post_url = f"{base}/issues/{pr_number}/comments"
+        edit_base = f"{base}/issues/comments"
+        footer = "*(Grug answered from the PR diff - may be wrong; verify.)*"
+        # A top-level answer names the question it answers (#822 criterion
+        # 1). The quote is neutralized like the answer: it is echoed user
+        # text posted under Grug's authority.
+        lead = f"> {neutralize_mentions(q[:280])}\n\n"
 
-    def _do(token: str) -> str:
+    eyes_id = _comment_react(install_id, base, comment_id, in_thread, "eyes")
+    placeholder = with_install_token_retry(
+        install_id, lambda t: _gh_post(t, post_url, {"body": lead + _ASK_PLACEHOLDER}),
+    )
+    placeholder_id = int((placeholder or {}).get("id") or 0)
+
+    def _compose(token: str) -> tuple[str, str]:
         diff = _gh_get_text(
-            token,
-            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}/pulls/{pr_number}",
+            token, f"{base}/pulls/{pr_number}",
             accept="application/vnd.github.v3.diff",
         )
         context = diff
-        post_url = (
-            f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
-            f"/issues/{pr_number}/comments"
-        )
-        footer = "*(Grug answered from the PR diff - may be wrong; verify.)*"
         thread_note = ""
-        if reply_to_comment_id:
+        if in_thread:
             thread = _thread_context(token, owner, repo_name, reply_to_comment_id)
             if thread:
                 context = f"{thread}\n\nFULL PR DIFF:\n{diff}"
@@ -816,15 +940,8 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str, rep
                     "\n\n*(Grug could not load the thread itself, so this "
                     "answer is from the PR diff only.)*"
                 )
-            post_url = (
-                f"{_GH_API}/repos/{_q(owner, safe='')}/{_q(repo_name, safe='')}"
-                f"/pulls/{pr_number}/comments/{reply_to_comment_id}/replies"
-            )
-            footer = "*(Grug answered from the thread and the PR diff - may be wrong; verify.)*"
         answer = answer_pr_question(
-            q,
-            context,
-            install_id,
+            q, context, install_id,
             pr_context={
                 "installation_id": install_id,
                 "repo": repo_full,
@@ -835,22 +952,60 @@ def _run_ask(install_id: int, repo_full: str, pr_number: int, question: str, rep
         # posted under Grug's own installation-token authority - a live
         # @mention in it would notify a real GitHub user as if Grug itself
         # pinged them (#561, same class as Teller's #554 round-4 fix).
-        safe_answer = neutralize_mentions(answer) if answer else answer
-        if safe_answer:
-            body = f"{safe_answer}\n\n{footer}{thread_note}"
-            if not reply_to_comment_id:
-                # A top-level answer names the question it answers (#822
-                # criterion 1: the reply belongs to its thread - the PR
-                # conversation). The quote is neutralized like the answer:
-                # it is echoed user text posted under Grug's authority.
-                quoted = neutralize_mentions(q[:280])
-                body = f"> {quoted}\n\n{body}"
+        if not answer:
+            return lead + _ASK_TIRED, "ask_no_answer"
+        safe_answer = neutralize_mentions(answer)
+        return f"{lead}{safe_answer}\n\n{footer}{thread_note}", "answered"
+
+    try:
+        body, result = with_install_token_retry(install_id, _compose)
+    except Exception as e:  # noqa: BLE001 - the placeholder is up; it must resolve, not hang (#695)
+        log.error(
+            "ask_failed",
+            extra={"repo": repo_full, "pr": pr_number, "kind": type(e).__name__},
+            exc_info=True,
+        )
+        body, result = lead + _ASK_TIRED, "ask_failed"
+
+    def _publish(text: str) -> None:
+        if placeholder_id:
+            with_install_token_retry(
+                install_id,
+                lambda t: _gh_patch(t, f"{edit_base}/{placeholder_id}", {"body": text}),
+            )
         else:
-            # Criterion 6's wording, even when the model gave nothing back.
-            body = "Grug not know. The thinking-rock is tired - try again."
-        _gh_post(token, post_url, {"body": body})
-        return "answered" if answer else "ask_no_answer"
-    result = with_install_token_retry(install_id, _do)
+            # GitHub gave back no id to edit: the answer goes out as its
+            # own comment rather than not at all.
+            with_install_token_retry(
+                install_id, lambda t: _gh_post(t, post_url, {"body": text}),
+            )
+
+    try:
+        _publish(body)
+    except (httpx.HTTPError, RuntimeError) as e:
+        # A refused answer (an over-long body, a transient 5xx) must not
+        # leave "Grug thinking" up: write the short real message instead.
+        log.error(
+            "ask_publish_failed",
+            extra={"repo": repo_full, "pr": pr_number, "kind": type(e).__name__},
+            exc_info=True,
+        )
+        result = "ask_publish_failed"
+        try:
+            _publish(lead + _ASK_TIRED)
+        except (httpx.HTTPError, RuntimeError) as e2:
+            log.error(
+                "ask_placeholder_stuck",
+                extra={"repo": repo_full, "pr": pr_number,
+                       "placeholder_id": placeholder_id, "kind": type(e2).__name__},
+                exc_info=True,
+            )
+
+    _comment_react(
+        install_id, base, comment_id, in_thread,
+        "+1" if result == "answered" else "-1",
+    )
+    _comment_unreact(install_id, base, comment_id, in_thread, eyes_id)
     try:
         emit_gauge("grug.interactive.ask", 1)
     except Exception:  # noqa: BLE001
@@ -961,6 +1116,49 @@ def _defer_learn(
     return True
 
 
+def _store_learning(
+    install_id: int, repo_full: str, pr_number: int, comment_id: int,
+    author: str, reply_text: str, record: dict, classification: dict,
+    *, stored: bool,
+) -> tuple[str, str, bool]:
+    """Store a durable verdict and return `(ack, result, refused)`.
+
+    A rule that touches a security or SAST class is refused before the
+    store, so no later edit or status change can arm it; select_for_prompt
+    checks again at read time for rows that predate #1571. `stored` marks a
+    redelivery whose rule is already kept: it stores nothing, since a
+    re-stamp would restart the 90 days with no human act behind it."""
+    from adapters.install_store import put_learning  # type: ignore
+    from cave_drawings import MAX_TEXT_CHARS, touches_protected  # type: ignore
+    from redact import redact_secrets  # type: ignore
+
+    if not classification["durable"]:
+        # Deliberate one-off: acknowledge without storing.
+        return LEARN_REACTION_ONE_OFF, "learn_one_off", False
+    finding_tags = dict(record.get("finding_tags", {}))
+    finding_class = str(finding_tags.get("rule_name", ""))
+    finding_category = str(finding_tags.get("category", ""))
+    if touches_protected({
+        "text": classification["learning"],
+        "finding_class": finding_class, "finding_category": finding_category,
+    }):
+        return LEARN_REACTION_ONE_OFF, "learn_refused_protected", True
+    if not stored:
+        put_learning(
+            repo=repo_full,
+            text=classification["learning"],
+            scope_path=classification["scope_path"],
+            source_pr=pr_number,
+            source_comment_id=comment_id,
+            author=author,  # the maintainer who TAUGHT it (reply sender)
+            approval_delay_seconds=_org_learning_approval_delay(install_id, repo_full),
+            reason=redact_secrets(reply_text)[:MAX_TEXT_CHARS],
+            finding_class=finding_class,
+            finding_category=finding_category,
+        )
+    return LEARN_REACTION_LEARNED, "learned", False
+
+
 def _run_learn(
     install_id: int, repo_full: str, pr_number: int,
     comment_id: int, parent_comment_id: int, reply_text: str,
@@ -981,7 +1179,6 @@ def _run_learn(
     so the finding thread never gets duplicate acknowledgments."""
     from adapters.install_store import (  # type: ignore
         claim_delivery, get_comment_record, get_learning_by_source_comment,
-        put_learning,
     )
     from llm_client import (  # type: ignore
         LearnClassifierUnavailable, LearnClassifierUnusable, classify_learning,
@@ -1068,24 +1265,10 @@ def _run_learn(
             "repo": repo_full, "pr": pr_number, "comment_id": comment_id,
             "result": result})
         return result
-    if classification["durable"]:
-        # Org-configurable approval delay: default 0 = active immediately.
-        delay = _org_learning_approval_delay(install_id, repo_full)
-        put_learning(
-            repo=repo_full,
-            text=classification["learning"],
-            scope_path=classification["scope_path"],
-            source_pr=pr_number,
-            source_comment_id=comment_id,
-            author=author,  # the maintainer who TAUGHT it (reply sender)
-            approval_delay_seconds=delay,
-        )
-        ack = LEARN_REACTION_LEARNED
-        result = "learned"
-    else:
-        # Deliberate one-off: acknowledge without storing.
-        ack = LEARN_REACTION_ONE_OFF
-        result = "learn_one_off"
+    ack, result, refused = _store_learning(
+        install_id, repo_full, pr_number, comment_id, author, reply_text,
+        record, classification, stored=already is not None,
+    )
 
     # The claim guards ONLY the ack (the one non-idempotent side effect): a
     # redelivery whose learning is already stored must not re-post the reply.
@@ -1110,7 +1293,7 @@ def _run_learn(
     try:
         body = _learn_ack_body(
             repo_full, classification["learning"], classification["scope_path"],
-            author, pr_number, classification["durable"],
+            author, pr_number, classification["durable"], refused=refused,
         )
         _post_learn_reply(install_id, owner, repo_name, comment_id, body)
     except Exception as e:  # noqa: BLE001
@@ -1188,15 +1371,26 @@ def _post_learn_reply(
 
 def _learn_ack_body(
     repo_full: str, text: str, scope_path: str, author: str,
-    source_pr: int, durable: bool,
+    source_pr: int, durable: bool, refused: bool = False,
 ) -> str:
     """Collapsible acknowledgment for a reply-mined learning. `text`/`scope`/
     `author` are defused (classifier-/reply-produced, untrusted) so a hostile
-    reply can't break out of the <details> or inject mentions."""
+    reply can't break out of the <details> or inject mentions. `refused`
+    means a durable rule that touches a security or SAST class (#1571)."""
     text_d = _defuse_md(text)
     scope_d = _defuse_md(scope_path)
     author_d = _defuse_md(author)
     scope_line = f", scoped to `{scope_d}`" if scope_d else ""
+    if refused:
+        return (
+            "<details>\n"
+            "<summary>Not remembered (security rule)</summary>\n\n"
+            f"Grug read your reply but will NOT carry it into future reviews on "
+            f"`{repo_full}`: learned rules never touch security or SAST findings. "
+            "It applies to this PR only.\n\n"
+            f"Replied by `{author_d}` (PR #{source_pr}).\n"
+            "</details>"
+        )
     if durable:
         return (
             "<details>\n"
@@ -1251,12 +1445,12 @@ def _hold_or_requeue_learn(
 
 def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     """Re-run ONE job. Raises on a malformed message or an infra fetch failure
-    (→ ESM retry → DLQ). Returns a short status for the batch summary log.
+    (-> ESM retry -> DLQ). Returns a short status for the batch summary log.
 
-    Keyed by `repo` ("owner/name") — what the Activity row (the trigger) carries
-    — NOT a repo_id; the repo_id (for the RepoConfig lookup) is derived from the
+    Keyed by `repo` ("owner/name") - what the Activity row (the trigger) carries
+    - NOT a repo_id; the repo_id (for the RepoConfig lookup) is derived from the
     PR's `base.repo.id` in the same fetch."""
-    job = json.loads(body)  # malformed → JSONDecodeError → retry → DLQ
+    job = json.loads(body)  # malformed -> JSONDecodeError -> retry -> DLQ
     install_id = int(job["install_id"])
     repo_full = str(job["repo"])  # "owner/name"
     pr_number = int(job["pr_number"])
@@ -1264,6 +1458,7 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
         return _run_ask(
             install_id, repo_full, pr_number, str(job.get("question", "")),
             reply_to_comment_id=int(job.get("reply_to_comment_id", 0) or 0),
+            comment_id=int(job.get("comment_id", 0) or 0),
         )
     if job.get("kind") == "learn":
         # A deferred job (every classifier backend was rate limited) arrives
@@ -1287,7 +1482,7 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     persona = str(job.get("persona", "elder"))
 
     if persona not in _RERUNNABLE:
-        # Not an infra failure — don't retry/DLQ a persona we don't drive yet.
+        # Not an infra failure - don't retry/DLQ a persona we don't drive yet.
         log.info(
             "rerun_unsupported_persona",
             extra={"persona": persona, "repo": repo_full, "pr": pr_number},
@@ -1302,7 +1497,7 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     if deferred:
         return deferred
     # Fetch the PR's CURRENT head (+ the repo id, for RepoConfig). A 5xx/
-    # RequestError raises → ESM retry → DLQ. with_install_token_retry refreshes
+    # RequestError raises -> ESM retry -> DLQ. with_install_token_retry refreshes
     # a stale token once.
     pr = with_install_token_retry(
         install_id,
@@ -1324,7 +1519,7 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     # Neither dispatch raises a wire exception: each fetches the diff, re-runs
     # its persona, publishes, and upserts the verdict (heal-in-place on an
     # unchanged head, append on a moved-on PR). A repeat outage degrades to a
-    # published `errored` row — the job still completed.
+    # published `errored` row - the job still completed.
     if persona in _GUARD:
         dispatch_guard_review(
             payload, blocking=bool(cfg.get("guard_blocking", False)),
@@ -1332,7 +1527,11 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     elif persona in _SMASHER:
         # Smasher is advisory-only (no blocking flag); the global master switch
         # is re-checked inside dispatch_smasher_review.
-        dispatch_smasher_review(payload, blocking=False)
+        result = dispatch_smasher_review(payload, blocking=False)
+        _settle_command_reaction(
+            job, install_id=install_id, owner=owner, repo_name=repo_name,
+            done=_command_done(result),
+        )
     elif persona in _TELLER:
         # Teller has no blocking mode (comment-only, no blocking_flag).
         dispatch_walkthrough_review(payload, blocking=False)
@@ -1345,15 +1544,27 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
             pr_number=pr_number, head_sha=head_sha, message_id=message_id,
         )
         if queued:
+            # grug#1620: a coalesced command was served and one past the
+            # hold cap was not; a held one is still waiting, eyes and all.
+            if queued in _COMMAND_SETTLED_STATUSES:
+                _settle_command_reaction(
+                    job, install_id=install_id, owner=owner,
+                    repo_name=repo_name,
+                    done=_COMMAND_SETTLED_STATUSES[queued],
+                )
             return queued
         _record_command_run(
             job, install_id=install_id, repo_full=repo_full,
             pr_number=pr_number, head_sha=head_sha, started_at=_now(),
         )
         # Elder re-run: the `grug:reviewing` label rides it (grug#1270).
-        _dispatch_elder_rerun(
+        result = _dispatch_elder_rerun(
             payload, install_id=install_id, owner=owner, repo_name=repo_name,
             pr_number=pr_number, pr=pr, cfg=cfg,
+        )
+        _settle_command_reaction(
+            job, install_id=install_id, owner=owner, repo_name=repo_name,
+            done=_command_done(result),
         )
     log.info(
         "rerun_dispatched",
@@ -1749,6 +1960,14 @@ def _command_queue_status(
     return "rerun_held_behind_review"
 
 
+# grug#1620: the queue statuses that end a command without a fresh run,
+# and whether each one counts as done.
+_COMMAND_SETTLED_STATUSES = {
+    "rerun_coalesced": True,
+    "rerun_hold_cap_reached": False,
+}
+
+
 def _record_command_run(
     job: dict[str, Any], *, install_id: int, repo_full: str, pr_number: int,
     head_sha: str, started_at: float,
@@ -1809,9 +2028,9 @@ def _hold_or_requeue_deferred(
 def _dispatch_elder_rerun(
     payload: dict[str, Any], *, install_id: int, owner: str, repo_name: str,
     pr_number: int, pr: dict[str, Any], cfg: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     """Run Elder on the re-run, label the PR while it runs, and clear the
-    label when the Elder check concludes.
+    label when the Elder check concludes. Returns Elder's dispatch result.
 
     The `grug:reviewing` label goes on as the re-run STARTS, not only when
     it was queued: a command held back by the GitHub budget carries no sign
@@ -1827,7 +2046,7 @@ def _dispatch_elder_rerun(
         pr_number=pr_number,
     )
     try:
-        dispatch_code_review(
+        return dispatch_code_review(
             payload, blocking=bool(cfg.get("code_reviewer_blocking", False)),
         )
     finally:
@@ -1850,6 +2069,33 @@ def _fetch_current_pr(
             f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}/pulls/{pr_number}",
         ),
     )
+
+
+def _fetch_pr_if_changed(
+    install_id: int, owner: str, repo_name: str, pr_number: int, etag: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Read the PR only if it moved since `etag`: the PR and its new ETag, or
+    None and the same ETag on a 304. GitHub does not charge a 304 against the
+    rate limit, so a poll on an unchanged PR is free (grug#1537)."""
+    url = (
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
+        f"/pulls/{pr_number}"
+    )
+
+    def _do(token: str) -> tuple[dict[str, Any] | None, str]:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+        }
+        if etag:
+            headers["If-None-Match"] = etag
+        resp = httpx.get(url, headers=headers, timeout=_FETCH_TIMEOUT)
+        if resp.status_code == 304:
+            return None, etag
+        resp.raise_for_status()
+        return resp.json(), resp.headers.get("ETag", "")
+
+    return with_install_token_retry(install_id, _do)
 
 
 def _elder_blocking_from_pr(install_id: int, pr: dict[str, Any]) -> bool | None:
@@ -1911,6 +2157,8 @@ def _review_payload(
             "owner": {"login": owner},
             # grug#1269: Elder tells the spark-gateway whether it is public.
             "private": base_repo.get("private"),
+            # grug#1578: with base.ref, picks the steering source.
+            "default_branch": base_repo.get("default_branch"),
         },
         "pull_request": {
             "number": pr_number,
@@ -1926,16 +2174,9 @@ def _review_payload(
                 "sha": (pr.get("head") or {})["sha"],
                 "repo": _repo_id_only((pr.get("head") or {}).get("repo")),
             },
-            "base": {"sha": base.get("sha")},
+            "base": {"sha": base.get("sha"), "ref": base.get("ref")},
         },
     }
-
-
-def _review_eligible(pr: dict[str, Any]) -> bool:
-    """Only open, non-draft pull requests may publish a review."""
-    return str(pr.get("state") or "") == "open" and not bool(
-        pr.get("draft", False)
-    )
 
 
 def _enqueue_current_review(
@@ -1994,8 +2235,13 @@ def _redrive_or_give_up(
     instead."""
     repo_full = f"{owner}/{repo_name}"
     same_sha = current_head_sha == claimed_head_sha
-    next_redrive_count = job_redrive_count + 1 if same_sha else 0
-    if same_sha and next_redrive_count > _MAX_INTENT_DRIFT_REDRIVES:
+    is_held = _held_by_autopause(install_id, repo_full, pr_number, current_head_sha) if not same_sha else False
+    decision = decide_redrive(
+        same_sha=same_sha,
+        job_redrive_count=job_redrive_count,
+        is_held_by_autopause=is_held,
+    )
+    if decision.action == "give_up":
         log.warning(
             "elder_review_intent_drift_exhausted",
             extra={
@@ -2025,7 +2271,7 @@ def _redrive_or_give_up(
             conclusion=degraded_conclusion(blocking),
         )
         return False
-    if not same_sha and _held_by_autopause(install_id, repo_full, pr_number, current_head_sha):
+    if decision.action == "hold":
         return True
     _enqueue_current_review(
         install_id=install_id,
@@ -2033,7 +2279,7 @@ def _redrive_or_give_up(
         pr_number=pr_number,
         pr=pr,
         settle_seconds=settle_seconds,
-        redrive_count=next_redrive_count,
+        redrive_count=decision.next_redrive_count,
     )
     return True
 
@@ -2063,204 +2309,8 @@ def _held_by_autopause(
     return paused
 
 
-def _review_claim_heartbeat_loop(
-    owned_claim_args: dict[str, Any],
-    stop: threading.Event,
-    ownership_lost: threading.Event,
-) -> None:
-    from adapters.install_store import renew_review_claim
-
-    while not stop.wait(_REVIEW_CLAIM_HEARTBEAT_SECONDS):
-        try:
-            renewed = renew_review_claim(
-                **owned_claim_args,
-                lease_seconds=_REVIEW_CLAIM_LEASE_SECONDS,
-            )
-        except Exception as error:  # noqa: BLE001 - retry within lease buffer
-            log.warning(
-                "elder_review_claim_heartbeat_failed",
-                extra={
-                    "repo": owned_claim_args["repo"],
-                    "pr": owned_claim_args["pr_number"],
-                    "kind": type(error).__name__,
-                },
-            )
-            continue
-        if renewed:
-            continue
-        ownership_lost.set()
-        log.error(
-            "elder_review_claim_ownership_lost",
-            extra={
-                "repo": owned_claim_args["repo"],
-                "pr": owned_claim_args["pr_number"],
-            },
-        )
-        return
-
-
-def _review_staleness_watch_loop(
-    install_id: int, owner: str, repo_name: str, pr_number: int,
-    expected_freshness_id: str,
-    expected_head_sha: str,
-    stop: threading.Event,
-    cancel: threading.Event,
-) -> None:
-    """Poll the PR every `_STALENESS_WATCH_INTERVAL_S` while Elder is
-    actually generating a review (#635 follow-up: mid-flight cancellation).
-
-    Elder's per-arm network calls have no natural checkpoint mid-generation
-    - once `_call_backend` starts, nothing inside it re-checks the PR. This
-    loop is what lets a superseded review die within roughly
-    `_STALENESS_WATCH_INTERVAL_S` of the new commit landing, instead of
-    always running to its full ~330-660s budget for a snapshot that's
-    already known stale.
-
-    A transient GitHub hiccup must never cancel a genuinely current review,
-    so a fetch failure is logged and skipped, not treated as staleness."""
-    while not stop.wait(_STALENESS_WATCH_INTERVAL_S):
-        try:
-            latest = _fetch_current_pr(install_id, owner, repo_name, pr_number)
-        except Exception as error:  # noqa: BLE001 - transient fetch failure, keep watching
-            log.warning(
-                "elder_review_staleness_watch_fetch_failed",
-                extra={
-                    "repo": f"{owner}/{repo_name}",
-                    "pr": pr_number,
-                    "kind": type(error).__name__,
-                },
-            )
-            continue
-        # HEAD SHA DECIDES. Killing a running review is only justified when
-        # the DIFF changed, because that is the only case where the answer
-        # being generated is worthless.
-        #
-        # This used to compare `review_freshness_id`, which also hashes title
-        # and body - so editing the PR body aborted both Cave arms mid-
-        # generation and threw the whole review away. Live on
-        # quadseven/infra#2157 (2026-08-02), a PR breaking a packet-mode
-        # bootstrap deadlock: the review started at 13:51:12 over 2 cohorts,
-        # the author edited the body at ~13:52:43, and at 13:52:51 it landed
-        # as `all_failed` ("cancelled: review input changed while the review
-        # was running"). The human got mailed "eyes cloudy - read for self"
-        # carrying one cyclomatic-complexity nitpick, on a concurrency fix.
-        #
-        # An intent edit is exactly the case where the work is still good: the
-        # diff is byte-identical, so every finding still anchors to real lines.
-        # The pre-publish guard already knows this and publishes such a review
-        # (`code_review_intent_drift_publishing_anyway`) - but it had nothing
-        # left to publish, because this loop had already killed the generation
-        # that would have produced it. Same rule, both halves.
-        #
-        # Base-insensitive too: `review_snapshot_id_from_pr` hashes base_sha,
-        # so ANY unrelated merge to the base branch used to cancel this review.
-        # Measured on quadseven/infra 2026-07-25: eight merges in one session
-        # left Elder unable to publish, cancelling and re-enqueuing against an
-        # identical head. Comparing head sha covers that case as well.
-        latest_head = str((latest.get("head") or {}).get("sha") or "")
-        if not latest_head:
-            # A malformed payload is not evidence of a new commit. Treat it
-            # like a fetch failure and keep watching rather than killing a
-            # review that is probably fine.
-            log.warning(
-                "elder_review_staleness_watch_no_head_sha",
-                extra={"repo": f"{owner}/{repo_name}", "pr": pr_number},
-            )
-            continue
-        if latest_head != expected_head_sha:
-            cancel.set()
-            log.info(
-                "elder_review_cancelled_mid_flight",
-                extra={
-                    "repo": f"{owner}/{repo_name}", "pr": pr_number,
-                    "reviewed_head_sha": expected_head_sha[:8],
-                    "current_head_sha": latest_head[:8],
-                    # Carried for diagnosis only. If this DIFFERS while the
-                    # shas match, an intent edit happened and was correctly
-                    # ignored - that pairing is the signature of the
-                    # infra#2157 class, and it should never cancel again.
-                    "reviewed_freshness_id": expected_freshness_id[:11],
-                    "current_freshness_id": review_freshness_id_from_pr(
-                        latest,
-                    )[:11],
-                },
-            )
-            return
-
-
-# --- Active-claim registry (graceful-shutdown release) ----------------------
-# A consumer pod that dies mid-review (every deploy rolls it; reviews run
-# minutes, the terminationGracePeriod is 30s) orphans its snapshot claim: the
-# in-function except/finally never runs, the lease outlives the pod by up to
-# _REVIEW_CLAIM_LEASE_SECONDS, and the SQS redelivery bounces off
-# "claim busy" - burning receives toward the DLQ (maxReceiveCount) while the
-# PR sits without its (now REQUIRED, grug#515) check. The registry tracks
-# every in-flight claim so main() can release them all on SIGTERM; the next
-# consumer's redelivery then acquires cleanly on its first attempt.
-_ACTIVE_REVIEW_CLAIMS: dict[str, dict[str, Any]] = {}
-_ACTIVE_REVIEW_CLAIMS_LOCK = threading.Lock()
-
-
-def _register_active_review_claim(token: str, owned_claim_args: dict[str, Any]) -> None:
-    with _ACTIVE_REVIEW_CLAIMS_LOCK:
-        _ACTIVE_REVIEW_CLAIMS[token] = owned_claim_args
-
-
-def _unregister_active_review_claim(token: str) -> None:
-    with _ACTIVE_REVIEW_CLAIMS_LOCK:
-        _ACTIVE_REVIEW_CLAIMS.pop(token, None)
-
-
-def release_active_review_claims() -> int:
-    """Release every still-registered review claim (graceful shutdown).
-
-    Called by the consumer's main() after its threads were asked to stop: any
-    claim still registered belongs to a review that will not finish in this
-    process. Releasing lets the SQS redelivery acquire immediately instead of
-    bouncing off the orphaned lease. Best-effort per claim - one failed
-    release (e.g. ownership already lost to a completing handler racing the
-    shutdown) must not stop the rest. Returns the number released."""
-    with _ACTIVE_REVIEW_CLAIMS_LOCK:
-        claims = list(_ACTIVE_REVIEW_CLAIMS.items())
-        _ACTIVE_REVIEW_CLAIMS.clear()
-    released = 0
-    if not claims:
-        return 0
-    from adapters.install_store import release_review_claim
-
-    for _token, owned_claim_args in claims:
-        try:
-            if release_review_claim(**owned_claim_args):
-                released += 1
-                log.info(
-                    "elder_review_claim_released_on_shutdown",
-                    extra={
-                        "repo": owned_claim_args.get("repo"),
-                        "pr": owned_claim_args.get("pr_number"),
-                    },
-                )
-            else:
-                log.warning(
-                    "elder_review_claim_shutdown_release_lost_ownership",
-                    extra={
-                        "repo": owned_claim_args.get("repo"),
-                        "pr": owned_claim_args.get("pr_number"),
-                    },
-                )
-        except Exception:  # noqa: BLE001 - best-effort during shutdown
-            log.warning(
-                "elder_review_claim_shutdown_release_failed",
-                extra={
-                    "repo": owned_claim_args.get("repo"),
-                    "pr": owned_claim_args.get("pr_number"),
-                },
-                exc_info=True,
-            )
-    return released
-
-
 # --- In-progress board-note registry (#819) ---------------------------------
-# Mirrors the claim registry above: the re-review note is set when a review
+# Mirrors the claim registry in `elder_review`: the re-review note is set when a review
 # starts and cleared when it ends, but a SIGTERM'd consumer never runs its
 # finally. Notes still registered at shutdown belong to reviews that will
 # not finish in this process, so the sweep restores their saved headers.
@@ -2296,7 +2346,7 @@ def clear_active_board_notes() -> int:
     """Restore headers for every still-registered in-progress note (#819).
 
     Called by the consumer's shutdown path alongside
-    `release_active_review_claims`: any note still registered belongs to a
+    the claim sweep in `elder_review`: any note still registered belongs to a
     review killed mid-flight. Best-effort per note. Returns the number
     cleared."""
     with _ACTIVE_BOARD_NOTES_LOCK:
@@ -2427,62 +2477,6 @@ def _board_in_progress_note(
             )
 
 
-def _start_review_claim_heartbeat(
-    owned_claim_args: dict[str, Any],
-) -> _ReviewClaimHeartbeat:
-    stop = threading.Event()
-    ownership_lost = threading.Event()
-    thread = threading.Thread(
-        target=_review_claim_heartbeat_loop,
-        args=(owned_claim_args, stop, ownership_lost),
-        name="review-claim-heartbeat",
-        daemon=True,
-    )
-    thread.start()
-    return _ReviewClaimHeartbeat(
-        stop=stop,
-        ownership_lost=ownership_lost,
-        thread=thread,
-    )
-
-
-def _stop_review_claim_heartbeat(
-    heartbeat: _ReviewClaimHeartbeat | None,
-) -> bool:
-    if heartbeat is None:
-        return True
-    heartbeat.stop.set()
-    heartbeat.thread.join(timeout=1.0)
-    return not heartbeat.ownership_lost.is_set()
-
-
-def _start_staleness_watch(
-    install_id: int, owner: str, repo_name: str, pr_number: int,
-    expected_freshness_id: str,
-    expected_head_sha: str,
-) -> _StalenessWatch:
-    stop = threading.Event()
-    cancel = threading.Event()
-    thread = threading.Thread(
-        target=_review_staleness_watch_loop,
-        args=(
-            install_id, owner, repo_name, pr_number,
-            expected_freshness_id, expected_head_sha, stop, cancel,
-        ),
-        name="review-staleness-watch",
-        daemon=True,
-    )
-    thread.start()
-    return _StalenessWatch(stop=stop, cancel=cancel, thread=thread)
-
-
-def _stop_staleness_watch(watch: _StalenessWatch | None) -> None:
-    if watch is None:
-        return
-    watch.stop.set()
-    watch.thread.join(timeout=2.0)
-
-
 def _run_hot_review(
     job: dict[str, Any], install_id: int, repo_full: str, pr_number: int,
     receive_count: int = 0,
@@ -2512,7 +2506,39 @@ def _run_hot_review(
     if not sep or not owner or not repo_name:
         raise ValueError(f"invalid repo coordinate: {repo_full!r}")
 
-    before = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+    try:
+        before = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code != 403:
+            raise
+        queued_head_sha = str(job.get("requested_head_sha") or "")
+        log.error(
+            "elder_pr_read_forbidden",
+            extra={
+                "install_id": install_id,
+                "repo": repo_full,
+                "pr": pr_number,
+                "status": 403,
+                "head_sha": queued_head_sha[:8],
+            },
+        )
+        posted = _complete_elder_check_open(
+            install_id=install_id,
+            owner=owner,
+            repo_name=repo_name,
+            pr_number=pr_number,
+            head_sha=queued_head_sha,
+            title="Grug cannot read this pull request: 403 from GitHub",
+            summary=(
+                "GitHub denied Elder's pull request read with HTTP 403. "
+                "Review the GitHub App installation's repository access, "
+                "token permissions, and repository rules before re-running Elder."
+            ),
+            conclusion="failure",
+        )
+        if not posted:
+            raise RuntimeError("Elder 403 check completion did not land") from error
+        return "pr_read_forbidden"
     head_sha = str((before.get("head") or {}).get("sha") or "")
     if not head_sha:
         raise ValueError("current PR has no head SHA")
@@ -2567,12 +2593,6 @@ def _run_hot_review(
     repo_id = int(((before.get("base") or {}).get("repo") or {})["id"])
     snapshot_id = review_snapshot_id_from_pr(before)
 
-    from adapters.install_store import (
-        acquire_review_claim,
-        complete_review_claim,
-        release_review_claim,
-    )
-
     claim_args = {
         "install_id": install_id,
         "repo": repo_full,
@@ -2583,13 +2603,7 @@ def _run_hot_review(
         # dispatch payloads and logs.
         "head_sha": snapshot_id,
     }
-
-    owner_token = uuid.uuid4().hex
-    owned_claim_args = {**claim_args, "owner_token": owner_token}
-    claim_status = acquire_review_claim(
-        **owned_claim_args,
-        lease_seconds=_REVIEW_CLAIM_LEASE_SECONDS,
-    )
+    claim_status, lease = ReviewClaimLease.acquire(claim_args)
     if claim_status == "completed":
         log.info(
             "elder_review_duplicate_snapshot_skipped",
@@ -2601,7 +2615,7 @@ def _run_hot_review(
             },
         )
         return "duplicate_snapshot"
-    if claim_status != "acquired":
+    if lease is None:
         log.info(
             "elder_review_snapshot_claim_busy",
             extra={
@@ -2613,15 +2627,12 @@ def _run_hot_review(
         )
         raise RuntimeError("Elder review snapshot claim is still in progress")
 
-    heartbeat: _ReviewClaimHeartbeat | None = None
-    # Register for graceful-shutdown release; the finally-unregister runs on
-    # every in-process exit (normal, except-release, raise), so the shutdown
-    # sweep only ever sees claims whose handler was killed mid-flight.
-    _register_active_review_claim(owner_token, owned_claim_args)
+    # The lease registered itself for graceful-shutdown release; close() in
+    # the finally runs on every in-process exit (normal, abort, raise), so the
+    # shutdown sweep only ever sees claims whose handler was killed mid-flight.
     try:
-        heartbeat = _start_review_claim_heartbeat(owned_claim_args)
         settle_seconds = min(
-            _MAX_SETTLE_SECONDS,
+            _MAX_ELDER_SETTLE_SECONDS,
             max(0, int(job.get("settle_seconds", 0))),
         )
         if settle_seconds:
@@ -2640,15 +2651,8 @@ def _run_hot_review(
         after = _fetch_current_pr(install_id, owner, repo_name, pr_number)
         current_head = str((after.get("head") or {}).get("sha") or "")
         current_snapshot_id = review_snapshot_id_from_pr(after)
-        if not _review_eligible(after):
-            if not _stop_review_claim_heartbeat(heartbeat):
-                raise RuntimeError(
-                    "Elder review claim ownership lost during settle"
-                )
-            if not release_review_claim(**owned_claim_args):
-                raise RuntimeError(
-                    "Elder review claim ownership lost for ineligible PR"
-                )
+        if not review_eligible(after):
+            lease.settle(Transition.RELEASE, "during settle")
             log.info(
                 "elder_review_ineligible_after_settle",
                 extra={
@@ -2672,14 +2676,7 @@ def _run_hot_review(
                 current_head_sha=current_head,
                 job_redrive_count=int(job.get("redrive_count", 0)),
             )
-            if not _stop_review_claim_heartbeat(heartbeat):
-                raise RuntimeError(
-                    "Elder review claim ownership lost for stale snapshot"
-                )
-            if not release_review_claim(**owned_claim_args):
-                raise RuntimeError(
-                    "Elder review claim ownership lost while cancelling stale snapshot"
-                )
+            lease.settle(Transition.RELEASE, "for stale snapshot")
             log.info(
                 "elder_review_stale_snapshot_cancelled",
                 extra={
@@ -2701,7 +2698,7 @@ def _run_hot_review(
         # Mid-flight cancellation (#635 follow-up): current_snapshot_id is the
         # snapshot this job is ABOUT to spend the Elder budget on (checked
         # fresh, immediately above). The watch loop re-fetches the PR every
-        # _STALENESS_WATCH_INTERVAL_S for as long as dispatch_code_review is
+        # 10s for as long as dispatch_code_review is
         # running and sets `cancel` the moment that snapshot changes.
         # dispatch_code_review then returns almost immediately instead of
         # waiting out the arm calls' full remaining duration - the arm
@@ -2721,26 +2718,27 @@ def _run_hot_review(
         # board write doesn't cover - check-publish failure, DLQ/redrive
         # raise, fail-open, or an unexpected result.
         with _board_in_progress_note(install_id, owner, repo_name, pr_number):
-            watch = _start_staleness_watch(
+            watch = start_staleness_watch(
                 install_id, owner, repo_name, pr_number,
-                review_freshness_id_from_pr(after),
                 str((after.get("head") or {}).get("sha") or ""),
+                fetch_pr_if_changed=_fetch_pr_if_changed,
             )
             try:
-                result = dispatch_code_review(
-                    _review_payload(
-                        install_id=install_id,
-                        owner=owner,
-                        repo_name=repo_name,
-                        pr_number=pr_number,
-                        pr=after,
-                    ),
-                    blocking=elder_blocking,
-                    cancel_event=watch.cancel,
-                    rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
-                )
+                with count_review_calls(repo_full, pr_number):
+                    result = dispatch_code_review(
+                        _review_payload(
+                            install_id=install_id,
+                            owner=owner,
+                            repo_name=repo_name,
+                            pr_number=pr_number,
+                            pr=after,
+                        ),
+                        blocking=elder_blocking,
+                        cancel_event=watch.cancel,
+                        rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
+                    )
             finally:
-                _stop_staleness_watch(watch)
+                stop_staleness_watch(watch)
             degraded_reason = result.get("degraded_reason", "")
             if degraded_reason == "stale_snapshot":
                 latest = _fetch_current_pr(
@@ -2784,18 +2782,11 @@ def _run_hot_review(
                         current_head_sha=latest_head,
                         job_redrive_count=int(job.get("redrive_count", 0)),
                     )
-                    if _review_eligible(latest)
+                    if review_eligible(latest)
                     else False
                 )
-                if not _stop_review_claim_heartbeat(heartbeat):
-                    raise RuntimeError(
-                        "Elder review claim ownership lost during dispatch"
-                    )
-                if not release_review_claim(**owned_claim_args):
-                    raise RuntimeError(
-                        "Elder review claim ownership lost after stale dispatch"
-                    )
-                if not _review_eligible(latest):
+                lease.settle(Transition.RELEASE, "during dispatch")
+                if not review_eligible(latest):
                     return "pr_ineligible"
                 return "stale_snapshot" if redrived else "intent_drift_exhausted"
             if degraded_reason == "pr_ineligible":
@@ -2805,14 +2796,7 @@ def _run_hot_review(
                 # moment the PR is reopened/marked ready, before the freshly
                 # scheduled review posts. Leave the check pending; the
                 # ready_for_review/reopen enqueue completes it via a real review.
-                if not _stop_review_claim_heartbeat(heartbeat):
-                    raise RuntimeError(
-                        "Elder review claim ownership lost during dispatch"
-                    )
-                if not release_review_claim(**owned_claim_args):
-                    raise RuntimeError(
-                        "Elder review claim ownership lost for ineligible dispatch"
-                    )
+                lease.settle(Transition.RELEASE, "during dispatch")
                 return "pr_ineligible"
             result_status = result.get("result")
             if result_status == "publish_failed":
@@ -2855,19 +2839,7 @@ def _run_hot_review(
                     raise RuntimeError(
                         "Elder fail-open completion did not land (freshness outage)"
                     )
-                if not _stop_review_claim_heartbeat(heartbeat):
-                    raise RuntimeError(
-                        "Elder review claim ownership lost after fail-open"
-                    )
-                if not complete_review_claim(**owned_claim_args):
-                    # Prefer release over hang if complete fails - but if the
-                    # fallback release ALSO fails, the claim is still held and
-                    # silently returning would report success while blocking
-                    # every future attempt until lease expiry. Raise for redrive.
-                    if not release_review_claim(**owned_claim_args):
-                        raise RuntimeError(
-                            "Elder fail-open claim settlement failed (freshness)"
-                        )
+                lease.settle(Transition.COMPLETE_OR_RELEASE, "after fail-open")
                 return "fail_open_freshness"
             if result_status == "skipped" and degraded_reason in _RETRYABLE_SKIP_REASONS:
                 # Model/content-side transient (backend outage, unparseable
@@ -2878,6 +2850,15 @@ def _run_hot_review(
                 # poison monitor covers a sustained outage.
                 raise RuntimeError(
                     f"Elder review degraded: {degraded_reason}"
+                )
+            if result_status == "skipped" and result.get("rerun_scheduled"):
+                # A partial or low-confidence review on a blocking repo left
+                # the check pending because a re-run is still scheduled
+                # (dispatch's `_rerun_before_failing`). Raise for the queue's
+                # re-run, the same bounded lane all_failed uses; the last
+                # delivery publishes the degraded failure and completes.
+                raise RuntimeError(
+                    f"Elder review degraded: {degraded_reason}; re-run scheduled"
                 )
             if (
                 result_status == "skipped"
@@ -2906,17 +2887,7 @@ def _run_hot_review(
                         "Elder fail-open completion did not land "
                         f"(skip: {degraded_reason or 'unknown'})"
                     )
-                if not _stop_review_claim_heartbeat(heartbeat):
-                    raise RuntimeError(
-                        "Elder review claim ownership lost after fail-open skip"
-                    )
-                if not complete_review_claim(**owned_claim_args):
-                    # Same both-failed guard as the freshness branch above.
-                    if not release_review_claim(**owned_claim_args):
-                        raise RuntimeError(
-                            "Elder fail-open claim settlement failed "
-                            f"(skip: {degraded_reason or 'unknown'})"
-                        )
+                lease.settle(Transition.COMPLETE_OR_RELEASE, "after fail-open skip")
                 return f"fail_open_{degraded_reason or 'skipped'}"
             if (
                 result_status not in {"pass", "fail", "skipped", "review_rejected"}
@@ -2925,31 +2896,12 @@ def _run_hot_review(
                 raise RuntimeError(
                     f"Elder review returned unexpected result: {result_status!r}"
                 )
-            if not _stop_review_claim_heartbeat(heartbeat):
-                raise RuntimeError("Elder review claim ownership lost during review")
-            if not complete_review_claim(**owned_claim_args):
-                raise RuntimeError("Elder review claim completion lost ownership")
+            lease.settle(Transition.COMPLETE, "during review")
     except Exception:
-        _stop_review_claim_heartbeat(heartbeat)
-        try:
-            released = release_review_claim(**owned_claim_args)
-            if not released:
-                raise RuntimeError("Elder review claim release lost ownership")
-        except Exception as release_error:  # noqa: BLE001 - preserve primary failure
-            log.error(
-                "elder_review_claim_release_failed",
-                extra={
-                    "repo": repo_full,
-                    "pr": pr_number,
-                    "head_sha": head_sha[:8],
-                    "snapshot_id": snapshot_id[:11],
-                    "kind": type(release_error).__name__,
-                },
-                exc_info=True,
-            )
+        lease.abort()
         raise
     finally:
-        _unregister_active_review_claim(owner_token)
+        lease.close()
     log.info(
         "elder_review_durable_done",
         extra={"repo": repo_full, "pr": pr_number, **result},
@@ -2961,7 +2913,7 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
     """Consume `grug-rerun-jobs` SQS records (event-source mapping, batch 1).
 
     Unlike the cave result handler, a failed job is allowed to RAISE so the ESM
-    retries it (visibility timeout) → DLQ after `maxReceiveCount`. With batch
+    retries it (visibility timeout) -> DLQ after `maxReceiveCount`. With batch
     size 1 each invocation owns exactly one message, so a raise re-drives only
     that job. Returns a summary for the structured log on the success path."""
     records = event.get("Records", []) if isinstance(event, dict) else []

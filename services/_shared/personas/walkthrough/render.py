@@ -48,13 +48,6 @@ def _escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _escape_table_cell(text: str) -> str:
-    """For a PLAIN-TEXT table cell (the Summary column): a bare `|` or
-    newline lets model-authored text break the row into extra columns or
-    fake extra rows (round 4, codex). GFM honors a backslash-escaped `\\|`
-    as non-delimiting in plain text, so this is a true fix here."""
-    return text.replace("|", "\\|").replace("\n", " ").replace("\r", " ")
-
 
 def _escape_code_span_cell(text: str) -> str:
     """For a BACKTICK-WRAPPED table cell (the File column, `` `{path}` ``):

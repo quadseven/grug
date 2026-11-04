@@ -21,6 +21,7 @@ import pytest
 from llm_client import Backend, LlmReviewResponse
 from llm_client import Finding as LlmFinding
 from personas.code_reviewer import dispatch as cr_dispatch
+from personas.code_reviewer import elder_review
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion,
     degraded_lead_line,
@@ -462,7 +463,7 @@ def test_rerun_intent_drift_give_up_honours_the_mode(monkeypatch, blocking, want
 
     status = rerun._run_one(_job(
         requested_head_sha="same-head", settle_seconds=90,
-        redrive_count=rerun._MAX_INTENT_DRIFT_REDRIVES,
+        redrive_count=elder_review._MAX_INTENT_DRIFT_REDRIVES,
     ))
 
     assert status == "intent_drift_exhausted"

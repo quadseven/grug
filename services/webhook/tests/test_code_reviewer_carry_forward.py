@@ -136,15 +136,31 @@ def test_reraised_finding_is_not_double_counted():
 
 # --- filter_findings_against_resolved_threads (#1457) --------------------
 
-def _thread_for_filter(*, resolved=False, dismissed=False, rule="weakened-test",
-                       path="tests/test_foo.py", line=20, author="grug-tribe"):
+_UNSET = object()
+
+
+def _thread_for_filter(*, resolved=False, dismissed=False, outdated=False,
+                       rule="weakened-test", path="tests/test_foo.py", line=20,
+                       author="grug-tribe", reply=None, resolved_by=_UNSET):
     """Thread helper for filter tests."""
     from personas.code_reviewer import living_review as lr
     nodes = [_comment(severity="🔥 high", rule=rule, path=path, line=line, author=author)]
+    if reply is not None:
+        nodes.append({
+            "id": "C2", "databaseId": 2, "isMinimized": False, "url": "https://example.test/t1#c2",
+            "author": {"login": "human-reviewer"}, "path": path, "line": line,
+            "originalLine": line, "originalCommit": {"oid": "c0ffee"},
+            "body": reply,
+        })
     t = {
-        "id": "T1", "isResolved": resolved, "isOutdated": False,
+        "id": "T1", "isResolved": resolved, "isOutdated": outdated,
         "comments": {"totalCount": len(nodes), "nodes": nodes},
     }
+    if resolved_by is _UNSET:
+        if resolved:
+            t["resolvedBy"] = {"login": "maintainer"}
+    elif resolved_by is not None:
+        t["resolvedBy"] = resolved_by
     if dismissed:
         root = t["comments"]["nodes"][0]
         root["body"] = lr.render(root["body"], lr.DISMISSED)
@@ -156,7 +172,8 @@ def test_filter_removes_finding_matching_resolved_thread():
     thread = _thread_for_filter(resolved=True)
     finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
     filtered = cf.filter_findings_against_resolved_threads(
-        (finding,), 1, "o", "r", 2, threads=[thread])
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
     assert filtered == ()
 
 
@@ -165,7 +182,8 @@ def test_filter_removes_finding_matching_dismissed_thread():
     thread = _thread_for_filter(dismissed=True)
     finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
     filtered = cf.filter_findings_against_resolved_threads(
-        (finding,), 1, "o", "r", 2, threads=[thread])
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
     assert filtered == ()
 
 
@@ -174,7 +192,8 @@ def test_filter_keeps_finding_with_no_matching_thread():
     thread = _thread_for_filter(resolved=True, rule="other-rule")
     finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
     filtered = cf.filter_findings_against_resolved_threads(
-        (finding,), 1, "o", "r", 2, threads=[thread])
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
     assert filtered == (finding,)
 
 
@@ -183,7 +202,8 @@ def test_filter_keeps_finding_far_from_thread_line():
     thread = _thread_for_filter(resolved=True, line=20)
     finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=90)
     filtered = cf.filter_findings_against_resolved_threads(
-        (finding,), 1, "o", "r", 2, threads=[thread])
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
     assert filtered == (finding,)
 
 
@@ -192,7 +212,8 @@ def test_filter_keeps_finding_different_file():
     thread = _thread_for_filter(resolved=True, path="tests/test_bar.py")
     finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
     filtered = cf.filter_findings_against_resolved_threads(
-        (finding,), 1, "o", "r", 2, threads=[thread])
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
     assert filtered == (finding,)
 
 
@@ -201,7 +222,8 @@ def test_filter_keeps_open_thread():
     thread = _thread_for_filter(resolved=False)
     finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
     filtered = cf.filter_findings_against_resolved_threads(
-        (finding,), 1, "o", "r", 2, threads=[thread])
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
     assert filtered == (finding,)
 
 
@@ -209,7 +231,8 @@ def test_filter_with_none_threads_returns_original():
     """When threads is None (listing failure), original findings are returned."""
     finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
     filtered = cf.filter_findings_against_resolved_threads(
-        (finding,), 1, "o", "r", 2, threads=None)
+        (finding,), 1, "o", "r", 2, threads=None, pr_author="alice",
+    )
     assert filtered == (finding,)
 
 
@@ -220,8 +243,186 @@ def test_filter_multiple_findings_mixed():
     finding2 = _finding(rule="weakened-test", file="tests/test_foo.py", line=90)
     finding3 = _finding(rule="null-deref", file="tests/test_foo.py", line=20)
     filtered = cf.filter_findings_against_resolved_threads(
-        (finding1, finding2, finding3), 1, "o", "r", 2, threads=[thread])
+        (finding1, finding2, finding3), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
     assert filtered == (finding2, finding3)
+
+
+def test_filter_reraises_finding_when_code_changed_with_reply_explanation():
+    """#1457: When the code changed (outdated=True), finding is re-raised and
+    explains what changed since the earlier answer."""
+    thread = _thread_for_filter(
+        resolved=True, outdated=True, reply="Removed because feature deprecated",
+    )
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    (reraised,) = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
+    assert reraised.rule_name == "weakened-test"
+    assert "changed since earlier answer" in reraised.message
+    assert "Removed because feature deprecated" in reraised.message
+
+
+def test_filter_reraises_finding_when_code_changed_without_reply():
+    """#1457: When code changed (outdated=True) but no reply text, finding
+    is re-raised stating code changed since earlier answer."""
+    thread = _thread_for_filter(resolved=True, outdated=True)
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    (reraised,) = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
+    assert reraised.rule_name == "weakened-test"
+    assert "changed since earlier answer" in reraised.message
+
+
+def test_finding_resolved_with_reply_is_not_raised_unless_code_changed():
+    """#1457: A finding whose thread a person resolved with a reply is not raised
+    again on a later review of the same pull request unless the code it points at changed."""
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+
+    # When code did not change (outdated=False): finding is suppressed
+    thread_unchanged = _thread_for_filter(
+        resolved=True, outdated=False, reply="Removed because feature was deprecated",
+    )
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread_unchanged], pr_author="alice",
+    )
+    assert filtered == ()
+
+    # When code changed (outdated=True): finding is re-raised with explanation
+    thread_changed = _thread_for_filter(
+        resolved=True, outdated=True, reply="Removed because feature was deprecated",
+    )
+    (reraised,) = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread_changed], pr_author="alice",
+    )
+    assert reraised.rule_name == "weakened-test"
+    assert "changed since earlier answer" in reraised.message
+
+
+def test_thread_resolved_by_pr_author_does_not_hide_finding():
+    """#1582: A thread resolved by the PR author must not hide the matching finding."""
+    thread = _thread_for_filter(
+        resolved=True, resolved_by={"login": "alice"}, rule="weakened-test", line=20,
+    )
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
+    assert filtered == (finding,)
+
+
+@pytest.mark.parametrize("bot_resolver", [
+    {"login": "loom-lanes[bot]"},
+    {"login": "some-agent[bot]"},
+    {"login": "loom-brain", "__typename": "Bot"},
+    {"login": "grug-tribe"},
+])
+def test_thread_resolved_by_app_does_not_hide_finding(bot_resolver):
+    """#1582: A thread resolved by an App/Bot must not hide the matching finding."""
+    thread = _thread_for_filter(
+        resolved=True, resolved_by=bot_resolver, rule="weakened-test", line=20,
+    )
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
+    assert filtered == (finding,)
+
+
+def test_thread_resolved_by_another_maintainer_hides_finding():
+    """#1582: A thread resolved by another maintainer behaves as it does today (hidden)."""
+    thread = _thread_for_filter(
+        resolved=True, resolved_by={"login": "bob-maintainer"}, rule="weakened-test", line=20,
+    )
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
+    assert filtered == ()
+
+
+def test_seeded_security_finding_is_never_dropped_by_resolved_thread():
+    """#1582: A seeded security/SAST finding is never dropped by a thread resolve alone,
+    even if resolved by another maintainer. A thread resolve is not evidence of a fix."""
+    sec_finding = Finding(
+        file="services/auth.py", line=42, severity="high",
+        rule_name="cleartext-secret-log",
+        message="Logging plaintext token", suggestion=None,
+        category="security",
+    )
+    # Even if another maintainer resolved the thread:
+    thread_maintainer = _thread_for_filter(
+        resolved=True, resolved_by={"login": "bob-maintainer"},
+        rule="cleartext-secret-log", path="services/auth.py", line=42,
+    )
+    filtered = cf.filter_findings_against_resolved_threads(
+        (sec_finding,), 1, "o", "r", 2, threads=[thread_maintainer], pr_author="alice",
+    )
+    assert filtered == (sec_finding,)
+
+    # If resolved by PR author or App:
+    thread_author = _thread_for_filter(
+        resolved=True, resolved_by={"login": "alice"},
+        rule="cleartext-secret-log", path="services/auth.py", line=42,
+    )
+    filtered_author = cf.filter_findings_against_resolved_threads(
+        (sec_finding,), 1, "o", "r", 2, threads=[thread_author], pr_author="alice",
+    )
+    assert filtered_author == (sec_finding,)
+
+
+def test_seeded_security_finding_dismissed_via_living_review_is_dropped():
+    """#1582: A seeded security finding dismissed via living review (thumbs-down) is
+    dropped as a maintainer-confirmed false positive."""
+    sec_finding = Finding(
+        file="services/auth.py", line=42, severity="high",
+        rule_name="cleartext-secret-log",
+        message="Logging plaintext token", suggestion=None,
+        category="security",
+    )
+    thread_dismissed = _thread_for_filter(
+        dismissed=True, rule="cleartext-secret-log", path="services/auth.py", line=42,
+    )
+    filtered = cf.filter_findings_against_resolved_threads(
+        (sec_finding,), 1, "o", "r", 2, threads=[thread_dismissed], pr_author="alice",
+    )
+    assert filtered == ()
+
+
+def test_thread_resolved_without_resolver_does_not_hide_finding():
+    """#1582: A thread resolved without a resolver recorded does not hide finding."""
+    thread = _thread_for_filter(resolved=True, resolved_by=None, rule="weakened-test", line=20)
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
+    assert filtered == (finding,)
+
+
+def test_thread_resolved_with_empty_pr_author_does_not_hide_finding():
+    """#1582: If pr_author is empty, fail-closed: do not hide finding."""
+    thread = _thread_for_filter(
+        resolved=True, resolved_by={"login": "maintainer"}, rule="weakened-test", line=20,
+    )
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="",
+    )
+    assert filtered == (finding,)
+
+
+def test_non_security_grug_rule_is_hidden_by_maintainer_resolve():
+    """#1582: A non-security rule prefixed with grug- (e.g. grug-format) is hidden
+    when resolved by another maintainer."""
+    thread = _thread_for_filter(
+        resolved=True, resolved_by={"login": "bob-maintainer"}, rule="grug-format", line=20,
+    )
+    finding = _finding(rule="grug-format", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+    )
+    assert filtered == ()
 
 
 # --- verdict plumbing -----------------------------------------------------
@@ -432,3 +633,110 @@ def test_reraised_finding_counts_once(monkeypatch):
     check, _, _ = _run(monkeypatch, blocking=True, threads=[thread], llm=llm)
     assert check.conclusion == "failure"
     assert "earlier finding" not in check.title
+
+
+def test_merge_lane_work_reads_review_time_title_and_criteria_making_removal_non_blocking():
+    """#1457: _merge_lane_work_for_pass reads PR title and linked criteria at review time;
+    a removal they name produces medium severity (not blocking)."""
+    from personas.code_reviewer.diff_parser import parse_diff
+    from personas.code_reviewer.dispatch import _LaneWorkInputs, _merge_lane_work_for_pass
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+
+    diff = (
+        "diff --git a/tests/test_x.py b/tests/test_x.py\n"
+        "--- a/tests/test_x.py\n"
+        "+++ b/tests/test_x.py\n"
+        "@@ -1,6 +1,2 @@\n"
+        "-def test_alpha():\n"
+        "-    assert True\n"
+        "-def test_beta():\n"
+        "-    assert True\n"
+        "+def test_gamma():\n"
+        "+    pass\n"
+    )
+    hunks = parse_diff(diff)
+    inputs = _LaneWorkInputs(diff, hunks, {}, {})
+    clean_eval = CodeReviewEvaluation(findings=(), conclusion="success")
+
+    pr_context = {
+        "installation_id": 11,
+        "repo": "owner/repo",
+        "pr_number": 7,
+        "head_sha": "abc1234",
+        "title": "Initial title without removal",
+        "body": "Closes #9",
+    }
+
+    with (
+        patch(
+            "personas.code_reviewer.dispatch._fetch_pr_title_and_body",
+            return_value=("Retire the reaction-only acknowledgment and remove tests", "Closes #9"),
+        ),
+        patch("personas.code_reviewer.dispatch._full_pr_lane_work_inputs", return_value=inputs),
+        patch("personas.code_reviewer.dispatch._attach_linked_issue_context") as mock_attach,
+    ):
+        def _set_criteria(ctx, **kw):
+            ctx["linked_issue_context"] = "### Linked issue 9\n\n- [ ] Remove the reaction-only acknowledgment\n"
+        mock_attach.side_effect = _set_criteria
+
+        merged = _merge_lane_work_for_pass(
+            clean_eval, inputs, pr_context, living_range="p1..p2", base_sha="b0",
+            correctness_only=False, action="synchronize",
+        )
+
+    wv = [f for f in merged.findings if f.rule_name == "weakened-test"]
+    assert len(wv) == 1
+    assert wv[0].severity == "medium"
+
+    # Contrast: without review-time removal in title or criteria, finding is high (blocking)
+    pr_context_unnamed = {
+        "installation_id": 11, "repo": "owner/repo", "pr_number": 7,
+        "head_sha": "abc1234", "title": "Normal title", "body": "Closes #9",
+    }
+    with (
+        patch(
+            "personas.code_reviewer.dispatch._fetch_pr_title_and_body",
+            return_value=("Normal title", "Closes #9"),
+        ),
+        patch("personas.code_reviewer.dispatch._full_pr_lane_work_inputs", return_value=inputs),
+        patch("personas.code_reviewer.dispatch._attach_linked_issue_context"),
+    ):
+        merged_high = _merge_lane_work_for_pass(
+            clean_eval, inputs, pr_context_unnamed, living_range="p1..p2", base_sha="b0",
+            correctness_only=False, action="synchronize",
+        )
+    wv_high = [f for f in merged_high.findings if f.rule_name == "weakened-test"]
+    assert len(wv_high) == 1
+    assert wv_high[0].severity == "high"
+
+
+def test_fetch_pr_title_and_body_handles_http_errors_and_propagates_unexpected():
+    from personas.code_reviewer.dispatch import _fetch_pr_title_and_body
+
+    # Short-circuits on falsy inputs
+    assert _fetch_pr_title_and_body(0, "owner", "repo", 1) is None
+
+    # Expected HTTPStatusError returns None
+    with patch("personas.code_reviewer.dispatch.with_install_token_retry") as mock_retry:
+        req = httpx.Request("GET", "https://api.github.com/repos/owner/repo/pulls/1")
+        resp = httpx.Response(404, request=req)
+        mock_retry.side_effect = httpx.HTTPStatusError("not found", request=req, response=resp)
+        assert _fetch_pr_title_and_body(11, "owner", "repo", 1) is None
+
+    # Expected RequestError returns None
+    with patch("personas.code_reviewer.dispatch.with_install_token_retry") as mock_retry:
+        req = httpx.Request("GET", "https://api.github.com/repos/owner/repo/pulls/1")
+        mock_retry.side_effect = httpx.RequestError("connect fail", request=req)
+        assert _fetch_pr_title_and_body(11, "owner", "repo", 1) is None
+
+    # Expected ValueError (e.g. invalid json) returns None
+    with patch("personas.code_reviewer.dispatch.with_install_token_retry") as mock_retry:
+        mock_retry.side_effect = ValueError("bad json")
+        assert _fetch_pr_title_and_body(11, "owner", "repo", 1) is None
+
+    # Bug like TypeError is not swallowed (#1457)
+    with patch("personas.code_reviewer.dispatch.with_install_token_retry") as mock_retry:
+        mock_retry.side_effect = TypeError("bug in code")
+        with pytest.raises(TypeError, match="bug in code"):
+            _fetch_pr_title_and_body(11, "owner", "repo", 1)
+

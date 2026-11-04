@@ -3,6 +3,8 @@ given, and that usage is counted only for the ones actually supplied."""
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 import cave_drawings as cd
@@ -11,7 +13,12 @@ import llm_client as lc
 _CTX = {"repo": "o/r", "pr_number": 7, "head_sha": "abc123", "installation_id": 1}
 
 
-def _row(text, *, status=None, at="2026-01-01T00:00:00+00:00", **kw):
+def _ago(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def _row(text, *, status=None, at=None, **kw):
+    at = at or _ago(30)
     row = {"text": text, "repo": "o/r", "scope_path": "", "reinforced_at": at,
            "id": cd.learning_id(text), **kw}
     if status:
@@ -37,13 +44,13 @@ def store(monkeypatch):
 
 
 def test_only_active_unconflicted_learnings_reach_the_prompt(store):
-    older = _row("allow print in scripts", at="2026-01-01T00:00:00+00:00")
+    older = _row("allow print in scripts", at=_ago(30))
     store["rows"] = [
         older,
         _row("pending rule", status=cd.STATUS_PENDING),
         _row("disabled rule", status=cd.STATUS_DISABLED),
         _row("superseded rule", status=cd.STATUS_SUPERSEDED),
-        _row("never allow print", at="2026-02-01T00:00:00+00:00",
+        _row("never allow print", at=_ago(20),
              conflicts_with=[older["id"]]),
     ]
     block = lc._repo_learnings_block(_CTX)
