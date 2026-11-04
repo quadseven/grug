@@ -470,3 +470,11 @@ def test_redteam_measures_each_arm_and_quarantine_hides_the_metadata():
     assert all(report.quarantined.values())
     assert not report.with_metadata["timing-unsafe-token"]
     assert len(report.with_metadata) == len(CASES) >= 6
+
+
+@pytest.mark.parametrize("manifest", ["consumer-deployment.yaml", "webhook-deployment.yaml"])
+def test_the_quarantined_pass_is_switched_on_in_production(manifest):
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[3] / "k8s" / manifest).read_text()
+    assert '- {name: GRUG_QUARANTINED_SECURITY_PASS, value: "1"}' in text
