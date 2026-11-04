@@ -130,6 +130,42 @@ def test_pr_author_authorized_path_dispatches(_no_install_lookups):
     assert pub_kwargs["pr_number"] == 42
 
 
+def test_author_only_cannot_delete_learnings(_no_install_lookups, monkeypatch):
+    payload = _comment_payload(body="/grug learnings delete abc123")
+    payload["comment"]["id"] = 91
+    monkeypatch.setattr(d, "_actor_permission", lambda *_: "read")
+    deleted = []
+    monkeypatch.setattr("interactive._wake_learnings_delete", lambda repo, digest: deleted.append(digest))
+    replies = []
+    monkeypatch.setattr("interactive._reply", lambda token_fn, owner, repo, number, body: replies.append(body))
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get") as get_mock:
+        get_mock.return_value.raise_for_status = lambda: None
+        get_mock.return_value.json.return_value = {"head": {"sha": "abc123"}, "body": ""}
+        out = d.dispatch("issue_comment", payload)
+    assert out["status"] == "no_op"
+    assert "write access" in replies[0]
+    assert deleted == []
+
+
+def test_author_only_learnings_list_hides_author_login(_no_install_lookups, monkeypatch):
+    payload = _comment_payload(body="/grug learnings list")
+    payload["comment"]["id"] = 92
+    monkeypatch.setattr(d, "_actor_permission", lambda *_: "read")
+    monkeypatch.setattr("interactive._wake_learnings_list", lambda _repo: [
+        {"text": "keep tests", "author": "teacher-login", "source_pr": 3, "usage_count": 0},
+    ])
+    replies = []
+    monkeypatch.setattr("interactive._post_reply", lambda token, owner, repo, number, body: replies.append(body))
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get") as get_mock:
+        get_mock.return_value.raise_for_status = lambda: None
+        get_mock.return_value.json.return_value = {"head": {"sha": "abc123"}, "body": ""}
+        out = d.dispatch("issue_comment", payload)
+    assert out["status"] == "dispatched"
+    assert "teacher-login" not in replies[0]
+
+
 def test_non_author_with_write_perm_authorized(_no_install_lookups):
     payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="alice")
     fake_pr = {"head": {"sha": "def456"}, "body": ""}
