@@ -346,9 +346,22 @@ def format_metrics(rows: list[LedgerRow]) -> str:
     return "\n".join(lines)
 
 
+def format_tier_report(rows: list[LedgerRow]) -> str:
+    """One `TIER: addressed/labeled addressed` line per severity tier, top
+    tier first: the weekly report the comment budget is tuned from (#1570)."""
+    rates = tier_rates(rows)
+    return "\n".join(
+        f"{tier}: {rates[tier][0]}/{rates[tier][1]} addressed"
+        for tier in sorted(rates, key=lambda t: SEVERITY_ORDER.get(t, 4))
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     import sys
-    args = sys.argv[1:] if argv is None else argv
+    args = list(sys.argv[1:] if argv is None else argv)
+    tiers_only = "--tiers" in args
+    if tiers_only:
+        args.remove("--tiers")
     path = args[0] if args else "logs/review-ledger.jsonl"
     try:
         with open(path, encoding="utf-8") as f:
@@ -356,6 +369,14 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError:
         print(f"ledger: file not found: {path}")
         return 1
+    if tiers_only:
+        report = format_tier_report(rows)
+        if not report:
+            # A blank weekly summary would read as "nothing to tune".
+            print(f"ledger: no tier data in {path}")
+            return 1
+        print(report)
+        return 0
     print(format_metrics(rows))
     return 0
 

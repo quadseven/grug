@@ -1,0 +1,40 @@
+name: Report · ledger tiers
+
+# Weekly addressed-rate per severity tier, read from the committed review
+# ledger (#1570). The comment budget's cap and tiers are tuned from these
+# numbers, so they land in this run's job summary: no issue, comment or mail
+# per run, because cutting noise is what the budget exists for. The ledger is
+# a committed file, so the job needs no secrets and no backend.
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tiers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # ledger --tiers exits 1 on a missing or tier-less ledger, so an empty
+      # summary cannot pass as a quiet week.
+      - name: Addressed rate per tier
+        working-directory: services/_shared
+        run: |
+          set -euo pipefail
+          report=$(python3 -m ledger --tiers ../../logs/review-ledger.jsonl)
+          echo "$report"
+          {
+            echo "## Addressed rate per tier"
+            echo
+            echo '```'
+            echo "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

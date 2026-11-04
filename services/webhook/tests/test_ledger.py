@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from ledger import (
     LedgerRow,
@@ -247,6 +248,26 @@ def test_ledger_cli_main_outputs_metrics(capsys):
     assert "accepted" in captured.out
     assert "reviewers:" in captured.out
     assert "classes:" in captured.out
+
+
+def test_ledger_cli_tiers_prints_one_addressed_line_per_tier(capsys):
+    """#1570: the weekly report prints only the per-tier addressed rate."""
+    from pathlib import Path
+    p = str(Path(__file__).resolve().parents[3] / "logs" / "review-ledger.jsonl")
+    ret = ledger_main(["--tiers", p])
+    assert ret == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines, "the tier report printed nothing"
+    assert all(re.fullmatch(r"[A-Z]+: \d+/\d+ addressed", line) for line in lines), lines
+    assert len({line.split(":")[0] for line in lines}) == len(lines)
+
+
+def test_ledger_cli_tiers_fails_on_a_ledger_with_no_tier_data(tmp_path, capsys):
+    """An empty report must fail the weekly run, not post a blank summary."""
+    empty = tmp_path / "ledger.jsonl"
+    empty.write_text("", encoding="utf-8")
+    assert ledger_main(["--tiers", str(empty)]) == 1
+    assert "no tier data" in capsys.readouterr().out
 
 
 def test_ledger_cli_main_file_not_found(capsys):
