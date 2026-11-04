@@ -64,6 +64,12 @@ def _hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar") -> Hunk:
     return Hunk(path=path, body=body)
 
 
+def _large_hunk(path="src/x.py") -> Hunk:
+    """A diff past `_DEGENERATE_MIN_DIFF_CHARS`, where a short empty answer
+    is still untrusted (grug#1642)."""
+    return Hunk(path=path, body="@@ -1 +1 @@\n+" + "y" * lc._DEGENERATE_MIN_DIFF_CHARS)
+
+
 def _one_ladder_walk(hunks: list[Hunk], installation_id: int) -> LlmReviewResponse:
     """One walk down the model ladder, without review_diff's chunk retry.
 
@@ -5274,7 +5280,7 @@ def test_degenerate_empty_review_falls_through_to_the_next_tier(monkeypatch) -> 
     with patch.object(
         httpx, "post", side_effect=[_go_limit_429(), degenerate, real],
     ) as post:
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.POOLSIDE
@@ -5288,6 +5294,12 @@ def test_small_empty_review_is_not_degenerate() -> None:
     assert not lc._is_degenerate_empty_review((), {"input_tokens": 15_000, "output_tokens": 300})
     assert not lc._is_degenerate_empty_review((), {})
     assert lc._is_degenerate_empty_review((), {"input_tokens": 15_000, "output_tokens": 7})
+    # grug#1642: inside a review the diff's size decides, not the prompt's.
+    usage = {"input_tokens": 23_000, "output_tokens": 7}
+    with lc._reviewed_diff_scope([_hunk()]):
+        assert not lc._is_degenerate_empty_review((), usage)
+    with lc._reviewed_diff_scope([_large_hunk()]):
+        assert lc._is_degenerate_empty_review((), usage)
 
 
 def test_judge_truncated_at_output_cap_is_a_failure_not_a_verdict() -> None:
@@ -5423,7 +5435,7 @@ def test_two_models_agreeing_on_no_findings_is_a_clean_review(monkeypatch, caplo
     with caplog.at_level("INFO"), patch.object(
         httpx, "post", side_effect=[_degenerate_response(), _degenerate_response()],
     ) as post:
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.findings == ()
@@ -5440,7 +5452,7 @@ def test_second_model_findings_win_over_a_primary_skim(monkeypatch) -> None:
         '"severity": "medium", "message": "m"}]}', 15_000, 400,
     )
     with patch.object(httpx, "post", side_effect=[_degenerate_response(), real]) as post:
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert len(out.findings) == 1
@@ -5481,7 +5493,7 @@ def test_the_same_model_twice_is_not_consensus(monkeypatch) -> None:
         httpx, "post",
         side_effect=[_degenerate_response(), httpx.ConnectError("longcat down"), real],
     ) as post:
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
 
     assert out.backend_used == Backend.POOLSIDE
     assert post.call_count == 3
@@ -5536,7 +5548,7 @@ def test_the_free_openrouter_model_cannot_confirm_an_empty_answer(monkeypatch) -
             real,
         ],
     ) as post:
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
 
     assert out.backend_used == Backend.POOLSIDE
     assert len(out.findings) == 1
@@ -5792,7 +5804,7 @@ def test_fallback_empty_answer_agrees_with_a_paid_empty_answer(monkeypatch) -> N
     with patch.object(
         httpx, "post", side_effect=[_degenerate_response(), _degenerate_response()],
     ) as post:
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
     assert out.kind == "reviewed" and out.findings == ()
     assert post.call_count == 2
 
@@ -6068,7 +6080,7 @@ def test_deepseek_degenerate_with_every_later_tier_failing_is_low_confidence(
         raise httpx.ConnectError("down")
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.findings == ()
@@ -6086,11 +6098,11 @@ def test_low_confidence_cohort_does_not_starve_the_next_cohort(monkeypatch) -> N
     was retried, so later cohorts went unreviewed. Now the degenerate cohort
     keeps its answer, the next cohort is reviewed, and nothing is failed."""
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
-    monkeypatch.setenv("GRUG_REVIEW_COHORT_CHARS", "8000")
+    monkeypatch.setenv("GRUG_REVIEW_COHORT_CHARS", "16000")
     paid = _pin_deepseek_primary(monkeypatch)
     hunks = [
-        _hunk("src/x.py", "@@ -1 +1 @@\n+SRC_CHANGE\n" + "s" * 4100),
-        _hunk("tests/test_x.py", "@@ -1 +1 @@\n+TEST_CHANGE\n" + "t" * 4100),
+        _hunk("src/x.py", "@@ -1 +1 @@\n+SRC_CHANGE\n" + "s" * 9000),
+        _hunk("tests/test_x.py", "@@ -1 +1 @@\n+TEST_CHANGE\n" + "t" * 9000),
     ]
     src_primary_calls = 0
 
@@ -6144,7 +6156,7 @@ def test_deepseek_degenerate_then_a_garbled_cave_reaches_the_subscription_lane(
         return httpx.Response(200, json=_openai_json_response("not json"))
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
 
     assert len(lanes) == 1
     assert out.kind == "reviewed"
@@ -6165,12 +6177,79 @@ def test_deep_append_keeps_a_degenerate_answer_when_the_reasoner_fails(
         raise httpx.ConnectError("down")
 
     with patch.object(httpx, "post", side_effect=respond):
-        out = lc.review_reasoner_diff(assemble_evidence([_hunk()]), installation_id=1)
+        out = lc.review_reasoner_diff(assemble_evidence([_large_hunk()]), installation_id=1)
 
     assert out.kind == "reviewed"
     assert out.findings == ()
     assert out.backend_used == Backend.OPENCODE_GO
     assert out.error.startswith("low confidence:")
+
+
+# --- grug#1642: the degenerate rule keys on the reviewed diff, not the prompt ---
+
+
+def _only_the_lane_answers(monkeypatch, input_tokens: int):
+    """Every backend but the subscription lane is down; the lane answers
+    `{"findings": []}` in 7 output tokens on `input_tokens` of prompt."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
+    lanes: list[str] = []
+
+    def respond(url, **kwargs) -> httpx.Response:
+        if "/subscription/" in url:
+            lanes.append(url)
+            return _usage_response('{"findings": []}', input_tokens, 7)
+        raise httpx.ConnectError("down")
+
+    return lanes, respond
+
+
+def test_short_empty_answer_on_a_small_diff_is_a_trusted_clean_review(monkeypatch) -> None:
+    """grug#1642: a docs-only PR got four low-confidence passes in a row. The
+    lane answered `{"findings": []}` on about 23,000 input tokens, nearly all
+    of it fixed review context, so the rule read it as a skim. On a diff this
+    small an empty answer is the right one."""
+    lanes, respond = _only_the_lane_answers(monkeypatch, 23_000)
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert len(lanes) == 1
+    assert out.kind == "reviewed"
+    assert out.findings == ()
+    assert out.backend_used == Backend.SUBSCRIPTION
+    assert not (out.error or "").startswith("low confidence:")
+    assert evaluate_diff((), out).degraded_reason is None
+
+
+def test_short_empty_answer_on_a_large_diff_is_still_low_confidence(monkeypatch) -> None:
+    """grug#1642 regression: the same answer on a 20,000-character diff is
+    still untrusted, and with no later model answering it is low confidence."""
+    lanes, respond = _only_the_lane_answers(monkeypatch, 23_000)
+    large = _hunk(body="@@ -1 +1 @@\n+" + "x = 1\n" * 3_334)
+    assert len(large.body) >= 20_000
+    with patch.object(httpx, "post", side_effect=respond):
+        out = review_diff(assemble_evidence([large]), installation_id=1)
+
+    assert lanes
+    assert out.kind == "reviewed"
+    assert out.findings == ()
+    assert out.error.startswith("low confidence:")
+    assert evaluate_diff((), out).degraded_reason == "low_confidence_review"
+
+
+def test_small_diff_empty_answer_ends_the_cloud_chain_at_its_first_tier(monkeypatch) -> None:
+    """grug#1642, the cloud chain's arm: the first tier's short empty answer
+    on a small diff is the review, so no second model is asked."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    _pin_deepseek_primary(monkeypatch)
+    with patch.object(httpx, "post", side_effect=[_usage_response('{"findings": []}', 23_000, 7)]) as post:
+        out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert post.call_count == 1
+    assert out.kind == "reviewed"
+    assert out.backend_used == Backend.OPENCODE_GO
+    assert not (out.error or "").startswith("low confidence:")
 
 
 def test_coerce_finding_validates_category_and_degrades_to_general() -> None:
