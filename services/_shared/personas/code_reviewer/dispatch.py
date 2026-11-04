@@ -3278,6 +3278,31 @@ def _accept_guarded_removals(
     )
 
 
+def _delta_is_empty(diff_text: str) -> bool:
+    """A Living Hunt delta with no change at all: no hunk and no deleted file.
+
+    grug#1644: an empty commit since the last completed Elder head leaves
+    such a delta. Reviewed as is it publishes neutral no_diff, which never
+    clears a blocking gate, so the caller reviews the full PR diff on this
+    head instead: the same review `/grug improve` runs. A deletion-only
+    delta is not empty; it keeps its own path (#1401)."""
+    return not parse_diff(diff_text) and not removed_paths(diff_text)
+
+
+def _fetch_full_pr_diff(
+    installation_id: int, owner: str, repo_name: str, pull_number: int, *,
+    base_sha: str, head_sha: str,
+) -> str:
+    """The whole PR diff (base..head), as a review with no stored delta reads it."""
+    return with_install_token_retry(
+        installation_id,
+        lambda token: fetch_pr_diff(
+            token, owner, repo_name, pull_number,
+            base_sha=base_sha, head_sha=head_sha,
+        ),
+    )
+
+
 def _review_deletion_only(
     evaluation: CodeReviewEvaluation, diff_text: str,
     parsed_hunks: tuple[DiffHunk, ...], *, installation_id: int, owner: str, repo_name: str, pull_number: int,
@@ -3890,29 +3915,11 @@ def dispatch_code_review(
                 living_baseline_rejected = living_prior_sha[:8]
             living_prior_sha = ""
             living_range = ""
-        if (
-            living_prior_sha
-            and not parse_diff(diff_text)
-            and not removed_paths(diff_text)
-        ):
-            # grug#1644: nothing changed since the last completed Elder head
-            # (an empty commit). The delta would publish neutral no_diff,
-            # which never clears a blocking gate, so review the full PR diff
-            # on this head: the same review `/grug improve` runs. A
-            # deletion-only delta keeps its own path (#1401).
-            living_delta_empty = living_range
-            living_prior_sha = ""
-            living_range = ""
-            diff_text = with_install_token_retry(
-                installation_id,
-                lambda token: fetch_pr_diff(
-                    token,
-                    owner,
-                    repo_name,
-                    pull_number,
-                    base_sha=base_sha,
-                    head_sha=head_sha,
-                ),
+        if living_prior_sha and _delta_is_empty(diff_text):
+            living_delta_empty, living_prior_sha, living_range = living_range, "", ""
+            diff_text = _fetch_full_pr_diff(
+                installation_id, owner, repo_name, pull_number,
+                base_sha=base_sha, head_sha=head_sha,
             )
         pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
