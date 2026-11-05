@@ -405,8 +405,28 @@ def _query_fallback_chain(
     return None
 
 
+def _author_may_teach(author_id) -> bool:
+    """True when `author_id` is in TRUSTED_USER_IDS, the same list `/learn` checks.
+
+    Lore extraction writes reply sentences into the server fact store, which
+    every later prompt and `/what-know` reads. Only a trusted author's
+    exchange may write there; an unknown author (None) never does (#1632).
+    """
+    if author_id is None:
+        return False
+    try:
+        return int(author_id) in config.TRUSTED_USER_IDS
+    except (TypeError, ValueError):
+        return False
+
+
 def query_model(
-    statement: str, server_db, server_id: str, personality_engine, current_bot_id: Optional[str] = None
+    statement: str,
+    server_db,
+    server_id: str,
+    personality_engine,
+    current_bot_id: Optional[str] = None,
+    author_id: Optional[int] = None,
 ) -> Optional[str]:
     """Query the LLM with personality context and server-specific knowledge.
 
@@ -427,6 +447,9 @@ def query_model(
         personality_engine: The personality engine instance managing personalities.
         current_bot_id: Optional current bot identifier for logging and rate limiting.
             Defaults to None.
+        author_id: Discord user id of the person whose message prompted this
+            query. Lore is extracted from the reply only when this id is in
+            TRUSTED_USER_IDS; None (unknown or bot-initiated) skips extraction.
 
     Returns:
         Optional[str]: The LLM's response, or None if an error occurred. Returns a
@@ -530,9 +553,18 @@ def query_model(
     # Get personality name for lore extraction
     personality_name = personality.chosen_name or personality.name
 
+    # The fallback chain uses its server_db argument only to extract lore from
+    # the validated reply, so passing None is what skips that write.
+    lore_db = server_db if _author_may_teach(author_id) else None
+    if lore_db is None:
+        log.info(
+            "Skipping lore extraction for untrusted author",
+            extra={"bot_id": current_bot_id, "server_id": server_id},
+        )
+
     try:
         return _query_fallback_chain(
-            prompt_text, cache_key, server_db, personality_name, current_bot_id
+            prompt_text, cache_key, lore_db, personality_name, current_bot_id
         )
     except Exception as e:
         log.error("Query model failed", extra={"bot_id": current_bot_id, "error": str(e)})

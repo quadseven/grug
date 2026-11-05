@@ -58,7 +58,11 @@ jobs:
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8
       - name: 03. Infra unit tests
         working-directory: infra/pulumi
-        run: uv run --with pytest pytest tests/ -q
+        # Pinned: some runners ship CPython 3.14 as /usr/bin/python3, which uv
+        # picks by default. pulumi.runtime.set_mocks needs an implicit event
+        # loop that 3.14 no longer creates, so tests/test_oidc_role.py fails at
+        # collection there while passing on 3.12.
+        run: uv run --python 3.12 --with pytest pytest tests/ -q
 
   pulumi-up:
     needs: meta
