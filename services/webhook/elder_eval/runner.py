@@ -75,15 +75,18 @@ from llm_client import (
     review_diff,
 )
 from personas.code_reviewer.diff_parser import parse_diff
+from personas.code_reviewer.finding_funnel import publish_funnel
 from personas.code_reviewer.judge import (
+    falsification_verifier_enabled,
+    falsify_with_outcome,
     grade_findings,
-    partition_findings,
     partition_refuted,
     refute_findings,
 )
 from personas.code_reviewer.persona import (
     Finding as PublishedFinding,
     evaluate_diff,
+    with_findings,
 )
 from personas.code_reviewer.verify import verify_findings
 from review_evidence import ElderEvidence, assemble_evidence
@@ -127,31 +130,57 @@ def classes_for_findings(
     return out
 
 
+def production_refute(
+    findings: tuple[PublishedFinding, ...],
+    evidence: ElderEvidence,
+    installation_id: int,
+) -> tuple[FindingJudgement, ...]:
+    """The refute verdicts production would use: the falsification verifier
+    (#1567) when its switch is on, the batched refute gate otherwise."""
+    if not findings:
+        return ()
+    if falsification_verifier_enabled():
+        return falsify_with_outcome(findings, evidence, installation_id)[0].verdicts
+    return refute_findings(findings, evidence, installation_id)
+
+
 def _published_findings(
     response: LlmReviewResponse,
     hunks,
     evidence: ElderEvidence,
     *,
     grade: Callable[..., tuple[FindingJudgement, ...]] = grade_findings,
-    refute: Callable[..., tuple[FindingJudgement, ...]] = refute_findings,
+    refute: Callable[..., tuple[FindingJudgement, ...]] = production_refute,
 ) -> tuple[PublishedFinding, ...]:
-    """Replay publication gates available from the corpus diff alone.
+    """Replay publication through the same finding funnel dispatch uses
+    (#1586), against the evidence's own file contents.
 
-    Full-file-dependent verifier rules remain inconclusive until the evaluator
-    fetches immutable head contents; the judge and refute gates still receive
-    the exact evidence the replay's review read.
+    The judge and refute gates receive the exact evidence the replay's
+    review read. Bound-name downgrades and outage softening change severity
+    only, so the replay leaves them out.
     """
-    evaluation = evaluate_diff(tuple(hunks), response)
-    verdicts = grade(evaluation, evidence, 0)
-    kept, _ = partition_findings(evaluation.findings, verdicts)
-    verified, _ = verify_findings(kept, {})
-    high = tuple(
-        finding for finding in verified if finding.severity in ("high", "critical")
-    )
-    refuted_verdicts = refute(high, evidence, 0)
-    _, refuted = partition_refuted(high, refuted_verdicts)
-    refuted_ids = {id(finding) for finding in refuted}
-    return tuple(finding for finding in verified if id(finding) not in refuted_ids)
+    contents = dict(evidence.file_contents or {})
+
+    def verify(evaluation):
+        verified, _ = verify_findings(evaluation.findings, contents)
+        return with_findings(evaluation, verified)
+
+    def falsify(findings, _plain, _verdicts):
+        high = tuple(f for f in findings if f.severity in ("high", "critical"))
+        if not high:
+            return findings
+        _, refuted = partition_refuted(high, refute(high, evidence, 0))
+        refuted_ids = {id(finding) for finding in refuted}
+        return tuple(f for f in findings if id(f) not in refuted_ids)
+
+    return publish_funnel(
+        evaluate_diff(tuple(hunks), response),
+        contents,
+        evidence.pr_context or {},
+        grade=lambda evaluation: grade(evaluation, evidence, 0),
+        verify=verify,
+        falsify=falsify,
+    ).evaluation.findings
 
 
 def diff_to_hunks(diff_text: str) -> list[Hunk]:
@@ -519,7 +548,7 @@ def run_production_case(
     review: Callable[..., LlmReviewResponse] = review_diff,
     published: bool = False,
     grade: Callable[..., tuple[FindingJudgement, ...]] = grade_findings,
-    refute: Callable[..., tuple[FindingJudgement, ...]] = refute_findings,
+    refute: Callable[..., tuple[FindingJudgement, ...]] = production_refute,
     anchored: bool = False,
 ) -> CaseReplay:
     """Replay one case through production's staged discovery path.

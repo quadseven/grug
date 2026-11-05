@@ -156,11 +156,8 @@ from personas.tpm.issue_fetcher import (
 from personas.code_reviewer.omen import build_runtime_context
 from personas.code_reviewer.judge import (
     advisory_when_unrefuted, eval_tags, falsification_verifier_enabled,
-    falsify_with_outcome, grade_findings, partition_findings,
+    falsify_with_outcome, grade_findings,
     partition_refuted, refute_with_outcome, submit_evals, verifier_rows,
-)
-from personas.code_reviewer.intent_filter import (
-    filter_intent_mismatch_findings, scope_intent_mismatch_to_claimed_boxes,
 )
 from personas.code_reviewer.comment_budget import (
     budget_enabled, drip_fed, held_lines, is_model_blocking, split_for_budget,
@@ -185,7 +182,11 @@ from personas.code_reviewer.removed_files import (
     find_referrer_candidates, removed_paths, removed_reference_findings,
     scan_guarded_deletions,
 )
-from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
+from personas.code_reviewer.finding_funnel import (
+    CORRECTNESS_ONLY_SCOPE,
+    drop_non_correctness_findings, drop_unreachable_defensive_findings,
+    filter_checked_shell_commands, filter_intent_mismatches, publish_funnel,
+)
 from personas.code_reviewer.elder_review import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward, carry_verdict, hunt_link, living_review
 from personas.hunt_recorder import PrRef, now as hunt_now
@@ -209,32 +210,8 @@ from adapters.install_store import (  # type: ignore
 )
 
 
-# Defensive model rules eligible for the reachable-caller post-filter. Security
-# rules and deterministic linter rule IDs are intentionally absent.
-_DEFENSIVE_RULES = frozenset({
-    "missing-error-handling", "missing-timeout", "missing-pagination",
-    "missing-validation", "unchecked-input", "null-deref",
-    "off-by-one-or-bounds", "type-safety-gap", "subprocess-no-timeout",
-    "hot-path-unguarded",
-})
-_REACHABLE_SOURCE_RE = re.compile(
-    r"\b(?:caller|input)\s+(?:`[^`]+`|[A-Za-z_][\w.]*)", re.IGNORECASE,
-)
-
-
-def _drop_unreachable_defensive_findings(evaluation: CodeReviewEvaluation):
-    dropped = tuple(
-        f for f in evaluation.findings
-        if f.rule_name in _DEFENSIVE_RULES
-        and f.severity in ("low", "medium")
-        and not _REACHABLE_SOURCE_RE.search(f.message)
-    )
-    if not dropped:
-        return evaluation, 0
-    removed = {id(f) for f in dropped}
-    return with_findings(
-        evaluation, tuple(f for f in evaluation.findings if id(f) not in removed),
-    ), len(dropped)
+_drop_unreachable_defensive_findings = drop_unreachable_defensive_findings
+_drop_non_correctness_findings = drop_non_correctness_findings
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
 
@@ -3176,15 +3153,6 @@ def _linked_issue_summary_note(linked_context: str) -> str:
     )
 
 
-CORRECTNESS_ONLY_SCOPE = "correctness findings only (documentation/tests change)"
-
-# Rules a docs/tests-only review drops: shape and style findings, not
-# correctness (#1172).
-_NON_CORRECTNESS_RULES = frozenset({
-    "dead-code", "complexity-hotspot", "high-complexity", "type-safety-gap",
-})
-
-
 def _pr_labels(pr: dict[str, Any]) -> frozenset[str]:
     """The PR's label names, trimmed and lowercased; non-dict entries skipped."""
     return frozenset(
@@ -3221,19 +3189,6 @@ def _correctness_only_scope(paths: tuple[str, ...], labels: frozenset[str]) -> s
     if docs_or_tests_only or "class:docs" in labels or "class:tests" in labels:
         return CORRECTNESS_ONLY_SCOPE
     return ""
-
-
-def _drop_non_correctness_findings(
-    evaluation: CodeReviewEvaluation,
-) -> CodeReviewEvaluation:
-    """Keep only correctness findings for a correctness-only review."""
-    return with_findings(
-        evaluation,
-        tuple(
-            finding for finding in evaluation.findings
-            if finding.rule_name not in _NON_CORRECTNESS_RULES
-        ),
-    )
 
 
 def _accept_guarded_removals(
@@ -3694,55 +3649,22 @@ def _filter_checked_shell_commands(
     evaluation: CodeReviewEvaluation, file_contents: dict[str, str], *,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
 ) -> CodeReviewEvaluation:
-    """Drop `missing-error-handling` findings on shell commands whose exit
-    status control flow or errexit already checks (#771)."""
-    kept, dropped = filter_checked_shell_findings(
-        evaluation.findings, file_contents,
+    """The funnel's checked-shell filter (#771) under dispatch's PR naming."""
+    return filter_checked_shell_commands(
+        evaluation, file_contents, installation_id=installation_id,
+        pr=f"{owner}/{repo_name}#{pull_number}",
     )
-    if not dropped:
-        return evaluation
-    log.info(
-        "code_review_shell_flow_filter",
-        extra={
-            "installation_id": installation_id,
-            "pr": f"{owner}/{repo_name}#{pull_number}",
-            "dropped": dropped,
-        },
-    )
-    return with_findings(evaluation, kept)
 
 
 def _filter_intent_mismatches(
     evaluation: CodeReviewEvaluation, *, installation_id: int,
     owner: str, repo_name: str, pull_number: int, pr_context: PrContext,
 ) -> CodeReviewEvaluation:
-    """Apply the deterministic intent-mismatch evidence filter (#1170), then
-    scope what is left to the boxes a Refs-only PR claims (#1218)."""
-    kept, dropped, lowered = filter_intent_mismatch_findings(evaluation.findings)
-    body = str(pr_context.get("body") or "")
-    kept, scope_dropped, scope_lowered = scope_intent_mismatch_to_claimed_boxes(
-        kept,
-        boxes=rendered_criteria_with_state(
-            str(pr_context.get("linked_issue_context") or ""),
-        ),
-        closed_issues=closes_refs(body),
-        pr_body=body,
+    """The funnel's intent-mismatch filter (#1170, #1218)."""
+    return filter_intent_mismatches(
+        evaluation, pr_context, installation_id=installation_id,
+        pr=f"{owner}/{repo_name}#{pull_number}",
     )
-    if kept != evaluation.findings:
-        evaluation = with_findings(evaluation, kept)
-    if dropped or lowered or scope_dropped or scope_lowered:
-        log.info(
-            "code_review_intent_filter",
-            extra={
-                "installation_id": installation_id,
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "dropped": dropped,
-                "lowered": lowered,
-                "scope_dropped": scope_dropped,
-                "scope_lowered": scope_lowered,
-            },
-        )
-    return evaluation
 
 
 def _repo_private(payload: dict[str, Any]) -> bool | None:
@@ -4332,31 +4254,6 @@ def dispatch_code_review(
         evaluation, pr=f"{owner}/{repo_name}#{pull_number}", head_sha=head_sha,
     )
     correctness_only = bool(pr_context.get("review_scope"))
-    if correctness_only:
-        evaluation = _drop_non_correctness_findings(evaluation)
-    evaluation, defensive_dropped_count = _drop_unreachable_defensive_findings(
-        evaluation,
-    )
-
-    # #771: a shell command inside `if`/`while`/`&&`/`||` or under errexit
-    # has its exit status checked; drop the "unchecked" finding on it.
-    evaluation = _filter_checked_shell_commands(
-        evaluation, file_contents,
-        installation_id=installation_id,
-        owner=owner,
-        repo_name=repo_name,
-        pull_number=pull_number,
-    )
-
-    # #1170: deterministic evidence filter for intent-mismatch findings.
-    evaluation = _filter_intent_mismatches(
-        evaluation,
-        installation_id=installation_id,
-        owner=owner,
-        repo_name=repo_name,
-        pull_number=pull_number,
-        pr_context=pr_context,
-    )
 
     # NOTE (#466, ADR-0012): the deterministic security suite (SAST + SCA +
     # secret + IaC scans -> exploitability judge) that used to merge into
@@ -4364,58 +4261,57 @@ def dispatch_code_review(
     # ("Grug - Guard") - see personas/guard/dispatch.py. Elder is the LLM
     # diff review only.
 
-    # Judge-gated publication (#467, ADR-0011): grade the findings with the
-    # exploitability judge BEFORE publishing, then suppress the ones it
-    # confidently calls false positives at low/medium severity. HIGH/CRITICAL
-    # always publish; a judge outage grades nothing and publishes everything
-    # (fail-open). ONE judge call - its verdicts drive both the gate here and
-    # the DD evals below. `graded_findings` keeps the FULL set so the eval
-    # denominator counts suppressed rows too.
-    graded_findings = evaluation.findings
-    judge_verdicts = grade_findings(evaluation, evidence, installation_id)
-    kept, suppressed = partition_findings(evaluation.findings, judge_verdicts)
+    # The one finding funnel (#1586): the deterministic filters (correctness
+    # scope, unreachable defensive, checked shell #771, intent #1170), then
+    # the judge (#467, ADR-0011: low/medium false positives suppressed, a
+    # judge outage grades nothing), the repo-grounded verifier (#708) and
+    # the refute gate or falsification verifier (#714, #1567). The deep and
+    # quarantined passes and the eval run the same funnel. `graded_findings`
+    # keeps the FULL judged set so the eval denominator counts suppressed
+    # rows too.
+    def _verify_tier1(current: CodeReviewEvaluation) -> CodeReviewEvaluation:
+        verified, killed = verify_findings(
+            current.findings, file_contents,
+            checks=_check_evidence(head_check_runs), head_sha=head_sha,
+        )
+        if killed:
+            current = with_findings(current, verified)
+        _record_verification_kills(
+            killed, installation_id=installation_id, owner=owner,
+            repo_name=repo_name, pull_number=pull_number, arm="tier1",
+        )
+        return _apply_bound_name_downgrade(
+            current, file_contents, installation_id=installation_id,
+            owner=owner, repo_name=repo_name, pull_number=pull_number, arm="tier1",
+        )
+
+    funnel = publish_funnel(
+        evaluation, file_contents, pr_context,
+        grade=lambda current: grade_findings(current, evidence, installation_id),
+        verify=_verify_tier1,
+        falsify=lambda findings, plain, verdicts: _apply_refute_gate(
+            findings, evidence, installation_id, owner=owner,
+            repo_name=repo_name, pull_number=pull_number, arm="tier1",
+            plain_findings=plain, plain_verdicts=verdicts,
+        ),
+        installation_id=installation_id,
+        pr=f"{owner}/{repo_name}#{pull_number}",
+    )
+    evaluation = funnel.evaluation
+    defensive_dropped_count = funnel.defensive_dropped
+    graded_findings = funnel.graded
+    judge_verdicts = funnel.verdicts
+    suppressed = funnel.suppressed
     if suppressed:
-        evaluation = with_findings(evaluation, kept)
         log.info(
             "judge_suppressed_findings",
             extra={
                 "installation_id": installation_id,
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "suppressed": len(suppressed),
-                "published": len(kept),
+                "published": len(graded_findings) - len(suppressed),
             },
         )
-
-    # Repo-grounded verification pass (#708, epic #707): the judge grades
-    # plausibility from the model's own frame; this step checks the
-    # load-bearing CLAIM against the fetched file contents and kills
-    # contradicted findings (prose file with an execution-class claim,
-    # async-family claim in a provably-sync context, suggested fix already
-    # on the anchored line). Runs on the LLM findings only - the
-    # deterministic sources merged below (complexity, claim-check) are
-    # precise by construction. One structured log row per kill so the
-    # #707 scoreboard can track precision contribution AND false kills.
-    verified, killed = verify_findings(
-        evaluation.findings, file_contents,
-        checks=_check_evidence(head_check_runs), head_sha=head_sha,
-    )
-    if killed:
-        evaluation = with_findings(evaluation, verified)
-    _record_verification_kills(
-        killed, installation_id=installation_id, owner=owner,
-        repo_name=repo_name, pull_number=pull_number, arm="tier1",
-    )
-    evaluation = _apply_bound_name_downgrade(
-        evaluation, file_contents, installation_id=installation_id,
-        owner=owner, repo_name=repo_name, pull_number=pull_number, arm="tier1",
-    )
-    surviving = _apply_refute_gate(
-        evaluation.findings, evidence, installation_id, owner=owner,
-        repo_name=repo_name, pull_number=pull_number, arm="tier1",
-        plain_findings=graded_findings, plain_verdicts=judge_verdicts,
-    )
-    if surviving != evaluation.findings:
-        evaluation = with_findings(evaluation, surviving)
 
     evaluation, quarantine_gap = _run_quarantined_pass(
         evaluation, hunks, evidence, installation_id,
@@ -5745,54 +5641,46 @@ def _grade_deep_response(
     _log_omit_markings(
         deep_eval, pr=f"{owner}/{repo_name}#{pull_number}", head_sha=head_sha,
     )
-    # The reasoner reads the same linked criteria, so its intent-mismatch
-    # findings get the same evidence filter and box scope (#1170, #1218).
-    deep_eval = _filter_intent_mismatches(
-        deep_eval, installation_id=installation_id, owner=owner,
-        repo_name=repo_name, pull_number=pull_number, pr_context=pr_context,
-    )
-    deep_graded = deep_eval.findings
-    deep_verdicts = grade_findings(deep_eval, evidence, installation_id)
-    deep_kept, deep_suppressed = partition_findings(deep_graded, deep_verdicts)
-    if deep_suppressed:
-        deep_eval = with_findings(deep_eval, deep_kept)
-    deep_verified, deep_killed = verify_findings(
-        deep_eval.findings,
-        evidence.file_contents,
-        checks=_fetch_check_evidence(
-            deep_eval.findings, installation_id=installation_id, owner=owner,
-            repo_name=repo_name, pull_number=pull_number, head_sha=head_sha,
+    # The deep, quarantined and second-lineage passes publish through the
+    # same funnel as tier-1 (#1586), so every filter runs on them too.
+    def _verify_deep(current: CodeReviewEvaluation) -> CodeReviewEvaluation:
+        verified, killed = verify_findings(
+            current.findings,
+            evidence.file_contents,
+            checks=_fetch_check_evidence(
+                current.findings, installation_id=installation_id, owner=owner,
+                repo_name=repo_name, pull_number=pull_number, head_sha=head_sha,
+            ),
+            head_sha=head_sha,
+        )
+        if killed:
+            current = with_findings(current, verified)
+        _record_verification_kills(
+            killed,
+            installation_id=installation_id,
+            owner=owner,
+            repo_name=repo_name,
+            pull_number=pull_number,
+            arm=arm,
+        )
+        return _apply_bound_name_downgrade(
+            current, evidence.file_contents, installation_id=installation_id,
+            owner=owner, repo_name=repo_name, pull_number=pull_number, arm=arm,
+        )
+
+    funnel = publish_funnel(
+        deep_eval, evidence.file_contents, pr_context,
+        grade=lambda current: grade_findings(current, evidence, installation_id),
+        verify=_verify_deep,
+        falsify=lambda findings, plain, verdicts: _apply_refute_gate(
+            findings, evidence, installation_id, owner=owner,
+            repo_name=repo_name, pull_number=pull_number, arm=arm,
+            plain_findings=plain, plain_verdicts=verdicts,
         ),
-        head_sha=head_sha,
-    )
-    if deep_killed:
-        deep_eval = with_findings(deep_eval, deep_verified)
-    _record_verification_kills(
-        deep_killed,
         installation_id=installation_id,
-        owner=owner,
-        repo_name=repo_name,
-        pull_number=pull_number,
-        arm=arm,
+        pr=f"{owner}/{repo_name}#{pull_number}",
     )
-    deep_eval = _apply_bound_name_downgrade(
-        deep_eval, evidence.file_contents, installation_id=installation_id,
-        owner=owner, repo_name=repo_name, pull_number=pull_number, arm=arm,
-    )
-    deep_surviving = _apply_refute_gate(
-        deep_eval.findings,
-        evidence,
-        installation_id,
-        owner=owner,
-        repo_name=repo_name,
-        pull_number=pull_number,
-        arm=arm,
-        plain_findings=deep_graded,
-        plain_verdicts=deep_verdicts,
-    )
-    if deep_surviving != deep_eval.findings:
-        deep_eval = with_findings(deep_eval, deep_surviving)
-    return deep_eval, deep_graded, deep_verdicts, len(deep_suppressed)
+    return funnel.evaluation, funnel.graded, funnel.verdicts, len(funnel.suppressed)
 
 
 def _publish_deep_check(
