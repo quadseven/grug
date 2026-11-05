@@ -297,6 +297,45 @@ def test_a_policy_class_production_code_constructs_draws_nothing():
     assert _scan(diff) == ()
 
 
+def test_a_construction_in_a_dict_literal_row_draws_nothing():
+    """Recorded shape (#1613): a module-level table built every instance as
+    a dict value, and the `:` after each key read as an annotation."""
+    diff = _added("bond/egress.py", _POLICY) + _transport([
+        "from bond.egress import EgressPolicy",
+        "POLICIES = {",
+        '    1: EgressPolicy(1, "a"),',
+        "}",
+    ])
+    assert _scan(diff) == ()
+
+
+def test_a_class_only_named_in_annotations_is_still_medium():
+    for use in (
+        "x: EgressPolicy",
+        "def f(x: EgressPolicy) -> EgressPolicy:",
+        "x: egress.EgressPolicy",
+        "def f(x: egress.EgressPolicy | None) -> list[egress.EgressPolicy]:",
+    ):
+        diff = _added("bond/egress.py", _POLICY) + _transport(
+            ["from bond import egress", use],
+        )
+        assert _summary(_scan(diff)) == [("dead-code", "medium", "bond/egress.py")], use
+
+
+def test_a_module_qualified_construction_draws_nothing():
+    """Recorded shape (#1606): app state built the class only through a
+    module-qualified `default_factory`."""
+    for use in (
+        "policy: egress.EgressPolicy = field(default_factory=egress.EgressPolicy)",
+        "policy = egress.EgressPolicy(load_clients())",
+        "factory = bond.egress.EgressPolicy",
+    ):
+        diff = _added("bond/egress.py", _POLICY) + _transport(
+            ["from bond import egress", use],
+        )
+        assert _scan(diff) == (), use
+
+
 def test_a_class_with_a_base_draws_nothing():
     lines = [line.replace("class EgressPolicy:", "class EgressPolicy(Policy):") for line in _POLICY]
     diff = _added("bond/egress.py", lines) + _transport(["from bond.egress import EgressPolicy"])
