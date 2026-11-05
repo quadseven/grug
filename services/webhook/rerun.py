@@ -49,13 +49,17 @@ from personas import board_client
 from personas.code_reviewer.dispatch import (
     DIFF_TOO_LARGE,
     RETRIED_DEGRADATIONS,
+    _REVIEW_PERSONA_TAG,
     dispatch_code_review,
 )
+from github_reviews_client import list_reviews
 from personas.code_reviewer.removed_files import REMOVED_REFERENCE_CHECK_FAILED
 from personas.review_publish import LOW_CONFIDENCE
 from personas.code_reviewer.living_review import sync_pr as _sync_living_review
+from personas.code_reviewer.thread_resolver import is_grug
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion,
+    degraded_lead_line,
     gate_sentence,
     lead_with_degraded_line,
 )
@@ -426,6 +430,178 @@ def _complete_elder_check_open(
             },
         )
         return False
+
+
+def _parse_github_time(value: Any) -> float | None:
+    """Epoch seconds for a GitHub ISO-8601 timestamp, or None if unusable."""
+    text = str(value or "")
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _settled_elder_check(
+    runs: list[dict[str, Any]], *, owner: str, repo_name: str,
+    pr_number: int, head_sha: str, since: float,
+) -> dict[str, Any] | None:
+    """The Elder check that a review run concluded on `head_sha` at or after
+    `since`, or None.
+
+    Only Elder's own review publication counts (the `grug-cr:` external id
+    dispatch stamps, on a run the Grug App itself created), so a fail-open
+    close, the pending placeholder, the reconciler's sweep, or another
+    App's look-alike run never reads as a verdict. A degraded check whose
+    reason the queue retries (every model call failed, unparseable output)
+    is not a verdict either: its job raised on purpose so the review runs
+    again."""
+    review_external_id = f"grug-cr:{owner}/{repo_name}#{pr_number}:{head_sha}"
+    retried_leads = tuple(
+        degraded_lead_line(reason) for reason in sorted(RETRIED_DEGRADATIONS)
+    )
+    for run in runs:
+        if str(run.get("name") or "") not in _ELDER_CHECK_NAMES:
+            continue
+        if str(run.get("status") or "") != "completed":
+            continue
+        if str(run.get("external_id") or "") != review_external_id:
+            continue
+        if not is_grug(str((run.get("app") or {}).get("slug") or "")):
+            continue
+        summary = str((run.get("output") or {}).get("summary") or "")
+        if summary.startswith(retried_leads):
+            continue
+        completed_at = _parse_github_time(run.get("completed_at"))
+        if completed_at is None or completed_at < since:
+            continue
+        return run
+    return None
+
+
+def _posted_elder_review(
+    reviews: list[dict[str, Any]], *, head_sha: str, since: float,
+) -> dict[str, Any] | None:
+    """Elder's review body on `head_sha`, submitted at or after `since`.
+
+    Only a review the Grug App wrote counts: the persona tag is plain text
+    that any reviewer can paste, and a pasted tag must never stand in for
+    the review it imitates."""
+    tag = _REVIEW_PERSONA_TAG.format("elder")
+    for review in reversed(reviews):
+        if not isinstance(review, dict):
+            continue
+        if not is_grug(str((review.get("user") or {}).get("login") or "")):
+            continue
+        if str(review.get("commit_id") or "") != head_sha:
+            continue
+        if tag not in str(review.get("body") or ""):
+            continue
+        submitted_at = _parse_github_time(review.get("submitted_at"))
+        if submitted_at is not None and submitted_at >= since:
+            return review
+    return None
+
+
+def _replayed_review_status(
+    *,
+    install_id: int,
+    owner: str,
+    repo_name: str,
+    pr_number: int,
+    head_sha: str,
+    receive_count: int,
+    first_received_at: float,
+) -> str | None:
+    """grug#1275: make replaying an interrupted Elder review idempotent.
+
+    A consumer killed after Elder published (a rollout's SIGTERM, a lost
+    lease, a crash before the claim settled or the message was deleted)
+    hands the same message back to the queue, and running it again would
+    post a second review body and a second check conclusion on the head.
+    GitHub is the ground truth for what the earlier delivery of THIS
+    message already did: anything Elder published on this head since the
+    message was first received came from it (the FIFO group runs one job
+    per PR at a time).
+
+    Returns None when the review must run: a first delivery (no extra
+    GitHub reads), an unknown first-receive time, or nothing published yet.
+    Returns `replay_already_reviewed` when the check is concluded; the
+    caller settles without dispatching. Returns `replay_review_posted` when
+    the review body landed but its check did not: the check is concluded
+    from that review, never by posting a second one. Raises if that
+    conclusion cannot be written, so the redelivery tries again rather than
+    leave the check `in_progress`. A failed read raises too: guessing
+    "nothing posted" is exactly how the duplicate happened."""
+    if receive_count < 2 or first_received_at <= 0 or not head_sha:
+        return None
+    runs = with_install_token_retry(
+        install_id,
+        lambda token: list_check_runs_for_ref(token, owner, repo_name, head_sha),
+    )
+    settled = _settled_elder_check(
+        runs, owner=owner, repo_name=repo_name, pr_number=pr_number,
+        head_sha=head_sha, since=first_received_at,
+    )
+    if settled is not None:
+        log.info(
+            "elder_review_replay_already_reviewed",
+            extra={
+                "repo": f"{owner}/{repo_name}",
+                "pr": pr_number,
+                "head_sha": head_sha[:8],
+                "check_run_id": settled.get("id"),
+                "receive_count": receive_count,
+            },
+        )
+        return "replay_already_reviewed"
+    reviews = with_install_token_retry(
+        install_id,
+        lambda token: list_reviews(token, owner, repo_name, pull_number=pr_number),
+    )
+    review = _posted_elder_review(
+        reviews, head_sha=head_sha, since=first_received_at,
+    )
+    if review is None:
+        return None
+    changes_requested = str(review.get("state") or "") == "CHANGES_REQUESTED"
+    review_url = str(review.get("html_url") or "")
+    posted = _complete_elder_check_open(
+        install_id=install_id,
+        owner=owner,
+        repo_name=repo_name,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        title=(
+            "Elder requested changes"
+            if changes_requested else "Elder review posted"
+        ),
+        summary=(
+            "Elder's review of this commit was posted before its consumer "
+            "restarted, so this check is concluded from that review instead "
+            "of posting a second one"
+            + (f": {review_url}" if review_url else ".")
+            + (
+                " It requested changes."
+                if changes_requested else " It requested no changes."
+            )
+        ),
+        conclusion="failure" if changes_requested else "neutral",
+    )
+    if not posted:
+        raise RuntimeError("Elder replay check completion did not land")
+    log.info(
+        "elder_review_replay_concluded_from_review",
+        extra={
+            "repo": f"{owner}/{repo_name}",
+            "pr": pr_number,
+            "head_sha": head_sha[:8],
+            "review_id": review.get("id"),
+            "receive_count": receive_count,
+        },
+    )
+    return "replay_review_posted"
 
 
 def _post_elder_in_progress_check(
@@ -1443,7 +1619,10 @@ def _hold_or_requeue_learn(
     return "learn_deferred"
 
 
-def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
+def _run_one(
+    body: str, *, receive_count: int = 0, message_id: str = "",
+    first_received_at: float = 0.0,
+) -> str:
     """Re-run ONE job. Raises on a malformed message or an infra fetch failure
     (-> ESM retry -> DLQ). Returns a short status for the batch summary log.
 
@@ -1478,6 +1657,7 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
     if job.get("kind") == "review":
         return _run_hot_review(
             job, install_id, repo_full, pr_number, receive_count=receive_count,
+            first_received_at=first_received_at,
         )
     persona = str(job.get("persona", "elder"))
 
@@ -1553,6 +1733,19 @@ def _run_one(body: str, *, receive_count: int = 0, message_id: str = "") -> str:
                     done=_COMMAND_SETTLED_STATUSES[queued],
                 )
             return queued
+        # grug#1275: a redelivery of a re-run whose earlier delivery already
+        # published on this head settles from what it published.
+        replayed = _replayed_review_status(
+            install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number, head_sha=head_sha,
+            receive_count=receive_count, first_received_at=first_received_at,
+        )
+        if replayed:
+            _settle_command_reaction(
+                job, install_id=install_id, owner=owner,
+                repo_name=repo_name, done=True,
+            )
+            return replayed
         _record_command_run(
             job, install_id=install_id, repo_full=repo_full,
             pr_number=pr_number, head_sha=head_sha, started_at=_now(),
@@ -2479,7 +2672,7 @@ def _board_in_progress_note(
 
 def _run_hot_review(
     job: dict[str, Any], install_id: int, repo_full: str, pr_number: int,
-    receive_count: int = 0,
+    receive_count: int = 0, first_received_at: float = 0.0,
 ) -> str:
     """Settle, cancel stale work, then run Elder on one current snapshot.
 
@@ -2689,6 +2882,18 @@ def _run_hot_review(
                 },
             )
             return "stale_snapshot" if redrived else "intent_drift_exhausted"
+
+        # grug#1275: an earlier delivery of this message may have published
+        # before its consumer died, leaving the claim released by the
+        # shutdown sweep. Settle from what it published; never post twice.
+        replayed = _replayed_review_status(
+            install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number, head_sha=head_sha,
+            receive_count=receive_count, first_received_at=first_received_at,
+        )
+        if replayed:
+            lease.settle(Transition.COMPLETE, "after replayed review")
+            return replayed
 
         cfg = get_repo_config(install_id, repo_id)
         # The Elder mode is read ONCE and frozen for this pass: the review
@@ -2926,9 +3131,16 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
         except (TypeError, ValueError):
             receive_count = 0
         message_id = str(rec.get("messageId", "")) if isinstance(rec, dict) else ""
+        try:
+            first_received_at = int(
+                (attrs or {}).get("ApproximateFirstReceiveTimestamp", 0),
+            ) / 1000.0
+        except (TypeError, ValueError):
+            first_received_at = 0.0
         # may raise -> ESM retry -> DLQ
         statuses.append(_run_one(
             body, receive_count=receive_count, message_id=message_id,
+            first_received_at=first_received_at,
         ))
     return {
         "records": len(records),
@@ -2938,7 +3150,8 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
             if status in {
                 "skipped_persona", "duplicate_snapshot", "stale_snapshot",
                 "draft_skipped", "pr_ineligible", "superseded_at_entry",
-                "intent_drift_exhausted",
+                "intent_drift_exhausted", "replay_already_reviewed",
+                "replay_review_posted",
             }
         ),
     }
