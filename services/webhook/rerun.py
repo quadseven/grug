@@ -47,14 +47,11 @@ from github_checks_client import (
 )
 from personas import board_client
 from personas.code_reviewer.dispatch import (
-    DIFF_TOO_LARGE,
     RETRIED_DEGRADATIONS,
     _REVIEW_PERSONA_TAG,
     dispatch_code_review,
 )
 from github_reviews_client import list_reviews
-from personas.code_reviewer.removed_files import REMOVED_REFERENCE_CHECK_FAILED
-from personas.review_publish import LOW_CONFIDENCE
 from personas.code_reviewer.thread_resolver import is_grug
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion,
@@ -67,7 +64,6 @@ from personas.code_reviewer.elder_review import (
     Transition,
     _MAX_ELDER_SETTLE_SECONDS,
     decide_redrive,
-    review_eligible,
     review_snapshot_id,
     review_snapshot_id_from_pr,
     start_staleness_watch,
@@ -82,6 +78,15 @@ from rerun_personas import (
     RERUNNABLE as _RERUNNABLE,
     SMASHER as _SMASHER,
     TELLER as _TELLER,
+)
+from review_lifecycle import (
+    ClaimState,
+    Decision,
+    NextStep,
+    PrSnapshot,
+    ReviewResult,
+    decide as decide_review,
+    rerun_pending,
 )
 from rerun_queue import (
     JobNotDue,
@@ -101,15 +106,8 @@ _sqs = boto3.client("sqs")
 # local/dev/tests -> enqueue raises, surfaced as best-effort by the caller.
 _RERUN_QUEUE_URL = os.getenv("GRUG_RERUN_QUEUE_URL", "")
 SCHEMA_VERSION = 1
-# grug#1494: a review where every model failed (`all_failed`) raises, so the
-# queue redelivers it. A partial or low-confidence review with nothing
-# blocking in it rides the same bound: dispatch leaves it pending and marks
-# the result `rerun_scheduled`, which raises below. Deliveries below this
-# number leave a blocking repo's Elder check pending; from this one on the
-# failure is published, so a long provider outage still ends in a red check
-# instead of waiting forever. The queue's own dead-letter limit stays the
-# outer bound.
-_ALL_FAILED_AUTO_RERUN_DELIVERIES = 3
+# The review job's decisions (redrive, fail open, hold pending, the skip
+# reason sets and the delivery bound) live in `review_lifecycle` (#1592).
 
 
 def _now() -> float:
@@ -121,47 +119,6 @@ def _now() -> float:
 # `personas.code_reviewer.elder_review`, the one home for the Elder lifecycle.
 _ELDER_CHECK_NAME = CHECK_ELDER
 _ELDER_CHECK_NAMES = frozenset(acceptable_check_names(CHECK_ELDER))
-
-# Skip reasons where a retry can plausibly succeed (model backend outage,
-# unparseable model output, transient diff-fetch error). These raise for SQS
-# redrive instead of terminal fail-open completion. Moved-head staleness,
-# freshness brownouts, and unknown skips complete neutral; same-head
-# staleness and ineligible (draft/closed) exits intentionally stay
-# non-terminal - the requeued/reopen review completes the pending check.
-# Sourced from the persona rather than restated, so the retry lane and the
-# board/email gate cannot drift apart. `worth_an_email` suppresses the board
-# for exactly these reasons on the grounds that a retry is coming; if this set
-# grew a member here only, that promise would silently become a lie.
-_RETRYABLE_SKIP_REASONS = RETRIED_DEGRADATIONS
-
-# Skips that ALREADY published their own terminal check, so the fail-open net
-# must leave them alone. Re-posting a generic "Elder skipped - <reason>" over
-# one of these replaces real content with strictly less.
-#
-# `partial_review` belongs here and was missing: it publishes a full check
-# naming which cohorts completed, yet fell through to the "unknown skip"
-# branch, which overwrote it. That is why one PR showed "Elder skipped -
-# partial_review" on the check while the board said "Degraded (partial_review)
-# - advisory only" - two surfaces describing one pass in different words,
-# because two different code paths wrote them.
-#
-# DIFF_TOO_LARGE belongs here for the same reason: its degraded check already
-# says the diff is over GitHub's size limit and what to do about it, and no
-# retry changes GitHub's answer.
-#
-# LOW_CONFIDENCE (grug#1097) publishes its own advisory check the same way a
-# partial review does.
-#
-# REMOVED_REFERENCE_CHECK_FAILED (grug#1401) publishes its own degraded check
-# for a deletion-only diff, naming the guard findings it did make.
-_SELF_COMPLETING_SKIP_REASONS = frozenset({
-    "no_diff",
-    "fail_open_freshness",
-    "partial_review",
-    LOW_CONFIDENCE,
-    DIFF_TOO_LARGE,
-    REMOVED_REFERENCE_CHECK_FAILED,
-})
 
 
 _SQS_DEDUP_ID_MAX_LEN = 128
@@ -2013,6 +1970,23 @@ def _board_in_progress_note(
             )
 
 
+def _review_step(
+    step: NextStep, status: str, *, repo_full: str, pr_number: int,
+) -> str:
+    """Log the lifecycle step a review job ended on and return its status."""
+    log.info(
+        "elder_review_step",
+        extra={"repo": repo_full, "pr": pr_number, "step": step.value, "status": status},
+    )
+    return status
+
+
+def _redrive_review(decision: Decision, *, repo_full: str, pr_number: int) -> RuntimeError:
+    """The error a REDRIVE decision raises, with its step logged first."""
+    _review_step(decision.step, decision.status, repo_full=repo_full, pr_number=pr_number)
+    return RuntimeError(decision.status)
+
+
 def _run_hot_review(
     job: dict[str, Any], install_id: int, repo_full: str, pr_number: int,
     receive_count: int = 0, first_received_at: float = 0.0,
@@ -2037,16 +2011,21 @@ def _run_hot_review(
     incident that filed this) used to burn its full SQS retry budget
     before dead-lettering, blocking the real job for the current head
     behind it in the same FIFO group for as long as that took.
+
+    Every branch below is chosen by `review_lifecycle.decide` (#1592); this
+    function performs the effects of the decision it gets back.
     """
     owner, sep, repo_name = repo_full.partition("/")
     if not sep or not owner or not repo_name:
         raise ValueError(f"invalid repo coordinate: {repo_full!r}")
+    where = {"repo_full": repo_full, "pr_number": pr_number}
 
     try:
         before = _fetch_current_pr(install_id, owner, repo_name, pr_number)
     except httpx.HTTPStatusError as error:
         if error.response.status_code != 403:
             raise
+        forbidden = decide_review(job, None)
         queued_head_sha = str(job.get("requested_head_sha") or "")
         log.error(
             "elder_pr_read_forbidden",
@@ -2074,19 +2053,19 @@ def _run_hot_review(
         )
         if not posted:
             raise RuntimeError("Elder 403 check completion did not land") from error
-        return "pr_read_forbidden"
+        return _review_step(forbidden.step, forbidden.status, **where)
     head_sha = str((before.get("head") or {}).get("sha") or "")
     if not head_sha:
         raise ValueError("current PR has no head SHA")
 
-    requested_head_sha = str(job.get("requested_head_sha") or "")
-    if requested_head_sha and requested_head_sha != head_sha:
+    entry = decide_review(job, PrSnapshot.from_pr(before))
+    if entry.step is NextStep.SUPERSEDE:
         log.info(
             "elder_review_superseded_at_entry",
             extra={
                 "repo": repo_full,
                 "pr": pr_number,
-                "requested_head_sha": requested_head_sha[:8],
+                "requested_head_sha": entry.close_head_sha[:8],
                 "current_head_sha": head_sha[:8],
             },
         )
@@ -2098,7 +2077,7 @@ def _run_hot_review(
             owner=owner,
             repo_name=repo_name,
             pr_number=pr_number,
-            head_sha=requested_head_sha,
+            head_sha=entry.close_head_sha,
             title="Elder superseded - new head",
             summary=(
                 "A newer commit arrived before this review started. This "
@@ -2107,25 +2086,24 @@ def _run_hot_review(
             ),
             conclusion="neutral",
         )
-        return "superseded_at_entry"
-
-    if bool(before.get("draft", False)):
-        log.info(
-            "elder_review_draft_skipped",
-            extra={"repo": repo_full, "pr": pr_number, "head_sha": head_sha[:8]},
-        )
-        return "draft_skipped"
-    if str(before.get("state") or "") != "open":
-        log.info(
-            "elder_review_ineligible_skipped",
-            extra={
-                "repo": repo_full,
-                "pr": pr_number,
-                "head_sha": head_sha[:8],
-                "state": str(before.get("state") or ""),
-            },
-        )
-        return "pr_ineligible"
+        return _review_step(entry.step, entry.status, **where)
+    if entry.step is NextStep.HOLD_PENDING:
+        if entry.status == "draft_skipped":
+            log.info(
+                "elder_review_draft_skipped",
+                extra={"repo": repo_full, "pr": pr_number, "head_sha": head_sha[:8]},
+            )
+        else:
+            log.info(
+                "elder_review_ineligible_skipped",
+                extra={
+                    "repo": repo_full,
+                    "pr": pr_number,
+                    "head_sha": head_sha[:8],
+                    "state": str(before.get("state") or ""),
+                },
+            )
+        return _review_step(entry.step, entry.status, **where)
     repo_id = int(((before.get("base") or {}).get("repo") or {})["id"])
     snapshot_id = review_snapshot_id_from_pr(before)
 
@@ -2140,28 +2118,22 @@ def _run_hot_review(
         "head_sha": snapshot_id,
     }
     claim_status, lease = ReviewClaimLease.acquire(claim_args)
-    if claim_status == "completed":
-        log.info(
-            "elder_review_duplicate_snapshot_skipped",
-            extra={
-                "repo": repo_full,
-                "pr": pr_number,
-                "head_sha": head_sha[:8],
-                "snapshot_id": snapshot_id[:11],
-            },
+    if claim_status == "completed" or lease is None:
+        claimed = decide_review(
+            job, None,
+            ClaimState.COMPLETED if claim_status == "completed" else ClaimState.BUSY,
         )
-        return "duplicate_snapshot"
-    if lease is None:
-        log.info(
-            "elder_review_snapshot_claim_busy",
-            extra={
-                "repo": repo_full,
-                "pr": pr_number,
-                "head_sha": head_sha[:8],
-                "snapshot_id": snapshot_id[:11],
-            },
-        )
-        raise RuntimeError("Elder review snapshot claim is still in progress")
+        claim_log = {
+            "repo": repo_full,
+            "pr": pr_number,
+            "head_sha": head_sha[:8],
+            "snapshot_id": snapshot_id[:11],
+        }
+        if claimed.step is NextStep.COMPLETE:
+            log.info("elder_review_duplicate_snapshot_skipped", extra=claim_log)
+            return _review_step(claimed.step, claimed.status, **where)
+        log.info("elder_review_snapshot_claim_busy", extra=claim_log)
+        raise _redrive_review(claimed, **where)
 
     # The lease registered itself for graceful-shutdown release; close() in
     # the finally runs on every in-process exit (normal, abort, raise), so the
@@ -2187,7 +2159,11 @@ def _run_hot_review(
         after = _fetch_current_pr(install_id, owner, repo_name, pr_number)
         current_head = str((after.get("head") or {}).get("sha") or "")
         current_snapshot_id = review_snapshot_id_from_pr(after)
-        if not review_eligible(after):
+        settled = decide_review(
+            job, PrSnapshot.from_pr(after, current_snapshot_id), ClaimState.HELD,
+            claimed_snapshot_id=snapshot_id,
+        )
+        if settled.step is NextStep.HOLD_PENDING:
             lease.settle(Transition.RELEASE, "during settle")
             log.info(
                 "elder_review_ineligible_after_settle",
@@ -2199,8 +2175,8 @@ def _run_hot_review(
                     "draft": bool(after.get("draft", False)),
                 },
             )
-            return "pr_ineligible"
-        if current_snapshot_id != snapshot_id:
+            return _review_step(settled.step, settled.status, **where)
+        if settled.step is NextStep.SUPERSEDE:
             redrived = _redrive_or_give_up(
                 install_id=install_id,
                 owner=owner,
@@ -2224,7 +2200,10 @@ def _run_hot_review(
                     "current_snapshot_id": current_snapshot_id[:11],
                 },
             )
-            return "stale_snapshot" if redrived else "intent_drift_exhausted"
+            # decide_redrive (grug#773 AC3) chose between redrive and give-up.
+            if redrived:
+                return _review_step(settled.step, "stale_snapshot", **where)
+            return _review_step(NextStep.GIVE_UP, "intent_drift_exhausted", **where)
 
         # grug#1275: an earlier delivery of this message may have published
         # before its consumer died, leaving the claim released by the
@@ -2236,7 +2215,7 @@ def _run_hot_review(
         )
         if replayed:
             lease.settle(Transition.COMPLETE, "after replayed review")
-            return replayed
+            return _review_step(NextStep.COMPLETE, replayed, **where)
 
         cfg = get_repo_config(install_id, repo_id)
         # The Elder mode is read ONCE and frozen for this pass: the review
@@ -2283,17 +2262,25 @@ def _run_hot_review(
                         ),
                         blocking=elder_blocking,
                         cancel_event=watch.cancel,
-                        rerun_pending=1 <= receive_count < _ALL_FAILED_AUTO_RERUN_DELIVERIES,
+                        rerun_pending=rerun_pending(receive_count),
                     )
             finally:
                 stop_staleness_watch(watch)
+            review = ReviewResult.from_dispatch(result)
             degraded_reason = result.get("degraded_reason", "")
+            latest: dict[str, Any] = {}
+            latest_snapshot = None
             if degraded_reason == "stale_snapshot":
                 latest = _fetch_current_pr(
                     install_id, owner, repo_name, pr_number,
                 )
-                latest_head = str((latest.get("head") or {}).get("sha") or "")
-                if latest_head and latest_head != head_sha:
+                latest_snapshot = PrSnapshot.from_pr(latest)
+            done = decide_review(
+                job, latest_snapshot, ClaimState.HELD, review,
+                claimed_head_sha=head_sha,
+            )
+            if degraded_reason == "stale_snapshot":
+                if done.close_head_sha:
                     # Head actually moved: close the abandoned head's check so it
                     # never sticks in_progress. Best-effort - required-status
                     # evaluates the NEW head, so a failed post here is cosmetic.
@@ -2302,7 +2289,7 @@ def _run_hot_review(
                         owner=owner,
                         repo_name=repo_name,
                         pr_number=pr_number,
-                        head_sha=head_sha,
+                        head_sha=done.close_head_sha,
                         title="Elder superseded - new head",
                         summary=(
                             "A newer commit arrived while Elder was reviewing. "
@@ -2327,17 +2314,19 @@ def _run_hot_review(
                         pr=latest,
                         settle_seconds=settle_seconds,
                         claimed_head_sha=head_sha,
-                        current_head_sha=latest_head,
+                        current_head_sha=latest_snapshot.head_sha if latest_snapshot else "",
                         job_redrive_count=int(job.get("redrive_count", 0)),
                     )
-                    if review_eligible(latest)
+                    if done.step is NextStep.SUPERSEDE
                     else False
                 )
                 lease.settle(Transition.RELEASE, "during dispatch")
-                if not review_eligible(latest):
-                    return "pr_ineligible"
-                return "stale_snapshot" if redrived else "intent_drift_exhausted"
-            if degraded_reason == "pr_ineligible":
+                if done.step is NextStep.HOLD_PENDING:
+                    return _review_step(done.step, done.status, **where)
+                if redrived:
+                    return _review_step(done.step, "stale_snapshot", **where)
+                return _review_step(NextStep.GIVE_UP, "intent_drift_exhausted", **where)
+            if done.step is NextStep.HOLD_PENDING:
                 # NO terminal completion here: a draft/closed PR cannot merge, so
                 # a lingering in_progress check blocks nothing - but a terminal
                 # neutral on this head WOULD satisfy the required check the
@@ -2345,105 +2334,60 @@ def _run_hot_review(
                 # scheduled review posts. Leave the check pending; the
                 # ready_for_review/reopen enqueue completes it via a real review.
                 lease.settle(Transition.RELEASE, "during dispatch")
-                return "pr_ineligible"
-            result_status = result.get("result")
-            if result_status == "publish_failed":
-                raise RuntimeError("Elder review publication failed")
-            # `review_rejected` (#770) is deliberately NOT in that raise: GitHub
-            # returned a deterministic 4xx on the inline review (422 for a
-            # comment outside the diff). The check-run already landed, so the
-            # merge gate is intact; redriving would re-send the identical
-            # payload and collect the identical answer five times over - which
-            # is exactly how four Elder jobs reached the DLQ. It completes below
-            # like pass/fail; dispatch already logged the status and body.
-            # Infra / GH brownout must COMPLETE the required check, never
-            # leave in_progress forever and never redrive forever. No review
-            # landed, so the conclusion follows the repo's Elder mode
-            # (grug#1212): `failure` in BLOCK, `neutral` in WARN - the same
-            # `elder_blocking` the review itself ran under. Real model
-            # findings still use pass/fail.
-            if result_status == "skipped" and degraded_reason == "freshness_check_failed":
-                posted = _complete_elder_check_open(
-                    install_id=install_id,
-                    owner=owner,
-                    repo_name=repo_name,
-                    pr_number=pr_number,
-                    head_sha=head_sha,
-                    title="Elder eyes clouded - GitHub unavailable",
-                    summary=lead_with_degraded_line(
+                return _review_step(done.step, done.status, **where)
+            if done.step is NextStep.REDRIVE:
+                # publish_failed, a retryable degradation, a scheduled re-run
+                # (grug#1494) or an unexpected result. `review_rejected` (#770)
+                # is not among them: it completes like pass/fail.
+                raise _redrive_review(done, **where)
+            if done.step is NextStep.FAIL_OPEN:
+                # Infra / GH brownout must COMPLETE the required check, never
+                # leave in_progress forever and never redrive forever. No review
+                # landed, so the conclusion follows the repo's Elder mode
+                # (grug#1212): `failure` in BLOCK, `neutral` in WARN - the same
+                # `elder_blocking` the review itself ran under. Real model
+                # findings still use pass/fail.
+                if degraded_reason == "freshness_check_failed":
+                    title = "Elder eyes clouded - GitHub unavailable"
+                    lead = (
                         "Could not re-fetch the PR to confirm snapshot freshness "
                         "(GitHub 5xx / transport). "
                         + gate_sentence(elder_blocking)
-                        + " Push again or re-run Elder when GitHub is healthy.",
-                        degraded_reason,
-                    ),
-                    conclusion=degraded_conclusion(elder_blocking),
-                )
-                if not posted:
-                    # The same brownout ate the neutral completion: finishing the
-                    # job now would leave the required check in_progress forever
-                    # with no retry - the exact bug fail-open exists to prevent.
-                    # Raise for redrive; a later attempt reviews or re-posts.
-                    raise RuntimeError(
-                        "Elder fail-open completion did not land (freshness outage)"
+                        + " Push again or re-run Elder when GitHub is healthy."
                     )
-                lease.settle(Transition.COMPLETE_OR_RELEASE, "after fail-open")
-                return "fail_open_freshness"
-            if result_status == "skipped" and degraded_reason in _RETRYABLE_SKIP_REASONS:
-                # Model/content-side transient (backend outage, unparseable
-                # output, diff fetch blip): a retry can succeed, so release the
-                # claim and raise for SQS redrive instead of failing open. These
-                # paths publish their own completed degraded check (or redrive
-                # re-runs the review), so they cannot stick in_progress; the DLQ
-                # poison monitor covers a sustained outage.
-                raise RuntimeError(
-                    f"Elder review degraded: {degraded_reason}"
-                )
-            if result_status == "skipped" and result.get("rerun_scheduled"):
-                # A partial or low-confidence review on a blocking repo left
-                # the check pending because a re-run is still scheduled
-                # (dispatch's `_rerun_before_failing`). Raise for the queue's
-                # re-run, the same bounded lane all_failed uses; the last
-                # delivery publishes the degraded failure and completes.
-                raise RuntimeError(
-                    f"Elder review degraded: {degraded_reason}; re-run scheduled"
-                )
-            if (
-                result_status == "skipped"
-                and degraded_reason not in _SELF_COMPLETING_SKIP_REASONS
-            ):
-                # Unknown skip: complete the check rather than redrive forever.
+                    missed = "Elder fail-open completion did not land (freshness outage)"
+                    note = "after fail-open"
+                else:
+                    # Unknown skip: complete the check rather than redrive forever.
+                    title = f"Elder skipped - {degraded_reason or 'unknown'}"
+                    lead = (
+                        f"Review returned skipped ({degraded_reason or 'unknown'}). "
+                        + gate_sentence(elder_blocking)
+                        + " Re-run Elder if needed."
+                    )
+                    missed = (
+                        "Elder fail-open completion did not land "
+                        f"(skip: {degraded_reason or 'unknown'})"
+                    )
+                    note = "after fail-open skip"
                 posted = _complete_elder_check_open(
                     install_id=install_id,
                     owner=owner,
                     repo_name=repo_name,
                     pr_number=pr_number,
                     head_sha=head_sha,
-                    title=f"Elder skipped - {degraded_reason or 'unknown'}",
-                    summary=lead_with_degraded_line(
-                        f"Review returned skipped ({degraded_reason or 'unknown'}). "
-                        + gate_sentence(elder_blocking)
-                        + " Re-run Elder if needed.",
-                        degraded_reason,
-                    ),
+                    title=title,
+                    summary=lead_with_degraded_line(lead, degraded_reason),
                     conclusion=degraded_conclusion(elder_blocking),
                 )
                 if not posted:
-                    # Fail-open only counts if the completion landed; otherwise
-                    # redrive so the check cannot stay in_progress forever.
-                    raise RuntimeError(
-                        "Elder fail-open completion did not land "
-                        f"(skip: {degraded_reason or 'unknown'})"
-                    )
-                lease.settle(Transition.COMPLETE_OR_RELEASE, "after fail-open skip")
-                return f"fail_open_{degraded_reason or 'skipped'}"
-            if (
-                result_status not in {"pass", "fail", "skipped", "review_rejected"}
-                and not str(result_status).startswith("fail_open")
-            ):
-                raise RuntimeError(
-                    f"Elder review returned unexpected result: {result_status!r}"
-                )
+                    # ADR-0023: fail-open only counts if the completion landed.
+                    # Finishing the job now would leave the required check
+                    # in_progress forever with no retry - the exact bug
+                    # fail-open exists to prevent. Raise for redrive.
+                    raise _redrive_review(Decision(NextStep.REDRIVE, missed), **where)
+                lease.settle(Transition.COMPLETE_OR_RELEASE, note)
+                return _review_step(done.step, done.status, **where)
             lease.settle(Transition.COMPLETE, "during review")
     except Exception:
         lease.abort()
@@ -2454,7 +2398,7 @@ def _run_hot_review(
         "elder_review_durable_done",
         extra={"repo": repo_full, "pr": pr_number, **result},
     )
-    return "dispatched"
+    return _review_step(done.step, done.status, **where)
 
 
 def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
