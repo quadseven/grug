@@ -90,7 +90,7 @@ from personas.code_reviewer.diff_parser import (
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
-from personas.code_reviewer.lock_sources import is_lock_file_path, lock_source_findings
+from personas.code_reviewer.lock_sources import is_lock_file_path, lock_source_check
 from personas.code_reviewer.move_detection import (
     SubtreeImport, split_move_hunks, subtree_imports,
 )
@@ -3300,9 +3300,10 @@ def _is_lock_only(diff_text: str) -> bool:
 def _lock_findings(
     parsed_hunks: tuple[DiffHunk, ...], *, installation_id: int, owner: str,
     repo_name: str, head_sha: str, base_sha: str,
-) -> tuple[Finding, ...]:
-    """The deterministic lock-source findings for this diff (#1649)."""
-    return lock_source_findings(
+) -> tuple[tuple[Finding, ...], str]:
+    """The deterministic lock-source findings and summary note for this
+    diff (#1649): a second layer on top of the model review, not the gate."""
+    return lock_source_check(
         parsed_hunks,
         fetch=lambda paths, ref: with_install_token_retry(
             installation_id,
@@ -4502,7 +4503,7 @@ def dispatch_code_review(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,
     )
-    lock_findings = _lock_findings(
+    lock_findings, lock_note = _lock_findings(
         parsed_hunks, installation_id=installation_id, owner=owner,
         repo_name=repo_name, head_sha=head_sha, base_sha=base_sha,
     )
@@ -4645,6 +4646,7 @@ def dispatch_code_review(
     summary += f"\n\n{budget.note}" if budget.note else ""
     summary += config_note
     summary += deletion_note
+    summary += lock_note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
     )

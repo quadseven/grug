@@ -217,3 +217,12 @@ def test_a_failed_lock_review_keeps_the_baseline(monkeypatch, extra):
     seen = _review_pr(monkeypatch, full=full, files=_lock_files(_EVIL))
     assert seen["checks"][-1].conclusion == "failure"
     assert seen["baseline"] == []
+
+
+def test_an_unchecked_lock_format_is_reviewed_and_noted(monkeypatch):
+    full = _added("web/yarn.lock", ['  resolved "https://registry.yarnpkg.com/x.tgz"'])
+    seen = _review_pr(monkeypatch, full=full, files={})
+    assert seen["reviewed"] == [{"web/yarn.lock"}]
+    final = seen["checks"][-1]
+    assert final.conclusion == "success", (final.conclusion, final.title)
+    assert "registry sources not machine-checked for this format" in final.summary

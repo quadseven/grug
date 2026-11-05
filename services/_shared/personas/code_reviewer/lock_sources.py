@@ -1,25 +1,20 @@
 """Deterministic lock-source check (#1649).
 
-A lock file is not inert data: a changed entry can point an install at
-another registry, a git repository or a local path. Elder reviews lock
-files with the model when a diff holds nothing else; this check is a
-second layer on top of that review, not the gate. It adds one blocking
-finding per changed lock file (a removal-only change included) whose
-change names:
+Elder reviews a lock-file-only diff with the model like any other diff;
+that review is the gate. This check is a second layer on top of it, and
+it runs only where the standard library has a real parser for the format:
+`package-lock.json` (`json`) and `uv.lock`, `poetry.lock`, `Cargo.lock`
+(`tomllib`). Each file is parsed whole at head and at base, and every
+package entry that differs from base must:
 
-- a source that is not a registry (git, file, link, path, directory, or a
-  bare local path);
-- a URL whose authority carries a backslash, a `\\u` escape, a percent
-  escape or user info, or whose host the standard parser reads differently;
-- a plain http URL, or a host outside `ALLOWED_HOSTS`;
-- in a line format, an integrity or hash line removed without a replacement;
-- or content that its own format's parser cannot read.
+- name only https URLs on `ALLOWED_HOSTS` (the two exact crates.io index
+  identities Cargo writes count as the registry);
+- name no non-registry source (git, file, link, path, directory, alias);
+- keep its integrity or hash when the same entry at base had one.
 
-JSON and TOML locks are parsed whole at head and at base with `json` and
-`tomllib`, and only entries that differ from base are judged, so an
-unchanged project root or workspace link does not fire. Other formats are
-scanned line by line over the added lines. Pure apart from the injected
-`fetch`.
+A file its parser cannot read, or that cannot be read at head, is a
+finding too. Any other lock format gets one non-blocking summary note
+saying its sources are not machine-checked. Pure apart from `fetch`.
 """
 
 from __future__ import annotations
@@ -32,7 +27,7 @@ from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
-from personas.code_reviewer.diff_parser import DiffHunk, added_lines
+from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.persona import Finding
 
 RULE = "lock-untrusted-source"
@@ -50,9 +45,6 @@ ALLOWED_HOSTS: frozenset[str] = frozenset({
     "registry.terraform.io", "releases.hashicorp.com",
 })
 
-# Cargo names the crates.io registry by its index URL. These exact strings
-# are the registry itself, not a git source, so they pass whole; no other
-# URL on their hosts does.
 _CARGO_REGISTRIES: frozenset[str] = frozenset({
     "registry+https://github.com/rust-lang/crates.io-index",
     "sparse+https://index.crates.io/",
@@ -62,10 +54,16 @@ _NON_REGISTRY_PREFIXES: tuple[str, ...] = (
     "git+", "git:", "git@", "github:", "gitlab:", "bitbucket:", "file:",
     "link:", "portal:", "workspace:", "directory:", "exec:", "patch:", "npm:",
 )
-_STRUCTURED = frozenset({
-    "uv.lock", "poetry.lock", "Cargo.lock", "package-lock.json",
-    "Pipfile.lock", "composer.lock",
+
+CHECKED_FORMATS: frozenset[str] = frozenset({
+    "package-lock.json", "uv.lock", "poetry.lock", "Cargo.lock",
 })
+
+UNCHECKED_NOTE = (
+    "registry sources not machine-checked for this format; Elder's review covers it"
+)
+
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 _MAX_LISTED = 5
 
 
@@ -75,18 +73,16 @@ def is_lock_file_path(path: str) -> bool:
 
 
 def url_problem(url: str) -> str | None:
-    """Why a lock source is not an allowed registry URL, or None."""
+    """Why a lock source is not an allowed https registry URL, or None."""
     if url in _CARGO_REGISTRIES:
         return None
     if not url:
         return "an empty source"
     if url.startswith("//"):
-        # A scheme-relative reference is fetched as https at best.
         return url_problem("https:" + url)
-    low = url.lower()
-    if low.startswith(_NON_REGISTRY_PREFIXES):
+    if url.lower().startswith(_NON_REGISTRY_PREFIXES):
         return f"non-registry source `{url}`"
-    if re.match(r"(?i)http://", url):
+    if url.lower().startswith("http://"):
         return f"plain http URL `{url}`"
     m = re.match(r"(?i)https://([^/?#]*)", url)
     if not m:
@@ -98,7 +94,7 @@ def url_problem(url: str) -> str | None:
     try:
         parsed = urlsplit(url).hostname
     except ValueError:
-        return f"URL that does not parse `{url}`"
+        parsed = None
     if parsed != host:
         return f"URL that does not parse `{url}`"
     if host not in ALLOWED_HOSTS:
@@ -106,49 +102,63 @@ def url_problem(url: str) -> str | None:
     return None
 
 
-# --- structured formats ------------------------------------------------------
-
-
 def _str(v: object) -> str:
     return v if isinstance(v, str) else ""
 
 
-def _uv_problems(pkg: Mapping[str, Any]) -> Iterator[str]:
+def _urls(*urls: object) -> Iterator[str]:
+    for url in urls:
+        problem = url_problem(_str(url))
+        if problem:
+            yield problem
+
+
+# --- per-format entries ------------------------------------------------------
+# Each format has a loader (text -> {key: entry}), a source judge, and a
+# probe for whether an entry carries an integrity hash.
+
+
+def _uv_sources(pkg: Mapping[str, Any]) -> Iterator[str]:
     source = pkg.get("source")
     if isinstance(source, Mapping):
         for kind, value in source.items():
             if kind == "registry":
-                yield from filter(None, [url_problem(_str(value))])
+                yield from _urls(value)
             else:
                 yield f"non-registry source `{kind} = {value}`"
-    sdist = pkg.get("sdist")
-    for art in [sdist] + list(pkg.get("wheels") or []):
+    for art in [pkg.get("sdist"), *(pkg.get("wheels") or [])]:
         if isinstance(art, Mapping):
             if "url" in art:
-                yield from filter(None, [url_problem(_str(art["url"]))])
+                yield from _urls(art["url"])
             elif "path" in art:
                 yield f"local artifact `{art['path']}`"
 
 
-def _cargo_problems(pkg: Mapping[str, Any]) -> Iterator[str]:
+def _uv_hashed(pkg: Mapping[str, Any]) -> bool:
+    arts = [pkg.get("sdist"), *(pkg.get("wheels") or [])]
+    return any(isinstance(a, Mapping) and a.get("hash") for a in arts)
+
+
+def _cargo_sources(pkg: Mapping[str, Any]) -> Iterator[str]:
     if "source" in pkg:
-        yield from filter(None, [url_problem(_str(pkg["source"]))])
+        yield from _urls(pkg["source"])
 
 
-def _poetry_problems(pkg: Mapping[str, Any]) -> Iterator[str]:
+def _poetry_sources(pkg: Mapping[str, Any]) -> Iterator[str]:
     source = pkg.get("source")
-    if isinstance(source, Mapping):
-        kind = _str(source.get("type"))
-        if kind != "legacy":
-            yield f"non-registry source `{kind}` `{_str(source.get('url'))}`"
-        else:
-            yield from filter(None, [url_problem(_str(source.get("url")))])
+    if not isinstance(source, Mapping):
+        return
+    if _str(source.get("type")) != "legacy":
+        yield f"non-registry source `{_str(source.get('type'))}` `{_str(source.get('url'))}`"
+    else:
+        yield from _urls(source.get("url"))
 
 
-_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+def _poetry_hashed(pkg: Mapping[str, Any]) -> bool:
+    return any(isinstance(f, Mapping) and f.get("hash") for f in pkg.get("files") or [])
 
 
-def _npm_problems(pkg: Mapping[str, Any]) -> Iterator[str]:
+def _npm_sources(pkg: Mapping[str, Any]) -> Iterator[str]:
     if pkg.get("link"):
         yield f"linked local package `{_str(pkg.get('resolved'))}`"
         return
@@ -161,27 +171,24 @@ def _npm_problems(pkg: Mapping[str, Any]) -> Iterator[str]:
         elif "resolved" not in pkg:
             yield f"non-semver version `{version}` with no resolved registry URL"
     if "resolved" in pkg:
-        yield from filter(None, [url_problem(_str(pkg["resolved"]))])
+        yield from _urls(pkg["resolved"])
 
 
-def _pipfile_problems(pkg: Mapping[str, Any]) -> Iterator[str]:
-    for key in ("git", "hg", "svn", "path", "file", "editable"):
-        if key in pkg:
-            yield f"non-registry source `{key} = {pkg[key]}`"
-
-
-def _composer_problems(pkg: Mapping[str, Any]) -> Iterator[str]:
-    for key in ("dist", "source"):
-        part = pkg.get(key)
-        if isinstance(part, Mapping) and "url" in part:
-            yield from filter(None, [url_problem(_str(part["url"]))])
-
-
-def _npm_entries(doc: Mapping[str, Any]) -> dict[str, Any]:
+def _toml_packages(doc: Mapping[str, Any]) -> dict[str, Any]:
+    """Package entries keyed by name, with `#n` for repeats of a name."""
     out: dict[str, Any] = {}
-    for key, pkg in (doc.get("packages") or {}).items():
-        if key:  # "" is the project itself
-            out[f"packages:{key}"] = pkg
+    for pkg in doc.get("package") or []:
+        name = _str(pkg.get("name")) if isinstance(pkg, Mapping) else ""
+        key, n = name, 1
+        while key in out:
+            n += 1
+            key = f"{name}#{n}"
+        out[key] = pkg
+    return out
+
+
+def _npm_packages(doc: Mapping[str, Any]) -> dict[str, Any]:
+    out = {f"packages:{k}": v for k, v in (doc.get("packages") or {}).items() if k}
 
     def walk(deps: Mapping[str, Any], prefix: str) -> None:
         for name, pkg in deps.items():
@@ -193,215 +200,117 @@ def _npm_entries(doc: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _entries(name: str, text: str) -> dict[str, tuple[Any, Callable]]:
-    """key -> (entry, judge) for every source-bearing entry. Raises on a
-    document its parser cannot read."""
-    if name in ("uv.lock", "Cargo.lock", "poetry.lock"):
-        doc = tomllib.loads(text)
-        judge = {"uv.lock": _uv_problems, "Cargo.lock": _cargo_problems,
-                 "poetry.lock": _poetry_problems}[name]
-        return {
-            f"{p.get('name')}@{p.get('version')}@{i}": (p, judge)
-            for i, p in enumerate(doc.get("package") or [])
-            if isinstance(p, Mapping)
-        }
-    doc = json.loads(text)
-    if not isinstance(doc, Mapping):
-        raise TypeError("not an object")
-    if name == "package-lock.json":
-        return {k: (v, _npm_problems) for k, v in _npm_entries(doc).items()}
-    if name == "Pipfile.lock":
-        out: dict[str, tuple[Any, Callable]] = {}
-        for i, src in enumerate((doc.get("_meta") or {}).get("sources") or []):
-            out[f"source:{i}"] = (src, lambda s: filter(None, [url_problem(_str(s.get("url")))]))
-        for group in ("default", "develop"):
-            for pkg_name, pkg in (doc.get(group) or {}).items():
-                out[f"{group}:{pkg_name}"] = (pkg, _pipfile_problems)
-        return out
-    out = {}
-    for group in ("packages", "packages-dev"):
-        for i, pkg in enumerate(doc.get(group) or []):
-            if isinstance(pkg, Mapping):
-                out[f"{group}:{pkg.get('name')}:{i}"] = (pkg, _composer_problems)
-    return out
+_FORMATS: dict[str, tuple[Callable, Callable, Callable]] = {
+    "package-lock.json": (
+        lambda t: _npm_packages(json.loads(t)), _npm_sources,
+        lambda p: bool(p.get("integrity")),
+    ),
+    "uv.lock": (lambda t: _toml_packages(tomllib.loads(t)), _uv_sources, _uv_hashed),
+    "poetry.lock": (lambda t: _toml_packages(tomllib.loads(t)), _poetry_sources, _poetry_hashed),
+    "Cargo.lock": (
+        lambda t: _toml_packages(tomllib.loads(t)), _cargo_sources,
+        lambda p: bool(p.get("checksum")),
+    ),
+}
 
 
-def _structured_problems(name: str, head: str, base: str | None) -> list[str]:
+def _load(name: str, text: str) -> dict[str, Any]:
+    entries = _FORMATS[name][0](text)
+    if not all(isinstance(e, Mapping) for e in entries.values()):
+        raise TypeError("an entry is not a table")
+    return entries
+
+
+def file_problems(name: str, head: str, base: str | None) -> list[str]:
+    """Problems in every entry of `head` that differs from `base`."""
     try:
-        entries = _entries(name, head)
+        entries = _load(name, head)
     except (ValueError, TypeError, AttributeError) as e:
-        return [f"content `{name}` cannot parse ({type(e).__name__})"]
+        return [f"`{name}` does not parse ({type(e).__name__})"]
     try:
-        before = _entries(name, base) if base is not None else {}
+        before = _load(name, base) if base is not None else {}
     except (ValueError, TypeError, AttributeError):
         before = {}
+    _, sources, hashed = _FORMATS[name]
     problems: list[str] = []
-    for key, (entry, judge) in entries.items():
-        if key in before and before[key][0] == entry:
+    for key, entry in entries.items():
+        prior = before.get(key)
+        if prior == entry:
             continue
-        if not isinstance(entry, Mapping):
-            problems.append(f"entry `{key}` cannot parse")
-            continue
-        problems.extend(judge(entry))
-    return problems
-
-
-# --- line formats ------------------------------------------------------------
-
-
-_URL_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>,()\[\]{}]+")
-# Built from `_NON_REGISTRY_PREFIXES`, so the line scan and `url_problem`
-# can never disagree on what a non-registry source is.
-_PREFIX_TOKEN_RE = re.compile(
-    r"(?:^|[\s\"'@,{:])((?:"
-    + "|".join(re.escape(p) for p in _NON_REGISTRY_PREFIXES)
-    + r")\S*)",
-    re.IGNORECASE,
-)
-# `npm:<range>` is yarn's plain registry form; `npm:<name>@<range>` is an
-# alias that installs a different package under this name.
-# A scheme-relative reference (`//host/path`) not inside a full URL.
-_SCHEME_RELATIVE_RE = re.compile(r"""(?:^|[\s"'{,=(])(//[^\s"'<>,()\[\]{}]+)""")
-_NPM_ALIAS_RE = re.compile(r"(?i)^npm:@?[^@\s\"']+@")
-_PNPM_SOURCE_RE = re.compile(r"""\btype:\s*['"]?(?:directory|git)\b""")
-# Lines that carry an integrity hash, per line format. go.sum is left out:
-# each of its lines is a whole entry, so a dropped dependency removes its
-# line by design.
-_INTEGRITY_RE: dict[str, re.Pattern[str]] = {
-    "yarn.lock": re.compile(r"^\s*(?:integrity\s|checksum:)"),
-    "pnpm-lock.yaml": re.compile(r"\bintegrity:"),
-    ".terraform.lock.hcl": re.compile(r"""^\s*"(?:h1|zh):"""),
-    "Gemfile.lock": re.compile(r"\bsha256="),
-}
-_GO_SUM_RE = re.compile(r"^\S+ v\S+ h1:[A-Za-z0-9+/]+=*$")
-_TF_PROVIDER_RE = re.compile(r'^\s*provider\s+"([^"]*)"')
-_ESCAPE_RE = re.compile(r"\\[uUx]")
-
-
-def _line_problems(name: str, text: str) -> list[str]:
-    stripped = text.strip()
-    if name == "go.sum":
-        ok = not stripped or _GO_SUM_RE.match(stripped)
-        return [] if ok else [f"line that does not parse `{stripped}`"]
-    if name == ".terraform.lock.hcl":
-        m = _TF_PROVIDER_RE.match(text)
-        if m:
-            host = m.group(1).split("/", 1)[0].lower()
-            if host not in ALLOWED_HOSTS:
-                return [f"provider host `{host}` not on the registry allowlist"]
-        return []
-    if name == "Gemfile.lock" and stripped in ("GIT", "PATH", "PLUGIN SOURCE"):
-        return [f"non-registry `{stripped}` section"]
-    problems: list[str] = []
-    if "\\" in text:
-        problems.append(f"line with a backslash `{stripped}`")
-    for m in _URL_TOKEN_RE.finditer(text):
-        problem = url_problem(m.group(0).rstrip(".;:#"))
-        if problem:
-            problems.append(problem)
-    for m in _SCHEME_RELATIVE_RE.finditer(text):
-        problem = url_problem(m.group(1).rstrip(".;:#"))
-        if problem:
-            problems.append(problem)
-    for m in _PREFIX_TOKEN_RE.finditer(text):
-        token = m.group(1).strip(chr(34) + chr(39) + ":,")
-        if token.lower().startswith("npm:") and not _NPM_ALIAS_RE.match(token):
-            continue
-        problems.append(f"non-registry source `{token}`")
-    if name == "pnpm-lock.yaml" and _PNPM_SOURCE_RE.search(text):
-        problems.append(f"non-registry source `{stripped}`")
-    if name == "Gemfile.lock" and stripped.startswith("remote:"):
-        remote = stripped.split(":", 1)[1].strip()
-        if not _URL_TOKEN_RE.match(remote):
-            problems.append(f"non-registry remote `{remote}`")
+        problems.extend(sources(entry))
+        if prior is not None and hashed(prior) and not hashed(entry):
+            problems.append(f"entry `{key}` lost its integrity hash")
     return problems
 
 
 # --- entry point -------------------------------------------------------------
 
 
-def _removed_lines(hunk: DiffHunk) -> list[str]:
-    return [
-        raw[1:] for raw in hunk.body.splitlines()[1:]
-        if raw.startswith("-")
-    ]
+def _finding(path: str, line: int, problems: list[str]) -> Finding:
+    problems = list(dict.fromkeys(problems))
+    listed = "; ".join(problems[:_MAX_LISTED])
+    more = f"; and {len(problems) - _MAX_LISTED} more" if len(problems) > _MAX_LISTED else ""
+    return Finding(
+        file=path,
+        line=line,
+        severity="high",
+        rule_name=RULE,
+        message=(
+            "This lock change installs from somewhere other than an allowed "
+            f"registry: {listed}{more}. Pin the dependency to an allowed "
+            "registry, or a maintainer confirms the source is intended."
+        ),
+        suggestion=None,
+        effort="quick-win",
+        category="security",
+    )
 
 
-def lock_source_findings(
+def _fetch_both(
+    paths: tuple[str, ...], fetch: Callable[[tuple[str, ...], str], dict[str, str]],
+    head_sha: str, base_sha: str,
+) -> tuple[dict[str, str], dict[str, str]] | None:
+    try:
+        return fetch(paths, head_sha), fetch(paths, base_sha)
+    except Exception:  # noqa: BLE001 - an unread lock is a finding, never a pass
+        return None
+
+
+def _unchecked_note(paths: tuple[str, ...]) -> str:
+    if not paths:
+        return ""
+    return "\n\nLock files " + ", ".join(f"`{p}`" for p in paths) + f": {UNCHECKED_NOTE}."
+
+
+def _path_problems(
+    path: str, fetched: tuple[dict[str, str], dict[str, str]] | None,
+) -> list[str]:
+    name = posixpath.basename(path)
+    if fetched is None or path not in fetched[0]:
+        return [f"`{name}` could not be read at head"]
+    return file_problems(name, fetched[0][path], fetched[1].get(path))
+
+
+def lock_source_check(
     hunks: tuple[DiffHunk, ...], *,
     fetch: Callable[[tuple[str, ...], str], dict[str, str]],
     head_sha: str, base_sha: str,
-) -> tuple[Finding, ...]:
-    """One high finding per changed lock file whose change fails the check.
-    Every changed lock file is judged, a removal-only change included.
-    `fetch(paths, ref)` returns path -> text for files present at `ref`,
-    omits absent ones, and raises when it cannot tell."""
-    added: dict[str, list[tuple[int, str]]] = {}
-    removed: dict[str, list[str]] = {}
-    first_line: dict[str, int] = {}
+) -> tuple[tuple[Finding, ...], str]:
+    """(findings, summary note) for every changed lock file. `fetch(paths,
+    ref)` returns path -> text for files present at `ref`, omits absent
+    ones, and raises when it cannot tell."""
+    first: dict[str, int] = {}
     for h in hunks:
         if is_lock_file_path(h.file_path):
-            added.setdefault(h.file_path, []).extend(added_lines(h))
-            removed.setdefault(h.file_path, []).extend(_removed_lines(h))
-            first_line.setdefault(h.file_path, max(1, h.new_start))
-    if not added:
-        return ()
-    structured = tuple(p for p in added if posixpath.basename(p) in _STRUCTURED)
-    heads: dict[str, str] = {}
-    bases: dict[str, str] = {}
-    fetch_failed = False
-    if structured:
-        try:
-            heads = fetch(structured, head_sha)
-            bases = fetch(structured, base_sha)
-        except Exception:  # noqa: BLE001 - an unread lock is a finding, never a pass
-            fetch_failed = True
-    found: list[Finding] = []
-    for path, lines in added.items():
-        name = posixpath.basename(path)
-        anchor = lines[0][0] if lines else first_line[path]
-        problems: list[str] = []
-        if path in structured:
-            if fetch_failed or path not in heads:
-                problems.append(f"content `{name}` could not be read at head")
-            else:
-                problems.extend(_structured_problems(name, heads[path], bases.get(path)))
-            # The parser decodes escapes, so look for them in the raw text.
-            for lineno, text in lines:
-                if _ESCAPE_RE.search(text):
-                    problems.append(f"escaped characters on line {lineno} `{text.strip()}`")
-        else:
-            for lineno, text in lines:
-                line_found = _line_problems(name, text)
-                if line_found and not problems:
-                    anchor = lineno
-                problems.extend(line_found)
-            integrity = _INTEGRITY_RE.get(name)
-            if integrity is not None:
-                gone = sum(1 for t in removed[path] if integrity.search(t))
-                kept = sum(1 for _, t in lines if integrity.search(t))
-                if gone > kept:
-                    problems.append(
-                        f"{gone - kept} integrity or hash line(s) removed without a replacement"
-                    )
-        problems = list(dict.fromkeys(problems))
-        if not problems:
-            continue
-        listed = "; ".join(problems[:_MAX_LISTED])
-        more = f"; and {len(problems) - _MAX_LISTED} more" if len(problems) > _MAX_LISTED else ""
-        found.append(Finding(
-            file=path,
-            line=anchor,
-            severity="high",
-            rule_name=RULE,
-            message=(
-                f"This lock change installs from somewhere other than an allowed "
-                f"registry: {listed}{more}. A lock file can redirect an install "
-                "to any source. Pin the dependency to an allowed registry, or a "
-                "maintainer confirms the source is intended."
-            ),
-            suggestion=None,
-            effort="quick-win",
-            category="security",
-        ))
-    return tuple(found)
+            first.setdefault(h.file_path, max(1, h.new_start))
+    checked = tuple(p for p in first if posixpath.basename(p) in CHECKED_FORMATS)
+    note = _unchecked_note(tuple(p for p in first if p not in checked))
+    if not checked:
+        return (), note
+    fetched = _fetch_both(checked, fetch, head_sha, base_sha)
+    found = []
+    for path in checked:
+        problems = _path_problems(path, fetched)
+        if problems:
+            found.append(_finding(path, first[path], problems))
+    return tuple(found), note

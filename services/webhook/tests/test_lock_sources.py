@@ -1,11 +1,11 @@
 """grug#1649: the deterministic lock-source check.
 
-A lock file is not inert data: a changed source can point an install at
-another registry, a git repository or a local path. Elder reviews a
-lock-file-only diff like any other diff, and this check adds one blocking
-finding per lock file whose added entries name a source that is not an
-allowed registry, a URL with a disguised authority, or content that its
-own parser cannot read.
+Elder reviews a lock-file-only diff with the model; that review is the
+gate. This check is a second layer, and it runs only for formats the
+standard library parses: package-lock.json (json) and uv.lock,
+poetry.lock, Cargo.lock (tomllib). Every package entry that differs from
+base must name only allowed https registry sources and keep its integrity
+hash. Other lock formats get a non-blocking note.
 """
 
 from __future__ import annotations
@@ -18,8 +18,9 @@ from personas.code_reviewer.diff_parser import parse_diff
 from personas.code_reviewer.lock_sources import (
     ALLOWED_HOSTS,
     RULE,
+    UNCHECKED_NOTE,
     is_lock_file_path,
-    lock_source_findings,
+    lock_source_check,
     url_problem,
 )
 
@@ -35,11 +36,9 @@ def _diff(path: str, added: list[str], removed: list[str] = ()) -> str:
     )
 
 
-def _scan(path: str, added: list[str], *, head: str | None = None,
-          base: str | None = None, removed: list[str] = (),
-          fetch_error: Exception | None = None):
-    """Findings for one changed lock file. `head`/`base` are the whole file
-    at each ref (None: not there)."""
+def _run(path: str, *, head: str | None, base: str | None,
+         added: list[str] = ("x",), removed: list[str] = (),
+         fetch_error: Exception | None = None):
     files = {"HEAD": head, "BASE": base}
 
     def fetch(paths, ref):
@@ -48,11 +47,17 @@ def _scan(path: str, added: list[str], *, head: str | None = None,
         text = files[ref]
         return {path: text} if text is not None and path in paths else {}
 
-    hunks = parse_diff(_diff(path, added, removed))
-    return lock_source_findings(hunks, fetch=fetch, head_sha="HEAD", base_sha="BASE")
+    return lock_source_check(
+        parse_diff(_diff(path, list(added), list(removed))),
+        fetch=fetch, head_sha="HEAD", base_sha="BASE",
+    )
 
 
-# --- names and hosts -------------------------------------------------------
+def _scan(path: str, **kw):
+    return _run(path, **kw)[0]
+
+
+# --- names, hosts, URLs ----------------------------------------------------
 
 
 @pytest.mark.parametrize("path", [
@@ -64,9 +69,7 @@ def test_listed_lock_file_names_are_recognised(path):
     assert is_lock_file_path(path)
 
 
-@pytest.mark.parametrize("path", [
-    "src/app.py", "flake.lock", "evil.lock", "uv.lock.bak", "docs/uv.lock.md",
-])
+@pytest.mark.parametrize("path", ["src/app.py", "flake.lock", "evil.lock", "uv.lock.bak"])
 def test_unlisted_names_are_not_lock_files(path):
     assert not is_lock_file_path(path)
 
@@ -81,6 +84,8 @@ def test_github_is_not_an_allowed_host():
     "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
     "https://PyPI.org/simple",
     "https://registry.npmjs.org:443/x.tgz",
+    "//registry.npmjs.org/x/-/x-1.0.0.tgz",
+    "registry+https://github.com/rust-lang/crates.io-index",
 ])
 def test_allowed_registry_urls_pass(url):
     assert url_problem(url) is None
@@ -94,12 +99,15 @@ def test_allowed_registry_urls_pass(url):
     "https://registry.npmjs.org\\@evil.example/x.tgz",
     "https://registry.npmjs.org%2f@evil.example/x.tgz",
     "https://registry%2enpmjs.org/x.tgz",
-    "https://registry.npmjs.org\\u002f@evil.example/x.tgz",
+    "http://registry.npmjs.org/x.tgz",
+    "HTTP://pypi.org/simple",
+    "//evil.example.net/x.tgz",
     "git+https://github.com/a/b.git",
     "git://example.org/a.git",
     "git@github.com:a/b.git",
     "file:../pkg",
     "link:../pkg",
+    "npm:other@1.0.0",
     "../pkg",
     "/abs/pkg",
     "ftp://pypi.org/x",
@@ -109,46 +117,34 @@ def test_bad_sources_are_flagged(url):
     assert url_problem(url)
 
 
-# --- structured formats parse with their real parser ------------------------
+# --- uv.lock ---------------------------------------------------------------
 
 
-_UV_BASE = """version = 1
-requires-python = ">=3.12"
+_ROOT_UV = """version = 1
 
 [[package]]
 name = "app"
 version = "0.1.0"
 source = { virtual = "." }
-
-[[package]]
-name = "requests"
-version = "2.31.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/r/requests-2.31.0.tar.gz", hash = "sha256:aa" }
 """
 
-
-def _uv_with(extra: str) -> str:
-    return _UV_BASE + "\n" + extra
-
-
-_UV_GOOD = '''[[package]]
+_IDNA_36 = '''
+[[package]]
 name = "idna"
-version = "3.7"
+version = "3.6"
 source = { registry = "https://pypi.org/simple" }
-wheels = [{ url = "https://files.pythonhosted.org/packages/i/idna-3.7-py3-none-any.whl", hash = "sha256:bb" }]
+sdist = { url = "https://files.pythonhosted.org/packages/i/idna-3.6.tar.gz", hash = "sha256:aa" }
 '''
+_IDNA_37 = _IDNA_36.replace("3.6", "3.7").replace("sha256:aa", "sha256:bb")
+_UV_BASE = _ROOT_UV + _IDNA_36
 
 
 def test_a_registry_bump_in_uv_lock_is_clean():
-    head = _uv_with(_UV_GOOD)
-    assert _scan("uv.lock", _UV_GOOD.splitlines(), head=head, base=_UV_BASE) == ()
+    assert _scan("uv.lock", head=_ROOT_UV + _IDNA_37, base=_UV_BASE) == ()
 
 
 def test_an_unchanged_virtual_root_is_not_flagged():
-    # The project's own `virtual = "."` entry is in both refs.
-    head = _uv_with(_UV_GOOD)
-    assert _scan("uv.lock", ["# touch"], head=head, base=_UV_BASE) == ()
+    assert _scan("uv.lock", head=_UV_BASE, base=_UV_BASE) == ()
 
 
 @pytest.mark.parametrize("source", [
@@ -158,57 +154,69 @@ def test_an_unchanged_virtual_root_is_not_flagged():
     'source = { editable = "libs/x" }',
     'source = { url = "https://evil.example.net/x.whl" }',
     'source = { registry = "https://evil.example.net/simple" }',
+    'source = { registry = "http://pypi.org/simple" }',
 ])
 def test_a_non_registry_uv_source_is_flagged(source):
-    entry = f'[[package]]\nname = "x"\nversion = "1.0"\n{source}\n'
-    found = _scan("uv.lock", entry.splitlines(), head=_uv_with(entry), base=_UV_BASE)
+    idna = _IDNA_37.replace('source = { registry = "https://pypi.org/simple" }', source)
+    found = _scan("uv.lock", head=_ROOT_UV + idna, base=_UV_BASE)
     assert len(found) == 1
-    f = found[0]
-    assert (f.rule_name, f.severity, f.file) == (RULE, "high", "uv.lock")
+    assert (found[0].rule_name, found[0].severity, found[0].file) == (RULE, "high", "uv.lock")
 
 
 def test_a_uv_sdist_on_another_host_is_flagged():
-    entry = (
-        '[[package]]\nname = "x"\nversion = "1.0"\n'
-        'source = { registry = "https://pypi.org/simple" }\n'
-        'sdist = { url = "https://evil.example.net/x-1.0.tar.gz", hash = "sha256:cc" }\n'
-    )
-    found = _scan("uv.lock", entry.splitlines(), head=_uv_with(entry), base=_UV_BASE)
+    idna = _IDNA_37.replace("files.pythonhosted.org", "evil.example.net")
+    found = _scan("uv.lock", head=_ROOT_UV + idna, base=_UV_BASE)
     assert found and re.search(r"evil\.example\.net", found[0].message)
 
 
+def test_a_uv_entry_that_loses_its_hash_is_flagged():
+    idna = _IDNA_37.replace(', hash = "sha256:bb"', "")
+    found = _scan("uv.lock", head=_ROOT_UV + idna, base=_UV_BASE)
+    assert found and "lost its integrity hash" in found[0].message
+
+
+def test_a_removal_only_change_is_still_checked():
+    # The hunk only removes lines, but the head entry now names another host.
+    head = _ROOT_UV + _IDNA_36.replace("https://pypi.org/simple", "https://evil.example.net/simple")
+    assert _scan("uv.lock", head=head, base=_UV_BASE, added=[], removed=["x"])
+
+
+def test_a_clean_removal_only_change_passes():
+    assert _scan("uv.lock", head=_ROOT_UV, base=_UV_BASE, added=[], removed=["x"]) == ()
+
+
 def test_an_unparseable_toml_lock_is_flagged():
-    found = _scan("uv.lock", ["[[package"], head="[[package\nname = ", base=_UV_BASE)
-    assert len(found) == 1 and "parse" in found[0].message
+    found = _scan("uv.lock", head="[[package\nname = ", base=_UV_BASE)
+    assert len(found) == 1 and "does not parse" in found[0].message
 
 
-def test_a_lock_that_cannot_be_read_at_head_is_flagged():
-    found = _scan("uv.lock", ["x = 1"], fetch_error=RuntimeError("boom"))
+@pytest.mark.parametrize("head", ["x", None])
+def test_a_lock_that_cannot_be_read_at_head_is_flagged(head):
+    kw = {"fetch_error": RuntimeError("boom")} if head == "x" else {}
+    found = _scan("uv.lock", head=head, base=_UV_BASE, **kw)
     assert len(found) == 1 and found[0].rule_name == RULE
 
 
-def test_a_lock_missing_at_head_while_lines_are_added_is_flagged():
-    found = _scan("uv.lock", ["x = 1"], head=None, base=_UV_BASE)
-    assert len(found) == 1
+# --- Cargo.lock and poetry.lock ----------------------------------------------
+
+
+_CRATES = 'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
 
 
 def test_cargo_crates_io_index_is_the_registry():
-    base = 'version = 3\n'
-    entry = (
-        '[[package]]\nname = "serde"\nversion = "1.0.0"\n'
-        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
-        'checksum = "ab"\n'
-    )
-    assert _scan("Cargo.lock", entry.splitlines(), head=base + entry, base=base) == ()
+    entry = f'[[package]]\nname = "serde"\nversion = "1.0.0"\n{_CRATES}checksum = "ab"\n'
+    assert _scan("Cargo.lock", head="version = 3\n" + entry, base="version = 3\n") == ()
 
 
 def test_a_cargo_git_source_is_flagged():
-    base = 'version = 3\n'
-    entry = (
-        '[[package]]\nname = "x"\nversion = "1.0.0"\n'
-        'source = "git+https://github.com/a/x?rev=1#abc"\n'
-    )
-    assert _scan("Cargo.lock", entry.splitlines(), head=base + entry, base=base)
+    entry = '[[package]]\nname = "x"\nversion = "1.0.0"\nsource = "git+https://github.com/a/x?rev=1#abc"\n'
+    assert _scan("Cargo.lock", head="version = 3\n" + entry, base="version = 3\n")
+
+
+def test_a_cargo_entry_that_loses_its_checksum_is_flagged():
+    base = f'version = 3\n[[package]]\nname = "x"\nversion = "1.0.0"\n{_CRATES}checksum = "ab"\n'
+    head = f'version = 3\n[[package]]\nname = "x"\nversion = "1.0.1"\n{_CRATES}'
+    assert _scan("Cargo.lock", head=head, base=base)
 
 
 @pytest.mark.parametrize(("source", "bad"), [
@@ -216,153 +224,69 @@ def test_a_cargo_git_source_is_flagged():
     ('[package.source]\ntype = "directory"\nurl = "../x"\n', True),
     ('[package.source]\ntype = "legacy"\nurl = "https://evil.example.net/simple"\nreference = "e"\n', True),
     ('[package.source]\ntype = "legacy"\nurl = "https://pypi.org/simple"\nreference = "p"\n', False),
-    ('', False),
+    ("", False),
 ])
 def test_poetry_sources(source, bad):
     base = '[metadata]\nlock-version = "2.0"\n'
     entry = f'[[package]]\nname = "x"\nversion = "1.0"\nfiles = []\n{source}'
-    found = _scan("poetry.lock", entry.splitlines(), head=entry + base, base=base)
-    assert bool(found) is bad, found
+    assert bool(_scan("poetry.lock", head=entry + base, base=base)) is bad
 
 
-def _npm(packages: dict) -> str:
-    return json.dumps({"name": "app", "lockfileVersion": 3, "packages": packages}, indent=2)
+def test_a_poetry_entry_that_loses_its_hashes_is_flagged():
+    meta = '[metadata]\nlock-version = "2.0"\n'
+    base = f'[[package]]\nname = "x"\nversion = "1.0"\nfiles = [{{file = "x.whl", hash = "sha256:a"}}]\n{meta}'
+    head = f'[[package]]\nname = "x"\nversion = "1.1"\nfiles = []\n{meta}'
+    assert _scan("poetry.lock", head=head, base=base)
 
 
-_NPM_BASE = {"": {"name": "app"}}
+# --- package-lock.json -----------------------------------------------------
+
+
+def _npm(packages: dict, version: int = 3) -> str:
+    return json.dumps({"name": "app", "lockfileVersion": version, "packages": packages})
+
+
+_ROOT = {"": {"name": "app"}}
+_GOOD_NPM = {"version": "1.3.0", "integrity": "sha512-a",
+             "resolved": "https://registry.npmjs.org/x/-/x-1.3.0.tgz"}
 
 
 @pytest.mark.parametrize(("entry", "bad"), [
-    ({"version": "1.3.0", "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
-      "funding": {"url": "https://github.com/sponsors/x"}}, False),
-    ({"version": "1.0.0", "resolved": "https://evil.example.net/x.tgz"}, True),
-    ({"version": "1.0.0", "resolved": "git+ssh://git@github.com/a/b.git#abc"}, True),
+    ({**_GOOD_NPM, "funding": {"url": "https://github.com/sponsors/x"}}, False),
+    ({**_GOOD_NPM, "resolved": "https://evil.example.net/x.tgz"}, True),
+    ({**_GOOD_NPM, "resolved": "http://registry.npmjs.org/x.tgz"}, True),
+    ({**_GOOD_NPM, "resolved": "//evil.example.net/x.tgz"}, True),
+    ({**_GOOD_NPM, "resolved": "git+ssh://git@github.com/a/b.git#abc"}, True),
     ({"resolved": "../local", "link": True}, True),
     ({"version": "file:../x", "resolved": "file:../x"}, True),
 ])
 def test_package_lock_sources(entry, bad):
-    head = _npm({**_NPM_BASE, "node_modules/x": entry})
-    found = _scan("package-lock.json", ['    "node_modules/x": {'], head=head, base=_npm(_NPM_BASE))
+    found = _scan("package-lock.json", head=_npm({**_ROOT, "node_modules/x": entry}), base=_npm(_ROOT))
     assert bool(found) is bad, found
 
 
 def test_an_unchanged_workspace_link_is_not_flagged():
-    packages = {**_NPM_BASE, "node_modules/ws": {"resolved": "packages/ws", "link": True}}
-    head = _npm({**packages, "node_modules/y": {
-        "version": "1.0.0", "resolved": "https://registry.npmjs.org/y/-/y-1.0.0.tgz"}})
-    assert _scan("package-lock.json", ["  x"], head=head, base=_npm(packages)) == ()
+    packages = {**_ROOT, "node_modules/ws": {"resolved": "packages/ws", "link": True}}
+    head = _npm({**packages, "node_modules/y": _GOOD_NPM})
+    assert _scan("package-lock.json", head=head, base=_npm(packages)) == ()
 
 
-def test_unparseable_json_lock_is_flagged():
-    assert _scan("package-lock.json", ["{"], head="{", base=_npm(_NPM_BASE))
+def test_a_package_lock_entry_that_loses_its_integrity_is_flagged():
+    base = _npm({**_ROOT, "node_modules/x": _GOOD_NPM})
+    bumped = {k: v for k, v in _GOOD_NPM.items() if k != "integrity"}
+    head = _npm({**_ROOT, "node_modules/x": {**bumped, "version": "1.3.1"}})
+    found = _scan("package-lock.json", head=head, base=base)
+    assert found and "lost its integrity hash" in found[0].message
 
 
-def test_pipfile_lock_git_and_index():
-    base = json.dumps({"_meta": {"sources": [{"name": "pypi", "url": "https://pypi.org/simple"}]},
-                       "default": {}, "develop": {}})
-    head = json.loads(base)
-    head["default"]["x"] = {"git": "https://github.com/a/x.git", "ref": "abc"}
-    assert _scan("Pipfile.lock", ["  x"], head=json.dumps(head), base=base)
-    head = json.loads(base)
-    head["_meta"]["sources"].append({"name": "evil", "url": "https://evil.example.net/simple"})
-    assert _scan("Pipfile.lock", ["  x"], head=json.dumps(head), base=base)
-
-
-# --- line formats ---------------------------------------------------------
-
-
-@pytest.mark.parametrize(("path", "line", "bad"), [
-    ("yarn.lock", '  resolved "https://registry.yarnpkg.com/x/-/x-1.0.0.tgz#ab"', False),
-    ("yarn.lock", '  resolved "https://evil.example.net/x.tgz"', True),
-    ("yarn.lock", '  resolved "git+https://github.com/a/b.git#abc"', True),
-    ("yarn.lock", '"x@file:../x":', True),
-    ("yarn.lock", '"x@link:../x":', True),
-    ("yarn.lock", '"lodash@^4.17.21":', False),
-    ("pnpm-lock.yaml", "    resolution: {integrity: sha512-abc}", False),
-    ("pnpm-lock.yaml", "    resolution: {tarball: https://evil.example.net/x.tgz}", True),
-    ("pnpm-lock.yaml", "      x: link:../x", True),
-    ("pnpm-lock.yaml", "    resolution: {directory: ../x, type: directory}", True),
-    ("Gemfile.lock", "  remote: https://rubygems.org/", False),
-    ("Gemfile.lock", "GIT", True),
-    ("Gemfile.lock", "PATH", True),
-    ("Gemfile.lock", "  remote: https://gems.evil.example/", True),
-    ("go.sum", "golang.org/x/text v0.3.0 h1:g61tztE5qeGQ89tm6NTjjM9VPIm088od1l6aSorWRWg=", False),
-    ("go.sum", "golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=", False),
-    ("go.sum", "replace golang.org/x/text => ../text", True),
-    (".terraform.lock.hcl", 'provider "registry.terraform.io/hashicorp/aws" {', False),
-    (".terraform.lock.hcl", 'provider "evil.example.net/hashicorp/aws" {', True),
-    ("yarn.lock", '  resolved "https://registry.yarnpkg.com\\@evil.example/x.tgz"', True),
-])
-def test_line_formats(path, line, bad):
-    found = _scan(path, [line])
-    assert bool(found) is bad, found
-
-
-def test_a_removed_bad_line_does_not_count():
-    assert _scan("yarn.lock", ['  resolved "https://registry.yarnpkg.com/x.tgz"'],
-                 removed=['  resolved "https://evil.example.net/x.tgz"']) == ()
-
-
-def test_one_finding_per_file_anchored_on_an_added_line():
-    found = _scan("yarn.lock", ["# ok", '  resolved "https://a.evil/x"', '  resolved "https://b.evil/y"'])
-    assert len(found) == 1
-    assert found[0].line == 2
-    assert re.search(r"`a\.evil`", found[0].message)
-    assert re.search(r"`b\.evil`", found[0].message)
-
-
-def test_non_lock_files_are_ignored():
-    hunks = parse_diff(_diff("src/app.py", ["URL = 'https://evil.example.net'"]))
-    assert lock_source_findings(
-        hunks, fetch=lambda p, r: {}, head_sha="HEAD", base_sha="BASE",
-    ) == ()
-
-
-def test_a_json_unicode_escape_in_an_added_line_is_flagged():
-    line = '      "resolved": "https://registry.npmjs.org\\u002f@evil.example/x.tgz",'
-    head = _npm({**_NPM_BASE, "node_modules/x": {
-        "version": "1.0.0", "resolved": json.loads('"https://registry.npmjs.org\\u002f@evil.example/x.tgz"')}})
-    found = _scan("package-lock.json", [line], head=head, base=_npm(_NPM_BASE))
-    assert found and "escaped" in found[0].message
-
-
-# --- third review --------------------------------------------------------
-
-
-def test_the_line_scan_is_built_from_the_prefix_list():
-    from personas.code_reviewer import lock_sources as ls
-
-    for prefix in ls._NON_REGISTRY_PREFIXES:
-        assert ls._PREFIX_TOKEN_RE.search(f' "x@{prefix}thing"'), prefix
-
-
-@pytest.mark.parametrize(("path", "line", "bad"), [
-    ("yarn.lock", '"x@exec:./build.sh":', True),
-    ("yarn.lock", '  resolution: "ts@patch:ts@npm%3A5.0.0#~builtin<compat/ts>"', True),
-    ("yarn.lock", '"x@npm:evil-pkg@1.0.0":', True),
-    ("yarn.lock", '"x@npm:@evil/pkg@1.0.0":', True),
-    ("yarn.lock", '  resolution: "lodash@npm:4.17.21"', False),
-    ("yarn.lock", '"lodash@npm:^4.17.21":', False),
-    ("pnpm-lock.yaml", "    resolution: {repo: x, type: 'git'}", True),
-    ("pnpm-lock.yaml", '    resolution: {type: "directory"}', True),
-])
-def test_more_prefix_forms(path, line, bad):
-    assert bool(_scan(path, [line])) is bad
-
-
-@pytest.mark.parametrize("url", [
-    "http://registry.npmjs.org/x.tgz", "HTTP://pypi.org/simple",
-])
-def test_plain_http_is_a_finding(url):
-    assert url_problem(url)
-
-
-def test_plain_http_in_a_line_format_is_a_finding():
-    assert _scan("yarn.lock", ['  resolved "http://registry.yarnpkg.com/x.tgz"'])
+def test_a_json_unicode_escape_is_decoded_then_checked():
+    resolved = json.loads('"https://registry.npmjs.org\\u005c@evil.example/x.tgz"')
+    head = _npm({**_ROOT, "node_modules/x": {**_GOOD_NPM, "resolved": resolved}})
+    assert _scan("package-lock.json", head=head, base=_npm(_ROOT))
 
 
 def _npm_v1(deps: dict) -> str:
-    return json.dumps({"name": "app", "lockfileVersion": 1, "dependencies": deps}, indent=2)
+    return json.dumps({"name": "app", "lockfileVersion": 1, "dependencies": deps})
 
 
 @pytest.mark.parametrize(("entry", "bad"), [
@@ -375,52 +299,32 @@ def _npm_v1(deps: dict) -> str:
     ({"version": "npm:other@1.0.0", "resolved": "https://registry.npmjs.org/other/-/other-1.0.0.tgz"}, True),
 ])
 def test_npm_v1_versions(entry, bad):
-    head = _npm_v1({"x": entry})
-    found = _scan("package-lock.json", ['    "x": {'], head=head, base=_npm_v1({}))
+    found = _scan("package-lock.json", head=_npm_v1({"x": entry}), base=_npm_v1({}))
     assert bool(found) is bad, found
 
 
-def test_a_removal_only_structured_change_is_still_checked():
-    # The head entry changed (its source moved) though the hunk only removes.
-    base = _uv_with(_UV_GOOD)
-    head = _uv_with(_UV_GOOD.replace("https://pypi.org/simple", "https://evil.example.net/simple"))
-    found = _scan("uv.lock", [], removed=["# a line"], head=head, base=base)
-    assert len(found) == 1
+def test_unparseable_json_lock_is_flagged():
+    assert _scan("package-lock.json", head="{", base=_npm(_ROOT))
 
 
-def test_a_removal_only_clean_structured_change_passes():
-    found = _scan("uv.lock", [], removed=['name = "idna"'], head=_UV_BASE, base=_uv_with(_UV_GOOD))
-    assert found == ()
+# --- other formats get a note, never a finding --------------------------------
 
 
-@pytest.mark.parametrize(("path", "removed", "added", "bad"), [
-    ("yarn.lock", ["  integrity sha512-old=="], [], True),
-    ("yarn.lock", ["  integrity sha512-old=="], ["  integrity sha512-new=="], False),
-    ("yarn.lock", ["  checksum: 10/abc"], [], True),
-    ("pnpm-lock.yaml", ["    resolution: {integrity: sha512-old==}"], [], True),
-    (".terraform.lock.hcl", ['    "h1:abc=",'], [], True),
-    (".terraform.lock.hcl", ['    "h1:abc=",'], ['    "h1:def=",'], False),
-    ("Gemfile.lock", ["  rake (13.0.6) sha256=abc"], [], True),
-    ("yarn.lock", ['  version "1.0.0"'], [], False),
+@pytest.mark.parametrize("path", [
+    "yarn.lock", "pnpm-lock.yaml", "Gemfile.lock", "go.sum",
+    ".terraform.lock.hcl", "Pipfile.lock", "composer.lock",
 ])
-def test_a_removed_integrity_line_is_a_finding(path, removed, added, bad):
-    assert bool(_scan(path, added, removed=removed)) is bad
+def test_other_formats_get_a_non_blocking_note(path):
+    findings, note = _run(path, head=None, base=None, added=['resolved "https://evil.example.net/x"'])
+    assert findings == ()
+    assert UNCHECKED_NOTE in note and path in note
 
 
-@pytest.mark.parametrize(("url", "bad"), [
-    ("//evil.example.net/x.tgz", True),
-    ("//registry.npmjs.org/x/-/x-1.0.0.tgz", False),
-    ("//registry.npmjs.org\\@evil.example/x.tgz", True),
-])
-def test_a_scheme_relative_url_is_checked_as_https(url, bad):
-    assert bool(url_problem(url)) is bad
+def test_checked_formats_get_no_note():
+    _, note = _run("uv.lock", head=_UV_BASE, base=_UV_BASE)
+    assert note == ""
 
 
-@pytest.mark.parametrize(("path", "line", "bad"), [
-    ("pnpm-lock.yaml", "    resolution: {tarball: //evil.example.net/x.tgz}", True),
-    ("pnpm-lock.yaml", "    resolution: {tarball: //registry.npmjs.org/x/-/x-1.0.0.tgz}", False),
-    ("yarn.lock", '  resolved "//evil.example.net/x.tgz"', True),
-    ("yarn.lock", '  resolved "https://registry.yarnpkg.com/x.tgz"', False),
-])
-def test_a_scheme_relative_reference_in_a_line_format(path, line, bad):
-    assert bool(_scan(path, [line])) is bad
+def test_non_lock_files_are_ignored():
+    hunks = parse_diff(_diff("src/app.py", ["URL = 'https://evil.example.net'"]))
+    assert lock_source_check(hunks, fetch=lambda p, r: {}, head_sha="H", base_sha="B") == ((), "")
