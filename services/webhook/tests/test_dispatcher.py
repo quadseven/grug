@@ -1541,3 +1541,74 @@ def test_review_thread_question_from_bot_is_ignored():
         out = dispatch("pull_request_review_comment", payload)
     assert out["status"] == "no_op"
     assert not mock_ask.called
+
+
+# --- grug#1624: each /grug verb is gated on the persona it drives ---------
+
+
+def _slash_payload(body: str, *, sender_type: str = "User") -> dict:
+    return {
+        "action": "created",
+        "issue": {"number": 42, "user": {"login": "alice"},
+                  "pull_request": {"url": "..."}},
+        "comment": {"id": 77, "body": body},
+        "repository": {"id": 100, "name": "myrepo",
+                       "owner": {"login": "myorg"}, "full_name": "myorg/myrepo"},
+        "installation": {"id": 1},
+        "sender": {"login": "alice", "type": sender_type},
+    }
+
+
+def _run_slash(body: str, enabled: set[str], *, sender_type: str = "User"):
+    """Dispatch one /grug comment with only `enabled` personas on. Returns
+    (result, run_command mock, posted reply bodies)."""
+    fake_pr = MagicMock()
+    fake_pr.raise_for_status = lambda: None
+    fake_pr.json.return_value = {"head": {"sha": "abc123"}, "body": ""}
+    replies: list[str] = []
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled",
+               side_effect=lambda *a: a[2] in enabled), \
+         patch("dispatcher._actor_has_write", return_value=True), \
+         patch("dispatcher._defer_if_budget_spent", return_value=None), \
+         patch("github_app_auth.with_install_token_retry",
+               side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", return_value=fake_pr), \
+         patch("interactive._post_reply",
+               side_effect=lambda _t, _o, _r, _n, b: replies.append(b)), \
+         patch("interactive.run_command",
+               return_value={"status": "dispatched"}) as run_cmd:
+        out = dispatch("issue_comment", _slash_payload(body, sender_type=sender_type))
+    return out, run_cmd, replies
+
+
+@pytest.mark.parametrize("body,verb", [
+    ("/grug improve", "improve"),
+    ("/grug ask why is this here?", "ask"),
+])
+def test_elder_verb_runs_with_chief_off_and_elder_on(body, verb):
+    out, run_cmd, replies = _run_slash(body, {"code_reviewer"})
+    assert out == {"status": "dispatched"}
+    assert run_cmd.call_args.args[0] == verb
+    assert replies == []
+
+
+def test_recheck_still_needs_chief_and_says_so():
+    out, run_cmd, replies = _run_slash("/grug recheck", {"code_reviewer"})
+    assert out["status"] == "no_op" and "tpm disabled" in out["reason"]
+    assert not run_cmd.called
+    assert len(replies) == 1 and "Chief" in replies[0]
+
+
+def test_elder_off_refuses_improve_with_a_reply():
+    out, run_cmd, replies = _run_slash("/grug improve", {"tpm"})
+    assert out["status"] == "no_op" and "code_reviewer disabled" in out["reason"]
+    assert not run_cmd.called
+    assert len(replies) == 1 and "Elder" in replies[0] and "/grug improve" in replies[0]
+
+
+def test_persona_off_refusal_does_not_answer_a_bot():
+    out, run_cmd, replies = _run_slash("/grug improve", {"tpm"}, sender_type="Bot")
+    assert out["status"] == "no_op"
+    assert not run_cmd.called
+    assert replies == []

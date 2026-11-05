@@ -1175,6 +1175,37 @@ def _refuse_rerun_command(
     )
 
 
+# The name a reader knows each persona toggle by (grug#1624).
+_PERSONA_DISPLAY = {"tpm": "Chief", "code_reviewer": "Elder", "walkthrough": "Teller"}
+
+
+def _refuse_persona_disabled(
+    persona: str, *, installation_id: int, owner: str, repo_name: str,
+    pr_number: int, verb: str,
+) -> None:
+    """Tell the commenter once that `/grug <verb>` needs a persona this
+    repo has turned off (grug#1624). Best-effort, like the other refusals:
+    a reply GitHub refuses must not turn the refusal into a webhook 500."""
+    from github_app_auth import with_install_token_retry  # type: ignore
+    from interactive import _reply  # type: ignore
+
+    name = _PERSONA_DISPLAY.get(persona, persona)
+    try:
+        _reply(
+            lambda fn: with_install_token_retry(int(installation_id), fn),
+            owner, repo_name, int(pr_number),
+            f"Grug refused `/grug {verb}`: {name} (`{persona}`) is turned off "
+            f"for this repo. Turn {name} on in the repo settings, then comment "
+            f"`/grug {verb}` again.",
+        )
+    except Exception as e:  # noqa: BLE001 - token minting can fail outside httpx
+        log.warning(
+            "persona_disabled_reply_failed",
+            extra={"owner": owner, "repo": repo_name, "pr_number": pr_number,
+                   "persona": persona, "kind": type(e).__name__},
+        )
+
+
 def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     action = payload.get("action", "")
     if action != "created":
@@ -1187,7 +1218,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     comment = payload.get("comment") or {}
     body = comment.get("body") or ""
     comment_id = comment.get("id")
-    from grug_commands import ELDER_RERUN_VERBS, parse_command  # type: ignore
+    from grug_commands import ELDER_RERUN_VERBS, VERB_PERSONA, parse_command  # type: ignore
     cmd = parse_command(body)
     if cmd is None:
         return {"status": "no_op", "reason": "no /grug command trigger"}
@@ -1217,11 +1248,20 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     if not is_install_allowlisted(int(installation_id)):
         return {"status": "no_op", "reason": "installer not allowlisted"}
 
+    # grug#1624: each verb is gated on the persona it drives, not on Chief
+    # for every verb. With Elder on and Chief off, `/grug improve` runs and
+    # `/grug recheck` is refused; a refused verb is answered, never dropped.
     repo_id = repo.get("id")
+    persona = VERB_PERSONA[cmd.verb]
     if repo_id is not None and not is_persona_enabled(
-        int(installation_id), int(repo_id), "tpm",
+        int(installation_id), int(repo_id), persona,
     ):
-        return {"status": "no_op", "reason": "tpm disabled for this repo"}
+        if sender_type != "Bot":  # bots never answer bots
+            _refuse_persona_disabled(
+                persona, installation_id=int(installation_id), owner=owner,
+                repo_name=repo_name, pr_number=int(pr_number), verb=cmd.verb,
+            )
+        return {"status": "no_op", "reason": f"{persona} disabled for this repo"}
 
     # grug#1405: accepting a deleted guard clears a blocking finding, so it
     # takes a stricter gate than a re-run. The comment's author must be a
@@ -1440,7 +1480,8 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "skip", "reason": "pr_has_no_head_sha"}
 
     # Interactive commands (#528) reuse the SAME gating above (allowlist +
-    # tpm + author-or-write-collaborator), then branch to their own actions.
+    # the verb's persona toggle + author-or-write-collaborator), then
+    # branch to their own actions.
     # recheck keeps the original DoR-re-evaluate path below.
     if cmd.verb == "walkthrough":
         return _handle_grug_walkthrough(

@@ -1,24 +1,28 @@
 """Interactive `/grug <verb>` PR-comment command parser (#528, epic #522).
 
 Pure: turn an issue-comment body into a (verb, arg) command or None. The
-dispatcher gates (allowlist, collaborator, tpm-enabled) and executes; this
-just recognizes the command, so the recognition has a unit-test seam.
+dispatcher gates (allowlist, the verb's persona toggle, collaborator) and
+executes; this just recognizes the command, so the recognition has a
+unit-test seam.
 
 Supported verbs (all default-safe - none mutate code, except `learnings
 delete` which forgets a taught preference and `fix` which commits to the
-PR branch):
-  /grug recheck        re-run Chief's DoR check (NOT Elder - use improve)
-  /grug improve        Elder re-reviews and re-posts its findings
-  /grug ask <question> scoped Q&A over the PR diff, answered as a reply
-  /grug test-gaps      the pr-test lens on demand
-  /grug resume         lift Elder's auto-pause and review since the last look
-  /grug review         one Elder review now; an auto-pause stays (grug#1188)
-  /grug learnings list list the repo's remembered markings (usage counts)
-  /grug learnings delete <digest>  forget one remembered marking by digest
-  /grug accept-removal <path> <sha>  accept one deleted guard path on head <sha> (#1405)
-  /grug walkthrough    opt in to Teller walkthrough on this PR
-  /grug fix            apply all unresolved committable suggestions as one bot commit
-  /grug docstrings     generate docs for changed public functions as one bot commit
+PR branch). The second column is the per-repo persona toggle the verb
+needs (`VERB_PERSONA`, grug#1624); with that persona off the command is
+refused with a reply naming it, and the other personas' toggles do not
+matter:
+  /grug recheck        tpm            re-run Chief's DoR check (NOT Elder - use improve)
+  /grug improve        code_reviewer  Elder re-reviews and re-posts its findings
+  /grug ask <question> code_reviewer  scoped Q&A over the PR diff, answered as a reply
+  /grug test-gaps      code_reviewer  the pr-test lens on demand
+  /grug resume         code_reviewer  lift Elder's auto-pause and review since the last look
+  /grug review         code_reviewer  one Elder review now; an auto-pause stays (grug#1188)
+  /grug learnings list code_reviewer  list the repo's remembered markings (usage counts)
+  /grug learnings delete <digest>  code_reviewer  forget one remembered marking by digest
+  /grug accept-removal <path> <sha>  code_reviewer  accept one deleted guard path on head <sha> (#1405)
+  /grug walkthrough    walkthrough    opt in to Teller walkthrough on this PR
+  /grug fix            code_reviewer  apply all unresolved committable suggestions as one bot commit
+  /grug docstrings     code_reviewer  generate docs for changed public functions as one bot commit
 """
 
 from __future__ import annotations
@@ -39,6 +43,25 @@ VERBS = frozenset({
     "recheck", "improve", "ask", "test-gaps", "resume", "review", "learnings",
     "accept-removal", "walkthrough", "fix", "docstrings",
 })
+
+# The persona toggle (`<persona>_enabled` in the repo config) each verb
+# needs (grug#1624). Only `recheck` drives Chief. `accept-removal` clears an
+# Elder finding and queues an Elder re-review, so it follows Elder, as the
+# learnings verbs do (learnings steer Elder's prompt). `walkthrough` is
+# Teller's own toggle. Every verb in VERBS has an entry; a test holds that.
+VERB_PERSONA: dict[str, str] = {
+    "recheck": "tpm",
+    "improve": "code_reviewer",
+    "ask": "code_reviewer",
+    "test-gaps": "code_reviewer",
+    "resume": "code_reviewer",
+    "review": "code_reviewer",
+    "learnings": "code_reviewer",
+    "accept-removal": "code_reviewer",
+    "walkthrough": "walkthrough",
+    "fix": "code_reviewer",
+    "docstrings": "code_reviewer",
+}
 
 # The verbs that start an ELDER re-run. They are the ones that must not
 # overlap with a review already in flight, that must carry the

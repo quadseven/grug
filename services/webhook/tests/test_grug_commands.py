@@ -98,3 +98,18 @@ def test_freeform_imperative_is_not_a_question():
     # Imperatives are statements to the room, not questions to Grug.
     assert parse_command("/grug do the thing") is None
     assert parse_command("/grug tell the team this is fine") is None
+
+
+def test_every_verb_names_a_persona_toggle():
+    """grug#1624: the dispatcher gates each verb on its own persona, so a
+    verb with no entry would have no gate. Every parsed verb maps to a
+    persona whose `<persona>_enabled` flag the repo config carries."""
+    from grug_commands import VERB_PERSONA, VERBS
+    from adapters.pg_install_store import _DEFAULT_PERSONA_CONFIG
+
+    assert set(VERB_PERSONA) == set(VERBS)
+    for verb, persona in VERB_PERSONA.items():
+        assert f"{persona}_enabled" in _DEFAULT_PERSONA_CONFIG, verb
+    assert VERB_PERSONA["recheck"] == "tpm"
+    assert VERB_PERSONA["improve"] == "code_reviewer"
+    assert VERB_PERSONA["ask"] == "code_reviewer"
