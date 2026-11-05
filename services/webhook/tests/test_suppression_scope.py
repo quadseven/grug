@@ -51,6 +51,20 @@ def test_nosemgrep_inside_a_string_is_not_a_directive():
     assert opengrep_scope(src, 2, "elder-js-dynamic-eval", {2}) == "none"
 
 
+@pytest.mark.parametrize("line", [
+    'const note = "/* nosemgrep */"; eval(x);',
+    'const url = "https://example"; const note = "nosemgrep"; eval(x);',
+    "const s = 'it\\'s // nosemgrep'; eval(x);",
+])
+def test_comment_markers_inside_strings_do_not_start_a_comment(line):
+    assert opengrep_scope(line + "\n", 1, "elder-js-dynamic-eval", set()) == "none"
+
+
+def test_a_real_comment_after_a_string_still_counts():
+    src = 'const url = "https://example"; eval(x); // nosemgrep\n'
+    assert opengrep_scope(src, 1, "elder-js-dynamic-eval", set()) == "base"
+
+
 def test_nosemgrep_matches_a_dotted_rule_id_suffix():
     src = "eval(x) // nosemgrep: dynamic-eval\n"
     assert opengrep_scope(src, 1, "rules.dynamic-eval", set()) == "base"

@@ -57,12 +57,34 @@ def _ids(raw: str | None) -> tuple[str, ...]:
     return tuple(part for part in re.split(r"[\s,]+", raw or "") if part)
 
 
+def _comment_start(text: str) -> int | None:
+    """Index of the first comment marker outside a quoted string on this
+    line, or None. Line-local: a string opened on an earlier line is not
+    seen, which errs toward reporting rather than hiding a finding."""
+    quote: str | None = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'`":
+            quote = ch
+        elif _COMMENT_START.match(text, i):
+            return i
+        i += 1
+    return None
+
+
 def _nosem_matches(text: str, rule_id: str) -> bool:
     # Only comment text counts: `x = "nosemgrep"` is a string, not a directive.
-    start = _COMMENT_START.search(text)
+    start = _comment_start(text)
     if start is None:
         return False
-    for m in _NOSEM_RE.finditer(text, start.start()):
+    for m in _NOSEM_RE.finditer(text, start):
         ids = _ids(m.group("ids"))
         if not ids:
             return True
