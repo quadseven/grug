@@ -572,6 +572,35 @@ def test_extract_symbols_includes_removed_string_literal():
     assert "Welcome back, friend" in symbols
 
 
+_DIFF_CHANGED_LITERAL_AMONG_DEFS = """diff --git a/src/messages.py b/src/messages.py
+--- a/src/messages.py
++++ b/src/messages.py
+@@ -3,3 +3,13 @@
+ def greeting():
+-    return "Welcome back, friend"
++    return "Welcome back"
++def farewell():
++    return "bye"
++def nudge():
++    return "hi"
++def title():
++    return "t"
++def footer():
++    return "f"
++def header():
++    return "h"
+"""
+
+
+def test_removed_literal_survives_the_symbol_cap():
+    """#847 review: five or more new defs filled the capped symbol list
+    before the removed literal, so the untouched test asserting the old
+    string was never searched. The literal keeps a slot."""
+    symbols = cross_file.extract_symbols(parse_diff(_DIFF_CHANGED_LITERAL_AMONG_DEFS))
+    assert len(symbols) == cross_file._MAX_SYMBOLS
+    assert "Welcome back, friend" in symbols
+
+
 def test_extract_symbols_skips_literal_still_present_and_short_ones():
     diff = """diff --git a/src/m.py b/src/m.py
 --- a/src/m.py

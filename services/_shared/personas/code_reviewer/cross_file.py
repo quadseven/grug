@@ -226,14 +226,21 @@ def extract_symbols(
             if name not in _STOP_NAMES and name not in calls:
                 calls.append(name)
 
-    out: list[str] = list(defs)
-    out.extend(lit for lit in _removed_literals(hunks) if lit not in out)
+    literals = [lit for lit in _removed_literals(hunks) if lit not in defs]
+    out: list[str] = list(defs) + literals
     for name in calls:
         # A name defined in-diff needs no definition lookup; as a DEF it
         # is already queued above (callers elsewhere still matter).
         if name not in defined_here and name not in out:
             out.append(name)
-    return tuple(out[:_MAX_SYMBOLS])
+    if len(out) > _MAX_SYMBOLS:
+        # The removed literals keep their slots (#847): a diff that adds
+        # many defs would otherwise push out the only symbol that finds an
+        # untouched test still asserting the old value. Order is kept.
+        room = _MAX_SYMBOLS - len(literals)
+        kept = set([name for name in out if name not in literals][:room])
+        out = [name for name in out if name in literals or name in kept]
+    return tuple(out)
 
 
 def fetch_cross_file_context(
