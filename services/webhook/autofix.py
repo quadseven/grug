@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import quote as _q
 
 import review_session as rs
+from bot_identity import commit_identity
 from personas.code_reviewer.suggestion import checked_suggestion
 from review_session import FindingRecord
 
@@ -28,8 +29,6 @@ log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.fix")
 
 _API = "https://api.github.com"
 _TIMEOUT = 15.0
-_BOT_NAME = "grug-tribe[bot]"
-_BOT_EMAIL = "grug-tribe[bot]@users.noreply.github.com"
 _DEFAULT_MODE = "100644"
 
 
@@ -212,8 +211,8 @@ def _do_commit(
                            "message": message,
                            "tree": new_tree_sha,
                            "parents": [head_sha],
-                           "author": {"name": _BOT_NAME, "email": _BOT_EMAIL},
-                           "committer": {"name": _BOT_NAME, "email": _BOT_EMAIL},
+                           "author": commit_identity(),
+                           "committer": commit_identity(),
                        })
     commit_resp.raise_for_status()
     new_commit_sha = commit_resp.json()["sha"]

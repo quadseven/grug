@@ -46,6 +46,7 @@ from activity_log import record_check_verdict
 from adapters.install_store import (
     CheckVerdictRecord, CommentRecord, get_check_verdict, list_comment_records_for_pr,
 )
+from bot_identity import bot_login
 from github_app_auth import get_app_id, with_install_token_retry
 from personas.registry import PullRequestContext
 
@@ -77,10 +78,8 @@ _HIGH_SEVERITY = frozenset(("high", "critical"))
 MARKER = "<!-- grug-sentinel:abandoned-review -->"
 # Elder's author login on REST review comments (pulls/N/comments) and on
 # webhook comment payloads. Neither carries performed_via_github_app, so the
-# login is the only own-app signal there (grug#1162). Literal for the same
-# reason as _HIGH_SEVERITY; Elder's GraphQL form, without the [bot] suffix,
-# is personas.code_reviewer.thread_resolver._BOT_LOGIN.
-_ELDER_BOT_LOGIN = "grug-tribe[bot]"
+# login is the only own-app signal there (grug#1162). The login comes from
+# bot_identity.bot_login() (GRUG_BOT_SLUG, #1630).
 # The fleet's agent Apps, whose reply on a finding thread counts as handled
 # (grug#1559). The brains post through their own Apps, so with an empty list
 # every one of their answers read as no reply at all.
@@ -192,7 +191,7 @@ def _is_own_bot(comment: dict, own_app_id: str) -> bool:
     if str(app.get("id", "")) == own_app_id:
         return True
     user = comment.get("user") or {}
-    return user.get("type") == "Bot" and user.get("login") == _ELDER_BOT_LOGIN
+    return user.get("type") == "Bot" and user.get("login") == bot_login()
 
 
 def _replied_to_comment_ids(token: str, owner: str, repo: str, pr_number: int) -> set[int]:

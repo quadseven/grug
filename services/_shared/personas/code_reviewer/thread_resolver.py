@@ -34,6 +34,7 @@ import os
 from typing import Any
 
 import httpx
+from bot_identity import is_own_login
 from github_app_auth import with_install_token_retry
 
 from personas import board, board_client
@@ -53,8 +54,6 @@ _COMMENTS_PER_THREAD = 20
 # thread's original line: pushes shift lines, so exact equality under-matches
 # and an under-match would resolve a thread the review just raised again.
 _NEARBY_LINES = 10
-# GraphQL reports an app author without the REST `[bot]` suffix.
-_BOT_LOGIN = "grug-tribe"
 
 _LIST_QUERY = """
 query($owner: String!, $repo: String!, $pr: Int!, $after: String,
@@ -134,7 +133,9 @@ def _graphql(token: str, query: str, variables: dict[str, Any]) -> dict:
 
 
 def is_grug(login: str | None) -> bool:
-    return (login or "").removesuffix("[bot]") == _BOT_LOGIN
+    """True when this App (GRUG_BOT_SLUG) wrote it. GraphQL reports an
+    App author without the REST `[bot]` suffix; both forms match."""
+    return is_own_login(login)
 
 
 def _fetch_threads(token: str, owner: str, repo: str, pr: int) -> list[dict]:
