@@ -28,6 +28,14 @@ GitHub Apps are personal — you can't share ours. Walk through
 - Client ID + Client Secret
 - Webhook secret
 - Private key file (`.pem`)
+- App slug (the name in the App's URL, `github.com/apps/<slug>`)
+
+Set `GRUG_BOT_SLUG=<slug>` in the env of every Deployment and CronJob.
+Grug compares comment authors against this slug (GraphQL `<slug>`, REST
+`<slug>[bot]`) to find its own review threads, so thread resolution,
+"Fixed in" replies, carry-forward and Sentinel only see the App's own
+comments when it matches. The autofix commit author is `<slug>[bot]` too.
+Unset or blank means `grug-tribe`, the hosted App.
 
 ### 2. Pre-load secrets into AWS SSM
 

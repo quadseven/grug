@@ -34,7 +34,6 @@ _MAX_PRS_PER_REPO = 20
 _MAX_REPOS_PER_INSTALL = 30
 _FETCH_TIMEOUT = 10
 _MARKER_PREFIX = "<!-- grug-pulse-comment-nudge:{comment_id} -->"
-_BOT_LOGINS = frozenset({"grug-tribe[bot]", "github-actions[bot]"})
 
 
 def _headers(token: str) -> dict[str, str]:
