@@ -600,6 +600,30 @@ def test_removed_literal_survives_the_symbol_cap():
     assert len(symbols) == cross_file._MAX_SYMBOLS
     assert "Welcome back, friend" in symbols
 
+    # And through the fetcher: the unchanged test that still asserts the old
+    # string is searched for and its stale assertion reaches review context.
+    test_src = (
+        "from messages import greeting\n\n"
+        "def test_greeting():\n"
+        '    assert greeting() == "Welcome back, friend"\n'
+    )
+    queried: list[str] = []
+
+    def fake_get(url, **kw):
+        if "/search/code" in url:
+            queried.append(kw["params"]["q"])
+            hit = "Welcome back, friend" in kw["params"]["q"]
+            return _search_response(["tests/test_messages.py"] if hit else [])
+        return _raw_response(test_src)
+
+    with patch.object(cross_file.httpx, "get", side_effect=fake_get):
+        out = cross_file.fetch_cross_file_context(
+            "tok", "o", "r", symbols,
+            head_sha="abc", exclude_paths=frozenset({"src/messages.py"}),
+        )
+    assert any("Welcome back, friend" in q for q in queried)
+    assert 'assert greeting() == "Welcome back, friend"' in out["tests/test_messages.py"]
+
 
 def test_extract_symbols_skips_literal_still_present_and_short_ones():
     diff = """diff --git a/src/m.py b/src/m.py
