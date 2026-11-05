@@ -164,41 +164,53 @@ def _request(mod, repo: str = "myorg/myrepo"):
     return mod.PrePrReviewRequest(repo=repo, base="main", head="feature/x")
 
 
-def test_returns_the_findings_elder_would_publish_and_writes_nothing(env):
-    mod, gh = env["mod"], env["gh"]
-
-    out = mod.pre_pr_review(_request(mod), _user())
-
-    kept_hunks = tuple(h for h in parse_diff(_DIFF) if h.file_path == "app.py")
-    expected = evaluate_diff(kept_hunks, _REPLY).findings
-    assert [f["file"] for f in out["findings"]] == ["app.py"]
-    assert out["findings"] == [
+def _published(findings) -> list[dict]:
+    return [
         {
             "file": f.file, "line": f.line, "severity": f.severity,
             "class": f.rule_name, "text": f.message,
         }
-        for f in expected
+        for f in findings
     ]
-    assert out["head_sha"] == _HEAD_SHA
-    assert out["base_sha"] == _BASE_SHA
-    # The base-ref `.grug.yaml` `ignore` kept vendor/ out of the review.
+
+
+def test_returns_the_findings_elder_would_publish(env):
+    mod = env["mod"]
+
+    out = mod.pre_pr_review(_request(mod), _user())
+
+    # The base-ref `.grug.yaml` `ignore` keeps vendor/ out of the review.
+    kept_hunks = tuple(h for h in parse_diff(_DIFF) if h.file_path == "app.py")
+    assert out["findings"] == _published(evaluate_diff(kept_hunks, _REPLY).findings)
+    assert [f["file"] for f in out["findings"]] == ["app.py"]
+    assert (out["base_sha"], out["head_sha"]) == (_BASE_SHA, _HEAD_SHA)
     assert out["ignored_paths"] == ["vendor/lib.py"]
     assert [h.path for h in env["reviewed"][0].hunks] == ["app.py"]
-    # Read-only: no write call, and the token itself can only read.
+
+
+def test_review_makes_no_github_write_and_holds_a_read_only_token(env):
+    mod, gh = env["mod"], env["gh"]
+
+    mod.pre_pr_review(_request(mod), _user())
+
     assert gh.calls, "the fake saw no GitHub traffic"
     assert gh.writes() == []
     assert env["scoped"] == [{
-        "install": 11, "repositories": ["myrepo"],
+        "install": _INSTALL, "repositories": ["myrepo"],
         "permissions": {"contents": "read", "metadata": "read"},
     }]
-    assert env["reserved"] == ["pre_pr_review:11"]
-    assert len(env["rows"]) == 1
-    row = env["rows"][0]
-    assert row["persona"] == "pre_pr_review"
-    assert row["install_id"] == 11
-    assert row["repo"] == "myorg/myrepo"
-    assert row["head_sha"] == _HEAD_SHA
-    assert row["findings_count"] == 1
+
+
+def test_review_records_one_pre_pr_review_activity_row(env):
+    mod = env["mod"]
+
+    mod.pre_pr_review(_request(mod), _user())
+
+    assert env["reserved"] == [f"pre_pr_review:{_INSTALL}"]
+    assert [
+        (r["persona"], r["install_id"], r["repo"], r["head_sha"], r["findings_count"])
+        for r in env["rows"]
+    ] == [("pre_pr_review", _INSTALL, "myorg/myrepo", _HEAD_SHA, 1)]
 
 
 def test_repo_outside_the_callers_installation_is_404(env):
