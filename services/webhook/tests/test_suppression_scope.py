@@ -46,6 +46,11 @@ def test_nosemgrep_for_another_rule_does_not_match():
     assert opengrep_scope(src, 1, "elder-js-dynamic-eval", set()) == "none"
 
 
+def test_nosemgrep_inside_a_string_is_not_a_directive():
+    src = 'const note = "nosemgrep";\neval(x);\n'
+    assert opengrep_scope(src, 2, "elder-js-dynamic-eval", {2}) == "none"
+
+
 def test_nosemgrep_matches_a_dotted_rule_id_suffix():
     src = "eval(x) // nosemgrep: dynamic-eval\n"
     assert opengrep_scope(src, 1, "rules.dynamic-eval", set()) == "base"
@@ -63,13 +68,13 @@ def test_noqa_scopes():
 # --- ruff ------------------------------------------------------------------
 
 def _ruff_hit(path: str, row: int, code: str) -> dict:
-    return {"filename": f"/tmp/x/{path}", "location": {"row": row},
+    return {"filename": f"/scan/{path}", "location": {"row": row},
             "code": code, "message": "Use of possibly insecure function"}
 
 
 def test_ruff_security_finding_with_pr_added_noqa_still_surfaces():
     src = "x = 1\neval(user)  # noqa: S307\n"
-    (f,) = lint_mod._map_results([_ruff_hit("a.py", 2, "S307")], "/tmp/x/",
+    (f,) = lint_mod._map_results([_ruff_hit("a.py", 2, "S307")], "/scan/",
                                  {"a.py": {2}}, {"a.py": src})
     assert f.line == 2 and "S307" in f.message
     assert f.severity == "medium"  # advisory, never blocking
@@ -78,14 +83,14 @@ def test_ruff_security_finding_with_pr_added_noqa_still_surfaces():
 
 def test_ruff_base_file_level_noqa_still_hides_the_finding():
     src = "# ruff: noqa: S307\neval(user)\n"
-    out = lint_mod._map_results([_ruff_hit("a.py", 2, "S307")], "/tmp/x/",
+    out = lint_mod._map_results([_ruff_hit("a.py", 2, "S307")], "/scan/",
                                 {"a.py": {2}}, {"a.py": src})
     assert out == ()
 
 
 def test_ruff_noqa_for_a_different_rule_does_not_hide_the_finding():
     src = "eval(user)  # noqa: B023\n"
-    (f,) = lint_mod._map_results([_ruff_hit("a.py", 1, "S307")], "/tmp/x/",
+    (f,) = lint_mod._map_results([_ruff_hit("a.py", 1, "S307")], "/scan/",
                                  {"a.py": {1}}, {"a.py": src})
     assert f.severity == "high" and PR_ADDED_NOTE not in f.message
 
@@ -106,7 +111,7 @@ def test_ruff_runs_with_noqa_ignored():
 def test_deferred_recheck_still_honors_noqa_at_head():
     """ruff_hits has no PR context, so every suppression counts as the
     repo's own, as it did before the engine stopped reading them."""
-    payload = json.dumps([_ruff_hit("a.py", 1, "S307")]).replace("/tmp/x/", "")
+    payload = json.dumps([_ruff_hit("a.py", 1, "S307")]).replace("/scan/", "")
 
     def fake_run(argv, **_kw):
         prefix = argv[-1].rstrip("/") + "/"

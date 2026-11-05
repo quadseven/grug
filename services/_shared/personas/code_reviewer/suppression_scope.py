@@ -32,6 +32,8 @@ PR_ADDED_NOTE = (
     "already on the base branch is still honored."
 )
 
+# Where a line comment starts, in the languages the rule packs read.
+_COMMENT_START = re.compile(r"#|//|/\*|<!--")
 # `nosemgrep` / `nosem`, optionally scoped: `nosemgrep: rule-a, rule-b`.
 _NOSEM_RE = re.compile(
     r"(?<![A-Za-z0-9_-])nosem(?:grep)?\b"
@@ -56,7 +58,11 @@ def _ids(raw: str | None) -> tuple[str, ...]:
 
 
 def _nosem_matches(text: str, rule_id: str) -> bool:
-    for m in _NOSEM_RE.finditer(text):
+    # Only comment text counts: `x = "nosemgrep"` is a string, not a directive.
+    start = _COMMENT_START.search(text)
+    if start is None:
+        return False
+    for m in _NOSEM_RE.finditer(text, start.start()):
         ids = _ids(m.group("ids"))
         if not ids:
             return True
