@@ -3924,6 +3924,8 @@ def dispatch_code_review(
         action=action, installation_id=installation_id, owner=owner,
         repo_name=repo_name, pull_number=pull_number, head_sha=head_sha,
         blocking=blocking, title=pr_context["title"], body=pr_context["body"],
+        labels=labels, author_family=author_family or "",
+        config=repr(base_repo_config),
     )
     full_pr_diff = functools.partial(
         _fetch_full_pr_diff, installation_id, owner, repo_name, pull_number,

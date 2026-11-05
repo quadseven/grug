@@ -105,11 +105,16 @@ def world(monkeypatch):
     return state
 
 
-def _record(diff=_DIFF, *, title="t", body="b", mode="blocking", head=_PRIOR):
-    return {
-        "head_sha": head, "patch_id": cv.patch_id(diff),
-        "context_id": cv.context_id(mode=mode, title=title, body=body),
-    }
+def _record(diff=_DIFF, *, body="b", blocking=True, labels=(), head=_PRIOR):
+    """The record a passed review of `_payload()` on `head` stored."""
+    pr = _payload()["pull_request"]
+    context = cv.CarryRequest(
+        action="review", installation_id=11, owner="o", repo_name="r",
+        pull_number=5, head_sha=head, blocking=blocking, title="t", body=body,
+        labels=frozenset(labels), author_family=cr_dispatch._author_family(pr) or "",
+        config=repr(None),
+    ).context
+    return {"head_sha": head, "patch_id": cv.patch_id(diff), "context_id": context}
 
 
 # --- patch-id -------------------------------------------------------------
@@ -120,6 +125,14 @@ def test_patch_id_ignores_blob_ids_and_line_offsets():
 
 def test_patch_id_sees_a_one_line_change():
     assert cv.patch_id(_DIFF) != cv.patch_id(_DIFF_ONE_LINE_MORE)
+
+
+def test_patch_id_sees_an_indentation_only_change():
+    assert cv.patch_id(_DIFF) != cv.patch_id(_DIFF.replace("+new2", "+    new2"))
+
+
+def test_patch_id_sees_lines_moved_under_another_function():
+    assert cv.patch_id(_DIFF) != cv.patch_id(_DIFF.replace("def f():", "def g():"))
 
 
 def test_patch_id_of_no_change_or_a_binary_file_is_empty():
@@ -226,7 +239,8 @@ def test_a_prior_head_without_elder_success_runs_the_full_review(world, runs):
     {"record": {"head_sha": _PRIOR, "patch_id": "", "context_id": ""}},
     {"record": _record(head=_HEAD)},
     {"record": _record(body="other intent")},
-    {"record": _record(mode="advisory")},
+    {"record": _record(blocking=False)},
+    {"record": _record(labels=("class:sensitive",))},
     {"threads": None},
 ])
 def test_anything_unproven_runs_the_full_review(world, change):

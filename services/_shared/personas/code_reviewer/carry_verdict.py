@@ -10,7 +10,8 @@ review of the PR's diff (review_publish, #845 and #1092).
 
 On a re-review, Elder reads the record of the last head it finished with
 (`ELDER#LAST`), which now also holds a patch-id of that head's PR diff and
-an id of the review context (mode, title and body). It carries only when
+an id of the review context (mode, title, body, labels, author family and
+the base repo's `.grug.yaml`). It carries only when
 every one of these holds:
 
   - that head's newest `Grug - Elder` run from this app completed
@@ -58,10 +59,12 @@ _BINARY_MARKERS = ("Binary files ", "GIT binary patch")
 def patch_id(diff_text: str) -> str:
     """A patch-id of a unified diff, stable across line-number shifts.
 
-    Like `git patch-id`: index lines and hunk line numbers are dropped and
-    whitespace is removed, so the same change on a moved base hashes the
-    same. "" for a diff with no change, and for one with a binary file,
-    whose content the diff text does not show."""
+    Every line is hashed byte for byte, whitespace included, since an
+    indent can move a statement in or out of a block. Only `index` lines
+    (blob ids change with the base) and the hunk line numbers are dropped;
+    the hunk's section heading and its context lines stay, so lines moved
+    under another function do not match. "" for a diff with no change, and
+    for one with a binary file, whose content the diff text does not show."""
     lines: list[str] = []
     changed = False
     for raw in diff_text.splitlines():
@@ -69,22 +72,23 @@ def patch_id(diff_text: str) -> str:
             return ""
         if raw.startswith("index "):
             continue
-        if _HUNK_HEADER_RE.match(raw):
-            lines.append("@@")
+        header = _HUNK_HEADER_RE.match(raw)
+        if header:
+            lines.append("@@" + raw[header.end():])
             continue
         if raw.startswith(("+", "-")) and not raw.startswith(("+++ ", "--- ")):
             changed = True
         elif raw.startswith(("rename from ", "deleted file", "new file", "old mode")):
             changed = True
-        lines.append("".join(raw.split()))
+        lines.append(raw)
     if not changed:
         return ""
     return hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
-def context_id(*, mode: str, title: str, body: str) -> str:
-    """An id of what else steers the review: a new mode or intent re-reviews."""
-    return hashlib.sha256(f"{mode}\0{title}\0{body}".encode()).hexdigest()
+def context_id(*parts: str) -> str:
+    """An id of the other review inputs: any change re-reviews."""
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,10 @@ class CarryRequest:
     blocking: bool
     title: str
     body: str
+    labels: frozenset[str] = frozenset()
+    author_family: str = ""
+    # The base repo's loaded `.grug.yaml`, as its frozen dataclass repr.
+    config: str = ""
 
     @property
     def pr(self) -> str:
@@ -107,8 +115,10 @@ class CarryRequest:
 
     @property
     def context(self) -> str:
-        mode = "blocking" if self.blocking else "advisory"
-        return context_id(mode=mode, title=self.title, body=self.body)
+        return context_id(
+            "blocking" if self.blocking else "advisory", self.title, self.body,
+            ",".join(sorted(self.labels)), self.author_family, self.config,
+        )
 
 
 def _read_record(req: CarryRequest) -> dict[str, str] | None:
