@@ -25,7 +25,15 @@ its reason and the review goes on. An analyzer never blocks or fails a review.
 THE REPO'S OWN CONFIG WINS. Ruff findings pass through the repo's ruff policy
 (repo_ruff_policy.py). Opengrep runs with the repo's `.semgrepignore`, read
 at the PR base, placed at the scan root, so paths the team ignored stay
-ignored; a `// nosemgrep` comment in the file is honored by the engine.
+ignored.
+
+INLINE SUPPRESSIONS COME FROM THE BASE (#1579). A `// nosemgrep` or `# noqa`
+comment sits inside the PR's own files, so a PR could hide its own finding by
+adding one. Both engines therefore run with in-file suppression off
+(`--disable-nosem`, `--ignore-noqa`), and suppression_scope.py honors a
+suppression only when its line was already on the base. A finding whose
+suppression the PR added is kept as an advisory marking that says so, and a
+rule-scoped suppression for a different rule hides nothing.
 
 READ-ONLY. Engines scan a temp copy of the changed files in a read-only tree,
 with a scrubbed environment and grug's own rules - see analyzer_sandbox.py.
@@ -63,6 +71,9 @@ from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.repo_ruff_policy import RepoRuffPolicy
 from personas.code_reviewer.sast import (
     _budget_files, _opengrep_home_env, _write_scan_files,
+)
+from personas.code_reviewer.suppression_scope import (
+    PR_ADDED_NOTE, opengrep_scope, record,
 )
 from review_types import Severity
 
@@ -164,7 +175,7 @@ def _run_opengrep(ctx: _Context) -> tuple[Finding, ...]:
             proc = subprocess.run(
                 ["opengrep", "scan", "--config", _ELDER_RULES_DIR, "--json",
                  "--quiet", "--disable-version-check", "--no-rewrite-rule-ids",
-                 "."],
+                 "--disable-nosem", "."],
                 cwd=scan_root, env=sandbox_env(home["HOME"], home),
                 capture_output=True, text=True, timeout=ctx.timeout_s,
                 check=False,
@@ -179,7 +190,7 @@ def _run_opengrep(ctx: _Context) -> tuple[Finding, ...]:
         data = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError as exc:
         raise AnalyzerSkip("unparseable") from exc
-    return map_opengrep_results(data, _changed_by_file(ctx.hunks))
+    return map_opengrep_results(data, _changed_by_file(ctx.hunks), kept)
 
 
 ANALYZERS: dict[str, AnalyzerSpec] = {
@@ -273,9 +284,13 @@ def _run_one(
 
 def map_opengrep_results(
     data: object, added: dict[str, set[int]],
+    files: dict[str, str] | None = None,
 ) -> tuple[Finding, ...]:
     """Opengrep JSON to diff-anchored, attributed Findings. A result missing
-    a field is skipped, never fatal."""
+    a field is skipped, never fatal.
+
+    `files` (path -> scanned text) lets a base `nosemgrep` hide its finding
+    and marks one the PR added (#1579); `added` is the PR's added lines."""
     results = data.get("results") if isinstance(data, dict) else None
     if not isinstance(results, list):
         return ()
@@ -295,8 +310,16 @@ def map_opengrep_results(
             continue
         if line not in added.get(path, set()):
             continue
-        findings.append(_opengrep_finding(path, line, rule_id, message,
-                                          str(extra.get("severity") or "")))
+        scope = opengrep_scope((files or {}).get(path), line, rule_id,
+                               added.get(path, set()))
+        record("opengrep", rule_id, path, scope)
+        if scope == "base":
+            continue
+        finding = _opengrep_finding(path, line, rule_id, message,
+                                    str(extra.get("severity") or ""))
+        if scope == "pr_added":
+            finding = replace(finding, message=f"{finding.message} {PR_ADDED_NOTE}")
+        findings.append(finding)
     return tuple(findings)
 
 

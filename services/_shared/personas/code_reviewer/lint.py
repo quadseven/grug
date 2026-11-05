@@ -57,6 +57,10 @@ Every other rule, and every rule in non-test files, is unchanged.
 Diff-anchored like every other source: only violations on lines THIS PR
 ADDED are reported, so Elder flags what the PR introduces rather than
 pre-existing debt the author did not touch.
+
+A `noqa` the PR itself added does not hide a finding (#1579): ruff runs with
+`--ignore-noqa` and suppression_scope.py honors only the suppressions already
+on the base. A finding whose `noqa` the PR added stays advisory and says so.
 """
 from __future__ import annotations
 
@@ -66,6 +70,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from dataclasses import replace
 from typing import NamedTuple
 
 from personas.code_reviewer.diff_parser import DiffHunk
@@ -78,6 +83,9 @@ from review_types import Severity  # single source (#250)
 # walks the unified diff body and returns new-side ADDED line numbers.
 from personas.code_reviewer.complexity import _changed_by_file
 from personas.code_reviewer.repo_ruff_policy import RepoRuffPolicy
+from personas.code_reviewer.suppression_scope import (
+    PR_ADDED_NOTE, record, ruff_scope,
+)
 from personas.code_reviewer.analyzer_sandbox import (
     AnalyzerSkip, read_only_tree, sandbox_env,
 )
@@ -323,7 +331,13 @@ def ruff_hits(file_contents: dict[str, str]) -> tuple[RuffHit, ...]:
     if not isinstance(results, list):
         raise AnalyzerSkip("unparseable")
     parsed = (_parse_result(r, prefix) for r in results)
-    return tuple(RuffHit(*hit) for hit in parsed if hit is not None)
+    # Ruff runs with --ignore-noqa (#1579). With no PR here, every noqa at
+    # the head is the repo's own, so it is honored as before.
+    return tuple(
+        RuffHit(*hit) for hit in parsed
+        if hit is not None
+        and ruff_scope(file_contents.get(hit[0]), hit[1], hit[2], set()) != "base"
+    )
 
 
 def _run_ruff(
@@ -337,12 +351,14 @@ def _run_ruff(
             # Read-only tree, scrubbed environment (#1254): ruff only parses
             # the copied files, and no pod secret reaches the child process.
             # --isolated stops ruff's walk up the tree finding a config above
-            # the temp directory (#1574).
+            # the temp directory (#1574). --ignore-noqa stops a `noqa` the
+            # PR wrote from hiding its own finding; suppression_scope puts
+            # back the ones already on the base (#1579).
             with read_only_tree(tmp):
                 proc = subprocess.run(
                     ["ruff", "check", "--isolated", "--select", _SELECT,
-                     "--ignore", _IGNORE, "--output-format", "json",
-                     "--no-cache", tmp],
+                     "--ignore", _IGNORE, "--ignore-noqa", "--output-format",
+                     "json", "--no-cache", tmp],
                     capture_output=True, text=True, timeout=timeout,
                     check=False, env=sandbox_env(tmp),
                 )
@@ -413,10 +429,19 @@ def _map_results(
         path, row, code, msg = parsed
         if not _is_reportable(path, row, code, added):
             continue
+        scope = ruff_scope((file_contents or {}).get(path), row, code,
+                           added.get(path, set()))
+        record("ruff", code, path, scope)
+        if scope == "base":
+            continue
         if policy and policy.drops(code, path):
             dropped_policy += 1
             continue
-        findings.append(_finding(path, row, code, msg, file_contents, r.get("fix")))
+        finding = _finding(path, row, code, msg, file_contents, r.get("fix"))
+        if scope == "pr_added":
+            finding = replace(finding, severity="medium",
+                              message=f"{finding.message} {PR_ADDED_NOTE}")
+        findings.append(finding)
         if len(findings) >= _MAX_FINDINGS:
             log.info("lint_ruff_findings_capped", extra={"cap": _MAX_FINDINGS})
             break

@@ -11,7 +11,9 @@
 # pinned by a planted case in tests/test_elder_analyzer_rules.py.
 #
 # A repo silences one line with `// nosemgrep: <rule id>` and whole paths with
-# its own `.semgrepignore`; the runner honors both.
+# its own `.semgrepignore`. The runner honors `.semgrepignore`, and honors a
+# `nosemgrep` only when its line is already on the base: one the PR adds does
+# not hide the finding, which is reported as advisory instead (#1579).
 rules:
   - id: elder-js-unescaped-html-sink
     languages: [javascript, typescript]
