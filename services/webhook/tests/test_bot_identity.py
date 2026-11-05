@@ -36,7 +36,7 @@ def test_blank_env_falls_back_to_default(monkeypatch):
     assert bot_identity.bot_slug() == "grug-tribe"
 
 
-@pytest.mark.parametrize("login", ["other-bot", "other-bot[bot]", "Other-Bot[bot]"])
+@pytest.mark.parametrize("login", ["other-bot", "other-bot[bot]", "Other-Bot[bot]", "OTHER-BOT[BOT]"])
 def test_is_own_login_matches_graphql_and_rest_forms(monkeypatch, login):
     monkeypatch.setenv("GRUG_BOT_SLUG", "other-bot")
     assert bot_identity.is_own_login(login)

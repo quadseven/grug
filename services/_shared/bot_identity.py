@@ -35,7 +35,8 @@ def is_own_login(login: str | None) -> bool:
     GitHub logins are case-insensitive."""
     if not login:
         return False
-    return login.removesuffix(_BOT_SUFFIX).lower() == bot_slug().lower()
+    folded = login.lower()
+    return folded.removesuffix(_BOT_SUFFIX) == bot_slug().lower()
 
 
 def commit_identity() -> dict[str, str]:
