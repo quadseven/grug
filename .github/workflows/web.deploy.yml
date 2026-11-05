@@ -8,14 +8,11 @@ on:
   push:
     branches:
       - main
-      - 'feat/27-*'
     tags: ['v*']
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: "Git ref to deploy"
-        required: false
-        default: ""
+  # No inputs: the run deploys the ref it was dispatched from, and the job
+  # guard below admits only main (#1626). A free-form `ref` input used to
+  # publish any ref as the production build with the prod token.
+  workflow_dispatch: {}
 
 concurrency:
   group: web-deploy-${{ github.ref }}
@@ -38,6 +35,9 @@ env:
 
 jobs:
   build-and-deploy:
+    # workflow_dispatch carries no branch restriction by itself; this guard
+    # matches deploy.k8s.yml so a manual run deploys main only (#1626).
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     # Public repo → GitHub-hosted ubuntu-latest is free + unmetered + no
     # nightly auto-reboot interruption risk. Swapped from a self-hosted
     # runner 2026-05-24.
@@ -46,8 +46,6 @@ jobs:
     steps:
       - name: 01. Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ inputs.ref || github.ref }}
 
       - name: 02. Setup Node 20
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
@@ -57,7 +55,7 @@ jobs:
       - name: 03. Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
         with:
-          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
           aws-region: us-east-1
 
       - name: 04. Resolve secrets from SSM
@@ -168,9 +166,11 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+        # Exact pin: this step holds the Cloudflare token, so the CLI must not
+        # float to whatever 3.x is newest at run time (#1626).
         run: |
           set -euo pipefail
-          npx --yes wrangler@3 pages deploy dist \
+          npx --yes wrangler@3.114.17 pages deploy dist \
             --project-name grug-web \
             --branch "${GITHUB_REF_NAME}" \
             --commit-hash "${GITHUB_SHA}"
