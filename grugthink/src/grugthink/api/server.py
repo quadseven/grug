@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
-from ..__version__ import __build_hash__, __version__
+from ..__version__ import __version__
 from ..bot_manager import BotManager
 from ..config.manager import ConfigManager
 from ..logging_config import get_logger, setup_logging
@@ -120,32 +120,14 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
             if not user:
                 return RedirectResponse("/login")
 
-        try:
-            # Serve modern interface
-            return FileResponse("web/modern-index.html")
-        except Exception:
-            try:
-                return FileResponse("web/index.html")
-            except Exception:
-                return {"message": "GrugThink Management API", "version": __version__, "build": __build_hash__}
+        return FileResponse("web/modern-index.html")
 
+    # The admin views live in the dashboard's settings page; there is no
+    # separate admin page, so the old paths land on the dashboard.
     @app.get("/admin")
-    async def admin_page(request: Request):
-        # Check if OAuth is disabled
-        disable_oauth = config_manager.get_env_var("DISABLE_OAUTH", "false").lower() == "true"
-        if not disable_oauth:
-            # Check if user is authenticated
-            user = request.session.get("user")
-            if not user:
-                return RedirectResponse("/login")
-        try:
-            return FileResponse("web/admin.html")
-        except Exception:
-            return {"message": "Admin page not available"}
-
     @app.get("/admin.html")
-    async def serve_admin_html():
-        return FileResponse("web/admin.html")
+    async def admin_page():
+        return RedirectResponse("/")
 
     @app.get("/login")
     async def login(request: Request):

@@ -1,4 +1,3 @@
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -28,8 +27,10 @@ if HAS_FASTAPI:
     from src.grugthink.config.manager import ConfigManager
 
 
-def make_server(tmp_cfg: Path):
-    os.environ["GRUGTHINK_CONFIG_PATH"] = str(tmp_cfg)
+def make_server(tmp_cfg: Path, monkeypatch):
+    # monkeypatch restores the variable, so later test files do not inherit a
+    # config path inside this test's deleted temporary directory.
+    monkeypatch.setenv("GRUGTHINK_CONFIG_PATH", str(tmp_cfg))
     cm = ConfigManager()
     # Disable OAuth for tests
     cm.set_env_var("DISABLE_OAUTH", "true")
@@ -38,12 +39,12 @@ def make_server(tmp_cfg: Path):
     return app, cm
 
 
-def test_admin_settings_get_and_put():
+def test_admin_settings_get_and_put(monkeypatch):
     if not HAS_FASTAPI:
         pytest.skip("fastapi/uvicorn not installed in this environment")
     with tempfile.TemporaryDirectory() as td:
         cfg = Path(td) / "grugthink_config.yaml"
-        app, cm = make_server(cfg)
+        app, cm = make_server(cfg, monkeypatch)
         client = TestClient(app)
 
         # GET default settings

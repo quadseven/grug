@@ -132,5 +132,8 @@ config + memory across restarts.
   granted visibility + send permission on the per-repo channels under
   the "GitHub" category - the same one-time step already done for
   Hermes. See the module docstrings for the full security model.
-- `readOnlyRootFilesystem` is intentionally not set yet - harden it once the
-  container's write paths (beyond `/data` and `/tmp`) are confirmed.
+- `readOnlyRootFilesystem: true` is set, so the container writes only to
+  `/data` (the PVC) and `/tmp` (an emptyDir). Personalities created through
+  the API are written to `$GRUGBOT_DATA_DIR/personalities` (`/data/personalities`
+  here), or to `GRUGTHINK_PERSONALITIES_DIR` when set; the image's own
+  `/app/personalities` is read-only and loads first.

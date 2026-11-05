@@ -1234,10 +1234,12 @@ async def wrapper(interaction, {params_sig}):
     await cmd(interaction, bot_instance, {call_args})
 """
 
-            # Execute the code to create the function
-            local_vars = {"cmd": cmd, "bot_instance": bot_instance}
-            exec(func_code, {}, local_vars)
-            wrapper = local_vars["wrapper"]
+            # Execute the code to create the function. cmd and bot_instance go
+            # in the GLOBALS: the function body resolves free names there, so
+            # passing them as exec locals raised NameError on every call.
+            namespace = {"cmd": cmd, "bot_instance": bot_instance}
+            exec(func_code, namespace)
+            wrapper = namespace["wrapper"]
 
             return wrapper
 
