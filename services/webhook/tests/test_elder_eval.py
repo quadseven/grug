@@ -1172,9 +1172,11 @@ def test_carried_scores_pass_only_at_the_sha_they_were_carried_to():
 
 def test_migration_left_the_committed_scores_alone():
     """grug#1511 added sha fields to the entry and moved no score. A live
-    re-record drops `carried_prompt_sha`, and the scores may then move."""
-    entry = load_baseline()["backends"]["cave"]
-    if "carried_prompt_sha" not in entry:
+    re-record drops `carried_prompt_sha`, and the scores may then move. A
+    re-record on a changed prompt drops the stale `cave` entry altogether
+    (`merge_baseline`), which ends the migration the same way."""
+    entry = load_baseline()["backends"].get("cave")
+    if entry is None or "carried_prompt_sha" not in entry:
         return
     assert entry["cases_scored"] == 17
     assert entry["overall_catch"] == 0.1746031746031746

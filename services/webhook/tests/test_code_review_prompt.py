@@ -439,6 +439,20 @@ def test_intent_mismatch_rule_contract():
         assert rule.description in prompt, f"variant {variant} lost the rule text"
 
 
+def test_stale_test_assertion_rule_contract():
+    """#847: a diff that changes a value while an UNCHANGED test still
+    asserts the old one (the zippie PR 165 shape) needs a named rule, or
+    the model is never asked to look. The rule must tell the model to
+    anchor on the changed diff line and to rely on cross-file evidence."""
+    rule = next((r for r in crp.RULES if r.name == "stale-test-assertion"), None)
+    assert rule is not None, "stale-test-assertion missing from RULES"
+    assert rule.bug_class == "test fidelity"
+    assert "UNCHANGED" in rule.description
+    assert "cross-file" in rule.description
+    for variant in ("v1", "v2"):
+        assert rule.description in crp.build_system_prompt(variant)
+
+
 def test_stale_reverse_check_intermediary_rule_contract():
     """#1421: Elder flags a reverse check built from a stale intermediary.
     Pin the rule contract: correctness-class rule at high severity whose
