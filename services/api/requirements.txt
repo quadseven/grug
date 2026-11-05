@@ -10,3 +10,5 @@ ddtrace>=3.5,<4
 # Postgres store (#306 epic store port) - pool included for the
 # long-lived k8s runtime (Lambda used per-invoke connections).
 psycopg[binary,pool]>=3.2,<4.0
+# .grug.yaml parsing (repo_config.py) for the pre-PR Elder review (grug#1438).
+pyyaml>=6,<7

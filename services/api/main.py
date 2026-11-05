@@ -24,6 +24,7 @@ from auth.github_oauth import router as github_oauth_router
 from cf_auth import CfAuthMiddleware
 from installations import router as installations_router
 from learnings import router as learnings_router
+from pre_pr_review import router as pre_pr_review_router
 from aws_identity import prove_roles_anywhere_identity
 from observability import configure_logging
 
@@ -105,6 +106,7 @@ app.include_router(github_oauth_router)
 app.include_router(installations_router)
 app.include_router(admin_router)
 app.include_router(learnings_router)
+app.include_router(pre_pr_review_router)
 
 
 @app.get("/api/v1/health")
