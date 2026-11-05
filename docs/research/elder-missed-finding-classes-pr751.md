@@ -122,13 +122,25 @@ The `stale-test-assertion` rule (issue 847) targets the `test-gap` class.
 `baseline.json` holds only the `prompt_sha` plus the backends recorded
 against that exact prompt, so the pre-change numbers are kept here.
 
+Both rows below were measured on 2026-11-04 with the same harness and model,
+OpenRouter's free tier (`nvidia/nemotron-3-ultra-550b-a55b:free`, no spend),
+via the `make elder-eval` command with `--backend openrouter` and
+`GRUG_BENCH_OPENROUTER_MODEL` set to that model (plus
+`--with-requirements requirements.txt`, because the target's dependency
+list lacks `pyyaml`). "Before" ran main at
+`f3a2b581` (prompt without the rule); "after" ran this change with `--record`,
+which wrote the committed `baseline.json` entry.
+
 | Measurement | Prompt sha | Backend | Cases scored | test-gap catch | Overall catch |
 | --- | --- | --- | --- | --- | --- |
-| Before the rule | `8f85cf9da27d...` | cave (`qwen3-coder-next:q8_0`) | 17 | 0.25 | 0.1746 |
-| After the rule | `4d66baea506b...` | not yet measured | - | - | - |
+| Before the rule | `fd698008772e...` | openrouter (nemotron-3-ultra free) | 17 (1 errored) | 0.27 | 0.25 |
+| After the rule | `aed36784141d...` | openrouter (nemotron-3-ultra free) | 18 | 0.25 | 0.29 |
 
-The "after" row needs the benchmark environment's LLM backend, which this
-change could not reach. An operator records it with
-`make elder-eval ARGS="--backend cave --record"` and fills in the row. The
-before numbers come from the `cave` entry that `baseline.json` carried
-before the rule landed (git history of that file).
+Result: the rule did not move the test-gap catch rate on this corpus. The
+difference is within one case, and the two runs scored different case sets
+(the "before" run lost one case to an error). The original miss that motivated the rule
+is excluded from the corpus as known-dead (#895), so the eval holds no
+stale-assertion case of the shape this rule targets; the regression test in
+`test_cross_file.py` is the direct evidence for that shape. The previous
+cave measurement (`qwen3-coder-next:q8_0`, 17 cases, test-gap 0.25, overall
+0.1746) is not comparable to these rows because the model differs.
