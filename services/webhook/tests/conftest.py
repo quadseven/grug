@@ -171,16 +171,16 @@ def _mock_chief_ticket_recheck(monkeypatch):
 def _mock_learn_living_review_sync(monkeypatch):
     """Neutralize the learn lane's living-review sync (#1187) by default.
 
-    `rerun._run_learn` ends by syncing the PR's Elder findings, which lists
+    `learn_job._run_learn` ends by syncing the PR's Elder findings, which lists
     review threads on GitHub and reads CommentRecords from the store - side
     effects the learn tests never expected. Tests that verify the sync patch
-    `rerun._sync_living_review` themselves (innermost patch wins).
+    `learn_job._sync_living_review` themselves (innermost patch wins).
     """
     from unittest.mock import MagicMock
 
-    import rerun
+    import learn_job
 
-    monkeypatch.setattr(rerun, "_sync_living_review", MagicMock(return_value=0))
+    monkeypatch.setattr(learn_job, "_sync_living_review", MagicMock(return_value=0))
 
 
 class _LabelHttpResponse:
