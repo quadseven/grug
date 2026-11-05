@@ -240,6 +240,11 @@ make chief-check REPO=owner/name PR=123       # an open PR
 - `make smoke`: checks the public endpoints answer.
 - `make elder-eval` and `make sast-benchmark`: score review quality on a
   committed corpus. These call real models.
+- [`scripts/shepherd.py`](scripts/shepherd.py): read-only operator report.
+  `python3 scripts/shepherd.py pr-queue --repo OWNER/NAME` lists open PRs
+  by readiness across CI and the bot comment surfaces;
+  `python3 scripts/shepherd.py webhook` says whether the last merged image
+  is the one deployed.
 - [`scripts/shepherd_verify.py`](scripts/shepherd_verify.py): after a
   deploy, checks a PR's acceptance bullets that name a `Metric`,
   `Log event`, `Endpoint` or `GET` signal.

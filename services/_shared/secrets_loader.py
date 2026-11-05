@@ -69,11 +69,6 @@ def get_app_id() -> str:
     return _get_ssm_secure_string(name)
 
 
-def get_app_private_key() -> str:
-    name = os.getenv("GITHUB_APP_PRIVATE_KEY_SSM", "")
-    return _get_ssm_secure_string(name)
-
-
 def get_openrouter_api_key() -> str:
     name = os.getenv("GRUG_OPENROUTER_API_KEY_SSM", "")
     return _get_ssm_secure_string(name)
@@ -303,9 +298,3 @@ def get_fallback_enabled() -> bool:
         return False
     return value in ("true", "1", "yes", "on")
 
-
-def get_dd_service_env_pair() -> tuple[str, str]:
-    """(DD_SERVICE, DD_ENV) pair for tagging ad-hoc spans outside the
-    normal request path, read straight from process env with no SSM
-    round-trip - both are non-secret deploy-time labels."""
-    return (os.getenv("DD_SERVICE", "grug"), os.getenv("DD_ENV", "prod"))

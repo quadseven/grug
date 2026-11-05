@@ -1,8 +1,9 @@
 """Tests for github_oauth route handlers — login + me + logout.
 
-Callback tests (token exchange + user upsert) deferred to v1.5
-(needs httpx.MockTransport per #105). These cover the simpler routes
-that can be tested by direct call + mocked deps.
+The callback tests at the end mock httpx.post / httpx.get at the module
+boundary and cover every exit: state mismatch, upstream failure on the
+token and user endpoints, a missing token, a malformed user payload and
+the success path (#1636).
 """
 
 from __future__ import annotations
@@ -179,3 +180,138 @@ def test_callback_non_json_token_response_is_502_not_500(_oauth_mod, monkeypatch
     with patch("httpx.post", return_value=fake), pytest.raises(HTTPException) as e:
         _oauth_mod.callback(code="c", state="s", grug_oauth_state="s")
     assert e.value.status_code == 502
+
+
+# --- callback branches (#1636) ----------------------------------------------
+
+def _resp(json_body=None, status_error=None):
+    from unittest.mock import MagicMock
+
+    r = MagicMock()
+    r.raise_for_status = MagicMock(side_effect=status_error)
+    r.json = MagicMock(return_value=json_body)
+    return r
+
+
+def _status_error(code):
+    import httpx
+
+    req = httpx.Request("POST", "https://github.com/login/oauth/access_token")
+    return httpx.HTTPStatusError(
+        "upstream", request=req, response=httpx.Response(code, request=req),
+    )
+
+
+@pytest.mark.parametrize(
+    "state,cookie",
+    [("s", "other"), ("s", ""), ("", "")],
+    ids=["mismatch", "no-cookie", "empty"],
+)
+def test_callback_state_mismatch_is_400_before_any_upstream_call(_oauth_mod, state, cookie):
+    from fastapi import HTTPException
+
+    with patch("httpx.post") as post, pytest.raises(HTTPException) as e:
+        _oauth_mod.callback(code="c", state=state, grug_oauth_state=cookie)
+    assert e.value.status_code == 400
+    assert e.value.detail == "invalid_state"
+    post.assert_not_called()
+
+
+def test_callback_unsigned_state_is_400_even_when_cookie_matches(_oauth_mod):
+    from fastapi import HTTPException
+
+    with patch("httpx.post") as post, pytest.raises(HTTPException) as e:
+        _oauth_mod.callback(code="c", state="forged", grug_oauth_state="forged")
+    assert e.value.status_code == 400
+    post.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["status", "transport"])
+def test_callback_token_endpoint_failure_is_502(_oauth_mod, monkeypatch, failure):
+    import httpx
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(_oauth_mod, "_verify_state", lambda s: True)
+    if failure == "status":
+        kw = {"return_value": _resp(status_error=_status_error(503))}
+    else:
+        kw = {"side_effect": httpx.ConnectError("dns")}
+    with patch("httpx.post", **kw), pytest.raises(HTTPException) as e:
+        _oauth_mod.callback(code="c", state="s", grug_oauth_state="s")
+    assert e.value.status_code == 502
+    assert e.value.detail == "oauth_upstream_failed"
+
+
+def test_callback_missing_access_token_is_400(_oauth_mod, monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(_oauth_mod, "_verify_state", lambda s: True)
+    body = {"error": "bad_verification_code"}
+    with patch("httpx.post", return_value=_resp(body)), \
+            patch("httpx.get") as get, \
+            patch.object(_oauth_mod, "upsert_oauth_user") as upsert, \
+            pytest.raises(HTTPException) as e:
+        _oauth_mod.callback(code="c", state="s", grug_oauth_state="s")
+    assert e.value.status_code == 400
+    assert e.value.detail == "oauth_token_exchange_failed"
+    get.assert_not_called()
+    upsert.assert_not_called()
+
+
+def test_callback_user_endpoint_failure_is_502(_oauth_mod, monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(_oauth_mod, "_verify_state", lambda s: True)
+    with patch("httpx.post", return_value=_resp({"access_token": "gho_x"})), \
+            patch("httpx.get", return_value=_resp(status_error=_status_error(401))), \
+            patch.object(_oauth_mod, "upsert_oauth_user") as upsert, \
+            pytest.raises(HTTPException) as e:
+        _oauth_mod.callback(code="c", state="s", grug_oauth_state="s")
+    assert e.value.status_code == 502
+    assert e.value.detail == "oauth_upstream_failed"
+    upsert.assert_not_called()
+
+
+def test_callback_user_payload_without_id_is_502(_oauth_mod, monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(_oauth_mod, "_verify_state", lambda s: True)
+    with patch("httpx.post", return_value=_resp({"access_token": "gho_x"})), \
+            patch("httpx.get", return_value=_resp({"login": "alice"})), \
+            patch.object(_oauth_mod, "upsert_oauth_user") as upsert, \
+            pytest.raises(HTTPException) as e:
+        _oauth_mod.callback(code="c", state="s", grug_oauth_state="s")
+    assert e.value.status_code == 502
+    assert e.value.detail == "oauth_user_malformed"
+    upsert.assert_not_called()
+
+
+def test_callback_success_upserts_and_sets_a_session_for_that_user(_oauth_mod):
+    from adapters.user_store import UserIdentity
+
+    login = _oauth_mod.login()
+    state = login.headers["set-cookie"].split("grug_oauth_state=", 1)[1].split(";", 1)[0]
+    user = UserIdentity(
+        github_user_id="4242", login="alice", role="user", tier="free",
+        allowlisted=False, created_at="", allowlisted_at=None, allowlisted_by=None,
+    )
+    token_body = {"access_token": "gho_access", "refresh_token": "ghr_refresh"}
+    with patch("httpx.post", return_value=_resp(token_body)) as post, \
+            patch("httpx.get", return_value=_resp({"id": 4242, "login": "alice"})) as get, \
+            patch.object(_oauth_mod, "upsert_oauth_user", return_value=user) as upsert:
+        resp = _oauth_mod.callback(code="the-code", state=state, grug_oauth_state=state)
+
+    assert post.call_args.kwargs["data"]["code"] == "the-code"
+    assert get.call_args.kwargs["headers"]["Authorization"] == "Bearer gho_access"
+    upsert.assert_called_once_with(
+        github_user_id="4242", login="alice",
+        oauth_access_token="gho_access", oauth_refresh_token="ghr_refresh",
+    )
+    assert resp.status_code == 302
+    assert resp.headers["location"] == _oauth_mod._DASHBOARD_URL
+    cookies = resp.headers.getlist("set-cookie")
+    session = next(c for c in cookies if c.startswith("grug_session="))
+    assert "HttpOnly" in session and "Secure" in session
+    value = session.split("grug_session=", 1)[1].split(";", 1)[0]
+    assert _oauth_mod._verify_session(value) == "4242"
+    assert any(c.startswith("grug_oauth_state=") for c in cookies)

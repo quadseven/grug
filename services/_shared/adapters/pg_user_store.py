@@ -112,7 +112,17 @@ def delete_user_state(github_user_id: str) -> None:
 def get_user_with_tokens(github_user_id: str) -> UserWithTokens | None:
     """Identity + decrypted OAuth tokens, or None. KMS Decrypt happens
     here; CredentialBlobCorrupt triggers the documented opportunistic
-    purge + clean miss (user re-auths)."""
+    purge + clean miss (user re-auths).
+
+    Kept without a route caller on purpose (#1636): it is the only read
+    path for the blobs `upsert_oauth_user` writes, and the KMS envelope
+    contract (the corruption purge and the single UserWithTokens
+    construction site) is pinned on it by test_pg_stores.py,
+    test_user_store_corruption_purge.py and the two attesters
+    attest_kms_corruption_cleanup.py and
+    attest_user_with_tokens_decrypt_boundary.py. Deleting it would leave
+    the stored tokens write-only; a route that acts on behalf of a user
+    wires it through an auth dependency."""
     from crypto.kms_envelope import CredentialBlobCorrupt, decrypt_for_user  # lazy
 
     item = _fetch_item(github_user_id)

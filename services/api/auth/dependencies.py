@@ -7,10 +7,10 @@ Layered deps so routes pick the strictness they need:
   - get_current_user                  → UserIdentity | None (for /me-like routes)
   - require_authenticated             → UserIdentity (401 if missing)
   - require_admin                     → UserIdentity (403 if not admin)
-  - require_authenticated_with_tokens → UserWithTokens (401 if missing)
-                                        ← ONLY for OAuth-refresh + on-behalf-of-user
-                                          paths. Forces an extra KMS Decrypt; default
-                                          paths use the identity-only deps above.
+
+No dependency returns decrypted OAuth tokens: no route acts on behalf of
+a user today. `get_user_with_tokens` in the user store is the decrypt
+path to wire here when one does.
 
 Allowlist-gating happens at the persona/dispatch layer, NOT here —
 non-allowlisted users still need to see /dashboard so they can be told
@@ -25,9 +25,7 @@ from fastapi import Cookie, HTTPException, status
 
 from adapters.user_store import (
     UserIdentity,
-    UserWithTokens,
     get_user,
-    get_user_with_tokens,
 )
 from auth.github_oauth import _verify_session  # type: ignore[reportPrivateUsage]
 
@@ -66,25 +64,3 @@ def require_admin(grug_session: str = Cookie(default="")) -> UserIdentity:
         )
     return user
 
-
-def require_authenticated_with_tokens(
-    grug_session: str = Cookie(default=""),
-) -> UserWithTokens:
-    """Authenticate + return user with decrypted OAuth tokens.
-
-    KMS Decrypt happens on every request through this dep. Default paths
-    must use `require_authenticated` instead.
-    """
-    gh_id = _verify_session(grug_session)
-    if gh_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="not authenticated",
-        )
-    user = get_user_with_tokens(gh_id)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="not authenticated",
-        )
-    return user
