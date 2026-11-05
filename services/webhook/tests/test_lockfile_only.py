@@ -1,97 +1,61 @@
-"""grug#1649: a lock-file-only pull request concludes success, not neutral.
+"""grug#1649: a lock-file-only pull request gets a real Elder review.
 
 Lock files are dropped from Elder's plate (#609), so a diff made only of
 them reached the model with nothing and published a neutral "eyes clouded
-(no_diff)" that never clears a blocking gate. A lock-file-only diff now
-concludes success only when (a) every file name is on the explicit list,
-(b) the head is in the base repository and its author is trusted, and
-(c) every URL host on an added lock line is an allowed registry host.
-Anything else stays neutral, and a diff that mixes a lock file with a
-reviewable file is reviewed as before.
+(no_diff)" that never clears a blocking gate. No verdict may come from a
+skip: when every changed file is a lock file, Elder sends the full
+base..head lock diff to the model and concludes from findings like any
+other diff, with the deterministic lock-source check added. A failed lock
+review does not advance the Living Hunt baseline.
 """
 
 from __future__ import annotations
 
+import re
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from github_checks_client import CheckRunResult
 from llm_client import Backend, LlmReviewResponse
 from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
-from personas.code_reviewer.diff_parser import file_changes, parse_diff
-from personas.code_reviewer.lock_files import (
-    LOCK_FILES_ONLY_TITLE as LOCK_TITLE,
-    is_lock_file_path,
-    judge_lock_only,
-    line_hosts,
-)
+from personas.code_reviewer.lock_sources import RULE
 
-_REPO = {"id": 22, "name": "myrepo", "owner": {"login": "myorg"}}
-_FORK = {"id": 99, "name": "myrepo", "owner": {"login": "stranger"}}
+_UV_BASE = """version = 1
+
+[[package]]
+name = "app"
+version = "0.1.0"
+source = { virtual = "." }
+"""
+_GOOD = [
+    "[[package]]",
+    'name = "idna"',
+    'version = "3.7"',
+    'source = { registry = "https://pypi.org/simple" }',
+]
+_EVIL = [
+    "[[package]]",
+    'name = "idna"',
+    'version = "3.7"',
+    'source = { registry = "https://evil.example.net/simple" }',
+]
 
 
-def _modified(path: str, old: str = "a = 1", new: str = "a = 2") -> str:
+def _added(path: str, lines: list[str]) -> str:
+    body = "".join(f"+{x}\n" for x in lines)
     return (
         f"diff --git a/{path} b/{path}\n"
         "index 39dc28b90..1a2b3c4d5 100644\n"
         f"--- a/{path}\n"
         f"+++ b/{path}\n"
-        "@@ -1,2 +1,2 @@\n"
-        " keep\n"
-        f"-{old}\n"
-        f"+{new}\n"
+        f"@@ -6,0 +7,{len(lines)} @@\n" + body
     )
 
 
-def _binary(path: str) -> str:
-    return (
-        f"diff --git a/{path} b/{path}\n"
-        "index 39dc28b90..1a2b3c4d5 100644\n"
-        f"Binary files a/{path} and b/{path} differ\n"
-    )
-
-
-_PYPI = 'sdist = { url = "https://files.pythonhosted.org/packages/ab/cd/x-1.0.tar.gz" }'
-_NPM = '"resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",'
-_EVIL = 'sdist = { url = "https://evil.example.net/packages/x-1.0.tar.gz" }'
-
-_LOCK_ONLY_DIFF = (
-    _modified("pulumi/stack-a/uv.lock", new=_PYPI)
-    + _modified("pulumi/stack-b/uv.lock")
-    + _modified("web/package-lock.json", new=_NPM)
-)
-_MIXED_DIFF = _modified("pulumi/stack-a/uv.lock") + _modified("src/app.py")
-
-
-@pytest.fixture(autouse=True)
-def _patch_token(monkeypatch):
-    monkeypatch.setattr(
-        cr_dispatch, "with_install_token_retry", lambda inst_id, fn: fn("fake-token"),
-    )
-    monkeypatch.setattr(
-        review_publish, "with_install_token_retry", lambda inst_id, fn: fn("fake-token"),
-    )
-
-
-def _payload(*, head_repo: dict, user: dict, association: str) -> dict:
-    return {
-        "action": "opened",
-        "installation": {"id": 11},
-        "repository": _REPO,
-        "pull_request": {
-            "number": 7,
-            "head": {"sha": "abcd1234efgh", "repo": head_repo},
-            "base": {"sha": "base5678ijkl"},
-            "title": "Bump a dependency in the locks",
-            "body": "Refreshes the lock files.",
-            "user": user,
-            "author_association": association,
-        },
-    }
-
-
-_MEMBER = {"login": "alice", "type": "User"}
+def _head(lines: list[str]) -> str:
+    return _UV_BASE + "\n" + "\n".join(lines) + "\n"
 
 
 def _response(*, text: str = "", json: object = None, status: int = 200):
@@ -109,180 +73,147 @@ def _response(*, text: str = "", json: object = None, status: int = 200):
     return r
 
 
-def _run(
-    monkeypatch, diff: str, *, head_repo: dict = _REPO, user: dict = _MEMBER,
-    association: str = "MEMBER",
-) -> tuple[list, list]:
-    posted_check: list = []
-    reviewed_paths: list = []
+def _review_pr(
+    monkeypatch, *, full: str, files: dict[tuple[str, str], str],
+    delta: str | None = None,
+) -> dict:
+    """Run one Elder review. `files` maps (path, ref) to whole-file text;
+    `delta` set means a stored last Elder head and a synchronize push."""
+    seen: dict = {"reviewed": [], "full": [], "checks": [], "baseline": []}
 
     def _fake_get(url, *args, **kwargs):
         if "/contents/" in url:
-            return _response(status=404)
+            path = url.split("/contents/", 1)[1]
+            ref = (kwargs.get("params") or {}).get("ref", "")
+            text = files.get((path, ref))
+            return _response(text=text) if text is not None else _response(status=404)
         if "/git/trees/" in url:
             return _response(json={"tree": []})
         if "/search/code" in url:
             return _response(json={"total_count": 0, "items": []})
-        return _response(text=diff)
+        return _response(text=full)
 
-    def _review(evidence, **kw):
-        # The real review_diff short-circuits to no_diff on empty hunks.
-        paths = [h.path for h in evidence.hunks]
-        reviewed_paths.append(paths)
-        if not paths:
+    def _review(evidence, *_a, **_k):
+        if not evidence.hunks:
             return LlmReviewResponse(kind="no_diff")
+        seen["reviewed"].append({h.path for h in evidence.hunks})
         return LlmReviewResponse(
-            kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+            kind="reviewed", findings=(), backend_used=Backend.CAVE, model_name="coder",
         )
 
+    def _check(*a, **k):
+        result = k.get("result") or next(x for x in a if isinstance(x, CheckRunResult))
+        seen["checks"].append(result)
+        return {"id": 1}
+
+    def _full(*_a, **k):
+        seen["full"].append((k.get("base_sha"), k.get("head_sha")))
+        return full
+
+    monkeypatch.setattr(cr_dispatch, "with_install_token_retry", lambda _i, fn: fn("t"))
+    monkeypatch.setattr(review_publish, "with_install_token_retry", lambda _i, fn: fn("t"))
     monkeypatch.setattr(cr_dispatch, "review_diff", _review)
-    monkeypatch.setattr(
-        cr_dispatch, "post_check_run",
-        lambda token, owner, repo, result, external_id=None: (
-            posted_check.append(result) or {"id": 1}
-        ),
-    )
+    monkeypatch.setattr(cr_dispatch, "post_check_run", _check)
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 2})
-    payload = _payload(head_repo=head_repo, user=user, association=association)
-    with patch("httpx.get", side_effect=_fake_get):
-        cr_dispatch.dispatch_code_review(payload, blocking=True)
-    return posted_check, reviewed_paths
+    monkeypatch.setattr(cr_dispatch, "fetch_pr_diff", _full)
+    monkeypatch.setattr(
+        cr_dispatch, "fetch_pr_diff_with_scope",
+        lambda *_a, **_k: (delta or "", True, False),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "_fetch_current_review_snapshot",
+        lambda *a, **k: ("base5678ijkl", "abcd1234efgh", "t", "b"),
+    )
+    with patch("httpx.get", side_effect=_fake_get), patch(
+        "adapters.install_store.get_elder_last_reviewed",
+        return_value="prior0001head" if delta is not None else None,
+    ), patch(
+        "adapters.install_store.put_elder_last_reviewed",
+        lambda **k: seen["baseline"].append(k["head_sha"]),
+    ):
+        cr_dispatch.dispatch_code_review({
+            "action": "synchronize" if delta is not None else "opened",
+            "installation": {"id": 11},
+            "repository": {"id": 22, "name": "myrepo", "owner": {"login": "myorg"}},
+            "pull_request": {
+                "number": 7,
+                "head": {"sha": "abcd1234efgh"},
+                "base": {"sha": "base5678ijkl"},
+                "title": "Bump idna in the lock",
+                "body": "Refreshes the lock file.",
+                "user": {"login": "alice"},
+            },
+        }, blocking=True)
+    return seen
 
 
-# (a) the explicit file-name list
+def _lock_files(lines: list[str], path: str = "uv.lock") -> dict:
+    return {(path, "abcd1234efgh"): _head(lines), (path, "base5678ijkl"): _UV_BASE}
 
 
-@pytest.mark.parametrize("path", [
-    "uv.lock", "pulumi/stack/uv.lock", "poetry.lock", "Pipfile.lock",
-    "Cargo.lock", "web/package-lock.json", "pnpm-lock.yaml", "yarn.lock",
-    "go.sum", "Gemfile.lock", "infra/.terraform.lock.hcl", "composer.lock",
-])
-def test_listed_lock_file_names_are_recognised(path):
-    assert is_lock_file_path(path)
-
-
-@pytest.mark.parametrize("path", [
-    "src/app.py", "data/rows.jsonl", "vendor/lib/x.go", "dist/app.js",
-    "docs/lockfile.md", "src/lock.py", "flake.lock", "mix.lock",
-    "evil.lock", "uv.lock.bak",
-])
-def test_unlisted_names_are_not_lock_files(path):
-    assert not is_lock_file_path(path)
-
-
-def test_an_unlisted_dot_lock_file_stays_neutral(monkeypatch):
-    final = _run(monkeypatch, _modified("tools/flake.lock"))[0][-1]
-    assert final.conclusion == "neutral", (final.conclusion, final.title)
-    assert final.title != LOCK_TITLE
-
-
-# The success path and the mixed path
-
-
-def test_a_trusted_lock_file_only_diff_concludes_success(monkeypatch):
-    checks, _ = _run(monkeypatch, _LOCK_ONLY_DIFF)
-    final = checks[-1]
+def test_a_lock_file_only_diff_is_sent_to_the_model(monkeypatch):
+    seen = _review_pr(monkeypatch, full=_added("uv.lock", _GOOD), files=_lock_files(_GOOD))
+    assert seen["reviewed"] == [{"uv.lock"}]
+    final = seen["checks"][-1]
     assert final.conclusion == "success", (final.conclusion, final.title)
-    assert final.title == LOCK_TITLE
-    assert "pulumi/stack-a/uv.lock" in final.summary
+    assert "no_diff" not in final.title
+    assert "lock files only" not in final.title
 
 
-def test_a_lock_file_plus_source_file_is_reviewed_as_normal(monkeypatch):
-    checks, reviewed = _run(monkeypatch, _MIXED_DIFF)
-    final = checks[-1]
-    assert ["src/app.py"] in reviewed, reviewed
-    assert final.title != LOCK_TITLE
-    assert "Lock-file-only" not in final.summary
+def test_a_lock_file_only_diff_with_a_bad_source_fails(monkeypatch):
+    seen = _review_pr(monkeypatch, full=_added("uv.lock", _EVIL), files=_lock_files(_EVIL))
+    final = seen["checks"][-1]
+    assert final.conclusion == "failure", (final.conclusion, final.title)
+    assert RULE in final.summary
+    assert re.search(r"host `evil\.example\.net` not on", final.summary)
 
 
-def test_a_vendored_only_diff_does_not_take_the_lock_file_path(monkeypatch):
-    final = _run(monkeypatch, _modified("vendor/lib/x.go"))[0][-1]
-    assert final.title != LOCK_TITLE
-    assert final.conclusion != "success", (final.conclusion, final.title)
+def test_a_mixed_diff_reviews_the_source_and_still_checks_the_lock(monkeypatch):
+    full = _added("uv.lock", _EVIL) + _added("src/app.py", ["a = 1"])
+    seen = _review_pr(monkeypatch, full=full, files=_lock_files(_EVIL))
+    assert seen["reviewed"] == [{"src/app.py"}]
+    final = seen["checks"][-1]
+    assert final.conclusion == "failure", (final.conclusion, final.title)
+    assert RULE in final.summary
 
 
-# (b) same-repo head and a trusted author
+def test_a_mixed_clean_diff_still_skips_the_lock_for_the_model(monkeypatch):
+    full = _added("uv.lock", _GOOD) + _added("src/app.py", ["a = 1"])
+    seen = _review_pr(monkeypatch, full=full, files=_lock_files(_GOOD))
+    assert seen["reviewed"] == [{"src/app.py"}]
+    assert seen["checks"][-1].conclusion == "success"
 
 
-def test_a_fork_head_stays_neutral(monkeypatch):
-    final = _run(monkeypatch, _LOCK_ONLY_DIFF, head_repo=_FORK)[0][-1]
-    assert final.conclusion == "neutral", (final.conclusion, final.title)
-    assert final.title != LOCK_TITLE
-    assert "not a trusted" in final.summary
+def test_an_unlisted_lock_name_is_still_skipped(monkeypatch):
+    seen = _review_pr(monkeypatch, full=_added("tools/flake.lock", ["x"]), files={})
+    assert seen["reviewed"] == []
+    assert seen["checks"][-1].conclusion != "success"
 
 
-def test_a_deleted_fork_head_stays_neutral(monkeypatch):
-    final = _run(monkeypatch, _LOCK_ONLY_DIFF, head_repo={})[0][-1]
-    assert final.conclusion == "neutral", (final.conclusion, final.title)
+def test_a_lock_only_living_delta_reviews_the_full_pr_diff(monkeypatch):
+    delta = _added("uv.lock", _GOOD)
+    full = delta + _added("src/app.py", ["a = 1"])
+    seen = _review_pr(monkeypatch, full=full, files=_lock_files(_GOOD), delta=delta)
+    assert ("base5678ijkl", "abcd1234efgh") in seen["full"]
+    assert seen["reviewed"] == [{"src/app.py"}]
+    assert not seen["checks"][-1].title.startswith("Living Hunt")
 
 
-@pytest.mark.parametrize("association", ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE"])
-def test_an_untrusted_author_stays_neutral(monkeypatch, association):
-    final = _run(monkeypatch, _LOCK_ONLY_DIFF, association=association)[0][-1]
-    assert final.conclusion == "neutral", (final.conclusion, final.title)
-    assert final.title != LOCK_TITLE
+def test_a_lock_only_full_diff_after_a_lock_only_delta_is_reviewed(monkeypatch):
+    delta = _added("uv.lock", _GOOD)
+    seen = _review_pr(monkeypatch, full=delta, files=_lock_files(_GOOD), delta=delta)
+    assert ("base5678ijkl", "abcd1234efgh") in seen["full"]
+    assert seen["reviewed"] == [{"uv.lock"}]
 
 
-def test_an_unlisted_app_stays_neutral(monkeypatch):
-    monkeypatch.delenv("GRUG_APP_AUTHOR_FAMILIES", raising=False)
-    bot = {"login": "some-app[bot]", "type": "Bot"}
-    final = _run(monkeypatch, _LOCK_ONLY_DIFF, user=bot, association="NONE")[0][-1]
-    assert final.conclusion == "neutral", (final.conclusion, final.title)
+def test_a_passing_lock_review_advances_the_baseline(monkeypatch):
+    seen = _review_pr(monkeypatch, full=_added("uv.lock", _GOOD), files=_lock_files(_GOOD))
+    assert seen["baseline"] == ["abcd1234efgh"]
 
 
-def test_a_known_app_passes(monkeypatch):
-    monkeypatch.setenv("GRUG_APP_AUTHOR_FAMILIES", "lane-app[bot]:claude")
-    bot = {"login": "lane-app[bot]", "type": "Bot"}
-    final = _run(monkeypatch, _LOCK_ONLY_DIFF, user=bot, association="NONE")[0][-1]
-    assert final.conclusion == "success", (final.conclusion, final.title)
-    assert final.title == LOCK_TITLE
-
-
-# (c) the registry host allowlist and unparseable files
-
-
-def test_an_unlisted_registry_host_stays_neutral_and_is_named(monkeypatch):
-    final = _run(monkeypatch, _modified("uv.lock", new=_EVIL))[0][-1]
-    assert final.conclusion == "neutral", (final.conclusion, final.title)
-    assert final.title != LOCK_TITLE
-    assert "evil.example.net" in final.summary
-
-
-def test_a_lookalike_host_is_not_allowed(monkeypatch):
-    line = '"resolved": "https://registry.npmjs.org.evil.example/x.tgz",'
-    final = _run(monkeypatch, _modified("package-lock.json", new=line))[0][-1]
-    assert final.conclusion == "neutral", (final.conclusion, final.title)
-    assert "registry.npmjs.org.evil.example" in final.summary
-
-
-def test_a_binary_lock_file_is_unparseable_and_stays_neutral(monkeypatch):
-    final = _run(monkeypatch, _binary("uv.lock"))[0][-1]
-    assert final.conclusion == "neutral", (final.conclusion, final.title)
-    assert "could not scan" in final.summary
-
-
-def test_a_removed_line_naming_a_bad_host_does_not_count():
-    diff = _modified("uv.lock", old=_EVIL, new=_PYPI)
-    verdict = judge_lock_only(file_changes(diff), parse_diff(diff), trusted=True)
-    assert verdict.applies and verdict.passed, verdict.note
-
-
-def test_untrusted_never_passes_even_with_clean_hosts():
-    diff = _modified("uv.lock", new=_PYPI)
-    verdict = judge_lock_only(file_changes(diff), parse_diff(diff), trusted=False)
-    assert verdict.applies and not verdict.passed
-
-
-@pytest.mark.parametrize(("line", "hosts"), [
-    (_PYPI, ("files.pythonhosted.org",)),
-    ('source = { registry = "https://pypi.org/simple" }', ("pypi.org",)),
-    ('source = "registry+https://github.com/rust-lang/crates.io-index"', ("github.com",)),
-    ('"resolved": "git+ssh://git@evil.example.org/x.git#abc",', ("evil.example.org",)),
-    ('"resolved": "git@evil.example.org:x/y.git",', ("evil.example.org",)),
-    ("https://PyPI.org/simple", ("pypi.org",)),
-    ("https://user:pw@evil.example.org/x", ("evil.example.org",)),
-    ("github.com/pkg/errors v0.9.1 h1:abc=", ()),
-    ('"lodash@4.17.21":', ()),
-])
-def test_line_hosts(line, hosts):
-    assert line_hosts(line) == hosts
+@pytest.mark.parametrize("extra", ["", "src"])
+def test_a_failed_lock_review_keeps_the_baseline(monkeypatch, extra):
+    full = _added("uv.lock", _EVIL) + (_added("src/app.py", ["a = 1"]) if extra else "")
+    seen = _review_pr(monkeypatch, full=full, files=_lock_files(_EVIL))
+    assert seen["checks"][-1].conclusion == "failure"
+    assert seen["baseline"] == []
