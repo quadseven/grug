@@ -158,12 +158,10 @@ jobs:
 
       - name: Join tailnet (ephemeral)
         if: steps.seeding.outputs.seeded == 'true'
-        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        uses: ./.github/actions/join-tailnet
         with:
           # Reusable key on purpose: both matrix legs join concurrently.
           authkey: ${{ secrets.CI_TS_AUTHKEY }}
-          tags: tag:ci
-          use-cache: 'true'
 
       - name: Registry login
         if: steps.seeding.outputs.seeded == 'true'

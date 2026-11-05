@@ -11,27 +11,12 @@ name: Check · attesters
 # same 23 checks with no Rust toolchain and no SMT solver.
 
 on:
+  # Every PR, no `paths:` filter (#1626). The attesters read files across
+  # services/, web/src, infra/ and specs/, and the old path list drifted:
+  # a PR touching only an unlisted file landed without a run and the next
+  # unrelated PR went red. The whole suite is pure stdlib and takes seconds.
   pull_request:
     branches: [main]
-    paths:
-      - 'infra/scripts/attest_*.py'
-      - 'services/**/personas/tpm/**'
-      - 'services/**/adapters/**'
-      - 'services/**/github_checks_client.py'
-      - 'services/**/github_reviews_client.py'
-      - 'services/**/personas/code_reviewer/**'
-      - 'services/**/llm_client.py'
-      - 'services/**/crypto/**'
-      - 'services/**/github_app_auth/**'
-      - 'services/**/dispatcher.py'
-      - 'web/public/**'
-      - 'web/index.html'
-      - 'web/app.html'
-      - 'web/vite.config.ts'
-      - 'web/src/main.tsx'
-      - 'web/src/rum.ts'
-      - 'web/package.json'
-      - '.github/workflows/check.attesters.yml'
   workflow_dispatch:
 
 permissions:
