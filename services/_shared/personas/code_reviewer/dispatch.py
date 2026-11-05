@@ -187,7 +187,7 @@ from personas.code_reviewer.removed_files import (
 )
 from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
 from personas.code_reviewer.elder_review import review_freshness_id_from_pr
-from personas.code_reviewer import carry_forward, hunt_link, living_review
+from personas.code_reviewer import carry_forward, carry_verdict, hunt_link, living_review
 from personas.hunt_recorder import PrRef, now as hunt_now
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion, gate_sentence, lead_with_degraded_line,
@@ -3919,6 +3919,22 @@ def dispatch_code_review(
             rule=skip_rule,
         )
 
+    # grug#1648: a new head whose own PR diff matches a passed head's.
+    carry_request = carry_verdict.CarryRequest(
+        action=action, installation_id=installation_id, owner=owner,
+        repo_name=repo_name, pull_number=pull_number, head_sha=head_sha,
+        blocking=blocking, title=pr_context["title"], body=pr_context["body"],
+        labels=labels, author_family=author_family or "",
+        config=repr(base_repo_config),
+    )
+    full_pr_diff = functools.partial(
+        _fetch_full_pr_diff, installation_id, owner, repo_name, pull_number,
+        base_sha=base_sha, head_sha=head_sha,
+    )
+    carried = carry_verdict.carry_if_unchanged(carry_request, fetch_pr_diff=full_pr_diff)
+    if carried is not None:
+        return carried
+
     # DiffParseError → advisory neutral so a fetcher bug or GitHub
     # format drift cannot 500 the webhook.
     try:
@@ -4965,8 +4981,6 @@ def dispatch_code_review(
         and not lock_check.unreviewed
     ):
         try:
-            from adapters.install_store import put_elder_last_reviewed
-
             _, current_head_sha, _, _ = with_install_token_retry(
                 installation_id,
                 lambda token: _fetch_current_review_snapshot(
@@ -4974,12 +4988,10 @@ def dispatch_code_review(
                 ),
             )
             if current_head_sha == head_sha:
-                put_elder_last_reviewed(
-                    install_id=installation_id,
-                    repo=f"{owner}/{repo_name}",
-                    pr_number=pull_number,
-                    head_sha=head_sha,
-                )
+                carry_verdict.store_record(carry_request, diff_id=carry_verdict.passed_diff_id(
+                    conclusion, full_diff=None if living_prior_sha else diff_text,
+                    fetch_pr_diff=full_pr_diff,
+                ))
                 if living_range:
                     log.info(
                         "elder_living_hunt_delta_done",

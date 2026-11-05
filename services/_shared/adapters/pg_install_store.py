@@ -795,8 +795,13 @@ def put_elder_last_reviewed(
     repo: str,
     pr_number: int,
     head_sha: str,
+    patch_id: str = "",
+    context_id: str = "",
 ) -> None:
-    """Record the head Elder just finished reviewing for this PR."""
+    """Record the head Elder just finished reviewing for this PR.
+
+    `patch_id` and `context_id` (#1648) let a later head whose PR diff and
+    review context are unchanged carry this head's verdict."""
     if not head_sha:
         return
     ttl = int(datetime.now(timezone.utc).timestamp() + _ELDER_LAST_TTL_DAYS * 86400)
@@ -806,6 +811,9 @@ def put_elder_last_reviewed(
         "head_sha": head_sha,
         "reviewed_at": datetime.now(timezone.utc).isoformat(),
     }
+    if patch_id:
+        attrs["patch_id"] = patch_id
+        attrs["context_id"] = context_id
     with get_pool().connection() as conn:
         conn.execute(
             """
@@ -835,6 +843,22 @@ def get_elder_last_reviewed(
         return None
     head = item.get("head_sha")
     return str(head) if head else None
+
+
+def get_elder_carry_record(
+    *,
+    install_id: int,
+    repo: str,
+    pr_number: int,
+) -> dict[str, str] | None:
+    """The last Elder-reviewed head with its patch and context ids (#1648)."""
+    item = _get_item(_inst_pk(install_id), _elder_last_sk(repo, pr_number))
+    if not item or not item.get("head_sha"):
+        return None
+    return {
+        key: str(item.get(key) or "")
+        for key in ("head_sha", "patch_id", "context_id")
+    }
 
 
 # --- Hunt Board: canonical review session per PR (grug#1207) --------------
