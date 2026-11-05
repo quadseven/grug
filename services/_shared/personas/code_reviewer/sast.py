@@ -30,8 +30,10 @@ from llm_client import _cave_judge_config, FindingJudgement, Hunk, JudgeFindingR
 from review_evidence import assemble_evidence, without_author_text
 
 from .analyzer_sandbox import read_only_tree, sandbox_env, without_engine_config
+from .complexity import _changed_by_file
 from .diff_parser import added_lines, DiffHunk
 from .persona import Finding
+from .suppression_scope import PR_ADDED_NOTE, opengrep_scope, record
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer.sast")
 
@@ -72,12 +74,15 @@ class Candidate:
     """One detected candidate vuln site, pre-judgement. `(file, line)` map to a
     real added diff line (so a kept candidate passes the anti-hallucination
     filter). `snippet` is the offending added line (for the judge + the finding
-    message). `vuln_class` groups it (benchmark + future multi-class)."""
+    message). `vuln_class` groups it (benchmark + future multi-class).
+    `pr_added_suppression` marks a candidate whose `nosemgrep` the PR itself
+    added: it is still judged, but publishes as advisory (#1579)."""
 
     vuln_class: str
     file: str
     line: int
     snippet: str
+    pr_added_suppression: bool = False
 
 
 def _added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
@@ -246,6 +251,7 @@ def scan_opengrep(
         log.error("sast_opengrep_rules_dir_missing", extra={"rules_dir": _RULES_DIR})
         return ()
     added = _added_lines_by_file(hunks)
+    pr_added = _changed_by_file(hunks)
     try:
         with tempfile.TemporaryDirectory(prefix="grug-sast-") as tmp:
             scan_root = os.path.join(tmp, "scan")
@@ -278,12 +284,17 @@ def scan_opengrep(
             # (#1574): the pod's environment holds the App key and the
             # database URL, so the child gets the allowlist and a read-only
             # tree. The home sits beside the scanned tree, never in it.
+            #
+            # --disable-nosem: a `nosemgrep` in the scanned files is
+            # PR-controlled, so the engine must not honor it on its own;
+            # suppression_scope keeps only the ones on the base (#1579).
             home = _opengrep_home_env(os.path.join(tmp, "home"))
             os.makedirs(home["HOME"], exist_ok=True)
             with read_only_tree(scan_root):
                 proc = subprocess.run(
                     ["opengrep", "scan", "--config", _RULES_DIR, "--json", "--quiet",
-                     "--disable-version-check", "--no-rewrite-rule-ids", scan_root],
+                     "--disable-version-check", "--no-rewrite-rule-ids",
+                     "--disable-nosem", scan_root],
                     capture_output=True, text=True, timeout=_OPENGREP_TIMEOUT_S,
                     env=sandbox_env(home["HOME"], home),
                     # We inspect returncode ourselves below (a non-zero exit with
@@ -326,8 +337,7 @@ def scan_opengrep(
         log.warning("sast_opengrep_run_failed", extra={"kind": type(e).__name__})
         return ()
 
-    return _map_opengrep_results(data, added, tmp_prefix)
-
+    return _map_opengrep_results(data, added, tmp_prefix, kept_files, pr_added)
 
 
 def _log_unscanned_files(data: dict, tmp_prefix: str, staged: set[str]) -> None:
@@ -380,11 +390,17 @@ def _log_unscanned_files(data: dict, tmp_prefix: str, staged: set[str]) -> None:
 
 
 def _map_opengrep_results(
-    data: dict, added: dict[str, set[int]], tmp_prefix: str
+    data: dict, added: dict[str, set[int]], tmp_prefix: str,
+    files: dict[str, str] | None = None,
+    pr_added: dict[str, set[int]] | None = None,
 ) -> tuple[Candidate, ...]:
     """Map raw semgrep JSON results to Candidates: strip the temp-dir prefix
     back to repo-relative paths, require the rule's metadata.vuln_class, and
-    keep only findings on lines THIS PR added/changed."""
+    keep only findings on lines THIS PR added/changed.
+
+    `files` and `pr_added` (the PR's added lines, not context) scope inline
+    `nosemgrep` comments (#1579): a base one drops the candidate, one the PR
+    added marks it."""
     candidates: list[Candidate] = []
     for r in data.get("results", []):
         rel = r.get("path", "")
@@ -396,8 +412,15 @@ def _map_opengrep_results(
             continue
         if line not in added.get(rel, set()):
             continue
+        rule_id = str(r.get("check_id") or vuln_class)
+        scope = opengrep_scope((files or {}).get(rel), line, rule_id,
+                               (pr_added or {}).get(rel, set()))
+        record("opengrep-sast", rule_id, rel, scope)
+        if scope == "base":
+            continue
         snippet = (r.get("extra", {}).get("lines") or "").strip()
-        candidates.append(Candidate(vuln_class=vuln_class, file=rel, line=line, snippet=snippet))
+        candidates.append(Candidate(vuln_class=vuln_class, file=rel, line=line, snippet=snippet,
+                                    pr_added_suppression=scope == "pr_added"))
     return tuple(candidates)
 
 
@@ -605,13 +628,17 @@ def _judge_batch(
                 extra={"file": c.file, "line": c.line, "reason": _safe_reason(c, j)},
             )
             continue
+        message = _finding_message(c, j)
+        if c.pr_added_suppression:
+            message = f"{message} {PR_ADDED_NOTE}"
         kept.append(
             Finding(
                 file=c.file,
                 line=c.line,
-                severity=_SAST_SEVERITY,
+                # Advisory until the false-flag rate is sampled (#1579).
+                severity="medium" if c.pr_added_suppression else _SAST_SEVERITY,
                 rule_name=c.vuln_class,
-                message=_finding_message(c, j),
+                message=message,
                 suggestion=None,
             )
         )

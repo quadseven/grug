@@ -18,6 +18,7 @@ import yaml
 import personas.code_reviewer.analyzers as an
 from personas.code_reviewer.analyzers import RepoAnalyzerConfig, run_analyzers
 from personas.code_reviewer.diff_parser import DiffHunk
+from personas.code_reviewer.suppression_scope import PR_ADDED_NOTE
 
 RULES_DIR = Path(__file__).resolve().parents[1] / "elder_analyzer_rules"
 ENGINE = shutil.which("opengrep")
@@ -100,11 +101,30 @@ def test_planted_js_and_tsx_cases_match_and_literals_do_not(engine):
         ("web/a.js", 6, "elder-js-dynamic-eval"),
         ("web/a.js", 7, "elder-js-dynamic-eval"),
         ("web/a.js", 8, "elder-js-dynamic-eval"),
+        ("web/a.js", 10, "elder-js-unescaped-html-sink"),
         ("web/b.tsx", 3, "elder-js-unescaped-html-sink"),
         ("web/b.tsx", 4, "elder-js-react-dangerous-html"),
     ]
-    # Line 10 carries `nosemgrep`: the repo's own suppression wins.
+    # Line 10 carries a `nosemgrep` this PR added: it no longer hides the
+    # finding, which says so (#1579).
+    (line10,) = [f for f in run.findings if f.line == 10]
+    assert PR_ADDED_NOTE in line10.message
     assert all(f.message.startswith("opengrep `elder-js-") for f in run.findings)
+
+
+def test_base_nosemgrep_still_wins_with_the_engine_reading_none(engine):
+    """The engine runs with --disable-nosem; a `nosemgrep` on an unchanged
+    base line above the match still hides it (#1579)."""
+    text = "// nosemgrep: elder-js-dynamic-eval\neval(code);\neval(other);\n"
+    hunk = DiffHunk(file_path="web/c.js", new_start=1, new_lines=frozenset(),
+                    body="@@ -1,1 +1,3 @@\n // nosemgrep: elder-js-dynamic-eval\n"
+                         "+eval(code);\n+eval(other);\n")
+    run = run_analyzers((hunk,), {"web/c.js": text}, ("opengrep",),
+                        RepoAnalyzerConfig())
+    assert run.ran == ("opengrep",)
+    assert [(f.line, f.rule_name) for f in run.findings] == [
+        (3, "elder-js-dynamic-eval"),
+    ]
 
 
 def test_repo_semgrepignore_wins(engine):
