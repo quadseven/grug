@@ -130,6 +130,52 @@ def _ensure_can_access(install: dict[str, Any], user: UserIdentity) -> None:
         )
 
 
+def _repo_owned_by_install(install: dict[str, Any], repo: str) -> bool:
+    """True when `repo` ("owner/name") sits under the install's account.
+    Pure string check against the stored `account_login`: no GitHub call."""
+    owner, _, name = repo.partition("/")
+    return (
+        bool(name)
+        and "/" not in name
+        and owner.lower() == str(install.get("account_login", "")).lower()
+    )
+
+
+def _install_repo_names(install_id: int) -> set[str]:
+    """Lowercased `full_name`s of every repo the install can see, from
+    `GET /installation/repositories` (the same lookup update_repo_config
+    uses). No page cap: a membership answer must scan every page."""
+    def _fetch(token: str) -> set[str]:
+        try:
+            repos = paginate_all(
+                token, f"{_GH_API}/installation/repositories",
+                item_key="repositories", max_pages=None,
+            )
+        except GitHubMalformedPayload:
+            log.error(
+                "gh_install_repos_malformed",
+                extra={"install_id": install_id, "context": "rerun_repo_check"},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="gh_upstream_malformed",
+            ) from None
+        return {str(r["full_name"]).lower() for r in repos}
+
+    return with_install_token_retry(install_id, _fetch)
+
+
+def _repo_belongs_to_install(
+    install_id: int, install: dict[str, Any], repo: str,
+) -> bool:
+    """Owner match first (free); otherwise the install's visible repo list,
+    so a stale `account_login` (account rename) does not refuse a repo the
+    install can still read (grug#1628)."""
+    if _repo_owned_by_install(install, repo):
+        return True
+    return repo.lower() in _install_repo_names(install_id)
+
+
 @router.get("/installations")
 def list_installations(
     user: Annotated[UserIdentity, Depends(require_authenticated)],
@@ -358,12 +404,7 @@ def list_ledger(
     if not install:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
     _ensure_can_access(install, user)
-    owner, _, name = repo.partition("/")
-    if (
-        not name
-        or "/" in name
-        or owner.lower() != str(install.get("account_login", "")).lower()
-    ):
+    if not _repo_owned_by_install(install, repo):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not found")
     limit = max(1, min(limit, 200))
     # The store filters before its LIMIT: filtering the capped rows here would
@@ -383,12 +424,15 @@ def rerun_check(
     """Re-run one persona's check on a PR (#305, ADR-0004). Enqueues to
     `grug-rerun-jobs` and returns 202; the webhook re-runs on the PR's CURRENT
     head and upserts the verdict (heal-in-place / append). Caller must own the
-    install. The re-run acts with the INSTALL's GitHub token, so it can only
-    touch repos that install can reach (the bound on a user-supplied repo)."""
+    install. The re-run acts with the INSTALL's GitHub token, and `repo` must
+    belong to the install (404 otherwise), so a junk repo never reaches the
+    queue and retries into its DLQ (grug#1628)."""
     install = get_installation(install_id)
     if not install:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="install not found")
     _ensure_can_access(install, user)
+    if not _repo_belongs_to_install(install_id, install, body.repo):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="repo not found")
 
     from rerun import enqueue_rerun
 
@@ -431,6 +475,8 @@ def rerun_all_errored(
     from rerun import enqueue_rerun
 
     seen: set[tuple[str, int, str]] = set()
+    # Fetched at most once, and only if some row's owner does not match.
+    visible: set[str] | None = None
     queued = 0
     for r in list_check_verdicts(install_id, limit=None):
         v = derive_verdict(
@@ -444,6 +490,15 @@ def rerun_all_errored(
         if key in seen:  # same (repo,pr,persona) across heads → one job (dedup)
             continue
         seen.add(key)
+        if not _repo_owned_by_install(install, r["repo"]):
+            if visible is None:
+                visible = _install_repo_names(install_id)
+            if str(r["repo"]).lower() not in visible:
+                log.warning(
+                    "rerun_all_skipped_foreign_repo",
+                    extra={"install_id": install_id, "repo": r["repo"]},
+                )
+                continue
         try:
             enqueue_rerun(
                 install_id=install_id,
