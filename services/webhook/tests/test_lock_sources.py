@@ -40,8 +40,7 @@ def _diff(path: str, added: list[str], removed: list[str] = ()) -> str:
 def _run(path: str, *, head: str | None, base: str | None,
          added: list[str] = ("x",), removed: list[str] = (),
          fetch_error: Exception | None = None,
-         reviewed: frozenset[str] | None = None,
-         oversized: frozenset[str] = frozenset()):
+         reviewed: frozenset[str] | None = None):
     files = {"HEAD": head, "BASE": base}
 
     def fetch(paths, ref):
@@ -54,7 +53,6 @@ def _run(path: str, *, head: str | None, base: str | None,
         parse_diff(_diff(path, list(added), list(removed))),
         fetch=fetch, head_sha="HEAD", base_sha="BASE",
         reviewed=frozenset({path}) if reviewed is None else reviewed,
-        oversized=oversized,
     )
 
 
@@ -334,11 +332,11 @@ def test_the_note_names_basenames_only():
 def test_the_note_covers_only_files_the_model_received():
     check = _run("web/yarn.lock", head=None, base=None, reviewed=frozenset())
     assert UNCHECKED_NOTE not in check.note
+    assert check.unreviewed == ("yarn.lock",)
 
 
 def test_an_unchecked_lock_dropped_for_size_is_unreviewed():
-    check = _run("web/yarn.lock", head=None, base=None, reviewed=frozenset(),
-                 oversized=frozenset({"web/yarn.lock"}))
+    check = _run("web/yarn.lock", head=None, base=None, reviewed=frozenset())
     assert check.unreviewed == ("yarn.lock",)
     assert UNCHECKED_NOTE not in check.note
 
@@ -357,6 +355,6 @@ def test_non_lock_files_are_ignored():
     hunks = parse_diff(_diff("src/app.py", ["URL = 'https://evil.example.net'"]))
     check = lock_source_check(
         hunks, fetch=lambda p, r: {}, head_sha="H", base_sha="B",
-        reviewed=frozenset({"src/app.py"}), oversized=frozenset(),
+        reviewed=frozenset({"src/app.py"}),
     )
     assert (check.findings, check.note, check.unreviewed) == ((), "", ())

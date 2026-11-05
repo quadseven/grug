@@ -306,8 +306,8 @@ def _path_problems(
 class LockCheck:
     """`findings` block; `note` names, by file name only, the unchecked
     lock files the model received; `unreviewed` names unchecked lock files
-    the size rules kept from the model, which keeps the check from
-    concluding success."""
+    the model did not receive, whichever filter dropped them, which keeps
+    the check from concluding success."""
 
     findings: tuple[Finding, ...] = ()
     note: str = ""
@@ -318,10 +318,10 @@ def lock_source_check(
     hunks: tuple[DiffHunk, ...], *,
     fetch: Callable[[tuple[str, ...], str], dict[str, str]],
     head_sha: str, base_sha: str,
-    reviewed: frozenset[str], oversized: frozenset[str],
+    reviewed: frozenset[str],
 ) -> LockCheck:
-    """Check every changed lock file. `reviewed` is the paths the model
-    received, `oversized` the paths the size rules dropped. `fetch(paths,
+    """Check every changed lock file. `reviewed` is the final set of paths
+    the model received, after every filter. `fetch(paths,
     ref)` returns path -> text for files present at `ref`, omits absent
     ones, and raises when it cannot tell."""
     first: dict[str, int] = {}
@@ -331,7 +331,7 @@ def lock_source_check(
     checked = tuple(p for p in first if posixpath.basename(p) in CHECKED_FORMATS)
     unchecked = tuple(p for p in first if p not in checked)
     note = _unchecked_note(_basenames(p for p in unchecked if p in reviewed))
-    unreviewed = _basenames(p for p in unchecked if p in oversized and p not in reviewed)
+    unreviewed = _basenames(p for p in unchecked if p not in reviewed)
     found = []
     if checked:
         fetched = _fetch_both(checked, fetch, head_sha, base_sha)

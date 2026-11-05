@@ -3316,7 +3316,7 @@ def _keep_unchecked_locks(
 def _lock_findings(
     parsed_hunks: tuple[DiffHunk, ...], *, installation_id: int, owner: str,
     repo_name: str, head_sha: str, base_sha: str,
-    reviewed: frozenset[str], oversized: frozenset[str],
+    reviewed: frozenset[str],
 ) -> LockCheck:
     """The deterministic lock-source check for this diff (#1649): a second
     layer on top of the model review, not the gate."""
@@ -3329,7 +3329,7 @@ def _lock_findings(
             ),
         ),
         head_sha=head_sha, base_sha=base_sha,
-        reviewed=reviewed, oversized=oversized,
+        reviewed=reviewed,
     )
 
 
@@ -4528,8 +4528,8 @@ def dispatch_code_review(
     lock_check = _lock_findings(
         parsed_hunks, installation_id=installation_id, owner=owner,
         repo_name=repo_name, head_sha=head_sha, base_sha=base_sha,
+        # The final plate: after the ignore, size, copy and move filters.
         reviewed=frozenset(h.file_path for h in hunks),
-        oversized=frozenset(oversized_paths),
     )
     lock_findings = lock_check.findings
     if lock_findings:
@@ -4663,10 +4663,11 @@ def dispatch_code_review(
         # never passes.
         names = ", ".join(f"`{n}`" for n in lock_check.unreviewed)
         conclusion = "neutral"
-        title = _hunt_title("WARN Elder could not read lock file(s): too large", living_range)
+        title = _hunt_title("WARN Elder did not read lock file(s)", living_range)
         summary += (
-            f"\n\nLock files {names} were too large for Elder to read and "
-            "have no machine check, so this pass is neutral, not success."
+            f"\n\nLock files {names} were kept from Elder's review (size or "
+            "ignore rules) and have no machine check, so this pass is "
+            "neutral, not success."
         )
     if evaluation.reviewability_note:
         summary += "\n\n## Reviewability assessment\n\n" + evaluation.reviewability_note

@@ -252,3 +252,21 @@ def test_an_unchecked_lock_dropped_for_size_concludes_neutral(monkeypatch):
     assert "`yarn.lock`" in final.summary
     assert "machine-checked for this format; Elder's review covers it" not in final.summary
     assert seen["baseline"] == []
+
+
+def test_an_unchecked_lock_dropped_by_the_ignore_filter_concludes_neutral(monkeypatch):
+    original = cr_dispatch._apply_repo_config
+
+    def _ignore_yarn(hunks, *a, **k):
+        kept, config, note = original(hunks, *a, **k)
+        return tuple(h for h in kept if not h.file_path.endswith("yarn.lock")), config, note
+
+    monkeypatch.setattr(cr_dispatch, "_apply_repo_config", _ignore_yarn)
+    full = _added("web/yarn.lock", ['  resolved "https://registry.yarnpkg.com/x.tgz"']) + _added(
+        "src/app.py", ["a = 1"])
+    seen = _review_pr(monkeypatch, full=full, files={})
+    assert "web/yarn.lock" not in set().union(*seen["reviewed"])
+    final = seen["checks"][-1]
+    assert final.conclusion == "neutral", (final.conclusion, final.title)
+    assert "`yarn.lock`" in final.summary
+    assert seen["baseline"] == []
