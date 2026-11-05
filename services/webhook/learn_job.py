@@ -333,7 +333,7 @@ def _run_learn(
             "kind": type(e).__name__})
     try:
         emit_gauge("grug.learnings.classified", 1)
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 - best-effort metric
         pass
     # Living review (#1187): a maintainer who replied may have resolved the
     # thread too; the Resolved chip on Elder's comment is the in-place

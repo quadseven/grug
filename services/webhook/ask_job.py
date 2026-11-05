@@ -214,7 +214,7 @@ def run_ask(
     _comment_unreact(install_id, base, comment_id, in_thread, eyes_id)
     try:
         emit_gauge("grug.interactive.ask", 1)
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 - best-effort metric
         pass
     log.info("ask_answered", extra={"repo": repo_full, "pr": pr_number, "result": result})
     return result

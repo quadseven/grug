@@ -973,7 +973,6 @@ def _settle_command_reaction(
     _comment_unreact(install_id, base, comment_id, False, eyes_id)
 
 
-
 def _run_one(
     body: str, *, receive_count: int = 0, message_id: str = "",
     first_received_at: float = 0.0,
