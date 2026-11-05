@@ -745,3 +745,20 @@ def test_deployment_chain_verdict_returns_first_failure(monkeypatch):
     ]
     monkeypatch.setattr(shepherd, "deployment_stage_verdicts", lambda service: stages)
     assert shepherd.deployment_chain_verdict("webhook") is stages[1]
+
+
+def test_cli_passes_every_argument_to_main():
+    """#1636: `python3 scripts/shepherd.py pr-queue --repo O/N` is the
+    documented entry point, so the CLI must hand main() all of argv, not
+    just the first word (argparse then sees `--help` here and exits 0)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "shepherd.py"
+    proc = subprocess.run(
+        [sys.executable, str(script), "pr-queue", "--help"],
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--repo" in proc.stdout

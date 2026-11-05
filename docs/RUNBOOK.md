@@ -160,9 +160,9 @@ mitigation for this exact failure class, not a fix for the block itself.
 
 `[grug] Check-run publish failing - PRs are MERGE-BLOCKED (15min)` pages when
 more than 2 check-run publishes fail in 15 minutes, from any persona. The
-log events counted are listed in `CHECK_RUN_PUBLISH_FAILED_EVENTS`
-(`infra/pulumi/components/dd_monitors.py`, removed in #1223 with the other
-Datadog monitors): `tpm_publish_failed` (Chief),
+log events counted were listed in `CHECK_RUN_PUBLISH_FAILED_EVENTS` in the
+Pulumi monitors component, removed in #1223 with the other Datadog
+monitors: `tpm_publish_failed` (Chief),
 `guard_check_run_publish_failed`, `code_review_check_run_publish_failed`
 (Elder) and their degraded and sibling variants.
 
@@ -916,8 +916,8 @@ pup metrics query \
 
 **2a. If `none` (0.0)** - the repo really is ungated. Decide which it should be:
 
-- **Should be gated:** add it to `infrastructure/pulumi/github/repos.py` and
-  `pulumi up`. Repo config is Pulumi-owned; do NOT use the dashboard Fix
+- **Should be gated:** add it to the Pulumi stack that owns your GitHub
+  repository config and `pulumi up`. Repo config is Pulumi-owned; do NOT use the dashboard Fix
   button or the `ensure_enforcement` API on a Pulumi-managed repo, because a
   Grug-created ruleset then lives outside Pulumi and drifts.
 - **Should NOT be gated:** set an opt-out on the repo config -

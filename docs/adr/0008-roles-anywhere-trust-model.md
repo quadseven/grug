@@ -79,8 +79,8 @@ consumed per project.
 - Keep the static-key path live until a **real pod read of SSM, SQS, KMS, and
   S3 via the Roles Anywhere path is proven** on a deployed pod (the #388
   tracer). Only then (#389) retire the static key, the `/grug/k8s-pod-aws-*`
-  SSM params, and the #386 rotator (CronJob + `key_rotator.py` +
-  `k8s_rotator.py`).
+  SSM params, and the #386 rotator (its CronJob and its two Python
+  modules).
 - Rollback at any point is re-pointing the Deployment back at the static-key
   Secret, since both paths coexist until retirement.
 

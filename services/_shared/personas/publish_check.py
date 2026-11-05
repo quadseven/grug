@@ -106,10 +106,13 @@ def _publish_with_transient_retry(
     bounded budget above. HTTPStatusError and every non-httpx exception
     propagate immediately - the outer publish boundary owns those.
 
-    Safe to retry the POST itself: GitHub supersedes check-runs per
-    (name, head_sha) - a replayed create after a lost response yields an
-    identical, newest-wins check-run, not a visible duplicate (see
-    post_check_run's idempotency note)."""
+    A retried POST is NOT deduped by GitHub: every create makes a new
+    check-run object (see post_check_run). A transport failure usually
+    means the request never reached GitHub, so the retry is the first
+    real create. When a lost response hid a create that did land, the
+    retry adds a second run with the same name and head_sha; that
+    duplicate is the accepted cost, since dropping the check would leave
+    the PR without it."""
     attempt = 0
     slept = 0.0
     while True:

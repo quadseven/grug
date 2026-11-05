@@ -990,5 +990,4 @@ def report_shepherd_pr_queue(
 
 
 if __name__ == "__main__":
-    svc = sys.argv[1] if len(sys.argv) > 1 else "webhook"
-    sys.exit(main(svc))
+    sys.exit(main(*sys.argv[1:]))

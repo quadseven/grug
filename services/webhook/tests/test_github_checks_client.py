@@ -315,3 +315,52 @@ def test_github_error_diagnostics_tolerates_non_json_and_foreign_errors():
     err = httpx.HTTPStatusError("bad", request=req, response=html)
     assert github_error_diagnostics(err) == {"gh_request_id": None}
     assert github_error_diagnostics(ValueError("x")) == {}
+
+
+# --- #1636: the create endpoint is not deduped, and the docstrings agree ---
+
+def test_identical_post_check_run_calls_each_create_a_run():
+    """post_check_run never dedupes: two identical calls are two POSTs to
+    the create endpoint, with no list-and-match lookup first. The
+    transient retry in publish_check and delivery_replay both depend on
+    this being the real behaviour."""
+    result = CheckRunResult(
+        name="Grug - Chief", head_sha="abc123", status="completed",
+        conclusion="success", title="t", summary="s",
+    )
+    with patch("httpx.post", return_value=_ok_response()) as mock_post, \
+            patch("httpx.get") as mock_get:
+        post_check_run("tok", "o", "r", result)
+        post_check_run("tok", "o", "r", result)
+    assert mock_post.call_count == 2
+    assert all(c.args[0].endswith("/repos/o/r/check-runs") for c in mock_post.call_args_list)
+    mock_get.assert_not_called()
+
+
+def test_transient_retry_reposts_after_a_lost_response(monkeypatch):
+    """A transport error after a create landed still triggers a second
+    POST: the retry can make a duplicate run, as its docstring says."""
+    from personas import publish_check
+
+    monkeypatch.setattr(publish_check.time, "sleep", lambda s: None)
+    calls = []
+
+    def publish():
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("response lost")
+
+    publish_check._publish_with_transient_retry("chief", 1, publish)
+    assert len(calls) == 2
+
+
+def test_publish_retry_docstring_agrees_with_the_checks_client():
+    """The two docstrings used to disagree: publish_check claimed GitHub
+    supersedes runs per (name, head_sha), while post_check_run says every
+    POST makes a new run. Pin the retry docstring to the real behaviour."""
+    from personas import publish_check
+
+    retry_doc = publish_check._publish_with_transient_retry.__doc__ or ""
+    assert "NOT idempotent" in (post_check_run.__doc__ or "")
+    assert "supersede" not in retry_doc.lower()
+    assert "not deduped" in retry_doc.lower()
