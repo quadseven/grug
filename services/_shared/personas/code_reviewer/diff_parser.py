@@ -115,6 +115,20 @@ _REVIEW_EXCLUDED_PATH_RE = re.compile(
 )
 
 
+# The lock-file subset of the exclusions above (#1649): a diff made only of
+# these has nothing for Elder to read, and concludes success, not no_diff.
+_LOCK_FILE_RE = re.compile(
+    r"\.lock$"
+    r"|(?:^|/)(?:package-lock\.json|pnpm-lock\.yaml|go\.sum)$"
+)
+
+
+def is_lock_file_path(path: str) -> bool:
+    """True when a changed file is a dependency lock file (#1649). Every
+    such path is also `is_review_excluded_path`. Pure."""
+    return _LOCK_FILE_RE.search(path) is not None
+
+
 def is_review_excluded_path(path: str) -> bool:
     """True when a changed file is data/generated/vendored - no LLM review
     signal (#609). Pure; the single source the split + tests share."""

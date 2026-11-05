@@ -86,7 +86,8 @@ from personas.code_reviewer.dedup import (
 )
 from personas.code_reviewer.diff_parser import (
     added_lines,
-    DiffHunk, DiffParseError, file_changes, is_tree_copy_candidate, new_file_blob_ids,
+    DiffHunk, DiffParseError, file_changes, is_lock_file_path, is_tree_copy_candidate,
+    new_file_blob_ids,
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
@@ -3377,6 +3378,49 @@ def _review_deletion_only(
     return with_extra_findings(base, findings), note
 
 
+LOCK_FILES_ONLY_TITLE = "lock files only: nothing for Elder to review"
+
+
+def _lock_files_only(evaluation: CodeReviewEvaluation, diff_text: str) -> tuple[str, ...]:
+    """The changed paths when every one is a lock file, else () (#1649).
+
+    Lock files are dropped from the model's plate (#609), so a diff made only
+    of them reached the model with nothing and published a neutral "eyes
+    clouded (no_diff)" that never clears a blocking gate. Only a `no_diff`
+    evaluation qualifies, and every changed file, including binaries,
+    deletions and renames (both sides), must be a lock file: one reviewable
+    file anywhere keeps the normal path."""
+    if evaluation.degraded_reason != "no_diff":
+        return ()
+    changes = file_changes(diff_text)
+    paths = tuple(dict.fromkeys(
+        p for c in changes for p in (c.path, c.previous_path) if p
+    ))
+    if not paths or not all(is_lock_file_path(p) for p in paths):
+        return ()
+    return paths
+
+
+def _review_lock_files_only(
+    evaluation: CodeReviewEvaluation, diff_text: str,
+) -> tuple[CodeReviewEvaluation, str]:
+    """A lock-file-only diff concludes success, not no_diff (#1649).
+
+    Returns a clean evaluation and a summary note naming the lock files;
+    any other diff is returned unchanged with no note."""
+    paths = _lock_files_only(evaluation, diff_text)
+    if not paths:
+        return evaluation, ""
+    shown = ", ".join(f"`{p.replace(chr(96), '')}`" for p in paths[:10])
+    more = f" and {len(paths) - 10} more" if len(paths) > 10 else ""
+    note = (
+        f"\n\nLock-file-only diff: {len(paths)} lock file(s) changed "
+        f"({shown}{more}). Elder does not review lock file contents, and no "
+        "other file changed, so there is nothing for Elder to review."
+    )
+    return CodeReviewEvaluation(findings=(), conclusion="success"), note
+
+
 def _merge_lane_work(
     evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
     diff_text: str, file_contents: dict[str, str],
@@ -4459,6 +4503,7 @@ def dispatch_code_review(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,
     )
+    evaluation, lock_files_note = _review_lock_files_only(evaluation, diff_text)
 
     # Deterministic lane-work checks (#1179, #1363): a new function nothing
     # calls, linked criteria no hunk can satisfy, a file mostly deleted that
@@ -4583,6 +4628,8 @@ def dispatch_code_review(
         blocking=blocking,
         muted=muted,
     )
+    if lock_files_note and not evaluation.findings and not evaluation.degraded_reason:
+        title = _hunt_title(LOCK_FILES_ONLY_TITLE, living_range)
     if evaluation.reviewability_note:
         summary += "\n\n## Reviewability assessment\n\n" + evaluation.reviewability_note
     summary = _intent_paragraph(pr_context) + summary
@@ -4596,6 +4643,7 @@ def dispatch_code_review(
     summary += f"\n\n{budget.note}" if budget.note else ""
     summary += config_note
     summary += deletion_note
+    summary += lock_files_note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
     )
