@@ -455,6 +455,14 @@ class GrugThinkBot(commands.Cog):
                 extra={"bot_id": self.get_bot_id(), "server_id": server_id, "other_bot_mentioned": True},
             )
             return
+        # /chat-frequency 0 (also the default when never set) promises silence
+        # unless mentioned, so no unprompted model call may start here (#1632).
+        if self.chat_frequencies.get(server_id, 0) == 0:
+            self.log.info(
+                "Unprompted engagement disabled - chat frequency is 0%",
+                extra={"bot_id": self.get_bot_id(), "server_id": server_id},
+            )
+            return
         self.log.info(
             "No bot mentioned, checking engagement logic",
             extra={"bot_id": self.get_bot_id(), "server_id": server_id, "user_id": message.author.id},
@@ -766,6 +774,7 @@ class GrugThinkBot(commands.Cog):
             server_id,
             self.personality_engine,
             self.get_bot_id(),
+            message.author.id,
         )
         self.log.debug(
             "query_model completed",

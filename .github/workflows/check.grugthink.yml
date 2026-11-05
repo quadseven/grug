@@ -59,3 +59,7 @@ jobs:
       # answer (#1045). Pure mocks, no network, no database.
       - name: chat reply path tests (fallback chain + reply parsing)
         run: PYTHONPATH=. python -m pytest tests/test_llm_fallback.py tests/test_llm_api_mocks.py tests/test_llm_response_parsing.py -v
+      # Trust gates (#1632): lore extraction only for trusted authors, and no
+      # unprompted model call on a server at chat frequency 0. Pure mocks.
+      - name: trust gate tests (lore extraction + chat frequency 0)
+        run: PYTHONPATH=. python -m pytest tests/test_bot_trust_gates.py -v
