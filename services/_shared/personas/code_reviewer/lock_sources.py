@@ -2,14 +2,17 @@
 
 A lock file is not inert data: a changed entry can point an install at
 another registry, a git repository or a local path. Elder reviews lock
-files like any other file when a diff holds nothing else, and this check
-adds one blocking finding per lock file whose ADDED content names:
+files with the model when a diff holds nothing else; this check is a
+second layer on top of that review, not the gate. It adds one blocking
+finding per changed lock file (a removal-only change included) whose
+change names:
 
 - a source that is not a registry (git, file, link, path, directory, or a
   bare local path);
 - a URL whose authority carries a backslash, a `\\u` escape, a percent
   escape or user info, or whose host the standard parser reads differently;
-- a host outside `ALLOWED_HOSTS`;
+- a plain http URL, or a host outside `ALLOWED_HOSTS`;
+- in a line format, an integrity or hash line removed without a replacement;
 - or content that its own format's parser cannot read.
 
 JSON and TOML locks are parsed whole at head and at base with `json` and
@@ -57,7 +60,7 @@ _CARGO_REGISTRIES: frozenset[str] = frozenset({
 
 _NON_REGISTRY_PREFIXES: tuple[str, ...] = (
     "git+", "git:", "git@", "github:", "gitlab:", "bitbucket:", "file:",
-    "link:", "portal:", "workspace:", "directory:",
+    "link:", "portal:", "workspace:", "directory:", "exec:", "patch:", "npm:",
 )
 _STRUCTURED = frozenset({
     "uv.lock", "poetry.lock", "Cargo.lock", "package-lock.json",
@@ -77,13 +80,18 @@ def url_problem(url: str) -> str | None:
         return None
     if not url:
         return "an empty source"
+    if url.startswith("//"):
+        # A scheme-relative reference is fetched as https at best.
+        return url_problem("https:" + url)
     low = url.lower()
     if low.startswith(_NON_REGISTRY_PREFIXES):
         return f"non-registry source `{url}`"
-    m = re.match(r"(?i)(https?)://([^/?#]*)", url)
+    if re.match(r"(?i)http://", url):
+        return f"plain http URL `{url}`"
+    m = re.match(r"(?i)https://([^/?#]*)", url)
     if not m:
         return f"non-registry source `{url}`"
-    authority = m.group(2)
+    authority = m.group(1)
     if "\\" in url or "%" in authority or "@" in authority or not authority:
         return f"URL with a disguised authority `{url}`"
     host = re.sub(r":\d+$", "", authority).lower()
@@ -137,13 +145,21 @@ def _poetry_problems(pkg: Mapping[str, Any]) -> Iterator[str]:
             yield from filter(None, [url_problem(_str(source.get("url")))])
 
 
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+
+
 def _npm_problems(pkg: Mapping[str, Any]) -> Iterator[str]:
     if pkg.get("link"):
         yield f"linked local package `{_str(pkg.get('resolved'))}`"
         return
     version = _str(pkg.get("version"))
-    if version.lower().startswith(_NON_REGISTRY_PREFIXES):
-        yield f"non-registry source `{version}`"
+    if "version" in pkg and not _SEMVER_RE.match(version):
+        # Lockfile v1 puts a tarball, git or alias spec in `version`.
+        problem = url_problem(version)
+        if problem:
+            yield problem
+        elif "resolved" not in pkg:
+            yield f"non-semver version `{version}` with no resolved registry URL"
     if "resolved" in pkg:
         yield from filter(None, [url_problem(_str(pkg["resolved"]))])
 
@@ -234,9 +250,29 @@ def _structured_problems(name: str, head: str, base: str | None) -> list[str]:
 
 
 _URL_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>,()\[\]{}]+")
+# Built from `_NON_REGISTRY_PREFIXES`, so the line scan and `url_problem`
+# can never disagree on what a non-registry source is.
 _PREFIX_TOKEN_RE = re.compile(
-    r"(?:^|[\s\"'@,{:])((?:git\+|git:|git@|github:|file:|link:|portal:|workspace:)\S*)"
+    r"(?:^|[\s\"'@,{:])((?:"
+    + "|".join(re.escape(p) for p in _NON_REGISTRY_PREFIXES)
+    + r")\S*)",
+    re.IGNORECASE,
 )
+# `npm:<range>` is yarn's plain registry form; `npm:<name>@<range>` is an
+# alias that installs a different package under this name.
+# A scheme-relative reference (`//host/path`) not inside a full URL.
+_SCHEME_RELATIVE_RE = re.compile(r"""(?:^|[\s"'{,=(])(//[^\s"'<>,()\[\]{}]+)""")
+_NPM_ALIAS_RE = re.compile(r"(?i)^npm:@?[^@\s\"']+@")
+_PNPM_SOURCE_RE = re.compile(r"""\btype:\s*['"]?(?:directory|git)\b""")
+# Lines that carry an integrity hash, per line format. go.sum is left out:
+# each of its lines is a whole entry, so a dropped dependency removes its
+# line by design.
+_INTEGRITY_RE: dict[str, re.Pattern[str]] = {
+    "yarn.lock": re.compile(r"^\s*(?:integrity\s|checksum:)"),
+    "pnpm-lock.yaml": re.compile(r"\bintegrity:"),
+    ".terraform.lock.hcl": re.compile(r"""^\s*"(?:h1|zh):"""),
+    "Gemfile.lock": re.compile(r"\bsha256="),
+}
 _GO_SUM_RE = re.compile(r"^\S+ v\S+ h1:[A-Za-z0-9+/]+=*$")
 _TF_PROVIDER_RE = re.compile(r'^\s*provider\s+"([^"]*)"')
 _ESCAPE_RE = re.compile(r"\\[uUx]")
@@ -263,9 +299,16 @@ def _line_problems(name: str, text: str) -> list[str]:
         problem = url_problem(m.group(0).rstrip(".;:#"))
         if problem:
             problems.append(problem)
+    for m in _SCHEME_RELATIVE_RE.finditer(text):
+        problem = url_problem(m.group(1).rstrip(".;:#"))
+        if problem:
+            problems.append(problem)
     for m in _PREFIX_TOKEN_RE.finditer(text):
-        problems.append(f"non-registry source `{m.group(1).strip(chr(34) + chr(39) + ':,')}`")
-    if name == "pnpm-lock.yaml" and re.search(r"\b(?:directory|type):\s*(?:directory|git)\b|\bdirectory:", text):
+        token = m.group(1).strip(chr(34) + chr(39) + ":,")
+        if token.lower().startswith("npm:") and not _NPM_ALIAS_RE.match(token):
+            continue
+        problems.append(f"non-registry source `{token}`")
+    if name == "pnpm-lock.yaml" and _PNPM_SOURCE_RE.search(text):
         problems.append(f"non-registry source `{stripped}`")
     if name == "Gemfile.lock" and stripped.startswith("remote:"):
         remote = stripped.split(":", 1)[1].strip()
@@ -277,19 +320,30 @@ def _line_problems(name: str, text: str) -> list[str]:
 # --- entry point -------------------------------------------------------------
 
 
+def _removed_lines(hunk: DiffHunk) -> list[str]:
+    return [
+        raw[1:] for raw in hunk.body.splitlines()[1:]
+        if raw.startswith("-")
+    ]
+
+
 def lock_source_findings(
     hunks: tuple[DiffHunk, ...], *,
     fetch: Callable[[tuple[str, ...], str], dict[str, str]],
     head_sha: str, base_sha: str,
 ) -> tuple[Finding, ...]:
-    """One high finding per changed lock file whose added content fails the
-    check. `fetch(paths, ref)` returns path -> text for files present at
-    `ref`, omits absent ones, and raises when it cannot tell."""
+    """One high finding per changed lock file whose change fails the check.
+    Every changed lock file is judged, a removal-only change included.
+    `fetch(paths, ref)` returns path -> text for files present at `ref`,
+    omits absent ones, and raises when it cannot tell."""
     added: dict[str, list[tuple[int, str]]] = {}
+    removed: dict[str, list[str]] = {}
+    first_line: dict[str, int] = {}
     for h in hunks:
         if is_lock_file_path(h.file_path):
             added.setdefault(h.file_path, []).extend(added_lines(h))
-    added = {p: lines for p, lines in added.items() if lines}
+            removed.setdefault(h.file_path, []).extend(_removed_lines(h))
+            first_line.setdefault(h.file_path, max(1, h.new_start))
     if not added:
         return ()
     structured = tuple(p for p in added if posixpath.basename(p) in _STRUCTURED)
@@ -305,7 +359,7 @@ def lock_source_findings(
     found: list[Finding] = []
     for path, lines in added.items():
         name = posixpath.basename(path)
-        anchor = lines[0][0]
+        anchor = lines[0][0] if lines else first_line[path]
         problems: list[str] = []
         if path in structured:
             if fetch_failed or path not in heads:
@@ -322,6 +376,14 @@ def lock_source_findings(
                 if line_found and not problems:
                     anchor = lineno
                 problems.extend(line_found)
+            integrity = _INTEGRITY_RE.get(name)
+            if integrity is not None:
+                gone = sum(1 for t in removed[path] if integrity.search(t))
+                kept = sum(1 for _, t in lines if integrity.search(t))
+                if gone > kept:
+                    problems.append(
+                        f"{gone - kept} integrity or hash line(s) removed without a replacement"
+                    )
         problems = list(dict.fromkeys(problems))
         if not problems:
             continue

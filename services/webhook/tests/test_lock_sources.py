@@ -324,3 +324,103 @@ def test_a_json_unicode_escape_in_an_added_line_is_flagged():
         "version": "1.0.0", "resolved": json.loads('"https://registry.npmjs.org\\u002f@evil.example/x.tgz"')}})
     found = _scan("package-lock.json", [line], head=head, base=_npm(_NPM_BASE))
     assert found and "escaped" in found[0].message
+
+
+# --- third review --------------------------------------------------------
+
+
+def test_the_line_scan_is_built_from_the_prefix_list():
+    from personas.code_reviewer import lock_sources as ls
+
+    for prefix in ls._NON_REGISTRY_PREFIXES:
+        assert ls._PREFIX_TOKEN_RE.search(f' "x@{prefix}thing"'), prefix
+
+
+@pytest.mark.parametrize(("path", "line", "bad"), [
+    ("yarn.lock", '"x@exec:./build.sh":', True),
+    ("yarn.lock", '  resolution: "ts@patch:ts@npm%3A5.0.0#~builtin<compat/ts>"', True),
+    ("yarn.lock", '"x@npm:evil-pkg@1.0.0":', True),
+    ("yarn.lock", '"x@npm:@evil/pkg@1.0.0":', True),
+    ("yarn.lock", '  resolution: "lodash@npm:4.17.21"', False),
+    ("yarn.lock", '"lodash@npm:^4.17.21":', False),
+    ("pnpm-lock.yaml", "    resolution: {repo: x, type: 'git'}", True),
+    ("pnpm-lock.yaml", '    resolution: {type: "directory"}', True),
+])
+def test_more_prefix_forms(path, line, bad):
+    assert bool(_scan(path, [line])) is bad
+
+
+@pytest.mark.parametrize("url", [
+    "http://registry.npmjs.org/x.tgz", "HTTP://pypi.org/simple",
+])
+def test_plain_http_is_a_finding(url):
+    assert url_problem(url)
+
+
+def test_plain_http_in_a_line_format_is_a_finding():
+    assert _scan("yarn.lock", ['  resolved "http://registry.yarnpkg.com/x.tgz"'])
+
+
+def _npm_v1(deps: dict) -> str:
+    return json.dumps({"name": "app", "lockfileVersion": 1, "dependencies": deps}, indent=2)
+
+
+@pytest.mark.parametrize(("entry", "bad"), [
+    ({"version": "1.3.0", "resolved": "https://registry.npmjs.org/x/-/x-1.3.0.tgz"}, False),
+    ({"version": "1.3.0-beta.1+b2", "resolved": "https://registry.npmjs.org/x/-/x.tgz"}, False),
+    ({"version": "https://evil.example.net/x.tgz"}, True),
+    ({"version": "https://registry.npmjs.org/x/-/x-1.0.0.tgz"}, True),
+    ({"version": "github:a/b#abc"}, True),
+    ({"version": "a/b#abc"}, True),
+    ({"version": "npm:other@1.0.0", "resolved": "https://registry.npmjs.org/other/-/other-1.0.0.tgz"}, True),
+])
+def test_npm_v1_versions(entry, bad):
+    head = _npm_v1({"x": entry})
+    found = _scan("package-lock.json", ['    "x": {'], head=head, base=_npm_v1({}))
+    assert bool(found) is bad, found
+
+
+def test_a_removal_only_structured_change_is_still_checked():
+    # The head entry changed (its source moved) though the hunk only removes.
+    base = _uv_with(_UV_GOOD)
+    head = _uv_with(_UV_GOOD.replace("https://pypi.org/simple", "https://evil.example.net/simple"))
+    found = _scan("uv.lock", [], removed=["# a line"], head=head, base=base)
+    assert len(found) == 1
+
+
+def test_a_removal_only_clean_structured_change_passes():
+    found = _scan("uv.lock", [], removed=['name = "idna"'], head=_UV_BASE, base=_uv_with(_UV_GOOD))
+    assert found == ()
+
+
+@pytest.mark.parametrize(("path", "removed", "added", "bad"), [
+    ("yarn.lock", ["  integrity sha512-old=="], [], True),
+    ("yarn.lock", ["  integrity sha512-old=="], ["  integrity sha512-new=="], False),
+    ("yarn.lock", ["  checksum: 10/abc"], [], True),
+    ("pnpm-lock.yaml", ["    resolution: {integrity: sha512-old==}"], [], True),
+    (".terraform.lock.hcl", ['    "h1:abc=",'], [], True),
+    (".terraform.lock.hcl", ['    "h1:abc=",'], ['    "h1:def=",'], False),
+    ("Gemfile.lock", ["  rake (13.0.6) sha256=abc"], [], True),
+    ("yarn.lock", ['  version "1.0.0"'], [], False),
+])
+def test_a_removed_integrity_line_is_a_finding(path, removed, added, bad):
+    assert bool(_scan(path, added, removed=removed)) is bad
+
+
+@pytest.mark.parametrize(("url", "bad"), [
+    ("//evil.example.net/x.tgz", True),
+    ("//registry.npmjs.org/x/-/x-1.0.0.tgz", False),
+    ("//registry.npmjs.org\\@evil.example/x.tgz", True),
+])
+def test_a_scheme_relative_url_is_checked_as_https(url, bad):
+    assert bool(url_problem(url)) is bad
+
+
+@pytest.mark.parametrize(("path", "line", "bad"), [
+    ("pnpm-lock.yaml", "    resolution: {tarball: //evil.example.net/x.tgz}", True),
+    ("pnpm-lock.yaml", "    resolution: {tarball: //registry.npmjs.org/x/-/x-1.0.0.tgz}", False),
+    ("yarn.lock", '  resolved "//evil.example.net/x.tgz"', True),
+    ("yarn.lock", '  resolved "https://registry.yarnpkg.com/x.tgz"', False),
+])
+def test_a_scheme_relative_reference_in_a_line_format(path, line, bad):
+    assert bool(_scan(path, [line])) is bad
