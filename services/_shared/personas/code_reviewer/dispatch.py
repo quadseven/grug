@@ -86,11 +86,11 @@ from personas.code_reviewer.dedup import (
 )
 from personas.code_reviewer.diff_parser import (
     added_lines,
-    DiffHunk, DiffParseError, file_changes, is_lock_file_path, is_tree_copy_candidate,
-    new_file_blob_ids,
+    DiffHunk, DiffParseError, file_changes, is_tree_copy_candidate, new_file_blob_ids,
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
+from personas.code_reviewer.lock_files import LOCK_FILES_ONLY_TITLE, judge_lock_only
 from personas.code_reviewer.move_detection import (
     SubtreeImport, split_move_hunks, subtree_imports,
 )
@@ -3378,47 +3378,44 @@ def _review_deletion_only(
     return with_extra_findings(base, findings), note
 
 
-LOCK_FILES_ONLY_TITLE = "lock files only: nothing for Elder to review"
-
-
-def _lock_files_only(evaluation: CodeReviewEvaluation, diff_text: str) -> tuple[str, ...]:
-    """The changed paths when every one is a lock file, else () (#1649).
-
-    Lock files are dropped from the model's plate (#609), so a diff made only
-    of them reached the model with nothing and published a neutral "eyes
-    clouded (no_diff)" that never clears a blocking gate. Only a `no_diff`
-    evaluation qualifies, and every changed file, including binaries,
-    deletions and renames (both sides), must be a lock file: one reviewable
-    file anywhere keeps the normal path."""
-    if evaluation.degraded_reason != "no_diff":
-        return ()
-    changes = file_changes(diff_text)
-    paths = tuple(dict.fromkeys(
-        p for c in changes for p in (c.path, c.previous_path) if p
-    ))
-    if not paths or not all(is_lock_file_path(p) for p in paths):
-        return ()
-    return paths
+def _lock_author_trusted(pr: Mapping[str, Any], repo: Mapping[str, Any]) -> bool:
+    """grug's existing trust checks, all required for a lock-file pass
+    (#1649): the head is in the base repository (`_head_is_same_repo`),
+    and the author is a human owner, member or collaborator
+    (`is_trusted_operator`) or an App listed in the trusted App table
+    (`app_author_family`, grug#1553)."""
+    if not _head_is_same_repo(dict(pr), dict(repo)):
+        return False
+    if is_trusted_operator(pr):
+        return True
+    user = pr.get("user")
+    return (
+        isinstance(user, Mapping) and user.get("type") == "Bot"
+        and app_author_family(str(user.get("login") or "")) is not None
+    )
 
 
 def _review_lock_files_only(
     evaluation: CodeReviewEvaluation, diff_text: str,
-) -> tuple[CodeReviewEvaluation, str]:
-    """A lock-file-only diff concludes success, not no_diff (#1649).
-
-    Returns a clean evaluation and a summary note naming the lock files;
-    any other diff is returned unchanged with no note."""
-    paths = _lock_files_only(evaluation, diff_text)
-    if not paths:
-        return evaluation, ""
-    shown = ", ".join(f"`{p.replace(chr(96), '')}`" for p in paths[:10])
-    more = f" and {len(paths) - 10} more" if len(paths) > 10 else ""
-    note = (
-        f"\n\nLock-file-only diff: {len(paths)} lock file(s) changed "
-        f"({shown}{more}). Elder does not review lock file contents, and no "
-        "other file changed, so there is nothing for Elder to review."
+    parsed_hunks: tuple[DiffHunk, ...], *, trusted: bool,
+) -> tuple[CodeReviewEvaluation, str, bool]:
+    """A lock-file-only diff concludes success, not no_diff, when every
+    condition in `lock_files` holds (#1649). Returns the evaluation, a
+    summary note, and whether it passed. A diff that fails a condition
+    keeps its neutral no_diff and the note says which condition; any
+    other diff is returned unchanged with no note."""
+    if evaluation.degraded_reason != "no_diff":
+        return evaluation, "", False
+    verdict = judge_lock_only(file_changes(diff_text), parsed_hunks, trusted=trusted)
+    if not verdict.applies:
+        return evaluation, "", False
+    log.info(
+        "code_review_lock_files_only",
+        extra={"files": len(verdict.paths), "passed": verdict.passed},
     )
-    return CodeReviewEvaluation(findings=(), conclusion="success"), note
+    if not verdict.passed:
+        return evaluation, verdict.note, False
+    return CodeReviewEvaluation(findings=(), conclusion="success"), verdict.note, True
 
 
 def _merge_lane_work(
@@ -4503,7 +4500,10 @@ def dispatch_code_review(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,
     )
-    evaluation, lock_files_note = _review_lock_files_only(evaluation, diff_text)
+    evaluation, lock_files_note, lock_files_passed = _review_lock_files_only(
+        evaluation, diff_text, parsed_hunks,
+        trusted=_lock_author_trusted(pr, repo),
+    )
 
     # Deterministic lane-work checks (#1179, #1363): a new function nothing
     # calls, linked criteria no hunk can satisfy, a file mostly deleted that
@@ -4628,7 +4628,7 @@ def dispatch_code_review(
         blocking=blocking,
         muted=muted,
     )
-    if lock_files_note and not evaluation.findings and not evaluation.degraded_reason:
+    if lock_files_passed and not evaluation.findings and not evaluation.degraded_reason:
         title = _hunt_title(LOCK_FILES_ONLY_TITLE, living_range)
     if evaluation.reviewability_note:
         summary += "\n\n## Reviewability assessment\n\n" + evaluation.reviewability_note
