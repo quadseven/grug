@@ -291,13 +291,18 @@ def _new_classes(
 
 def _only_typed(text: str, name: str) -> bool:
     """Every use of `name` on this line is an import or a type annotation,
-    never a call, a subclass, an attribute read or a value passed on."""
+    never a call, a subclass, an attribute read or a value passed on. A
+    module-qualified name (`mod.Name`) is read as one name, and a call is
+    a use whatever precedes it, so a dict row `1: Name(...)` constructs."""
     code = text.split("#", 1)[0]
     if _IMPORT_LINE_RE.match(code):
         return True
-    for match in re.finditer(rf"(?<![\w.]){re.escape(name)}(?!\w)", code):
+    qualified = rf"(?<![\w.])(?:[A-Za-z_]\w*\s*\.\s*)*{re.escape(name)}(?!\w)"
+    for match in re.finditer(qualified, code):
         before = code[: match.start()].rstrip()
         after = code[match.end():].lstrip()
+        if after.startswith("("):
+            return False
         if not (before.endswith((":", "->", "|", "[")) or after.startswith(("|", "]"))):
             return False
     return True
