@@ -80,6 +80,14 @@ jobs:
       - name: 03. Stack name
         id: stack
         run: echo "stack=prod" >> "$GITHUB_OUTPUT"
+      # The hosted runner image stopped shipping the pulumi CLI on
+      # 2026-11-05, so step 04 exited 127 (#1655). Install-only (no
+      # `command`): the action puts the pinned CLI on PATH for every later
+      # step. Keep this version equal to step 10's so that step reuses it.
+      - name: 03b. Install Pulumi CLI (pinned)
+        uses: pulumi/actions@8582a9e8cc630786854029b4e09281acd6794b58 # v6.6.1
+        with:
+          pulumi-version: 3.273.0
       - name: 04. Pulumi login (S3 backend)
         env:
           PULUMI_BACKEND_URL: ${{ secrets.PULUMI_BACKEND_URL }}
@@ -105,6 +113,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           command: up
+          pulumi-version: 3.273.0
           stack-name: ${{ steps.stack.outputs.stack }}
           cloud-url: ${{ secrets.PULUMI_BACKEND_URL }}
           work-dir: infra/pulumi
