@@ -20,6 +20,7 @@ from personas.code_reviewer.lock_sources import (
     RULE,
     UNCHECKED_NOTE,
     is_lock_file_path,
+    is_unchecked_lock_path,
     lock_source_check,
     url_problem,
 )
@@ -38,7 +39,9 @@ def _diff(path: str, added: list[str], removed: list[str] = ()) -> str:
 
 def _run(path: str, *, head: str | None, base: str | None,
          added: list[str] = ("x",), removed: list[str] = (),
-         fetch_error: Exception | None = None):
+         fetch_error: Exception | None = None,
+         reviewed: frozenset[str] | None = None,
+         oversized: frozenset[str] = frozenset()):
     files = {"HEAD": head, "BASE": base}
 
     def fetch(paths, ref):
@@ -50,11 +53,13 @@ def _run(path: str, *, head: str | None, base: str | None,
     return lock_source_check(
         parse_diff(_diff(path, list(added), list(removed))),
         fetch=fetch, head_sha="HEAD", base_sha="BASE",
+        reviewed=frozenset({path}) if reviewed is None else reviewed,
+        oversized=oversized,
     )
 
 
 def _scan(path: str, **kw):
-    return _run(path, **kw)[0]
+    return _run(path, **kw).findings
 
 
 # --- names, hosts, URLs ----------------------------------------------------
@@ -315,16 +320,43 @@ def test_unparseable_json_lock_is_flagged():
     ".terraform.lock.hcl", "Pipfile.lock", "composer.lock",
 ])
 def test_other_formats_get_a_non_blocking_note(path):
-    findings, note = _run(path, head=None, base=None, added=['resolved "https://evil.example.net/x"'])
-    assert findings == ()
-    assert UNCHECKED_NOTE in note and path in note
+    check = _run(path, head=None, base=None, added=['resolved "https://evil.example.net/x"'])
+    assert check.findings == () and check.unreviewed == ()
+    assert UNCHECKED_NOTE in check.note and f"`{path}`" in check.note
+
+
+def test_the_note_names_basenames_only():
+    check = _run("private-app/web/yarn.lock", head=None, base=None)
+    assert "`yarn.lock`" in check.note
+    assert "private-app" not in check.note
+
+
+def test_the_note_covers_only_files_the_model_received():
+    check = _run("web/yarn.lock", head=None, base=None, reviewed=frozenset())
+    assert UNCHECKED_NOTE not in check.note
+
+
+def test_an_unchecked_lock_dropped_for_size_is_unreviewed():
+    check = _run("web/yarn.lock", head=None, base=None, reviewed=frozenset(),
+                 oversized=frozenset({"web/yarn.lock"}))
+    assert check.unreviewed == ("yarn.lock",)
+    assert UNCHECKED_NOTE not in check.note
+
+
+def test_unchecked_lock_paths():
+    assert is_unchecked_lock_path("web/yarn.lock")
+    assert not is_unchecked_lock_path("uv.lock")
+    assert not is_unchecked_lock_path("src/app.py")
 
 
 def test_checked_formats_get_no_note():
-    _, note = _run("uv.lock", head=_UV_BASE, base=_UV_BASE)
-    assert note == ""
+    assert _run("uv.lock", head=_UV_BASE, base=_UV_BASE).note == ""
 
 
 def test_non_lock_files_are_ignored():
     hunks = parse_diff(_diff("src/app.py", ["URL = 'https://evil.example.net'"]))
-    assert lock_source_check(hunks, fetch=lambda p, r: {}, head_sha="H", base_sha="B") == ((), "")
+    check = lock_source_check(
+        hunks, fetch=lambda p, r: {}, head_sha="H", base_sha="B",
+        reviewed=frozenset({"src/app.py"}), oversized=frozenset(),
+    )
+    assert (check.findings, check.note, check.unreviewed) == ((), "", ())

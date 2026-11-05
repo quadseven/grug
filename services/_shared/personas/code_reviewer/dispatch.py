@@ -90,7 +90,9 @@ from personas.code_reviewer.diff_parser import (
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
-from personas.code_reviewer.lock_sources import is_lock_file_path, lock_source_check
+from personas.code_reviewer.lock_sources import (
+    LockCheck, is_lock_file_path, is_unchecked_lock_path, lock_source_check,
+)
 from personas.code_reviewer.move_detection import (
     SubtreeImport, split_move_hunks, subtree_imports,
 )
@@ -3297,12 +3299,27 @@ def _is_lock_only(diff_text: str) -> bool:
     return bool(paths) and all(is_lock_file_path(p) for p in paths)
 
 
+def _keep_unchecked_locks(
+    parsed_hunks: tuple[DiffHunk, ...], kept: tuple[DiffHunk, ...],
+    excluded_paths: tuple[str, ...],
+) -> tuple[tuple[DiffHunk, ...], tuple[str, ...]]:
+    """Put back the lock files the source check cannot parse, so the model
+    reviews them in a mixed diff too (#1649). Diff order is kept."""
+    kept_ids = {id(h) for h in kept}
+    hunks = tuple(
+        h for h in parsed_hunks
+        if id(h) in kept_ids or is_unchecked_lock_path(h.file_path)
+    )
+    return hunks, tuple(p for p in excluded_paths if not is_unchecked_lock_path(p))
+
+
 def _lock_findings(
     parsed_hunks: tuple[DiffHunk, ...], *, installation_id: int, owner: str,
     repo_name: str, head_sha: str, base_sha: str,
-) -> tuple[tuple[Finding, ...], str]:
-    """The deterministic lock-source findings and summary note for this
-    diff (#1649): a second layer on top of the model review, not the gate."""
+    reviewed: frozenset[str], oversized: frozenset[str],
+) -> LockCheck:
+    """The deterministic lock-source check for this diff (#1649): a second
+    layer on top of the model review, not the gate."""
     return lock_source_check(
         parsed_hunks,
         fetch=lambda paths, ref: with_install_token_retry(
@@ -3312,6 +3329,7 @@ def _lock_findings(
             ),
         ),
         head_sha=head_sha, base_sha=base_sha,
+        reviewed=reviewed, oversized=oversized,
     )
 
 
@@ -3980,6 +3998,10 @@ def dispatch_code_review(
         lock_only_review = bool(parsed_hunks) and _is_lock_only(diff_text)
         if lock_only_review:
             hunks, excluded_paths = parsed_hunks, ()
+        else:
+            hunks, excluded_paths = _keep_unchecked_locks(
+                parsed_hunks, hunks, excluded_paths,
+            )
         if excluded_paths:
             log.info(
                 "code_review_paths_excluded",
@@ -4503,10 +4525,13 @@ def dispatch_code_review(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,
     )
-    lock_findings, lock_note = _lock_findings(
+    lock_check = _lock_findings(
         parsed_hunks, installation_id=installation_id, owner=owner,
         repo_name=repo_name, head_sha=head_sha, base_sha=base_sha,
+        reviewed=frozenset(h.file_path for h in hunks),
+        oversized=frozenset(oversized_paths),
     )
+    lock_findings = lock_check.findings
     if lock_findings:
         evaluation = with_extra_findings(evaluation, lock_findings)
 
@@ -4633,6 +4658,16 @@ def dispatch_code_review(
         blocking=blocking,
         muted=muted,
     )
+    if lock_check.unreviewed and conclusion == "success":
+        # #1649: a lock file neither machine-checked nor read by the model
+        # never passes.
+        names = ", ".join(f"`{n}`" for n in lock_check.unreviewed)
+        conclusion = "neutral"
+        title = _hunt_title("WARN Elder could not read lock file(s): too large", living_range)
+        summary += (
+            f"\n\nLock files {names} were too large for Elder to read and "
+            "have no machine check, so this pass is neutral, not success."
+        )
     if evaluation.reviewability_note:
         summary += "\n\n## Reviewability assessment\n\n" + evaluation.reviewability_note
     summary = _intent_paragraph(pr_context) + summary
@@ -4646,7 +4681,7 @@ def dispatch_code_review(
     summary += f"\n\n{budget.note}" if budget.note else ""
     summary += config_note
     summary += deletion_note
-    summary += lock_note
+    summary += lock_check.note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
     )
@@ -4926,6 +4961,7 @@ def dispatch_code_review(
         # #1649: a failed lock review keeps the baseline, so the next push
         # judges the lock change again rather than only what follows it.
         and not ((lock_only_review or lock_findings) and result != "pass")
+        and not lock_check.unreviewed
     ):
         try:
             from adapters.install_store import put_elder_last_reviewed

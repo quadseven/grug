@@ -226,3 +226,29 @@ def test_an_unchecked_lock_format_is_reviewed_and_noted(monkeypatch):
     final = seen["checks"][-1]
     assert final.conclusion == "success", (final.conclusion, final.title)
     assert "registry sources not machine-checked for this format" in final.summary
+
+
+def test_a_mixed_pr_sends_an_unchecked_lock_to_the_model(monkeypatch):
+    full = _added("web/yarn.lock", ['  resolved "https://registry.yarnpkg.com/x.tgz"']) + _added(
+        "src/app.py", ["a = 1"])
+    seen = _review_pr(monkeypatch, full=full, files={})
+    sent = set().union(*seen["reviewed"])
+    assert {"web/yarn.lock", "src/app.py"} <= sent
+    final = seen["checks"][-1]
+    assert final.conclusion == "success", (final.conclusion, final.title)
+    assert "`yarn.lock`: registry sources not machine-checked" in final.summary
+    assert "web/yarn.lock`: registry" not in final.summary
+
+
+def test_an_unchecked_lock_dropped_for_size_concludes_neutral(monkeypatch):
+    monkeypatch.setattr(cr_dispatch, "review_cohort_char_budget", lambda: 80)
+    big = '  resolved "https://registry.yarnpkg.com/' + "x" * 200 + '.tgz"'
+    full = _added("web/yarn.lock", [big]) + _added("src/app.py", ["a = 1"])
+    seen = _review_pr(monkeypatch, full=full, files={})
+    sent = set().union(*seen["reviewed"]) if seen["reviewed"] else set()
+    assert "web/yarn.lock" not in sent
+    final = seen["checks"][-1]
+    assert final.conclusion == "neutral", (final.conclusion, final.title)
+    assert "`yarn.lock`" in final.summary
+    assert "machine-checked for this format; Elder's review covers it" not in final.summary
+    assert seen["baseline"] == []

@@ -24,6 +24,7 @@ import posixpath
 import re
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -70,6 +71,12 @@ _MAX_LISTED = 5
 def is_lock_file_path(path: str) -> bool:
     """True when the file name is exactly one of `LOCK_FILE_NAMES`."""
     return posixpath.basename(path) in LOCK_FILE_NAMES
+
+
+def is_unchecked_lock_path(path: str) -> bool:
+    """A listed lock file this check cannot parse. The model always gets it
+    (#1649), in a lock-only or a mixed diff, so Elder's review covers it."""
+    return is_lock_file_path(path) and posixpath.basename(path) not in CHECKED_FORMATS
 
 
 def url_problem(url: str) -> str | None:
@@ -276,10 +283,14 @@ def _fetch_both(
         return None
 
 
-def _unchecked_note(paths: tuple[str, ...]) -> str:
-    if not paths:
+def _basenames(paths: Iterator[str] | tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(posixpath.basename(p) for p in paths))
+
+
+def _unchecked_note(names: tuple[str, ...]) -> str:
+    if not names:
         return ""
-    return "\n\nLock files " + ", ".join(f"`{p}`" for p in paths) + f": {UNCHECKED_NOTE}."
+    return "\n\nLock files " + ", ".join(f"`{n}`" for n in names) + f": {UNCHECKED_NOTE}."
 
 
 def _path_problems(
@@ -291,12 +302,26 @@ def _path_problems(
     return file_problems(name, fetched[0][path], fetched[1].get(path))
 
 
+@dataclass(frozen=True)
+class LockCheck:
+    """`findings` block; `note` names, by file name only, the unchecked
+    lock files the model received; `unreviewed` names unchecked lock files
+    the size rules kept from the model, which keeps the check from
+    concluding success."""
+
+    findings: tuple[Finding, ...] = ()
+    note: str = ""
+    unreviewed: tuple[str, ...] = ()
+
+
 def lock_source_check(
     hunks: tuple[DiffHunk, ...], *,
     fetch: Callable[[tuple[str, ...], str], dict[str, str]],
     head_sha: str, base_sha: str,
-) -> tuple[tuple[Finding, ...], str]:
-    """(findings, summary note) for every changed lock file. `fetch(paths,
+    reviewed: frozenset[str], oversized: frozenset[str],
+) -> LockCheck:
+    """Check every changed lock file. `reviewed` is the paths the model
+    received, `oversized` the paths the size rules dropped. `fetch(paths,
     ref)` returns path -> text for files present at `ref`, omits absent
     ones, and raises when it cannot tell."""
     first: dict[str, int] = {}
@@ -304,13 +329,14 @@ def lock_source_check(
         if is_lock_file_path(h.file_path):
             first.setdefault(h.file_path, max(1, h.new_start))
     checked = tuple(p for p in first if posixpath.basename(p) in CHECKED_FORMATS)
-    note = _unchecked_note(tuple(p for p in first if p not in checked))
-    if not checked:
-        return (), note
-    fetched = _fetch_both(checked, fetch, head_sha, base_sha)
+    unchecked = tuple(p for p in first if p not in checked)
+    note = _unchecked_note(_basenames(p for p in unchecked if p in reviewed))
+    unreviewed = _basenames(p for p in unchecked if p in oversized and p not in reviewed)
     found = []
-    for path in checked:
-        problems = _path_problems(path, fetched)
-        if problems:
-            found.append(_finding(path, first[path], problems))
-    return tuple(found), note
+    if checked:
+        fetched = _fetch_both(checked, fetch, head_sha, base_sha)
+        for path in checked:
+            problems = _path_problems(path, fetched)
+            if problems:
+                found.append(_finding(path, first[path], problems))
+    return LockCheck(tuple(found), note, unreviewed)
