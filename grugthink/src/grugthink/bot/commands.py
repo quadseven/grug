@@ -1197,8 +1197,11 @@ def register_commands(bot: "GrugThinkBot") -> None:
         def make_wrapper(cmd, bot_instance, params_list):
             """Factory to create wrapper with proper closures and typed parameters.
 
-            Uses exec() to dynamically create a function with the EXACT signature needed,
-            preserving all type annotations. The bot parameter is hidden in the closure.
+            The wrapper's __signature__ is (interaction, <the command's own
+            parameters>), which is what discord.py inspects; the bot parameter
+            stays hidden in the closure. The previous exec()-built wrapper got
+            cmd and bot_instance as exec locals, which its body cannot see, so
+            every command with parameters raised NameError when called.
             """
             # Skip interaction and bot parameters, get the rest
             cmd_params = params_list[2:]  # Skip interaction and bot
@@ -1211,36 +1214,29 @@ def register_commands(bot: "GrugThinkBot") -> None:
 
                 return wrapper
 
-            # Build parameter signature string for exec()
-            param_strs = []
+            wrapper_params = [params_list[0].replace(annotation=inspect.Parameter.empty)]
             for p in cmd_params:
-                ptype = p.annotation if p.annotation != inspect.Parameter.empty else str
-                # Get type name
-                type_name = getattr(ptype, "__name__", str(ptype))
-                if p.default == inspect.Parameter.empty:
-                    param_strs.append(f"{p.name}: {type_name}")
-                else:
-                    # Handle default values
-                    is_simple_type = isinstance(p.default, (str, int, float, bool, type(None)))
-                    default_repr = repr(p.default) if is_simple_type else "None"
-                    param_strs.append(f"{p.name}: {type_name} = {default_repr}")
+                annotation = p.annotation if p.annotation is not inspect.Parameter.empty else "str"
+                default = p.default
+                if default is not inspect.Parameter.empty and not isinstance(
+                    default, (str, int, float, bool, type(None))
+                ):
+                    default = None
+                wrapper_params.append(
+                    p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=annotation, default=default)
+                )
 
-            params_sig = ", ".join(param_strs)
-            call_args = ", ".join([p.name for p in cmd_params])
+            signature = inspect.Signature(wrapper_params)
+            interaction_name = wrapper_params[0].name
 
-            # Create function code
-            func_code = f"""
-async def wrapper(interaction, {params_sig}):
-    await cmd(interaction, bot_instance, {call_args})
-"""
+            async def wrapper(*args, **kwargs):
+                bound = signature.bind(*args, **kwargs)
+                bound.apply_defaults()
+                arguments = dict(bound.arguments)
+                interaction = arguments.pop(interaction_name)
+                await cmd(interaction, bot_instance, **arguments)
 
-            # Execute the code to create the function. cmd and bot_instance go
-            # in the GLOBALS: the function body resolves free names there, so
-            # passing them as exec locals raised NameError on every call.
-            namespace = {"cmd": cmd, "bot_instance": bot_instance}
-            exec(func_code, namespace)
-            wrapper = namespace["wrapper"]
-
+            wrapper.__signature__ = signature
             return wrapper
 
         wrapper = make_wrapper(cmd_func, bot, params)

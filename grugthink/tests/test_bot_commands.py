@@ -105,3 +105,26 @@ async def test_chat_frequency_set_unauthorized(cog, interaction):
 async def test_chat_frequency_set_invalid_value(cog, interaction):
     await cog.chat_frequency.callback(interaction, 101)
     interaction.response.send_message.assert_called_with("Percentage must be between 0 and 100!", ephemeral=True)
+
+
+def test_registered_commands_expose_only_their_own_parameters(cog):
+    """discord.py builds each slash command's options from the wrapper's
+    signature: the hidden bot argument must not appear, and types and
+    defaults must survive."""
+    freq = {p.name: p for p in cog.chat_frequency.parameters}
+    assert list(freq) == ["percentage"]
+    assert freq["percentage"].type.name == "integer"
+    assert freq["percentage"].required
+
+    know = {p.name: p for p in cog.what_know.parameters}
+    assert list(know) == ["page", "search"]
+    assert know["page"].type.name == "integer"
+    assert know["page"].default == 1
+    assert not know["search"].required
+
+
+@pytest.mark.asyncio
+async def test_wrapper_passes_keyword_arguments_like_discord(cog, interaction):
+    """discord.py calls the callback as callback(interaction, **options)."""
+    await cog.chat_frequency.callback(interaction, percentage=50)
+    assert cog.chat_frequencies["test_guild"] == 50
