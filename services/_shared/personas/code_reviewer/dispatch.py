@@ -90,6 +90,9 @@ from personas.code_reviewer.diff_parser import (
     parse_diff, split_duplicate_hunks, split_oversized_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
+from personas.code_reviewer.lock_sources import (
+    LockCheck, is_lock_file_path, is_unchecked_lock_path, lock_source_check,
+)
 from personas.code_reviewer.move_detection import (
     SubtreeImport, split_move_hunks, subtree_imports,
 )
@@ -3289,6 +3292,47 @@ def _delta_is_empty(diff_text: str) -> bool:
     return not parse_diff(diff_text) and not removed_paths(diff_text)
 
 
+def _is_lock_only(diff_text: str) -> bool:
+    """Every changed file, both sides of a rename included, is a listed
+    lock file (#1649). An empty diff is not lock-only."""
+    paths = [p for c in file_changes(diff_text) for p in (c.path, c.previous_path) if p]
+    return bool(paths) and all(is_lock_file_path(p) for p in paths)
+
+
+def _keep_unchecked_locks(
+    parsed_hunks: tuple[DiffHunk, ...], kept: tuple[DiffHunk, ...],
+    excluded_paths: tuple[str, ...],
+) -> tuple[tuple[DiffHunk, ...], tuple[str, ...]]:
+    """Put back the lock files the source check cannot parse, so the model
+    reviews them in a mixed diff too (#1649). Diff order is kept."""
+    kept_ids = {id(h) for h in kept}
+    hunks = tuple(
+        h for h in parsed_hunks
+        if id(h) in kept_ids or is_unchecked_lock_path(h.file_path)
+    )
+    return hunks, tuple(p for p in excluded_paths if not is_unchecked_lock_path(p))
+
+
+def _lock_findings(
+    parsed_hunks: tuple[DiffHunk, ...], *, installation_id: int, owner: str,
+    repo_name: str, head_sha: str, base_sha: str,
+    reviewed: frozenset[str],
+) -> LockCheck:
+    """The deterministic lock-source check for this diff (#1649): a second
+    layer on top of the model review, not the gate."""
+    return lock_source_check(
+        parsed_hunks,
+        fetch=lambda paths, ref: with_install_token_retry(
+            installation_id,
+            lambda token: fetch_file_contents(
+                token, owner, repo_name, paths, ref, only_404_skips=True,
+            ),
+        ),
+        head_sha=head_sha, base_sha=base_sha,
+        reviewed=reviewed,
+    )
+
+
 def _fetch_full_pr_diff(
     installation_id: int, owner: str, repo_name: str, pull_number: int, *,
     base_sha: str, head_sha: str,
@@ -3921,6 +3965,18 @@ def dispatch_code_review(
                 installation_id, owner, repo_name, pull_number,
                 base_sha=base_sha, head_sha=head_sha,
             )
+        elif living_prior_sha and _is_lock_only(diff_text):
+            # #1649: a lock-only delta is judged on the whole base..head
+            # diff, never on the increment alone.
+            log.info(
+                "elder_living_hunt_lock_delta_full_review",
+                extra={"pr": f"{owner}/{repo_name}#{pull_number}", "range": living_range},
+            )
+            living_prior_sha, living_range = "", ""
+            diff_text = _fetch_full_pr_diff(
+                installation_id, owner, repo_name, pull_number,
+                base_sha=base_sha, head_sha=head_sha,
+            )
         pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
         # The lane-work checks (#1179, #1363) judge the WHOLE diff, so they
@@ -3936,6 +3992,16 @@ def dispatch_code_review(
         # big JSONL/lockfile hunk balloons the prompt into parse_failed and
         # carries no review signal. Named in the summary, never silent.
         hunks, excluded_paths = split_reviewable_hunks(hunks)
+        # #1649: no verdict may come from a skip. When every changed file
+        # is a lock file, the model reviews them like any other file; the
+        # size rules below still apply.
+        lock_only_review = bool(parsed_hunks) and _is_lock_only(diff_text)
+        if lock_only_review:
+            hunks, excluded_paths = parsed_hunks, ()
+        else:
+            hunks, excluded_paths = _keep_unchecked_locks(
+                parsed_hunks, hunks, excluded_paths,
+            )
         if excluded_paths:
             log.info(
                 "code_review_paths_excluded",
@@ -4459,6 +4525,15 @@ def dispatch_code_review(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,
     )
+    lock_check = _lock_findings(
+        parsed_hunks, installation_id=installation_id, owner=owner,
+        repo_name=repo_name, head_sha=head_sha, base_sha=base_sha,
+        # The final plate: after the ignore, size, copy and move filters.
+        reviewed=frozenset(h.file_path for h in hunks),
+    )
+    lock_findings = lock_check.findings
+    if lock_findings:
+        evaluation = with_extra_findings(evaluation, lock_findings)
 
     # Deterministic lane-work checks (#1179, #1363): a new function nothing
     # calls, linked criteria no hunk can satisfy, a file mostly deleted that
@@ -4583,6 +4658,17 @@ def dispatch_code_review(
         blocking=blocking,
         muted=muted,
     )
+    if lock_check.unreviewed and conclusion == "success":
+        # #1649: a lock file neither machine-checked nor read by the model
+        # never passes.
+        names = ", ".join(f"`{n}`" for n in lock_check.unreviewed)
+        conclusion = "neutral"
+        title = _hunt_title("WARN Elder did not read lock file(s)", living_range)
+        summary += (
+            f"\n\nLock files {names} were kept from Elder's review (size or "
+            "ignore rules) and have no machine check, so this pass is "
+            "neutral, not success."
+        )
     if evaluation.reviewability_note:
         summary += "\n\n## Reviewability assessment\n\n" + evaluation.reviewability_note
     summary = _intent_paragraph(pr_context) + summary
@@ -4596,6 +4682,7 @@ def dispatch_code_review(
     summary += f"\n\n{budget.note}" if budget.note else ""
     summary += config_note
     summary += deletion_note
+    summary += lock_check.note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
     )
@@ -4872,6 +4959,10 @@ def dispatch_code_review(
         and not check_publish_failed
         and evaluation.degraded_reason in (None, "", "no_diff")
         and not budget.keep_baseline
+        # #1649: a failed lock review keeps the baseline, so the next push
+        # judges the lock change again rather than only what follows it.
+        and not ((lock_only_review or lock_findings) and result != "pass")
+        and not lock_check.unreviewed
     ):
         try:
             from adapters.install_store import put_elder_last_reviewed
