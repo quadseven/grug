@@ -79,6 +79,7 @@ class FakeGitHub:
         stamp = _iso(self.clock.tick())
         run = {
             "id": len(self.check_runs) + 1,
+            "app": {"slug": "grug-tribe"},
             "name": result.name,
             "head_sha": result.head_sha,
             "status": result.status,
@@ -117,9 +118,12 @@ class FakeGitHub:
         ]
 
     # reviews --------------------------------------------------------------
-    def post_review(self, state: str = "COMMENTED") -> dict[str, Any]:
+    def post_review(
+        self, state: str = "COMMENTED", *, login: str = "grug-tribe[bot]",
+    ) -> dict[str, Any]:
         review = {
             "id": 900 + len(self.reviews),
+            "user": {"login": login},
             "commit_id": HEAD,
             "state": state,
             "body": f"**Grug Elder** gaze upon your PR\n\n{REVIEW_TAG}",
@@ -418,6 +422,35 @@ def test_a_new_message_for_the_same_head_reviews_again(world, monkeypatch):
     world.queue.deliver(second)
 
     assert len(calls) == 2
+
+
+def test_a_review_carrying_the_tag_from_another_account_does_not_count(world, monkeypatch):
+    """The persona tag is plain text. A reviewer who pastes it into their
+    own review on the head, and a look-alike check from another App, must
+    not stand in for Elder: the redelivery still runs the review."""
+    dispatch, calls = _publishing_dispatch(world.gh)
+    monkeypatch.setattr(rerun, "dispatch_code_review", dispatch)
+    message = _enqueue_review(world)
+    message["receives"] = 1  # an earlier delivery died before publishing
+    message["first_received_ms"] = int(world.clock.tick().timestamp() * 1000)
+    world.gh.post_review("APPROVED", login="another-reviewer")
+    world.gh.post_check_run(
+        "tok", OWNER, REPO,
+        rerun.CheckRunResult(
+            name=ELDER, head_sha=HEAD, status="completed",
+            conclusion="success", title="Looks fine", summary="",
+        ),
+        external_id=f"grug-cr:{OWNER}/{REPO}#{PR}:{HEAD}",
+    )
+    world.gh.check_runs[-1]["app"] = {"slug": "another-app"}
+
+    world.queue.deliver(message)
+
+    assert len(calls) == 1
+    grug_reviews = [
+        r for r in world.gh.reviews if r["user"]["login"] == "grug-tribe[bot]"
+    ]
+    assert len(grug_reviews) == 1
 
 
 def _spec(key: str, check_run_name: str) -> PersonaSpec:

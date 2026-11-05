@@ -56,6 +56,7 @@ from github_reviews_client import list_reviews
 from personas.code_reviewer.removed_files import REMOVED_REFERENCE_CHECK_FAILED
 from personas.review_publish import LOW_CONFIDENCE
 from personas.code_reviewer.living_review import sync_pr as _sync_living_review
+from personas.code_reviewer.thread_resolver import is_grug
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion,
     degraded_lead_line,
@@ -450,8 +451,9 @@ def _settled_elder_check(
     `since`, or None.
 
     Only Elder's own review publication counts (the `grug-cr:` external id
-    dispatch stamps), so a fail-open close, the pending placeholder, or the
-    reconciler's sweep never reads as a verdict. A degraded check whose
+    dispatch stamps, on a run the Grug App itself created), so a fail-open
+    close, the pending placeholder, the reconciler's sweep, or another
+    App's look-alike run never reads as a verdict. A degraded check whose
     reason the queue retries (every model call failed, unparseable output)
     is not a verdict either: its job raised on purpose so the review runs
     again."""
@@ -466,6 +468,8 @@ def _settled_elder_check(
             continue
         if str(run.get("external_id") or "") != review_external_id:
             continue
+        if not is_grug(str((run.get("app") or {}).get("slug") or "")):
+            continue
         summary = str((run.get("output") or {}).get("summary") or "")
         if summary.startswith(retried_leads):
             continue
@@ -479,10 +483,16 @@ def _settled_elder_check(
 def _posted_elder_review(
     reviews: list[dict[str, Any]], *, head_sha: str, since: float,
 ) -> dict[str, Any] | None:
-    """Elder's review body on `head_sha`, submitted at or after `since`."""
+    """Elder's review body on `head_sha`, submitted at or after `since`.
+
+    Only a review the Grug App wrote counts: the persona tag is plain text
+    that any reviewer can paste, and a pasted tag must never stand in for
+    the review it imitates."""
     tag = _REVIEW_PERSONA_TAG.format("elder")
     for review in reversed(reviews):
         if not isinstance(review, dict):
+            continue
+        if not is_grug(str((review.get("user") or {}).get("login") or "")):
             continue
         if str(review.get("commit_id") or "") != head_sha:
             continue
