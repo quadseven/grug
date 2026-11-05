@@ -31,6 +31,21 @@ spec:
             - {name: DD_ENV, value: preview}
           readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 10, timeoutSeconds: 5, initialDelaySeconds: 5}
           livenessProbe: {httpGet: {path: /livez, port: http}, initialDelaySeconds: 10, periodSeconds: 30}
+          # The LimitRange defaults made explicit (#1634): two deployments at
+          # these values fit the preview ResourceQuota twice over, which a
+          # rolling update needs while old and new pods overlap.
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 250m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
 ---
 apiVersion: v1
 kind: Service
@@ -66,6 +81,21 @@ spec:
             - {name: DD_ENV, value: preview}
           readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 10, timeoutSeconds: 5, initialDelaySeconds: 5}
           livenessProbe: {httpGet: {path: /livez, port: http}, initialDelaySeconds: 10, periodSeconds: 30}
+          # The LimitRange defaults made explicit (#1634): two deployments at
+          # these values fit the preview ResourceQuota twice over, which a
+          # rolling update needs while old and new pods overlap.
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 250m, memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
 ---
 apiVersion: v1
 kind: Service
