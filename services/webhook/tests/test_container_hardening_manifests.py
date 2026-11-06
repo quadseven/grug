@@ -93,7 +93,7 @@ def test_every_read_only_container_has_a_writable_emptydir_tmp():
     for label, c, pod in _containers():
         mounts = {m["mountPath"]: m["name"] for m in c.get("volumeMounts", [])}
         vols = {v["name"]: v for v in pod.get("volumes", [])}
-        vol = vols.get(mounts.get("/tmp", ""), {})
+        vol = vols.get(mounts.get("/tmp", ""), {})  # noqa: S108 - a manifest mountPath key, not a file write
         if "emptyDir" not in vol:
             broken.append(label)
     assert not broken, f"containers without an emptyDir /tmp: {broken}"
