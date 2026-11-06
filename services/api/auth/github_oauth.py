@@ -22,8 +22,8 @@ import hmac
 import logging
 import os
 import secrets
+import threading
 import time
-from functools import lru_cache
 from urllib.parse import urlencode
 
 import httpx
@@ -48,7 +48,29 @@ _DASHBOARD_URL = f"https://{_DOMAIN}/dashboard"
 _STATE_TTL_SECONDS = 600  # 10 min
 
 
-@lru_cache(maxsize=1)
+# A resolved signing key, cached for the life of the process. Only a
+# key that every pod resolves the same way is cached: the dedicated key,
+# or the webhook key when the dedicated one is not configured or not
+# provisioned. A transient read failure is never cached (#1627).
+_signing_secret_cache: str | None = None
+_signing_secret_lock = threading.Lock()
+
+
+class SessionSigningUnavailable(HTTPException):
+    """The dedicated signing key could not be read; the request fails closed."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=503, detail="session_signing_unavailable")
+
+
+def _is_parameter_not_found(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    error = response.get("Error")
+    return isinstance(error, dict) and error.get("Code") == "ParameterNotFound"
+
+
 def _state_secret() -> str:
     """HMAC key for CSRF state + session-cookie signing.
 
@@ -59,27 +81,50 @@ def _state_secret() -> str:
     and you could not rotate the webhook secret to respond without breaking
     inbound webhook verification + logging every user out at once.
 
-    Falls back to the webhook secret when the dedicated param isn't
-    provisioned yet, so this is a ZERO-DOWNTIME migration: create the
-    SecureString `/grug/session-signing-secret` (HITL, see
-    docs/HITL_PREREQUISITES.md), wire GRUG_SESSION_SIGNING_SECRET_SSM in
-    k8s/api-deployment.yaml, and the next deploy switches over (live
-    sessions invalidate once — users simply re-login).
-
-    lru_cache(maxsize=1): resolve once per process (pods restart on deploy
-    / rotation), so the fallback warning logs once, not per request.
+    Resolution:
+    - Dedicated read succeeds: cache it for the process.
+    - Dedicated env var unset (local dev), or the parameter does not exist
+      yet (ParameterNotFound, the zero-downtime migration path in
+      docs/HITL_PREREQUISITES.md): use the webhook secret with a warning.
+      Every pod sees the same answer, so this is cached too.
+    - Any other dedicated read failure (throttle, network, access): raise
+      SessionSigningUnavailable (503) and cache nothing, so the next
+      request retries. Falling back here would let one pod sign with a
+      different key than its peers for its whole lifetime (#1627).
     """
+    global _signing_secret_cache
+    cached = _signing_secret_cache
+    if cached is not None:
+        return cached
+    with _signing_secret_lock:
+        if _signing_secret_cache is not None:
+            return _signing_secret_cache
+        _signing_secret_cache = _resolve_signing_secret()
+        return _signing_secret_cache
+
+
+def _resolve_signing_secret() -> str:
+    from botocore.exceptions import BotoCoreError, ClientError
     from secrets_loader import _get_ssm_secure_string  # type: ignore
     dedicated = os.environ.get("GRUG_SESSION_SIGNING_SECRET_SSM", "")
     if dedicated:
         try:
             return _get_ssm_secure_string(dedicated)
-        except Exception:
+        except (ClientError, BotoCoreError) as e:
+            # Only SSM read faults land here. A bug in the loader (NameError,
+            # AttributeError) propagates as itself instead of posing as an
+            # SSM outage behind a 503.
             # NB: do NOT log `dedicated` (the SSM param name) - the only
             # such param is GRUG_SESSION_SIGNING_SECRET_SSM, so the message
             # already identifies it, and logging a value sourced from a
             # `*_SECRET_SSM` env var trips clear-text-secret scanners.
-            log.warning("session_signing_secret_unavailable_using_fallback")
+            if not _is_parameter_not_found(e):
+                log.error(
+                    "session_signing_secret_read_failed",
+                    extra={"kind": type(e).__name__},
+                )
+                raise SessionSigningUnavailable() from e
+            log.warning("session_signing_secret_unprovisioned_using_fallback")
     else:
         log.warning("session_signing_secret_unconfigured_using_fallback")
     return _get_ssm_secure_string(

@@ -1,0 +1,60 @@
+{
+  "about": "Manifest changes that break production in ways the diff shows (#1480). Damaging cases are anonymized excerpts of four lane pull requests an operator review rejected on 2026-10-27 after Elder passed them; names, namespaces, labels and registries are placeholders. Clean cases are controls written to sit next to each detector's trigger. `expected` lists the iac_scan manifest-break kinds a case must raise; any other manifest-break kind on any case is a false positive.",
+  "cases": [
+    {
+      "fixture": "damaging_pr_a_affinity_no_namespace.diff",
+      "label": "damaging",
+      "source": "lane PR A: hostname pins replaced by label and pod-affinity pins",
+      "expected": ["pod affinity term selects another workload with no namespaces"]
+    },
+    {
+      "fixture": "damaging_pr_b_docs_unbacked_numbers.diff",
+      "label": "damaging",
+      "source": "lane PR B: continuity runbook stating results no run produced",
+      "expected": [],
+      "llm_only": ["docs-unbacked-numbers"]
+    },
+    {
+      "fixture": "damaging_pr_c_live_state_only.diff",
+      "label": "damaging",
+      "source": "lane PR C: two replicas placed on a node label no node carries",
+      "expected": [],
+      "live_state": "The break needs the cluster's node labels and tailnet membership; Loom's lane-side live-cluster check owns it (out of scope for #1480)."
+    },
+    {
+      "fixture": "damaging_pr_d_singleton_and_pull_secret.diff",
+      "label": "damaging",
+      "source": "lane PR D: broker pair and device controllers made redundant",
+      "expected": [
+        "singleton Deployment switched from Recreate to RollingUpdate",
+        "imagePullSecrets removed with no re-add in this file"
+      ],
+      "llm_only": ["broker-config-key-typo", "two-way-bridge-without-loop-guard"]
+    },
+    {"fixture": "clean_self_anti_affinity.diff", "label": "clean", "expected": []},
+    {"fixture": "clean_affinity_with_namespaces.diff", "label": "clean", "expected": []},
+    {"fixture": "clean_affinity_with_namespace_selector.diff", "label": "clean", "expected": []},
+    {"fixture": "clean_rolling_update_many_replicas.diff", "label": "clean", "expected": []},
+    {"fixture": "clean_singleton_rolling_update_no_surge.diff", "label": "clean", "expected": []},
+    {"fixture": "clean_pull_secret_moved.diff", "label": "clean", "expected": []},
+    {"fixture": "clean_pull_secret_untouched.diff", "label": "clean", "expected": []},
+    {"fixture": "clean_new_singleton_rolling_update.diff", "label": "clean", "expected": []}
+  ],
+  "llm_only_reasons": {
+    "broker-config-key-typo": "A misspelled option is valid YAML inside a free-text config block. Catching it needs each broker's option vocabulary for the deployed version; a hand-kept list per broker goes stale and would flag every option it does not know. The LLM review reads the config against the broker's documentation.",
+    "two-way-bridge-without-loop-guard": "Whether two bridges echo depends on topic patterns, directions, prefixes and per-broker loop settings spread across two generated configs, often built by a shell script at pod start. No line-level shape separates a looping pair from a safe one without simulating the broker.",
+    "docs-unbacked-numbers": "A sentence stating a measured number is ordinary prose. Telling a fabricated figure from a real one needs the run output the claim cites, which is the unbacked-claim and fabricated-result checks' job (#1368, #1371) and the LLM review's, not a manifest scanner's."
+  },
+  "measurements": {
+    "before": {
+      "recall": "0/3",
+      "false_positive_rate": "0/8",
+      "source": "iac_scan at 1f1d6ad5 (no manifest-break detectors) over this corpus"
+    },
+    "after": {
+      "recall": "3/3",
+      "false_positive_rate": "0/8",
+      "source": "iac_scan with the #1480 detectors over this corpus; pinned by test_iac_scan_k8s_manifests.py"
+    }
+  }
+}

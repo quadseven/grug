@@ -1,0 +1,32 @@
+diff --git a/manifests/shop/api.yaml b/manifests/shop/api.yaml
+new file mode 100644
+--- /dev/null
++++ b/manifests/shop/api.yaml
+@@ -0,0 +1,27 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: api
++  namespace: shop
++spec:
++  replicas: 3
++  selector:
++    matchLabels:
++      app.kubernetes.io/name: api
++  template:
++    metadata:
++      labels:
++        app.kubernetes.io/name: api
++    spec:
++      affinity:
++        podAntiAffinity:
++          preferredDuringSchedulingIgnoredDuringExecution:
++            - weight: 100
++              podAffinityTerm:
++                labelSelector:
++                  matchLabels:
++                    app.kubernetes.io/name: api
++                topologyKey: kubernetes.io/hostname
++      containers:
++        - name: api
++          image: registry.example.com/api:3.1.0
