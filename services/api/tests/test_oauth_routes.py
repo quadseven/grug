@@ -31,6 +31,13 @@ def _oauth_mod(monkeypatch):
     monkeypatch.setattr(mod, "_state_secret", lambda: "test-secret-v1")
     monkeypatch.setattr(mod, "_client_id", lambda: "Iv1.testclientid")
     monkeypatch.setattr(mod, "_client_secret", lambda: "test-client-secret")
+    # The per-IP limit has its own suite (test_oauth_rate_limit.py); admit
+    # every request here so the router tests need no Postgres.
+    from adapters.pg_rate_limit_store import ReservationResult
+    monkeypatch.setattr(
+        mod, "try_reserve_slot",
+        lambda **_kw: ReservationResult(admitted=True, minute_count=1, day_count=1),
+    )
     return mod
 
 
