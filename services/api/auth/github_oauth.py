@@ -16,9 +16,14 @@ per minute through the Postgres rate-limit store. Settings:
   GRUG_OAUTH_CALLBACK_PER_MINUTE  (default 10) - GET .../callback
 Past the cap the route answers 429 with Retry-After set to the seconds
 left in the minute window. The callback check runs before the CSRF state
-check, so junk codes count too. The client IP is CF-Connecting-IP when
-present (the API sits behind Cloudflare), else the socket peer. A store
-fault fails open with a warning rather than locking every user out.
+check, so junk codes count too. The client IP is X-Grug-Client-IP, which
+the grug-api-host-rewrite Worker sets from the edge's CF-Connecting-IP
+and overwrites on every request; CfAuthMiddleware rejects any request
+that did not pass through that Worker. CF-Connecting-IP itself is not
+read: on the Worker's cross-zone subrequest it holds the Worker's own
+address. Without the header (local runs) the socket peer is used. IPv6
+addresses share one bucket per /64. A store fault fails open with a
+warning rather than locking every user out.
 
 Per Slice 5 (#26) the allowlist gate is enforced via FastAPI dependency
 on routes other than /me + /waitlist. v1 short-circuits non-allowlisted
@@ -29,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import logging
 import os
 import secrets
@@ -40,19 +46,11 @@ from urllib.parse import urlencode
 
 import httpx
 import psycopg
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import RedirectResponse
+
 from adapters.pg_rate_limit_store import try_reserve_slot
 from adapters.user_store import get_user, upsert_oauth_user
-from fastapi import (
-    APIRouter,
-    Cookie,
-    Depends,
-    HTTPException,
-    Query,
-    Request,
-    Response,
-    status,
-)
-from fastapi.responses import RedirectResponse
 
 log = logging.getLogger("grug.api.auth")
 
@@ -239,14 +237,29 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_CLIENT_IP_HEADER = "x-grug-client-ip"
+
+
 def _client_ip(request: Request) -> str:
-    """CF-Connecting-IP when present, else the socket peer."""
-    forwarded = request.headers.get("cf-connecting-ip", "").strip()
-    if forwarded:
+    """Rate-limit key for the caller: the Worker-set client IP header when
+    it parses as an address, else the socket peer. See the module docstring."""
+    forwarded = _ip_bucket(request.headers.get(_CLIENT_IP_HEADER, ""))
+    if forwarded is not None:
         return forwarded
     if request.client is not None:
-        return request.client.host
+        return _ip_bucket(request.client.host) or request.client.host
     return "unknown"
+
+
+def _ip_bucket(raw: str) -> str | None:
+    """IPv4 as is; IPv6 widened to its /64, the block one subscriber holds."""
+    try:
+        addr = ipaddress.ip_address(raw.strip())
+    except ValueError:
+        return None
+    if addr.version == 6:
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
 
 
 def _enforce_ip_limit(kind: Literal["login", "callback"], request: Request) -> None:
@@ -276,7 +289,7 @@ def _enforce_ip_limit(kind: Literal["login", "callback"], request: Request) -> N
     retry_after = max(1, 60 - int(now.timestamp() % 60))
     log.info(
         "oauth_rate_limited",
-        extra={"route": kind, "client_ip": ip, "minute_count": slot.minute_count},
+        extra={"route": kind, "minute_count": slot.minute_count},
     )
     raise HTTPException(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,

@@ -16,9 +16,10 @@ from datetime import datetime, timezone
 
 import psycopg
 import pytest
-from adapters.pg_rate_limit_store import ReservationResult
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+from adapters.pg_rate_limit_store import ReservationResult
 
 _LOGIN = "/api/v1/auth/github/login"
 _CALLBACK = "/api/v1/auth/github/callback"
@@ -69,13 +70,13 @@ def oauth(monkeypatch):
 
 
 def _login(client, ip="203.0.113.7"):
-    return client.get(_LOGIN, headers={"CF-Connecting-IP": ip}, follow_redirects=False)
+    return client.get(_LOGIN, headers={"X-Grug-Client-IP": ip}, follow_redirects=False)
 
 
 def _callback(client, ip="203.0.113.7"):
     return client.get(
         _CALLBACK, params={"code": "junk", "state": "forged"},
-        headers={"CF-Connecting-IP": ip}, follow_redirects=False,
+        headers={"X-Grug-Client-IP": ip}, follow_redirects=False,
     )
 
 
@@ -157,10 +158,46 @@ def test_store_fault_fails_open_and_logs_a_warning(oauth, monkeypatch, caplog, f
     assert {r.levelno for r in warnings} == {logging.WARNING}
 
 
-def test_ip_comes_from_cf_connecting_ip(oauth):
+def test_ip_comes_from_the_worker_set_header(oauth):
     _mod, client, slots, _clock = oauth
     _login(client, ip="198.51.100.20")
     assert slots.names == ["oauth_login:198.51.100.20"]
+
+
+def test_cf_connecting_ip_does_not_choose_the_bucket(oauth):
+    """On the Worker's cross-zone subrequest CF-Connecting-IP is the
+    Worker's own address, and a client can send any value; neither may
+    move the request to another bucket."""
+    _mod, client, slots, _clock = oauth
+    client.get(_LOGIN, headers={"CF-Connecting-IP": "198.51.100.66"}, follow_redirects=False)
+    client.get(
+        _LOGIN, headers={"CF-Connecting-IP": "198.51.100.66", "X-Grug-Client-IP": "203.0.113.7"},
+        follow_redirects=False,
+    )
+    assert slots.names == ["oauth_login:testclient", "oauth_login:203.0.113.7"]
+
+
+def test_ipv6_clients_share_a_bucket_per_64(oauth):
+    _mod, client, slots, _clock = oauth
+    _login(client, ip="2001:db8:1:2::1")
+    _login(client, ip="2001:db8:1:2:ffff::9")
+    assert slots.names == ["oauth_login:2001:db8:1:2::/64"] * 2
+
+
+def test_unparseable_header_falls_back_to_the_socket_peer(oauth):
+    _mod, client, slots, _clock = oauth
+    _login(client, ip="not-an-ip")
+    assert slots.names == ["oauth_login:testclient"]
+
+
+def test_rate_limited_log_line_carries_no_ip(oauth, monkeypatch, caplog):
+    mod, client, _slots, _clock = oauth
+    monkeypatch.setattr(mod, "_LOGIN_PER_MINUTE", 0)
+    with caplog.at_level(logging.INFO, logger="grug.api.auth"):
+        assert _login(client).status_code == 429
+    records = [r for r in caplog.records if r.getMessage() == "oauth_rate_limited"]
+    assert len(records) == 1
+    assert "203.0.113.7" not in str(records[0].__dict__)
 
 
 def test_ip_falls_back_to_the_socket_peer(oauth):
