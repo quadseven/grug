@@ -368,7 +368,7 @@ def _check_ssot_flow(
     """The PublishOutcome `plan_publish` returns must be bound to a Name whose
     `.conclusion` / `.event` are unpacked into two Names, and THOSE names must
     reach the two publish surfaces - conclusion -> CheckRunResult(conclusion=),
-    event -> build_review_result(event=). Proves the no-drift "single source
+    event -> FinishedPass(event=). Proves the no-drift "single source
     of truth" property."""
     outcome = _planned_outcome_name(f, ps_calls)
     names = _outcome_field_names(f, outcome) if outcome else None
@@ -390,14 +390,16 @@ def _check_ssot_flow(
             f"FAIL: {path} - CheckRunResult(conclusion=) is not the `{conclusion_name}` "
             "from plan_publish; check-run conclusion may drift from the gate"
         )
-    brr = _calls_named(f, "build_review_result")
+    # #1591: the review is rendered by the markings projection, so the event
+    # reaches it as `FinishedPass(event=)`; a direct build is still accepted.
+    brr = _calls_named(f, "FinishedPass") + _calls_named(f, "build_review_result")
     if not any(
         isinstance(_kwarg_value(c, "event"), ast.Name)
         and _kwarg_value(c, "event").id == event_name  # type: ignore[union-attr]
         for c in brr
     ):
         fails.append(
-            f"FAIL: {path} - build_review_result(event=) is not the `{event_name}` "
+            f"FAIL: {path} - FinishedPass(event=) is not the `{event_name}` "
             "from plan_publish; review event may drift from the gate"
         )
     return fails
@@ -528,7 +530,7 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
 
     # SSOT no-drift: the (conclusion, event) pair plan_publish returns must
     # be the SAME values published - conclusion into CheckRunResult(conclusion=),
-    # event into build_review_result(event=). Without this, a mutation could
+    # event into FinishedPass(event=). Without this, a mutation could
     # recompute `event` independently and the two surfaces would drift.
     fails.extend(_check_ssot_flow(f, path, ps_calls))
 
