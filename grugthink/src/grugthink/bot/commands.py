@@ -1209,10 +1209,10 @@ def register_commands(bot: "GrugThinkBot") -> None:
             if not cmd_params:
                 # No extra parameters - simple case
 
-                async def wrapper(interaction):
+                async def simple_wrapper(interaction):
                     await cmd(interaction, bot_instance)
 
-                return wrapper
+                return simple_wrapper
 
             wrapper_params = [params_list[0].replace(annotation=inspect.Parameter.empty)]
             for p in cmd_params:
@@ -1229,15 +1229,15 @@ def register_commands(bot: "GrugThinkBot") -> None:
             signature = inspect.Signature(wrapper_params)
             interaction_name = wrapper_params[0].name
 
-            async def wrapper(*args, **kwargs):
+            async def bound_wrapper(*args, **kwargs):
                 bound = signature.bind(*args, **kwargs)
                 bound.apply_defaults()
                 arguments = dict(bound.arguments)
                 interaction = arguments.pop(interaction_name)
                 await cmd(interaction, bot_instance, **arguments)
 
-            wrapper.__signature__ = signature
-            return wrapper
+            bound_wrapper.__signature__ = signature
+            return bound_wrapper
 
         wrapper = make_wrapper(cmd_func, bot, params)
 
