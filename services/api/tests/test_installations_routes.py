@@ -152,7 +152,7 @@ def test_get_enforcement_fallback_grug_managed_when_stored(_mod, monkeypatch):
     monkeypatch.setattr(inst, "get_installation", lambda i: {"installed_by_user_id": "999"})
     req = httpx.Request("GET", "https://api.github.com/x")
     err = httpx.HTTPStatusError("rate limited", request=req, response=httpx.Response(429, request=req))
-    monkeypatch.setattr(inst, "with_install_token_retry", lambda iid, fn: (_ for _ in ()).throw(err))
+    monkeypatch.setattr(inst, "with_install_token_retry", lambda iid, fn, **_: (_ for _ in ()).throw(err))
     monkeypatch.setattr(inst, "get_repo_config", lambda i, r: {"enforcement_ruleset_id": 555})
 
     out = inst.get_enforcement(1, 2, user=_user(role="admin"))
@@ -165,7 +165,7 @@ def test_get_enforcement_fallback_unknown_when_no_stored(_mod, monkeypatch):
     inst = _mod
     monkeypatch.setattr(inst, "get_installation", lambda i: {"installed_by_user_id": "999"})
     monkeypatch.setattr(inst, "with_install_token_retry",
-                        lambda iid, fn: (_ for _ in ()).throw(httpx.ConnectError("dns")))
+                        lambda iid, fn, **_: (_ for _ in ()).throw(httpx.ConnectError("dns")))
     monkeypatch.setattr(inst, "get_repo_config", lambda i, r: {})
 
     out = inst.get_enforcement(1, 2, user=_user(role="admin"))
@@ -179,7 +179,7 @@ def test_get_enforcement_404_propagates_not_swallowed(_mod, monkeypatch):
     inst = _mod
     monkeypatch.setattr(inst, "get_installation", lambda i: {"installed_by_user_id": "999"})
 
-    def _raise_404(iid, fn):
+    def _raise_404(iid, fn, **_):
         raise HTTPException(status_code=404, detail="repo not found")
 
     monkeypatch.setattr(inst, "with_install_token_retry", _raise_404)
@@ -192,7 +192,7 @@ def test_get_enforcement_404_propagates_not_swallowed(_mod, monkeypatch):
 
 def _throw(err):
     """Return a with_install_token_retry stub that raises `err`."""
-    def _stub(install_id, fn):
+    def _stub(install_id, fn, **_):
         raise err
     return _stub
 

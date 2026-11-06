@@ -225,7 +225,7 @@ def _heal_enforcement_on_repo(
     install_id: int, repo_id: int, owner: str, repo_name: str,
     default_branch: str, old_ruleset_id: int,
 ) -> None:
-    from github_app_auth import with_install_token_retry  # type: ignore
+    from github_app_auth import TokenPurpose, with_install_token_retry  # type: ignore
     from enforcement import heal_enforcement  # type: ignore
 
     try:
@@ -234,6 +234,7 @@ def _heal_enforcement_on_repo(
             lambda token, o=owner, r=repo_name, db=default_branch, iid=install_id, rid=repo_id, old=old_ruleset_id: (
                 heal_enforcement(token, o, r, db, iid, rid, old_ruleset_id=old)
             ),
+            purpose=TokenPurpose.RULESET,
         )
     except Exception:
         log.warning(
@@ -278,7 +279,7 @@ def _ensure_enforcement_on_pr(
         return
     if cfg.get("force_disable_enforcement", False):
         return
-    from github_app_auth import with_install_token_retry  # type: ignore
+    from github_app_auth import TokenPurpose, with_install_token_retry  # type: ignore
     from enforcement import ensure_enforcement  # type: ignore
 
     try:
@@ -287,6 +288,7 @@ def _ensure_enforcement_on_pr(
             lambda token, o=owner, r=repo_name, db=default_branch, iid=install_id, rid=repo_id: (
                 ensure_enforcement(token, o, r, db, iid, rid)
             ),
+            purpose=TokenPurpose.RULESET,
         )
     except Exception:
         log.warning(
@@ -298,7 +300,7 @@ def _ensure_enforcement_on_pr(
 
 def _enforce_on_repos(install_id: int, repositories: list[dict]) -> None:
     """Best-effort enforcement creation for repos in an install payload."""
-    from github_app_auth import with_install_token_retry  # type: ignore
+    from github_app_auth import TokenPurpose, with_install_token_retry  # type: ignore
     from enforcement import ensure_enforcement  # type: ignore
 
     for repo in repositories:
@@ -315,6 +317,7 @@ def _enforce_on_repos(install_id: int, repositories: list[dict]) -> None:
                 lambda token, o=owner, r=repo_name, db=default_branch, iid=install_id, rid=int(repo_id): (
                     ensure_enforcement(token, o, r, db, iid, rid)
                 ),
+                purpose=TokenPurpose.RULESET,
             )
         except Exception:
             log.warning(

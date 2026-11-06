@@ -65,7 +65,7 @@ def test_update_repo_config_admin_can_access_any():
     payload = inst.RepoConfigPayload(tpm_enabled=False)
     install = {"installed_by_user_id": "999"}
 
-    def _retry(install_id, fn):
+    def _retry(install_id, fn, **_):
         return fn("tok")
 
     fake_pages = [
@@ -95,7 +95,7 @@ def test_update_repo_config_repo_not_in_install_404():
     payload = inst.RepoConfigPayload(tpm_enabled=True)
     install = {"installed_by_user_id": "100"}
 
-    def _retry(install_id, fn):
+    def _retry(install_id, fn, **_):
         return fn("tok")
 
     fake_resp = _ok_resp({"repositories": [
@@ -123,7 +123,7 @@ def test_update_repo_config_malformed_gh_502():
     payload = inst.RepoConfigPayload(tpm_enabled=True)
     install = {"installed_by_user_id": "100"}
 
-    def _retry(install_id, fn):
+    def _retry(install_id, fn, **_):
         return fn("tok")
 
     fake_resp = _ok_resp({"unexpected": "shape"})
@@ -163,7 +163,7 @@ def test_update_repo_config_paginates_until_match():
         call_idx[0] += 1
         return resp
 
-    def _retry(install_id, fn):
+    def _retry(install_id, fn, **_):
         return fn("tok")
 
     with patch("installations.get_installation", return_value=install):
@@ -191,7 +191,7 @@ def test_update_repo_config_walkthrough_enabled_reaches_set_repo_config():
     payload = inst.RepoConfigPayload(tpm_enabled=True, walkthrough_enabled=False)
     install = {"installed_by_user_id": "100"}
 
-    def _retry(install_id, fn):
+    def _retry(install_id, fn, **_):
         return fn("tok")
 
     fake_resp = _ok_resp({"repositories": [{"id": 42, "full_name": "myorg/myrepo"}]})
@@ -217,7 +217,7 @@ def test_update_repo_config_complexity_caps_reach_set_repo_config():
     payload = inst.RepoConfigPayload(complexity_cyclomatic_cap=30)
     install = {"installed_by_user_id": "100"}
 
-    def _retry(install_id, fn):
+    def _retry(install_id, fn, **_):
         return fn("tok")
 
     fake_resp = _ok_resp({"repositories": [{"id": 42, "full_name": "myorg/myrepo"}]})
@@ -273,7 +273,7 @@ def test_sparse_update_does_not_resurrect_a_paused_repo():
 
     install = {"installed_by_user_id": "100"}
 
-    def _retry(install_id, fn):
+    def _retry(install_id, fn, **_):
         return fn("tok")
 
     fake_resp = _ok_resp({"repositories": [{"id": 42, "full_name": "myorg/myrepo"}]})
@@ -312,7 +312,7 @@ def _put_config(payload, *, previous_cfg, updated_fields):
     Returns (toggle mock, reconcile mock)."""
     install = {"installed_by_user_id": "100"}
 
-    def _retry(install_id, fn):
+    def _retry(install_id, fn, **_):
         return fn("tok")
 
     fake_resp = _ok_resp({"repositories": [{"id": 42, "full_name": "myorg/myrepo"}]})

@@ -24,6 +24,20 @@ Grug reports `permission_denied` for enforcement and keeps reviewing, so the
 runtime check above does not require it. It is the largest grant the App holds:
 see [the least-privilege comparison](reviewer-attack-surface.md#github-app-permissions).
 
+## Purpose-scoped tokens
+
+Each token is minted for one purpose and asks only for the granted
+permissions that purpose needs:
+
+- review (the default): no `administration`, `contents: read`, no `workflows`.
+- ruleset: adds `administration: write`. Enforcement create, heal, remove and
+  detection use it.
+- commit: adds `contents: write`. `/grug fix`, `/grug docstrings` and thread
+  resolution use it.
+
+A token never asks for a permission the installation lacks, so an installation
+without `administration` still reviews.
+
 ## Grant a permission
 
 1. Open the GitHub App's settings page.
@@ -34,7 +48,7 @@ see [the least-privilege comparison](reviewer-attack-surface.md#github-app-permi
 5. Accept the permission request for each existing installation. The new
    grant does not take effect for an installation until it is accepted.
 
-The bot checks the permissions returned when it first mints an installation
-token in each process. If a required permission is missing, it logs one
+The bot reads each installation's grant (`GET /app/installations/{id}`) before
+it mints a token, and re-reads it on a token refresh. If a required permission is missing, it logs one
 `app_permissions_missing` event for that installation. When `contents: write`
 is missing, Elder's check summary says fixed threads are collapsed instead.

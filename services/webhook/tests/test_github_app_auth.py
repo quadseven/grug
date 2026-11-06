@@ -51,6 +51,27 @@ def _reset_cache():
     gh._missing_install_permissions = original_missing
 
 
+@pytest.fixture(autouse=True)
+def _grant():
+    """The installation grant GitHub returns on `GET /app/installations/{id}`.
+    get_install_token reads it before minting a purpose-scoped token
+    (grug#1577). Tests replace `_grant["permissions"]` to change it."""
+    import github_app_auth as gh
+
+    grant = {"permissions": {
+        name: level for name, (level, _) in gh.REQUIRED_APP_PERMISSIONS.items()
+    }}
+
+    def _get(*args, **kwargs):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(return_value={"id": 1, "permissions": dict(grant["permissions"])})
+        return resp
+
+    with patch("httpx.get", side_effect=_get):
+        yield grant
+
+
 @pytest.fixture
 def _stub_secrets(monkeypatch, _rsa_pem):
     private_pem, public_pem = _rsa_pem
@@ -112,21 +133,18 @@ def test_get_install_token_cache_hit_skips_http(_stub_secrets):
 
 
 def test_missing_app_permission_is_reported_once_and_exposed_to_summary(
-    _stub_secrets, caplog,
+    _stub_secrets, _grant, caplog,
 ):
     import logging
     import github_app_auth as gh
 
-    payload = {
-        "token": "TOKEN-XYZ",
-        "permissions": {
-            "contents": "read", "pull_requests": "write", "issues": "write",
-            "checks": "write", "metadata": "read",
-        },
+    _grant["permissions"] = {
+        "contents": "read", "pull_requests": "write", "issues": "write",
+        "checks": "write", "metadata": "read",
     }
     fake = MagicMock()
     fake.raise_for_status = MagicMock()
-    fake.json = MagicMock(return_value=payload)
+    fake.json = MagicMock(return_value={"token": "TOKEN-XYZ"})
     with patch("httpx.post", return_value=fake), caplog.at_level(logging.WARNING):
         gh.get_install_token(123)
         gh.get_install_token(123, force_refresh=True)
@@ -150,10 +168,7 @@ def test_full_app_permission_set_is_not_reported(_stub_secrets, caplog):
 
     fake = MagicMock()
     fake.raise_for_status = MagicMock()
-    fake.json = MagicMock(return_value={
-        "token": "TOKEN-XYZ",
-        "permissions": {name: level for name, (level, _) in gh.REQUIRED_APP_PERMISSIONS.items()},
-    })
+    fake.json = MagicMock(return_value={"token": "TOKEN-XYZ"})
     with patch("httpx.post", return_value=fake), caplog.at_level(logging.WARNING):
         gh.get_install_token(123)
 
@@ -321,25 +336,24 @@ def test_app_id_strips_whitespace_from_the_raw_ssm_value(monkeypatch):
     assert gh.get_app_id() == "12345"
 
 
-def test_token_refresh_rereads_the_installation_permissions(_stub_secrets):
+def test_token_refresh_rereads_the_installation_permissions(_stub_secrets, _grant):
     """A permission the operator grants after the pod booted stops being
     reported as missing on the next forced token refresh (the path a
     401/403 already takes), not only after a restart."""
     import github_app_auth as gh
 
-    short = {"token": "T1", "permissions": {
+    full = dict(_grant["permissions"])
+    _grant["permissions"] = {
         "pull_requests": "write", "issues": "write", "checks": "write",
         "metadata": "read", "contents": "read",
-    }}
-    full = {"token": "T2", "permissions": {
-        name: level for name, (level, _) in gh.REQUIRED_APP_PERMISSIONS.items()
-    }}
+    }
     fake = MagicMock()
     fake.raise_for_status = MagicMock()
-    fake.json = MagicMock(side_effect=[short, full])
+    fake.json = MagicMock(side_effect=[{"token": "T1"}, {"token": "T2"}])
     with patch("httpx.post", return_value=fake):
         gh.get_install_token(321)
         assert gh.missing_install_permissions(321) == ("contents",)
+        _grant["permissions"] = full
         gh.get_install_token(321, force_refresh=True)
     assert gh.missing_install_permissions(321) == ()
     assert gh.installation_permission_summary_note(321) == ""
