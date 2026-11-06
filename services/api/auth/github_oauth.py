@@ -104,12 +104,16 @@ def _state_secret() -> str:
 
 
 def _resolve_signing_secret() -> str:
+    from botocore.exceptions import BotoCoreError, ClientError
     from secrets_loader import _get_ssm_secure_string  # type: ignore
     dedicated = os.environ.get("GRUG_SESSION_SIGNING_SECRET_SSM", "")
     if dedicated:
         try:
             return _get_ssm_secure_string(dedicated)
-        except Exception as e:
+        except (ClientError, BotoCoreError) as e:
+            # Only SSM read faults land here. A bug in the loader (NameError,
+            # AttributeError) propagates as itself instead of posing as an
+            # SSM outage behind a 503.
             # NB: do NOT log `dedicated` (the SSM param name) - the only
             # such param is GRUG_SESSION_SIGNING_SECRET_SSM, so the message
             # already identifies it, and logging a value sourced from a

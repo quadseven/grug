@@ -126,13 +126,19 @@ def _not_found() -> Exception:
     )
 
 
+def _client_error(code: str) -> Exception:
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": code, "Message": code}}, "GetParameter")
+
+
 def test_failed_dedicated_read_is_not_cached_and_retries(real_state_secret, monkeypatch):
     """A transient failure must not pin the pod to the webhook secret."""
     from fastapi import HTTPException
 
     mod, calls, script = real_state_secret
     monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
-    script[_DEDICATED] = [RuntimeError("ThrottlingException"), "dedicated"]
+    script[_DEDICATED] = [_client_error("ThrottlingException"), "dedicated"]
 
     with pytest.raises(HTTPException) as exc:
         mod._state_secret()
@@ -182,7 +188,7 @@ def test_session_signing_outage_returns_503_from_me(real_state_secret, monkeypat
 
     mod, calls, script = real_state_secret
     monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
-    script[_DEDICATED] = [RuntimeError("AccessDenied")]
+    script[_DEDICATED] = [_client_error("AccessDeniedException")]
     app = FastAPI()
     app.include_router(mod.router)
 
@@ -191,3 +197,29 @@ def test_session_signing_outage_returns_503_from_me(real_state_secret, monkeypat
     resp = client.get("/api/v1/me")
     assert resp.status_code == 503
     assert _WEBHOOK not in calls
+
+
+def test_network_fault_on_dedicated_read_returns_503(real_state_secret, monkeypatch):
+    from botocore.exceptions import EndpointConnectionError
+    from fastapi import HTTPException
+
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [EndpointConnectionError(endpoint_url="https://ssm.invalid")]
+
+    with pytest.raises(HTTPException) as exc:
+        mod._state_secret()
+    assert exc.value.status_code == 503
+    assert _WEBHOOK not in calls
+
+
+def test_loader_bug_is_not_masked_as_outage(real_state_secret, monkeypatch):
+    """A code bug in the loader surfaces as itself, not as a 503."""
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [AttributeError("loader bug")]
+
+    with pytest.raises(AttributeError):
+        mod._state_secret()
+    assert _WEBHOOK not in calls
+    assert mod._signing_secret_cache is None
