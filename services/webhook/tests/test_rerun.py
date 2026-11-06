@@ -808,6 +808,26 @@ def test_hot_review_retires_at_entry_when_already_superseded(monkeypatch):
     assert posted[0].conclusion == "neutral"
 
 
+def test_hot_review_logs_the_lifecycle_step_it_ends_on(monkeypatch, caplog):
+    """#1592: the consumer log names the step review_lifecycle chose, so a
+    live read can tell supersede from redrive or fail open."""
+    fetches = iter((_pr_data(head_sha="fresh-head"),))
+
+    def _fake_token_retry(iid, fn):
+        try:
+            return next(fetches)
+        except StopIteration:
+            return fn("tok")
+
+    monkeypatch.setattr(rerun, "with_install_token_retry", _fake_token_retry)
+    monkeypatch.setattr(rerun, "post_check_run", lambda *a, **k: {"id": 1})
+    _patch_hot_claims(monkeypatch)
+    with caplog.at_level(logging.INFO):
+        rerun._run_one(_job(kind="review", requested_head_sha="stale-head"))
+    steps = [r for r in caplog.records if r.msg == "elder_review_step"]
+    assert [(r.step, r.status) for r in steps] == [("supersede", "superseded_at_entry")]
+
+
 def test_hot_review_does_not_retire_when_requested_head_matches_current(monkeypatch):
     """The other half of #892's contract: a job whose head IS current must
     proceed exactly as before - no early-retire false positive."""
