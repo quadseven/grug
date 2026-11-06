@@ -3045,6 +3045,7 @@ def test_deep_review_publishes_and_captures_comment_records(monkeypatch):
 
 def test_deep_review_includes_matching_precedent_citation(monkeypatch):
     """Deep-arm findings receive ledger citations when a row matches."""
+    from personas.code_reviewer.markings import Markings
     from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 
     finding = Finding(
@@ -3060,10 +3061,11 @@ def test_deep_review_includes_matching_precedent_citation(monkeypatch):
         }],
         raising=False,
     )
-    captured = {}
+    captured = []
     monkeypatch.setattr(
-        cr_dispatch, "build_review_result",
-        lambda evaluation, **kwargs: captured.update(kwargs) or (None, ()),
+        cr_dispatch, "project",
+        lambda finished: captured.append(finished)
+        or Markings(None, (), None, False),
     )
     cr_dispatch._publish_deep_review(
         CodeReviewEvaluation(findings=(finding,), conclusion="success"),
@@ -3074,7 +3076,8 @@ def test_deep_review_includes_matching_precedent_citation(monkeypatch):
         combined_eval=CodeReviewEvaluation(findings=(finding,), conclusion="success"),
     )
 
-    assert "#400" in next(iter(captured["precedent_notes"].values()))
+    [finished] = captured
+    assert "#400" in next(iter(finished.precedent_notes.values()))
 
 
 def test_deep_review_capture_failure_does_not_change_result(monkeypatch):
