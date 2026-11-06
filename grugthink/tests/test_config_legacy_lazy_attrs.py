@@ -16,7 +16,7 @@ os.environ.setdefault("DISCORD_TOKEN", "fake_token")
 
 import pytest  # noqa: E402
 
-from src.grugthink import config_legacy  # noqa: E402
+from src.grugthink import bot_settings, config_legacy  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +24,7 @@ def _clear_env(monkeypatch):
     for var in (
         "OLLAMA_URLS", "OLLAMA_MODELS", "GEMINI_API_KEY", "GEMINI_MODEL",
         "POOLSIDE_API_KEY", "OPENROUTER_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CSE_ID",
+        "TRUSTED_USER_IDS",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -96,13 +97,42 @@ class TestDerivedAndPassthroughAttrs:
     def test_can_search_requires_both_google_keys(self, monkeypatch):
         assert config_legacy.CAN_SEARCH is False
         monkeypatch.setenv("GOOGLE_API_KEY", "g1")
-        # CAN_SEARCH reads the module-level GOOGLE_API_KEY/GOOGLE_CSE_ID
-        # constants (computed at import time), not freshly from os.environ -
-        # unlike every other attribute here. Set both via monkeypatch.setattr
-        # on the module itself to match that.
-        monkeypatch.setattr(config_legacy, "GOOGLE_API_KEY", "g1")
-        monkeypatch.setattr(config_legacy, "GOOGLE_CSE_ID", "c1")
+        assert config_legacy.CAN_SEARCH is False
+        monkeypatch.setenv("GOOGLE_CSE_ID", "c1")
         assert config_legacy.CAN_SEARCH is True
+
+    def test_google_keys_read_at_access_time(self, monkeypatch):
+        assert config_legacy.GOOGLE_API_KEY is None
+        assert config_legacy.GOOGLE_CSE_ID is None
+        monkeypatch.setenv("GOOGLE_API_KEY", "g1")
+        monkeypatch.setenv("GOOGLE_CSE_ID", "c1")
+        assert config_legacy.GOOGLE_API_KEY == "g1"
+        assert config_legacy.GOOGLE_CSE_ID == "c1"
+
+
+class TestTrustedUserIds:
+    def test_unset_is_empty(self):
+        assert config_legacy.TRUSTED_USER_IDS == []
+
+    def test_parses_ids_and_skips_invalid_entries(self, monkeypatch):
+        monkeypatch.setenv("TRUSTED_USER_IDS", "111, 222,,not-a-number")
+        assert config_legacy.TRUSTED_USER_IDS == [111, 222]
+
+
+class TestPerBotSettings:
+    """Inside an active bot's settings (grug#1667) each lazy attribute reads
+    the bot's value first and falls back to the process environment."""
+
+    def test_bot_settings_win_over_process_env(self, monkeypatch):
+        monkeypatch.setenv("TRUSTED_USER_IDS", "999")
+        monkeypatch.setenv("OLLAMA_URLS", "http://process.example.com:11434")
+        with bot_settings.activate({"TRUSTED_USER_IDS": "111", "GOOGLE_API_KEY": "bot-key"}):
+            assert config_legacy.TRUSTED_USER_IDS == [111]
+            assert config_legacy.GOOGLE_API_KEY == "bot-key"
+            # Not set for the bot: the process value shows through.
+            assert config_legacy.OLLAMA_URLS == ["http://process.example.com:11434"]
+        assert config_legacy.TRUSTED_USER_IDS == [999]
+        assert config_legacy.GOOGLE_API_KEY is None
 
 
 def test_unknown_attribute_raises_attribute_error():
@@ -118,5 +148,6 @@ def test_getattr_dispatch_covers_every_lazy_attr_name():
     for name in (
         "OLLAMA_URLS", "OLLAMA_MODELS", "GEMINI_API_KEY", "GEMINI_MODEL",
         "USE_GEMINI", "POOLSIDE_API_KEY", "OPENROUTER_API_KEY", "CAN_SEARCH",
+        "GOOGLE_API_KEY", "GOOGLE_CSE_ID", "TRUSTED_USER_IDS",
     ):
         getattr(config_legacy, name)  # must not raise

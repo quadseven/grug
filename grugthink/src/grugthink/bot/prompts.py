@@ -12,7 +12,6 @@ This module handles all personality-related logic including:
 All functions maintain backward compatibility with the main bot module.
 """
 
-import os
 import re
 import time
 from typing import Optional
@@ -24,6 +23,7 @@ from ..bot import cross_bot
 from ..bot.llm_clients import query_gemini_api, query_ollama_api, query_openrouter_api, query_poolside_api
 from ..bot.lore import extract_lore_from_response
 from ..bot.utils import LRUCache, clean_statement, get_cache_key
+from ..bot_settings import getenv as _bot_getenv
 from ..logging_config import get_logger
 from ..personality_engine import PersonalityEngine
 
@@ -51,7 +51,7 @@ def get_personality_engine() -> PersonalityEngine:
     global _personality_engine_instance
     if _personality_engine_instance is None:
         # For single-bot mode, respect FORCE_PERSONALITY environment variable
-        forced_personality = os.getenv("FORCE_PERSONALITY")
+        forced_personality = _bot_getenv("FORCE_PERSONALITY")
         _personality_engine_instance = PersonalityEngine("personalities.db", forced_personality=forced_personality)
     return _personality_engine_instance
 

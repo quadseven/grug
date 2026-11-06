@@ -9,10 +9,6 @@ Run with PYTHONUNBUFFERED so every print is flushed immediately.
 from __future__ import annotations
 
 import asyncio
-
-# Import config.py module (not config/ package) - handle shadowing
-# config/ package shadows config.py, so we need special handling
-import importlib.util
 import os
 import random
 import re
@@ -24,14 +20,9 @@ import traceback
 import discord
 from discord.ext import commands
 
-_config_py_path = os.path.join(os.path.dirname(__file__), "config_legacy.py")
-_config_spec = importlib.util.spec_from_file_location("grugthink.config_module", _config_py_path)
-if _config_spec and _config_spec.loader:
-    config = importlib.util.module_from_spec(_config_spec)
-    sys.modules["grugthink.config_module"] = config
-    _config_spec.loader.exec_module(config)
-else:
-    raise ImportError("Failed to load config.py module")
+# The same config_legacy module the bot/ package imports, so both check one
+# trusted-id list (grug#1667).
+from . import config_legacy as config  # noqa: E402
 
 # Lazy import of commands module to avoid loading Discord command decorators at module import time
 # cross_bot can be imported normally as it doesn't have decorator issues
@@ -766,8 +757,8 @@ class GrugThinkBot(commands.Cog):
                 "server_id": server_id,
             },
         )
-        result = await asyncio.get_running_loop().run_in_executor(
-            None,
+        # to_thread copies the context, so query_model reads this bot's settings.
+        result = await asyncio.to_thread(
             query_model,
             clean_content,
             server_db,
@@ -1386,9 +1377,8 @@ Response:"""
 
             # Get response using existing infrastructure
             server_db = self.get_server_db(message.guild.id if message.guild else "dm")
-            loop = asyncio.get_running_loop()
-            raw_response = await loop.run_in_executor(
-                None, query_model, prompt, server_db, server_id, self.personality_engine, self.get_bot_id()
+            raw_response = await asyncio.to_thread(
+                query_model, prompt, server_db, server_id, self.personality_engine, self.get_bot_id()
             )
 
             if raw_response and len(raw_response.strip()) > 0:
