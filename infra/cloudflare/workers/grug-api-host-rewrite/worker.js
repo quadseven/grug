@@ -32,6 +32,18 @@ export default {
     const headers = new Headers(request.headers);
     headers.set("Host", ORIGIN);
 
+    // Client IP for the API's per-IP rate limits (#1680). The edge sets
+    // CF-Connecting-IP on the request this Worker receives, but the
+    // cross-zone subrequest below carries the Worker's own address there
+    // instead, so the visitor's address travels in a header this Worker
+    // writes, overwriting any value the client sent.
+    const clientIp = request.headers.get("CF-Connecting-IP");
+    if (clientIp) {
+      headers.set("X-Grug-Client-IP", clientIp);
+    } else {
+      headers.delete("X-Grug-Client-IP");
+    }
+
     // See webhook worker for the binding-presence + tampering logic.
     const bindingValue = env ? env[BINDING_NAME] : undefined;
     if (typeof bindingValue === "string" && bindingValue.length > 0) {
