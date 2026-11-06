@@ -289,7 +289,7 @@ def _positive_int(job: dict[str, Any], key: str) -> int:
         raise InvalidJob(f"{key} is not an integer")
     try:
         value = int(raw)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise InvalidJob(f"{key} is not an integer") from None
     if value <= 0:
         raise InvalidJob(f"{key} is not positive")
@@ -311,7 +311,7 @@ def decode_job(body: str | bytes) -> QueueJob:
     if isinstance(version, bool) or version != SCHEMA_VERSION:
         raise UnknownJobVersion(f"schema_version {version!r} is not supported")
     kind = job.get("kind", KIND_RERUN)
-    if kind not in _KINDS:
+    if not isinstance(kind, str) or kind not in _KINDS:
         raise InvalidJob(f"kind {str(kind)[:40]!r} is unknown")
     install_id = _positive_int(job, "install_id")
     pr_number = _positive_int(job, "pr_number")

@@ -204,6 +204,12 @@ def test_missing_or_unknown_schema_version_is_rejected_loudly(body):
          '"pr_number": "+0,0"}'),
         '{"schema_version": 1, "install_id": 11, "repo": "a/b", "pr_number": 0}',
         '{"schema_version": 1, "install_id": 11, "repo": "nope", "pr_number": 7}',
+        '{"schema_version": 1, "kind": [], "install_id": 11, "repo": "a/b", "pr_number": 7}',
+        '{"schema_version": 1, "kind": {}, "install_id": 11, "repo": "a/b", "pr_number": 7}',
+        '{"schema_version": 1, "install_id": Infinity, "repo": "a/b", "pr_number": 7}',
+        '{"schema_version": 1, "install_id": 11, "repo": "a/b", "pr_number": NaN}',
+        '{"schema_version": 1, "install_id": 11, "repo": ["a/b"], "pr_number": 7}',
+        '{"schema_version": 1, "install_id": 11, "repo": "a/b", "pr_number": 7, "persona": 3}',
     ],
 )
 def test_malformed_jobs_raise_the_one_invalid_job_error(body):
