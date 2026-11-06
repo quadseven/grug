@@ -168,9 +168,9 @@ def test_the_shipped_chain_leads_with_go_then_the_free_cloud_tiers(monkeypatch) 
 
 
 def test_the_shipped_deep_escalation_is_a_mode_the_client_accepts(monkeypatch, caplog) -> None:
-    """grug#1487: GRUG_DEEP_ESCALATION ships as on_demand while the Sparks
-    are away. An unknown value falls back to auto with a warning, which
-    would silently undo the switch, so the shipped value must be a mode
+    """grug#1487: GRUG_DEEP_ESCALATION ships as auto now that the Spark
+    reasoner is back / paid credits are enabled. An unknown value falls
+    back to auto with a warning, so the shipped value must be a mode
     `_deep_escalation_mode` takes as-is."""
     root = Path(__file__).resolve().parents[3] / "k8s"
     per_manifest = {
