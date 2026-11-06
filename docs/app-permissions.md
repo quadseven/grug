@@ -35,6 +35,10 @@ permissions that purpose needs:
 - commit: adds `contents: write`. `/grug fix`, `/grug docstrings` and thread
   resolution use it.
 
+Writes are an allowlist. Every purpose may write `checks`, `issues`,
+`pull_requests` and `statuses`; any other granted permission is capped at
+`read`, and `secrets` and `workflows` are dropped.
+
 A token never asks for a permission the installation lacks, so an installation
 without `administration` still reviews.
 

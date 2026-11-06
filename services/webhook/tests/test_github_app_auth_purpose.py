@@ -129,6 +129,22 @@ def test_read_only_grant_is_never_raised_by_a_ceiling():
     assert perms == {"contents": "read", "metadata": "read"}
 
 
+@pytest.mark.parametrize("purpose", ["review", "ruleset", "commit"])
+def test_unlisted_permission_never_reaches_a_token_as_a_write(purpose):
+    """Writes are an allowlist: a later grant the purposes do not name
+    (actions, environments) is capped at read, and secrets is dropped."""
+    import github_app_auth as gh
+
+    grant = dict(FULL_GRANT, actions="write", environments="write",
+                 secrets="write", deployments="admin")
+    perms = gh.purpose_permissions(gh.TokenPurpose(purpose), grant)
+    assert perms["actions"] == "read"
+    assert perms["environments"] == "read"
+    assert perms["deployments"] == "read"
+    assert "secrets" not in perms
+    assert perms["pull_requests"] == "write"
+
+
 def test_tokens_are_cached_per_installation_and_purpose():
     import github_app_auth as gh
 

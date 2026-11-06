@@ -167,19 +167,29 @@ class TokenPurpose(str, Enum):
     COMMIT = "commit"
 
 
-# Ceiling per purpose for the permissions that can change a repository's
-# protection or its code. A permission not named here is requested at the
-# installation's granted level, so a read the review path depends on (checks,
-# statuses, actions) is never silently lost. "none" drops the permission.
+# Ceiling per purpose. Writes are an allowlist: a permission named here is
+# capped at its level, and any other granted permission is capped at "read",
+# so a later grant (secrets, actions, environments) never reaches a token as
+# a write. Reads pass through, so a read the review path depends on is never
+# silently lost. "none" drops the permission.
+_DEFAULT_CEILING = "read"
+_SHARED_WRITES = {
+    "checks": "write", "issues": "write", "pull_requests": "write",
+    "statuses": "write",
+}
+_SHARED_DROPS = {"secrets": "none", "workflows": "none"}
 _PURPOSE_CEILINGS: dict[TokenPurpose, dict[str, str]] = {
     TokenPurpose.REVIEW: {
-        "administration": "none", "contents": "read", "workflows": "none",
+        **_SHARED_WRITES, **_SHARED_DROPS,
+        "administration": "none", "contents": "read",
     },
     TokenPurpose.RULESET: {
-        "administration": "write", "contents": "read", "workflows": "none",
+        **_SHARED_WRITES, **_SHARED_DROPS,
+        "administration": "write", "contents": "read",
     },
     TokenPurpose.COMMIT: {
-        "administration": "none", "contents": "write", "workflows": "none",
+        **_SHARED_WRITES, **_SHARED_DROPS,
+        "administration": "none", "contents": "write",
     },
 }
 _GRANT_TTL_SECONDS = 55 * 60
@@ -193,8 +203,8 @@ def purpose_permissions(purpose: TokenPurpose, granted: dict) -> dict[str, str]:
     ceiling = _PURPOSE_CEILINGS[TokenPurpose(purpose)]
     wanted: dict[str, str] = {}
     for name, level in (granted or {}).items():
-        cap = ceiling.get(name)
-        if cap is not None and _permission_rank(cap) < _permission_rank(level):
+        cap = ceiling.get(name, _DEFAULT_CEILING)
+        if _permission_rank(cap) < _permission_rank(level):
             level = cap
         if _permission_rank(level) > 0:
             wanted[name] = str(level)
