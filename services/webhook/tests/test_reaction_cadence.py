@@ -102,7 +102,7 @@ class _Resp:
 
 def _wire_pass(monkeypatch, records, polled, *, rate=None):
     monkeypatch.setattr(poller_handler, "list_comment_records", lambda iid: records)
-    monkeypatch.setattr(poller_handler, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(poller_handler, "with_install_token_retry", lambda iid, fn, **_: fn("tok"))
     monkeypatch.setattr(
         poller_handler, "poll_and_annotate",
         lambda recs, **kw: polled.extend(r["comment_id"] for r in recs) or 0,
@@ -187,7 +187,7 @@ def _enforcement_pass(monkeypatch, repos, *, ticks, states=None):
         lambda _t: [{"id": n, "full_name": f"o/r{n}"} for n in repos],
     )
     monkeypatch.setattr("observability.emit_enforcement_metric", lambda *a, **k: None)
-    monkeypatch.setattr(poller_handler, "with_install_token_retry", lambda _i, fn: fn("t"))
+    monkeypatch.setattr(poller_handler, "with_install_token_retry", lambda _i, fn, **_: fn("t"))
     runs: list[list[int]] = []
     results = []
 

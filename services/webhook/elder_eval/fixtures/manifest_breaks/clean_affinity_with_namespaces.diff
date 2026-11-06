@@ -1,0 +1,35 @@
+diff --git a/manifests/edge-connector/deployment.yaml b/manifests/edge-connector/deployment.yaml
+--- a/manifests/edge-connector/deployment.yaml
++++ b/manifests/edge-connector/deployment.yaml
+@@ -15,9 +15,28 @@
+       annotations:
+         example.com/logs: '[{"source":"python"}]'
+     spec:
+-      # Pinned to one worker by hostname.
+-      nodeSelector:
+-        kubernetes.io/hostname: worker-a
++      # Run beside egress-proxy (node-local hostPort) on an amd64 LAN node,
++      # in place of the hostname pin.
++      affinity:
++        nodeAffinity:
++          requiredDuringSchedulingIgnoredDuringExecution:
++            nodeSelectorTerms:
++              - matchExpressions:
++                  - key: kubernetes.io/arch
++                    operator: In
++                    values: [amd64]
++                  - key: example.com/location
++                    operator: In
++                    values: [lan]
++        podAffinity:
++          requiredDuringSchedulingIgnoredDuringExecution:
++            - labelSelector:
++                matchExpressions:
++                  - key: app
++                    operator: In
++                    values: [egress-proxy]
++              namespaces: [egress-proxy]
++              topologyKey: kubernetes.io/hostname
+       automountServiceAccountToken: false
+       imagePullSecrets:
+         - name: registry-pull

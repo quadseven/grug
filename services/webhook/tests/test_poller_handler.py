@@ -98,7 +98,7 @@ def test_poller_polls_each_allowlisted_install(monkeypatch):
         monkeypatch,
         installs=[11, 22],
         records_for=lambda iid: [{"comment_id": iid}],
-        retry=lambda iid, fn: fn("tok"),
+        retry=lambda iid, fn, **_: fn("tok"),
         poll=_poll,
     )
     out = poller_handler.handler({}, None)
@@ -147,7 +147,7 @@ def test_poller_syncs_living_review_for_the_due_records(monkeypatch):
         monkeypatch,
         installs=[11],
         records_for=lambda iid: [{"comment_id": 1, "repo": "o/r", "pr_number": 5}],
-        retry=lambda iid, fn: fn("tok"),
+        retry=lambda iid, fn, **_: fn("tok"),
         poll=_poll,
     )
     monkeypatch.setattr(
@@ -166,7 +166,7 @@ def test_poller_low_budget_skips_living_review_too(monkeypatch):
         monkeypatch,
         installs=[11],
         records_for=lambda iid: [{"comment_id": 1, "repo": "o/r", "pr_number": 5}],
-        retry=lambda iid, fn: fn("tok"),
+        retry=lambda iid, fn, **_: fn("tok"),
         poll=lambda records, **kw: 0,
     )
     monkeypatch.setattr(poller_handler, "_github_core_budget", lambda token: (10, 5000))
@@ -185,7 +185,7 @@ def test_poller_one_install_failure_does_not_abort_cycle(monkeypatch, caplog):
     fires every time one of many installs hiccups)."""
     import logging as _logging
 
-    def _retry(iid, fn):
+    def _retry(iid, fn, **_):
         if iid == 1:
             raise RuntimeError("install 1 token fetch failed")
         return fn("tok")
@@ -223,7 +223,7 @@ def test_poller_records_listing_failure_is_best_effort(monkeypatch):
         monkeypatch,
         installs=[1, 2],
         records_for=_records,
-        retry=lambda iid, fn: fn("tok"),
+        retry=lambda iid, fn, **_: fn("tok"),
         poll=lambda records, *, install_id, fetch_token: 5,
     )
     out = poller_handler.handler({}, None)
@@ -247,7 +247,7 @@ def test_poller_skips_installs_with_no_records(monkeypatch):
         monkeypatch,
         installs=[7],
         records_for=lambda iid: [],
-        retry=lambda iid, fn: touched.append(iid),
+        retry=lambda iid, fn, **_: touched.append(iid),
         poll=lambda *a, **k: 0,
     )
     out = poller_handler.handler({}, None)
@@ -299,7 +299,7 @@ def _idle_wire(monkeypatch, *, installs):
         monkeypatch,
         installs=installs,
         records_for=lambda iid: [],
-        retry=lambda iid, fn: fn("tok"),
+        retry=lambda iid, fn, **_: fn("tok"),
         poll=lambda *a, **k: 0,
     )
 
@@ -401,7 +401,7 @@ def test_run_repo_scoped_pass_skips_installs_the_lister_has_nothing_for(monkeypa
     """The shared helper itself, isolated from any real pass: an install
     with no opted-in repos costs no runner call at all."""
     monkeypatch.setattr(
-        poller_handler, "with_install_token_retry", lambda iid, fn: fn("tok")
+        poller_handler, "with_install_token_retry", lambda iid, fn, **_: fn("tok")
     )
     calls = []
 
@@ -453,7 +453,7 @@ def test_handler_merges_replay_counts(monkeypatch):
         monkeypatch,
         installs=[],
         records_for=lambda iid: [],
-        retry=lambda iid, fn: 0,
+        retry=lambda iid, fn, **_: 0,
         poll=lambda *a, **k: 0,
     )
     monkeypatch.setattr(
@@ -475,7 +475,7 @@ def test_handler_replay_failure_does_not_abort_cron(monkeypatch, caplog):
         monkeypatch,
         installs=[1],
         records_for=lambda iid: [{"comment_id": iid}],
-        retry=lambda iid, fn: fn("tok"),
+        retry=lambda iid, fn, **_: fn("tok"),
         poll=lambda records, *, install_id, fetch_token: 1,
     )
 
@@ -496,7 +496,7 @@ def test_poller_all_installs_fail_logs_error(monkeypatch, caplog):
     never fires and it looks like a healthy idle cycle."""
     import logging as _logging
 
-    def _retry(iid, fn):
+    def _retry(iid, fn, **_):
         raise RuntimeError("systemic token failure")
 
     _wire(
@@ -550,7 +550,7 @@ def test_poller_no_installs_is_a_clean_noop(monkeypatch):
         monkeypatch,
         installs=[],
         records_for=lambda iid: [{"x": 1}],
-        retry=lambda iid, fn: fn("tok"),
+        retry=lambda iid, fn, **_: fn("tok"),
         poll=lambda *a, **k: 1,
     )
     out = poller_handler.handler({}, None)
@@ -682,7 +682,7 @@ def test_handler_surfaces_install_reconciliation_counts(monkeypatch):
         monkeypatch,
         installs=[],
         records_for=lambda iid: [],
-        retry=lambda iid, fn: fn("tok"),
+        retry=lambda iid, fn, **_: fn("tok"),
         poll=lambda *a, **k: 0,
     )
     monkeypatch.setattr(
@@ -716,7 +716,7 @@ def _wire_enforcement(
         monkeypatch,
         installs=installs,
         records_for=lambda iid: [],
-        retry=lambda iid, fn: fn("tok"),
+        retry=lambda iid, fn, **_: fn("tok"),
         poll=lambda *a, **k: 0,
     )
     monkeypatch.setattr(
@@ -1177,7 +1177,7 @@ def test_smoke_mode_proves_identity_store_and_token_then_stops(monkeypatch):
     calls = []
     monkeypatch.setattr(poller_handler, "_prove_roles_anywhere_identity", lambda: calls.append("identity"))
     monkeypatch.setattr(poller_handler, "list_allowlisted_installs", lambda: calls.append("store") or [111])
-    monkeypatch.setattr(poller_handler, "with_install_token_retry", lambda iid, fn: calls.append(("token", iid)) or fn("tok"))
+    monkeypatch.setattr(poller_handler, "with_install_token_retry", lambda iid, fn, **_: calls.append(("token", iid)) or fn("tok"))
 
     def boom(*a, **k):
         raise AssertionError("smoke mode must not run the poll passes")

@@ -10,6 +10,21 @@
 CSRF state: HMAC of a server secret + timestamp; stateless verify on
 callback. No session table needed.
 
+Rate limits (#1680): login and callback are each capped per client IP
+per minute through the Postgres rate-limit store. Settings:
+  GRUG_OAUTH_LOGIN_PER_MINUTE     (default 20) - GET .../login
+  GRUG_OAUTH_CALLBACK_PER_MINUTE  (default 10) - GET .../callback
+Past the cap the route answers 429 with Retry-After set to the seconds
+left in the minute window. The callback check runs before the CSRF state
+check, so junk codes count too. The client IP is X-Grug-Client-IP, which
+the grug-api-host-rewrite Worker sets from the edge's CF-Connecting-IP
+and overwrites on every request; CfAuthMiddleware rejects any request
+that did not pass through that Worker. CF-Connecting-IP itself is not
+read: on the Worker's cross-zone subrequest it holds the Worker's own
+address. Without the header (local runs) the socket peer is used. IPv6
+addresses share one bucket per /64. A store fault fails open with a
+warning rather than locking every user out.
+
 Per Slice 5 (#26) the allowlist gate is enforced via FastAPI dependency
 on routes other than /me + /waitlist. v1 short-circuits non-allowlisted
 users at /api/v1/installations/* etc.
@@ -19,17 +34,22 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import logging
 import os
 import secrets
+import threading
 import time
-from functools import lru_cache
+from datetime import datetime, timezone
+from typing import Literal
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Cookie, HTTPException, Query, Response
+import psycopg
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 
+from adapters.pg_rate_limit_store import try_reserve_slot
 from adapters.user_store import get_user, upsert_oauth_user
 
 log = logging.getLogger("grug.api.auth")
@@ -46,9 +66,34 @@ _DOMAIN = os.environ.get("GRUG_DOMAIN", "grug.lol")
 # but the SPA never had a /waitlist route → 404. Codex post-review #55.
 _DASHBOARD_URL = f"https://{_DOMAIN}/dashboard"
 _STATE_TTL_SECONDS = 600  # 10 min
+# Per-client-IP caps, see the module docstring (#1680).
+_LOGIN_PER_MINUTE = int(os.getenv("GRUG_OAUTH_LOGIN_PER_MINUTE", "20"))
+_CALLBACK_PER_MINUTE = int(os.getenv("GRUG_OAUTH_CALLBACK_PER_MINUTE", "10"))
 
 
-@lru_cache(maxsize=1)
+# A resolved signing key, cached for the life of the process. Only a
+# key that every pod resolves the same way is cached: the dedicated key,
+# or the webhook key when the dedicated one is not configured or not
+# provisioned. A transient read failure is never cached (#1627).
+_signing_secret_cache: str | None = None
+_signing_secret_lock = threading.Lock()
+
+
+class SessionSigningUnavailable(HTTPException):
+    """The dedicated signing key could not be read; the request fails closed."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=503, detail="session_signing_unavailable")
+
+
+def _is_parameter_not_found(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    error = response.get("Error")
+    return isinstance(error, dict) and error.get("Code") == "ParameterNotFound"
+
+
 def _state_secret() -> str:
     """HMAC key for CSRF state + session-cookie signing.
 
@@ -59,27 +104,50 @@ def _state_secret() -> str:
     and you could not rotate the webhook secret to respond without breaking
     inbound webhook verification + logging every user out at once.
 
-    Falls back to the webhook secret when the dedicated param isn't
-    provisioned yet, so this is a ZERO-DOWNTIME migration: create the
-    SecureString `/grug/session-signing-secret` (HITL, see
-    docs/HITL_PREREQUISITES.md), wire GRUG_SESSION_SIGNING_SECRET_SSM in
-    k8s/api-deployment.yaml, and the next deploy switches over (live
-    sessions invalidate once — users simply re-login).
-
-    lru_cache(maxsize=1): resolve once per process (pods restart on deploy
-    / rotation), so the fallback warning logs once, not per request.
+    Resolution:
+    - Dedicated read succeeds: cache it for the process.
+    - Dedicated env var unset (local dev), or the parameter does not exist
+      yet (ParameterNotFound, the zero-downtime migration path in
+      docs/HITL_PREREQUISITES.md): use the webhook secret with a warning.
+      Every pod sees the same answer, so this is cached too.
+    - Any other dedicated read failure (throttle, network, access): raise
+      SessionSigningUnavailable (503) and cache nothing, so the next
+      request retries. Falling back here would let one pod sign with a
+      different key than its peers for its whole lifetime (#1627).
     """
+    global _signing_secret_cache
+    cached = _signing_secret_cache
+    if cached is not None:
+        return cached
+    with _signing_secret_lock:
+        if _signing_secret_cache is not None:
+            return _signing_secret_cache
+        _signing_secret_cache = _resolve_signing_secret()
+        return _signing_secret_cache
+
+
+def _resolve_signing_secret() -> str:
+    from botocore.exceptions import BotoCoreError, ClientError
     from secrets_loader import _get_ssm_secure_string  # type: ignore
     dedicated = os.environ.get("GRUG_SESSION_SIGNING_SECRET_SSM", "")
     if dedicated:
         try:
             return _get_ssm_secure_string(dedicated)
-        except Exception:
+        except (ClientError, BotoCoreError) as e:
+            # Only SSM read faults land here. A bug in the loader (NameError,
+            # AttributeError) propagates as itself instead of posing as an
+            # SSM outage behind a 503.
             # NB: do NOT log `dedicated` (the SSM param name) - the only
             # such param is GRUG_SESSION_SIGNING_SECRET_SSM, so the message
             # already identifies it, and logging a value sourced from a
             # `*_SECRET_SSM` env var trips clear-text-secret scanners.
-            log.warning("session_signing_secret_unavailable_using_fallback")
+            if not _is_parameter_not_found(e):
+                log.error(
+                    "session_signing_secret_read_failed",
+                    extra={"kind": type(e).__name__},
+                )
+                raise SessionSigningUnavailable() from e
+            log.warning("session_signing_secret_unprovisioned_using_fallback")
     else:
         log.warning("session_signing_secret_unconfigured_using_fallback")
     return _get_ssm_secure_string(
@@ -165,7 +233,82 @@ def _client_secret() -> str:
     return _get_ssm_secure_string(name)
 
 
-@router.get("/auth/github/login")
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+_CLIENT_IP_HEADER = "x-grug-client-ip"
+
+
+def _client_ip(request: Request) -> str:
+    """Rate-limit key for the caller: the Worker-set client IP header when
+    it parses as an address, else the socket peer. See the module docstring."""
+    forwarded = _ip_bucket(request.headers.get(_CLIENT_IP_HEADER, ""))
+    if forwarded is not None:
+        return forwarded
+    if request.client is not None:
+        return _ip_bucket(request.client.host) or request.client.host
+    return "unknown"
+
+
+def _ip_bucket(raw: str) -> str | None:
+    """IPv4 as is; IPv6 widened to its /64, the block one subscriber holds."""
+    try:
+        addr = ipaddress.ip_address(raw.strip())
+    except ValueError:
+        return None
+    if addr.version == 6:
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
+
+
+def _enforce_ip_limit(kind: Literal["login", "callback"], request: Request) -> None:
+    """Admit one request for this client IP or raise 429 with Retry-After.
+
+    Only the minute window binds: the store also keeps a day counter, so
+    the day cap is set to a full day of minute caps and never trips first.
+    """
+    minute_limit = _LOGIN_PER_MINUTE if kind == "login" else _CALLBACK_PER_MINUTE
+    ip = _client_ip(request)
+    now = _now()
+    try:
+        slot = try_reserve_slot(
+            name=f"oauth_{kind}:{ip}",
+            minute_limit=minute_limit,
+            day_limit=minute_limit * 1440,
+            now=now,
+        )
+    except (psycopg.Error, OSError) as e:
+        log.warning(
+            "oauth_rate_limit_store_unavailable",
+            extra={"route": kind, "kind": type(e).__name__},
+        )
+        return
+    if slot.admitted:
+        return
+    retry_after = max(1, 60 - int(now.timestamp() % 60))
+    log.info(
+        "oauth_rate_limited",
+        extra={"route": kind, "minute_count": slot.minute_count},
+    )
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="rate_limited",
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
+def _limit_login(request: Request) -> None:
+    _enforce_ip_limit("login", request)
+
+
+def _limit_callback(request: Request) -> None:
+    _enforce_ip_limit("callback", request)
+
+
+# The limits are route dependencies, so FastAPI runs them before the
+# handler body: the callback is counted before its CSRF state check.
+@router.get("/auth/github/login", dependencies=[Depends(_limit_login)])
 def login() -> RedirectResponse:
     """302 to GitHub authorize URL."""
     state = _make_state()
@@ -189,7 +332,7 @@ def login() -> RedirectResponse:
     return resp
 
 
-@router.get("/auth/github/callback")
+@router.get("/auth/github/callback", dependencies=[Depends(_limit_callback)])
 def callback(
     code: str = Query(...),
     state: str = Query(...),

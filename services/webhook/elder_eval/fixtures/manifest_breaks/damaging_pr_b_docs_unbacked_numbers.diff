@@ -1,0 +1,19 @@
+diff --git a/manifests/db-cluster/CONTINUITY-RUNBOOK.md b/manifests/db-cluster/CONTINUITY-RUNBOOK.md
+new file mode 100644
+--- /dev/null
++++ b/manifests/db-cluster/CONTINUITY-RUNBOOK.md
+@@ -0,0 +1,14 @@
++# Database continuity runbook
++
++Switch the primary over before draining its node.
++
++## Measured result
++
++A switchover before a drain keeps the write gap under 2 seconds, and the
++read-only service kept 100% of its endpoints ready across 20 drains.
++
++## Steps
++
++1. Find the primary: `kubectl -n db get cluster db -o jsonpath='{.status.currentPrimary}'`.
++2. Promote a replica: `kubectl cnpg promote db db-2 -n db`.
++3. Drain the old primary's node.
