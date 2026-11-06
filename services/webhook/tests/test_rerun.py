@@ -15,6 +15,8 @@ from unittest.mock import ANY, MagicMock, patch
 import httpx
 import pytest
 
+import ask_job
+import learn_job
 import rerun
 from personas.code_reviewer import elder_review
 
@@ -1766,12 +1768,12 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
         lambda *a, **k: {"durable": True, "learning": "prefer early returns",
                          "scope_path": "**/mw/*.py"},
     )
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
-    monkeypatch.setattr(rerun, "_org_learning_approval_delay",
+    monkeypatch.setattr(learn_job, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    monkeypatch.setattr(learn_job, "_org_learning_approval_delay",
                         lambda install_id, repo_full: 0)
 
-    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "we prefer early returns", "teammate")
+    result = learn_job._run_learn(11, "o/r", 7, 5001, 4000, "we prefer early returns", "teammate")
 
     assert result == "learned"
     assert put_calls and put_calls[0]["text"] == "prefer early returns"
@@ -1779,7 +1781,7 @@ def test_run_learn_durable_stores_and_acks(monkeypatch):
     assert put_calls[0]["scope_path"] == "**/mw/*.py" and put_calls[0]["source_pr"] == 7
     # A reaction on the teacher's reply, plus a collapsible acknowledgment.
     assert posted and "/pulls/comments/5001/reactions" in posted[0][0]
-    assert posted[0][1] == {"content": rerun.LEARN_REACTION_LEARNED}
+    assert posted[0][1] == {"content": learn_job.LEARN_REACTION_LEARNED}
     comments = [b["body"] for (_u, b) in posted if "/pulls/comments/5001/replies" in _u]
     assert comments and "Markings remembered" in comments[0] and "prefer early returns" in comments[0]
 
@@ -1801,12 +1803,12 @@ def _learn_on(monkeypatch, tags, learning="prefer early returns"):
         "llm_client.classify_learning",
         lambda *a, **k: {"durable": True, "learning": learning, "scope_path": ""},
     )
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
-    monkeypatch.setattr(rerun, "_org_learning_approval_delay", lambda i, r: 0)
-    monkeypatch.setattr(rerun, "_sync_living_review", lambda *a, **k: None)
+    monkeypatch.setattr(learn_job, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    monkeypatch.setattr(learn_job, "_org_learning_approval_delay", lambda i, r: 0)
+    monkeypatch.setattr(learn_job, "_sync_living_review", lambda *a, **k: None)
     reply = "this is safe because the caller already checks it"
-    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, reply, "teammate")
+    result = learn_job._run_learn(11, "o/r", 7, 5001, 4000, reply, "teammate")
     return result, put_calls, posted
 
 
@@ -1822,7 +1824,7 @@ def test_run_learn_redelivery_does_not_restart_the_rule(monkeypatch):
     )
     monkeypatch.setattr("adapters.install_store.put_learning", lambda **kw: puts.append(kw))
     monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
-    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "a reason", "teammate") == "learn_duplicate"
+    assert learn_job._run_learn(11, "o/r", 7, 5001, 4000, "a reason", "teammate") == "learn_duplicate"
     assert puts == []
 
 
@@ -1868,15 +1870,15 @@ def test_run_learn_one_off_declines_without_storing(monkeypatch):
     monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
     monkeypatch.setattr("llm_client.classify_learning",
                         lambda *a, **k: {"durable": False, "learning": "", "scope_path": ""})
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    monkeypatch.setattr(learn_job, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body: posted.append((url, body)))
 
-    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "just for this PR")
+    result = learn_job._run_learn(11, "o/r", 7, 5001, 4000, "just for this PR")
 
     assert result == "learn_one_off"
     assert put_calls == []  # nothing stored
     assert posted and "/pulls/comments/5001/reactions" in posted[0][0]
-    assert posted[0][1] == {"content": rerun.LEARN_REACTION_ONE_OFF}
+    assert posted[0][1] == {"content": learn_job.LEARN_REACTION_ONE_OFF}
     # Declining is explicit in the acknowledgment comment (not just a reaction).
     bodies = [b["body"] for (_u, b) in posted if "/pulls/comments/5001/replies" in _u]
     assert bodies and "Not remembered" in bodies[0] and "one reply only" in bodies[0]
@@ -1897,11 +1899,11 @@ def test_run_learn_classifier_none_raises_for_redrive(monkeypatch):
     monkeypatch.setattr("adapters.install_store.claim_delivery",
                         lambda k: (_ for _ in ()).throw(AssertionError("must not claim")))
     monkeypatch.setattr("llm_client.classify_learning", lambda *a, **k: None)
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+    monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body: posted.append(body))
 
     # A transient classifier failure must redrive, NOT mislabel as one-off.
     with pytest.raises(RuntimeError, match="classifier unavailable"):
-        rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
+        learn_job._run_learn(11, "o/r", 7, 5001, 4000, "?")
     assert posted == []  # no misleading ack posted on the failure path
 
 
@@ -1932,15 +1934,15 @@ def test_run_learn_every_backend_unusable_completes_without_redrive(monkeypatch,
     def unusable(*a, **k):
         raise llm_client.LearnClassifierUnusable(("openrouter:http_403", "poolside:http_401"))
     monkeypatch.setattr("llm_client.classify_learning", unusable)
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    monkeypatch.setattr(learn_job, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body: posted.append((url, body)))
 
     with caplog.at_level(logging.ERROR):
-        result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
+        result = learn_job._run_learn(11, "o/r", 7, 5001, 4000, "?")
 
     assert result == "learn_classifier_unusable"
     assert posted and "/pulls/comments/5001/reactions" in posted[0][0]
-    assert posted[0][1] == {"content": rerun.LEARN_REACTION_UNJUDGED}
+    assert posted[0][1] == {"content": learn_job.LEARN_REACTION_UNJUDGED}
     assert gauges == []  # not a classification
     unusable_logs = [r for r in caplog.records if r.msg == "learn_classifier_unusable"]
     assert unusable_logs and unusable_logs[0].statuses == ["openrouter:http_403", "poolside:http_401"]
@@ -1962,14 +1964,14 @@ def test_run_learn_unusable_notice_post_failure_redrives(monkeypatch):
     def unusable(*a, **k):
         raise llm_client.LearnClassifierUnusable(("openrouter:http_403",))
     monkeypatch.setattr("llm_client.classify_learning", unusable)
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(learn_job, "with_install_token_retry", lambda iid, fn: fn("tok"))
 
     def github_down(token, url, body):
         raise httpx.ConnectError("github down")
-    monkeypatch.setattr(rerun, "_gh_post", github_down)
+    monkeypatch.setattr(learn_job, "_gh_post", github_down)
 
     with pytest.raises(httpx.ConnectError):
-        rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
+        learn_job._run_learn(11, "o/r", 7, 5001, 4000, "?")
 
 
 def test_run_learn_redelivery_is_win_once(monkeypatch):
@@ -1987,9 +1989,9 @@ def test_run_learn_redelivery_is_win_once(monkeypatch):
     monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
     monkeypatch.setattr("llm_client.classify_learning",
                         lambda *a, **k: {"durable": True, "learning": "r", "scope_path": ""})
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+    monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body: posted.append(body))
 
-    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "x") == "learn_duplicate"
+    assert learn_job._run_learn(11, "o/r", 7, 5001, 4000, "x") == "learn_duplicate"
     assert posted == []  # no duplicate ack on the finding thread
 
 
@@ -1997,16 +1999,16 @@ def test_run_learn_no_parent_record_is_silent(monkeypatch):
     posted = []
     monkeypatch.setattr("adapters.install_store.get_learning_by_source_comment", lambda repo, cid: None)
     monkeypatch.setattr("adapters.install_store.get_comment_record", lambda iid, cid: None)
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
+    monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body: posted.append(body))
 
-    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "reply") == "learn_no_parent"
+    assert learn_job._run_learn(11, "o/r", 7, 5001, 4000, "reply") == "learn_no_parent"
     assert posted == []  # no noise on a reply to a non-grug comment
 
 
 def test_run_one_routes_learn_kind(monkeypatch):
     called = {}
     monkeypatch.setattr(
-        rerun, "_run_learn",
+        learn_job, "_run_learn",
         lambda iid, repo, pr, cid, parent, text, author="", **_defer: called.update(
             iid=iid, repo=repo, pr=pr, cid=cid, parent=parent, text=text,
             author=author) or "learned",
@@ -2051,12 +2053,12 @@ def test_run_learn_ack_failure_keeps_learning_and_does_not_raise(monkeypatch):
     monkeypatch.setattr("llm_client.classify_learning",
                         lambda *a, **k: {"durable": True, "learning": "r", "scope_path": ""})
     # The threaded reply POST fails transiently.
-    monkeypatch.setattr(rerun, "with_install_token_retry",
+    monkeypatch.setattr(learn_job, "with_install_token_retry",
                         lambda iid, fn: (_ for _ in ()).throw(httpx.ConnectError("down")))
 
     # Learning is already stored, so a failed ack must NOT raise (which would
     # redrive + risk a different verdict) - it degrades to no courtesy reply.
-    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "x", "dev")
+    result = learn_job._run_learn(11, "o/r", 7, 5001, 4000, "x", "dev")
     assert result == "learned"
     assert put_calls  # the learning WAS stored despite the ack failure
 
@@ -2084,16 +2086,16 @@ def test_run_learn_redelivery_skips_classifier_and_reuses_stored_rule(monkeypatc
     )
     # Ack already claimed on the first delivery -> no duplicate ack.
     monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: False)
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append(body))
-    monkeypatch.setattr(rerun, "_org_learning_approval_delay",
+    monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body: posted.append(body))
+    monkeypatch.setattr(learn_job, "_org_learning_approval_delay",
                         lambda install_id, repo_full: 0)
 
-    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "x", "dev") == "learn_duplicate"
+    assert learn_job._run_learn(11, "o/r", 7, 5001, 4000, "x", "dev") == "learn_duplicate"
     assert posted == []
 
 
 def test_defuse_md_breaks_mentions():
-    out = rerun._defuse_md("thanks @org/team and @user")
+    out = learn_job._defuse_md("thanks @org/team and @user")
     assert "@org" not in out  # zwsp inserted after @ breaks the mention
     assert "@​org/team" in out and "@​user" in out
 
@@ -2103,17 +2105,57 @@ def test_defuse_md_logs_when_truncated(caplog):
     the operator - now logged."""
     import logging as _logging
     with caplog.at_level(_logging.INFO):
-        out = rerun._defuse_md("x" * 1000)
-    assert len(out) == rerun._DEFUSE_MD_CAP
+        out = learn_job._defuse_md("x" * 1000)
+    assert len(out) == learn_job._DEFUSE_MD_CAP
     hits = [r for r in caplog.records if r.msg == "defuse_md_truncated"]
-    assert hits and hits[0].raw_len == 1000 and hits[0].cap == rerun._DEFUSE_MD_CAP
+    assert hits and hits[0].raw_len == 1000 and hits[0].cap == learn_job._DEFUSE_MD_CAP
 
 
 def test_defuse_md_no_log_under_cap(caplog):
     import logging as _logging
     with caplog.at_level(_logging.INFO):
-        rerun._defuse_md("short")
+        learn_job._defuse_md("short")
     assert not [r for r in caplog.records if r.msg == "defuse_md_truncated"]
+
+
+# --- #1592: ask and learn jobs live in their own modules ----------------------
+
+def test_ask_and_learn_jobs_live_outside_rerun():
+    """rerun.py keeps the review lifecycle; the ask and learn jobs moved to
+    ask_job.py and learn_job.py, and rerun keeps no copy of them."""
+    for name in ("_run_ask", "_thread_context", "_ASK_PLACEHOLDER", "_ASK_TIRED",
+                 "_gh_get_text", "_gh_patch"):
+        assert not hasattr(rerun, name), name
+    for name in ("_run_learn", "_defer_learn", "_store_learning",
+                 "_hold_or_requeue_learn", "_post_learn_reply", "_learn_ack_body",
+                 "_react_to_learn_reply", "_org_learning_approval_delay",
+                 "_defuse_md", "_learn_defer_delay", "LEARN_REACTION_LEARNED",
+                 "_sync_living_review"):
+        assert not hasattr(rerun, name), name
+    assert callable(ask_job.run_ask_job) and callable(learn_job.run_learn_job)
+    # The producers stay in rerun: the webhook and the api share the job shape.
+    assert callable(rerun.enqueue_ask) and callable(rerun.enqueue_learn)
+
+
+def test_run_one_hands_an_ask_job_to_ask_job(monkeypatch):
+    seen = []
+    monkeypatch.setattr(ask_job, "run_ask_job", lambda job: seen.append(job) or "answered")
+    body = json.dumps({"kind": "ask", "install_id": 11, "repo": "o/r",
+                       "pr_number": 7, "question": "q"})
+    assert rerun._run_one(body) == "answered"
+    assert seen == [json.loads(body)]
+
+
+def test_run_one_hands_a_learn_job_to_learn_job(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        learn_job, "run_learn_job",
+        lambda job, **k: seen.append((job, k)) or "learned",
+    )
+    body = json.dumps({"kind": "learn", "install_id": 11, "repo": "o/r",
+                       "pr_number": 7, "comment_id": 5001})
+    assert rerun._run_one(body, receive_count=2, message_id="m-1") == "learned"
+    assert seen == [(json.loads(body), {"receive_count": 2, "message_id": "m-1"})]
 
 
 # --- _run_ask mention neutralization (#561) ---------------------------
@@ -2122,22 +2164,30 @@ _ZWSP = chr(0x200B)  # kept as a runtime chr() call, not a literal
 # character, so this source file stays 7-bit ASCII on disk.
 
 
+def _patch_ask_seam(monkeypatch, name, value):
+    """Patch a GitHub seam the ask job shares with rerun: the placeholder and
+    the answer go through ask_job, the reactions through rerun's helpers."""
+    for module in (ask_job, rerun):
+        if hasattr(module, name):
+            monkeypatch.setattr(module, name, value)
+
+
 def test_run_ask_neutralizes_mention_in_posted_answer(monkeypatch):
     """A prompt-injected diff could get the model to include a live
     @mention in its answer; posted under Grug's own installation-token
     authority, that would notify a real GitHub user as if Grug itself
     pinged them (#561, same class as Teller's #554 round-4 fix)."""
     posted = []
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_get_text", lambda _token, _url, accept=None: "diff --git a b")
-    monkeypatch.setattr(rerun, "_gh_post", lambda _token, _url, body: posted.append(body))
+    _patch_ask_seam(monkeypatch, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(ask_job, "_gh_get_text", lambda _token, _url, accept=None: "diff --git a b")
+    _patch_ask_seam(monkeypatch, "_gh_post", lambda _token, _url, body: posted.append(body))
     monkeypatch.setattr(
         "llm_client.answer_pr_question",
         lambda _q, _diff, _iid, pr_context=None: "ping @cait to review this",
     )
     monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
 
-    result = rerun._run_ask(11, "o/r", 7, "who should review this?")
+    result = ask_job.run_ask(11, "o/r", 7, "who should review this?")
 
     assert result == "answered"
     assert posted, "expected a comment to be posted"
@@ -2150,16 +2200,16 @@ def test_run_ask_no_answer_falls_back_without_crashing_on_none(monkeypatch):
     """answer_pr_question returning None (degraded) must not raise inside
     the mention-neutralization step - None has no mentions to break."""
     posted = []
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_get_text", lambda _token, _url, accept=None: "diff --git a b")
-    monkeypatch.setattr(rerun, "_gh_post", lambda _token, _url, body: posted.append(body))
+    _patch_ask_seam(monkeypatch, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(ask_job, "_gh_get_text", lambda _token, _url, accept=None: "diff --git a b")
+    _patch_ask_seam(monkeypatch, "_gh_post", lambda _token, _url, body: posted.append(body))
     monkeypatch.setattr(
         "llm_client.answer_pr_question",
         lambda _q, _diff, _iid, pr_context=None: None,
     )
     monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
 
-    result = rerun._run_ask(11, "o/r", 7, "who should review this?")
+    result = ask_job.run_ask(11, "o/r", 7, "who should review this?")
 
     assert result == "ask_no_answer"
     assert "thinking-rock is tired" in posted[-1]["body"]
@@ -2365,12 +2415,12 @@ def _learn_unavailable_fixture(monkeypatch):
             ("openrouter:http_403", "poolside:http_429"))
     monkeypatch.setattr("llm_client.classify_learning", unavailable)
     posted = []
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: posted.append((url, body)))
+    monkeypatch.setattr(learn_job, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body: posted.append((url, body)))
     sent = []
     monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/q.fifo")
     monkeypatch.setattr(rerun._sqs, "send_message", lambda **kw: sent.append(kw))
-    monkeypatch.setattr(rerun, "_now", lambda: 1_000_000.0)
+    monkeypatch.setattr(learn_job, "_now", lambda: 1_000_000.0)
     return posted, sent
 
 
@@ -2380,7 +2430,7 @@ def test_run_learn_all_backends_rate_limited_defers_instead_of_completing(monkey
     re-enqueued as a fresh message with a delay, and the current one ends."""
     posted, sent = _learn_unavailable_fixture(monkeypatch)
 
-    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "a rule", "teammate")
+    result = learn_job._run_learn(11, "o/r", 7, 5001, 4000, "a rule", "teammate")
 
     assert result == "learn_deferred"
     assert posted == []  # nothing said in the thread yet: it WILL be judged
@@ -2389,7 +2439,7 @@ def test_run_learn_all_backends_rate_limited_defers_instead_of_completing(monkey
     assert job["kind"] == "learn" and job["comment_id"] == 5001
     assert job["reply_text"] == "a rule" and job["author"] == "teammate"
     assert job["defer_count"] == 1
-    assert job["not_before"] == 1_000_000.0 + rerun._LEARN_DEFER_BASE_SECONDS
+    assert job["not_before"] == 1_000_000.0 + learn_job._LEARN_DEFER_BASE_SECONDS
     assert job["first_deferred_at"] == 1_000_000.0
     # A new dedup id per deferral, or SQS would collapse it into the original.
     first_dedup = sent[0]["MessageDeduplicationId"]
@@ -2399,22 +2449,22 @@ def test_run_learn_all_backends_rate_limited_defers_instead_of_completing(monkey
 
 
 def test_learn_defer_backoff_grows_and_is_bounded():
-    delays = [rerun._learn_defer_delay(n) for n in range(12)]
-    assert delays[0] == rerun._LEARN_DEFER_BASE_SECONDS
+    delays = [learn_job._learn_defer_delay(n) for n in range(12)]
+    assert delays[0] == learn_job._LEARN_DEFER_BASE_SECONDS
     assert delays == sorted(delays)
-    assert max(delays) == rerun._LEARN_DEFER_MAX_SECONDS
+    assert max(delays) == learn_job._LEARN_DEFER_MAX_SECONDS
     # SQS caps a visibility timeout at 12h; the delay must fit in one hide.
-    assert rerun._LEARN_DEFER_MAX_SECONDS < 12 * 3600
+    assert learn_job._LEARN_DEFER_MAX_SECONDS < 12 * 3600
 
 
 def test_run_learn_deferral_carries_the_first_deferral_time(monkeypatch):
     _posted, sent = _learn_unavailable_fixture(monkeypatch)
-    rerun._run_learn(11, "o/r", 7, 5001, 4000, "?", defer_count=3,
+    learn_job._run_learn(11, "o/r", 7, 5001, 4000, "?", defer_count=3,
                      first_deferred_at=900_000.0)
     job = json.loads(sent[0]["MessageBody"])
     assert job["defer_count"] == 4
     assert job["first_deferred_at"] == 900_000.0
-    assert job["not_before"] == 1_000_000.0 + rerun._learn_defer_delay(3)
+    assert job["not_before"] == 1_000_000.0 + learn_job._learn_defer_delay(3)
 
 
 def test_run_learn_deferral_past_the_horizon_tells_the_thread(monkeypatch):
@@ -2422,12 +2472,12 @@ def test_run_learn_deferral_past_the_horizon_tells_the_thread(monkeypatch):
     in-thread notice as an unusable backend, so the reply is never silently
     lost and never dead-lettered."""
     posted, sent = _learn_unavailable_fixture(monkeypatch)
-    started = 1_000_000.0 - rerun._LEARN_DEFER_MAX_AGE_SECONDS
-    result = rerun._run_learn(11, "o/r", 7, 5001, 4000, "?", defer_count=30,
+    started = 1_000_000.0 - learn_job._LEARN_DEFER_MAX_AGE_SECONDS
+    result = learn_job._run_learn(11, "o/r", 7, 5001, 4000, "?", defer_count=30,
                               first_deferred_at=started)
     assert result == "learn_defer_exhausted"
     assert sent == []
-    assert posted and posted[0][1] == {"content": rerun.LEARN_REACTION_UNJUDGED}
+    assert posted and posted[0][1] == {"content": learn_job.LEARN_REACTION_UNJUDGED}
 
 
 def test_run_learn_deferral_enqueue_failure_redrives(monkeypatch):
@@ -2438,13 +2488,13 @@ def test_run_learn_deferral_enqueue_failure_redrives(monkeypatch):
         raise RuntimeError("sqs down")
     monkeypatch.setattr(rerun._sqs, "send_message", sqs_down)
     with pytest.raises(RuntimeError, match="sqs down"):
-        rerun._run_learn(11, "o/r", 7, 5001, 4000, "?")
+        learn_job._run_learn(11, "o/r", 7, 5001, 4000, "?")
 
 
 def test_run_one_learn_not_yet_due_asks_the_consumer_to_hide_it(monkeypatch):
     from rerun_queue import JobNotDue
-    monkeypatch.setattr(rerun, "_now", lambda: 1_000.0)
-    monkeypatch.setattr(rerun, "_run_learn",
+    monkeypatch.setattr(learn_job, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(learn_job, "_run_learn",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("too early")))
     body = json.dumps({
         "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
@@ -2458,8 +2508,8 @@ def test_run_one_learn_not_yet_due_asks_the_consumer_to_hide_it(monkeypatch):
 
 def test_run_one_learn_due_passes_the_deferral_state(monkeypatch):
     seen = {}
-    monkeypatch.setattr(rerun, "_now", lambda: 5_000.0)
-    monkeypatch.setattr(rerun, "_run_learn", lambda *a, **k: seen.update(k) or "learned")
+    monkeypatch.setattr(learn_job, "_now", lambda: 5_000.0)
+    monkeypatch.setattr(learn_job, "_run_learn", lambda *a, **k: seen.update(k) or "learned")
     body = json.dumps({
         "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
         "comment_id": 5001, "parent_comment_id": 4000, "reply_text": "hi",
@@ -2478,8 +2528,8 @@ def test_not_due_learn_seen_again_is_replaced_by_a_fresh_copy(monkeypatch):
     sent = []
     monkeypatch.setattr(rerun, "_RERUN_QUEUE_URL", "https://sqs.example/q.fifo")
     monkeypatch.setattr(rerun._sqs, "send_message", lambda **kw: sent.append(kw))
-    monkeypatch.setattr(rerun, "_now", lambda: 1_000.0)
-    monkeypatch.setattr(rerun, "_run_learn",
+    monkeypatch.setattr(learn_job, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(learn_job, "_run_learn",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("too early")))
     job = {
         "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
@@ -2506,7 +2556,7 @@ def test_not_due_learn_seen_again_is_replaced_by_a_fresh_copy(monkeypatch):
 
 def test_not_due_learn_first_receive_is_hidden_not_copied(monkeypatch):
     from rerun_queue import JobNotDue
-    monkeypatch.setattr(rerun, "_now", lambda: 1_000.0)
+    monkeypatch.setattr(learn_job, "_now", lambda: 1_000.0)
     monkeypatch.setattr(rerun._sqs, "send_message",
                         lambda **kw: (_ for _ in ()).throw(AssertionError("no copy")))
     job = {"kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
@@ -2654,10 +2704,10 @@ def test_learn_acks_post_collapsible_comment(monkeypatch):
         monkeypatch.setattr("adapters.install_store.put_learning", lambda **kw: None)
         monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
         monkeypatch.setattr("llm_client.classify_learning", lambda *a, v=verdict, **k: v)
-        monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-        monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body, sink=posted: sink.append((url, body)))
-        monkeypatch.setattr(rerun, "_org_learning_approval_delay", lambda install_id, repo_full: 0)
-        rerun._run_learn(11, "o/r", 7, 5001, 4000, "reply")
+        monkeypatch.setattr(learn_job, "with_install_token_retry", lambda iid, fn: fn("tok"))
+        monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body, sink=posted: sink.append((url, body)))
+        monkeypatch.setattr(learn_job, "_org_learning_approval_delay", lambda install_id, repo_full: 0)
+        learn_job._run_learn(11, "o/r", 7, 5001, 4000, "reply")
 
         reactions = [b for (_u, b) in posted if _u.endswith("/reactions")]
         comments = [b["body"] for (_u, b) in posted if "/pulls/comments/5001/replies" in _u]
@@ -2672,7 +2722,7 @@ def test_learn_reply_syncs_the_findings_living_review_state(monkeypatch):
     from unittest.mock import MagicMock
 
     synced = MagicMock(return_value=1)
-    monkeypatch.setattr(rerun, "_sync_living_review", synced)
+    monkeypatch.setattr(learn_job, "_sync_living_review", synced)
     monkeypatch.setattr("adapters.install_store.get_learning_by_source_comment", lambda repo, cid: None)
     monkeypatch.setattr("adapters.install_store.get_comment_record",
                         lambda iid, cid: {"finding_text": "x", "finding_tags": {"rule_name": "r"}})
@@ -2680,9 +2730,9 @@ def test_learn_reply_syncs_the_findings_living_review_state(monkeypatch):
     monkeypatch.setattr("adapters.install_store.claim_delivery", lambda k: True)
     monkeypatch.setattr("llm_client.classify_learning",
                         lambda *a, **k: {"durable": False, "learning": "", "scope_path": ""})
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_post", lambda token, url, body: None)
-    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "done, resolving") == "learn_one_off"
+    monkeypatch.setattr(learn_job, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(learn_job, "_gh_post", lambda token, url, body: None)
+    assert learn_job._run_learn(11, "o/r", 7, 5001, 4000, "done, resolving") == "learn_one_off"
     synced.assert_called_once_with(11, "o", "r", 7)
 
 
@@ -2690,9 +2740,9 @@ def test_learn_reply_to_an_untracked_comment_does_not_sync(monkeypatch):
     from unittest.mock import MagicMock
 
     synced = MagicMock(return_value=0)
-    monkeypatch.setattr(rerun, "_sync_living_review", synced)
+    monkeypatch.setattr(learn_job, "_sync_living_review", synced)
     monkeypatch.setattr("adapters.install_store.get_comment_record", lambda iid, cid: None)
-    assert rerun._run_learn(11, "o/r", 7, 5001, 4000, "reply") == "learn_no_parent"
+    assert learn_job._run_learn(11, "o/r", 7, 5001, 4000, "reply") == "learn_no_parent"
     synced.assert_not_called()
 
 
@@ -3307,14 +3357,14 @@ def test_run_ask_in_thread_replies_in_thread_with_hunk_context(monkeypatch):
     model sees the thread's finding + diff hunk, not just the PR diff."""
     posted = []
     seen = {}
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_get_text", lambda _t, _u, accept=None: "diff --git a/x.py b/x.py")
-    monkeypatch.setattr(rerun, "_gh_get", lambda _t, url: {
+    _patch_ask_seam(monkeypatch, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(ask_job, "_gh_get_text", lambda _t, _u, accept=None: "diff --git a/x.py b/x.py")
+    monkeypatch.setattr(ask_job, "_gh_get", lambda _t, url: {
         "body": "Grug finding: this lock is held over a network call",
         "diff_hunk": "@@ -10,3 +10,4 @@ def f():\n lock.acquire()",
         "path": "x.py", "line": 12,
     })
-    monkeypatch.setattr(rerun, "_gh_post", lambda _t, url, body: posted.append((url, body)))
+    _patch_ask_seam(monkeypatch, "_gh_post", lambda _t, url, body: posted.append((url, body)))
 
     def _answer(q, diff, _iid, pr_context=None):
         seen["diff"] = diff
@@ -3323,7 +3373,7 @@ def test_run_ask_in_thread_replies_in_thread_with_hunk_context(monkeypatch):
     monkeypatch.setattr("llm_client.answer_pr_question", _answer)
     monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
 
-    result = rerun._run_ask(11, "o/r", 7, "why did you flag this?", reply_to_comment_id=4000)
+    result = ask_job.run_ask(11, "o/r", 7, "why did you flag this?", reply_to_comment_id=4000)
 
     assert result == "answered"
     assert posted and "/pulls/7/comments/4000/replies" in posted[-1][0]
@@ -3336,16 +3386,16 @@ def test_run_ask_top_level_quotes_the_question(monkeypatch):
     """#822 criterion 1 on the conversation surface: the answer names the
     question it answers."""
     posted = []
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_get_text", lambda _t, _u, accept=None: "diff --git a b")
-    monkeypatch.setattr(rerun, "_gh_post", lambda _t, url, body: posted.append((url, body)))
+    _patch_ask_seam(monkeypatch, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(ask_job, "_gh_get_text", lambda _t, _u, accept=None: "diff --git a b")
+    _patch_ask_seam(monkeypatch, "_gh_post", lambda _t, url, body: posted.append((url, body)))
     monkeypatch.setattr(
         "llm_client.answer_pr_question",
         lambda _q, _d, _iid, pr_context=None: "It adds a retry.",
     )
     monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
 
-    rerun._run_ask(11, "o/r", 7, "what does this add?")
+    ask_job.run_ask(11, "o/r", 7, "what does this add?")
 
     assert posted[-1][1]["body"].startswith("> what does this add?")
 
@@ -3354,21 +3404,21 @@ def test_run_ask_thread_context_failure_is_disclosed(monkeypatch):
     """If the thread itself cannot be loaded, the answer still posts in
     the thread but says plainly it never saw the finding."""
     posted = []
-    monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
-    monkeypatch.setattr(rerun, "_gh_get_text", lambda _t, _u, accept=None: "diff --git a b")
+    _patch_ask_seam(monkeypatch, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+    monkeypatch.setattr(ask_job, "_gh_get_text", lambda _t, _u, accept=None: "diff --git a b")
 
     def _boom(_t, _url):
         raise RuntimeError("api down")
 
-    monkeypatch.setattr(rerun, "_gh_get", _boom)
-    monkeypatch.setattr(rerun, "_gh_post", lambda _t, url, body: posted.append((url, body)))
+    monkeypatch.setattr(ask_job, "_gh_get", _boom)
+    _patch_ask_seam(monkeypatch, "_gh_post", lambda _t, url, body: posted.append((url, body)))
     monkeypatch.setattr(
         "llm_client.answer_pr_question",
         lambda _q, _d, _iid, pr_context=None: "From the diff alone.",
     )
     monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
 
-    rerun._run_ask(11, "o/r", 7, "why did you flag this?", reply_to_comment_id=4000)
+    ask_job.run_ask(11, "o/r", 7, "why did you flag this?", reply_to_comment_id=4000)
 
     assert "/pulls/7/comments/4000/replies" in posted[-1][0]
     assert "could not load the thread" in posted[-1][1]["body"]
@@ -3405,10 +3455,10 @@ class _FakeAskGitHub:
         self.calls.append(("delete", url))
 
     def install(self, monkeypatch, *, diff=lambda: "diff --git a b", answer="It adds a retry."):
-        monkeypatch.setattr(rerun, "with_install_token_retry", lambda _iid, fn: fn("tok"))
-        monkeypatch.setattr(rerun, "_gh_post", self.post)
-        monkeypatch.setattr(rerun, "_gh_patch", self.patch)
-        monkeypatch.setattr(rerun, "_gh_delete", self.delete)
+        _patch_ask_seam(monkeypatch, "with_install_token_retry", lambda _iid, fn: fn("tok"))
+        _patch_ask_seam(monkeypatch, "_gh_post", self.post)
+        monkeypatch.setattr(ask_job, "_gh_patch", self.patch)
+        _patch_ask_seam(monkeypatch, "_gh_delete", self.delete)
 
         def _diff(_t, _u, accept=None):
             self.calls.append(("diff",))
@@ -3418,8 +3468,8 @@ class _FakeAskGitHub:
             self.calls.append(("llm",))
             return answer() if callable(answer) else answer
 
-        monkeypatch.setattr(rerun, "_gh_get_text", _diff)
-        monkeypatch.setattr(rerun, "_gh_get", lambda _t, _u: {"body": "finding", "path": "x.py"})
+        monkeypatch.setattr(ask_job, "_gh_get_text", _diff)
+        monkeypatch.setattr(ask_job, "_gh_get", lambda _t, _u: {"body": "finding", "path": "x.py"})
         monkeypatch.setattr("llm_client.answer_pr_question", _answer)
         monkeypatch.setattr("llm_client._redact_secrets", lambda s: s)
 
@@ -3438,7 +3488,7 @@ def test_run_ask_posts_placeholder_before_work_then_patches_same_comment(monkeyp
     gh = _FakeAskGitHub()
     gh.install(monkeypatch)
 
-    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+    result = ask_job.run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
 
     assert result == "answered"
     kinds = [c[0] for c in gh.calls if c[0] in ("diff", "llm", "patch")
@@ -3460,7 +3510,7 @@ def test_run_ask_in_thread_placeholder_patches_the_review_reply(monkeypatch):
     gh = _FakeAskGitHub()
     gh.install(monkeypatch)
 
-    result = rerun._run_ask(
+    result = ask_job.run_ask(
         11, "o/r", 7, "why did you flag this?",
         reply_to_comment_id=4000, comment_id=5002,
     )
@@ -3480,7 +3530,7 @@ def test_run_ask_swaps_eyes_for_thumbs_up_when_answered(monkeypatch):
     gh = _FakeAskGitHub()
     gh.install(monkeypatch)
 
-    rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+    ask_job.run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
 
     assert gh.reactions() == ["eyes", "+1"]
     eyes_id = [c for c in gh.calls if c[0] == "post" and c[2].get("content") == "eyes"][0][3]
@@ -3501,7 +3551,7 @@ def test_run_ask_failure_resolves_placeholder_and_reacts_thumbs_down(monkeypatch
 
     gh.install(monkeypatch, diff=_boom)
 
-    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+    result = ask_job.run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
 
     assert result == "ask_failed"
     patches = [c for c in gh.calls if c[0] == "patch"]
@@ -3518,7 +3568,7 @@ def test_run_ask_no_answer_resolves_placeholder_with_thumbs_down(monkeypatch):
     gh = _FakeAskGitHub()
     gh.install(monkeypatch, answer=None)
 
-    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+    result = ask_job.run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
 
     assert result == "ask_no_answer"
     patch = [c for c in gh.calls if c[0] == "patch"][0]
@@ -3532,7 +3582,7 @@ def test_run_ask_refused_answer_patch_falls_back_to_real_message(monkeypatch):
     gh = _FakeAskGitHub(patch_fails=1)
     gh.install(monkeypatch)
 
-    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+    result = ask_job.run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
 
     assert result == "ask_publish_failed"
     kinds = [c[0] for c in gh.calls if c[0] in ("patch", "patch_refused")]
@@ -3553,9 +3603,9 @@ def test_run_ask_reaction_failure_does_not_block_the_answer(monkeypatch):
             raise httpx.ConnectError("reactions down")
         return real_post(token, url, body)
 
-    monkeypatch.setattr(rerun, "_gh_post", _post)
+    _patch_ask_seam(monkeypatch, "_gh_post", _post)
 
-    result = rerun._run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
+    result = ask_job.run_ask(11, "o/r", 7, "what does this add?", comment_id=5001)
 
     assert result == "answered"
     assert [c[0] for c in gh.calls if c[0] == "patch"] == ["patch"]
@@ -3563,7 +3613,7 @@ def test_run_ask_reaction_failure_does_not_block_the_answer(monkeypatch):
 
 def test_run_one_ask_passes_the_command_comment_id(monkeypatch):
     seen = {}
-    monkeypatch.setattr(rerun, "_run_ask", lambda *a, **k: seen.update(k) or "answered")
+    monkeypatch.setattr(ask_job, "run_ask", lambda *a, **k: seen.update(k) or "answered")
     body = json.dumps({"kind": "ask", "install_id": 11, "repo": "o/r", "pr_number": 7,
                        "comment_id": 5001, "question": "q", "reply_to_comment_id": 0})
     assert rerun._run_one(body) == "answered"
