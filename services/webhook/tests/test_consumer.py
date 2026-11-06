@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import consumer
+import rerun_queue
 
 
 def _spec(
@@ -46,7 +47,11 @@ _MSG = {
 
 _REVIEW_MSG = {
     **_MSG,
-    "Body": json.dumps({"kind": "review", "install_id": 11}),
+    "Body": rerun_queue.encode_review(
+        install_id=11, repo="myorg/myrepo", pr_number=7,
+        requested_head_sha="head-1", requested_snapshot_id="snap-1",
+        settle_seconds=0,
+    ).body,
 }
 
 
@@ -1504,3 +1509,70 @@ def test_poll_not_yet_due_visibility_is_capped_below_the_sqs_maximum():
     ):
         consumer._poll_once(_spec(False, handler), "https://q", "arn")
     assert mock_vis.call_args.kwargs["VisibilityTimeout"] <= 43200
+
+
+# --- grug#584: one decode call and one redrive decision for a malformed job ---
+
+
+def test_durable_review_detection_uses_the_protocol_decoder():
+    spec = _spec(False, MagicMock(), kind="rerun-jobs")
+    assert consumer._is_durable_review(spec, _REVIEW_MSG) is True
+    unversioned = {**_MSG, "Body": json.dumps({"kind": "review", "install_id": 11})}
+    assert consumer._is_durable_review(spec, unversioned) is False
+    ask = {**_MSG, "Body": rerun_queue.encode_ask(
+        install_id=11, repo="a/b", pr_number=7, comment_id=1, question="q",
+    ).body}
+    assert consumer._is_durable_review(spec, ask) is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "not json",
+        json.dumps({"install_id": 11, "repo": "a/b", "pr_number": 7}),
+        json.dumps({"schema_version": 2, "kind": "review", "install_id": 11,
+                    "repo": "a/b", "pr_number": 7, "requested_head_sha": "h"}),
+        json.dumps({"schema_version": 1, "install_id": 11, "repo": "a/b",
+                    "pr_number": "+0,0"}),
+    ],
+)
+def test_poll_acks_a_malformed_rerun_job_instead_of_redriving_it(body, caplog):
+    """The redrive decision: a body the protocol rejects is logged once as
+    `rerun_job_rejected` and deleted. Redriving it would replay the same
+    failure until SQS dead-letters it (#579)."""
+    import rerun
+
+    message = {**_MSG, "Body": body}
+    with (
+        patch.object(
+            consumer._sqs, "receive_message", return_value={"Messages": [message]}
+        ),
+        patch.object(consumer._sqs, "delete_message") as mock_delete,
+        patch.object(consumer, "_announce_terminal_failure") as announce,
+        caplog.at_level("INFO"),
+    ):
+        n = consumer._poll_once(
+            _spec(False, rerun.handle_rerun_jobs, kind="rerun-jobs"),
+            "https://q", "arn",
+        )
+    assert n == 1
+    mock_delete.assert_called_once_with(QueueUrl="https://q", ReceiptHandle="r-1")
+    announce.assert_not_called()
+    rejected = [r for r in caplog.records if r.msg == "rerun_job_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0].levelname == "ERROR"
+    assert rejected[0].redrive is False
+    assert "consumer_handler_raised" not in [r.msg for r in caplog.records]
+
+
+def test_terminal_failure_ignores_a_body_the_protocol_rejects(monkeypatch):
+    import rerun
+
+    called = []
+    monkeypatch.setattr(rerun, "_complete_elder_check_open",
+                        lambda **k: called.append(k) or True)
+    spec = types.SimpleNamespace(kind="rerun")
+    consumer._announce_terminal_failure(
+        spec, _dlq_message(5, schema_version=9), RuntimeError("x"),
+    )
+    assert called == []

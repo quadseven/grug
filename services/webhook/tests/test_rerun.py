@@ -18,6 +18,7 @@ import pytest
 import ask_job
 import learn_job
 import rerun
+import rerun_queue
 from personas.code_reviewer import elder_review
 
 
@@ -153,10 +154,10 @@ def test_enqueue_review_is_snapshot_scoped_and_carries_quiet_window(monkeypatch)
     )
     assert body["requested_snapshot_id"] == expected_snapshot_id
     assert body["settle_seconds"] == 90
-    assert sent["MessageDeduplicationId"] == rerun._review_dedup_id(
+    assert sent["MessageDeduplicationId"] == rerun_queue.review_dedup_id(
         11, "myorg/myrepo", 7, expected_snapshot_id,
     )
-    assert sent["MessageGroupId"] == rerun._review_group_id(
+    assert sent["MessageGroupId"] == rerun_queue.review_group_id(
         11, "myorg/myrepo", 7,
     )
     assert len(sent["MessageDeduplicationId"]) <= 128
@@ -298,8 +299,8 @@ def test_enqueue_review_survives_in_progress_check_failure(monkeypatch):
 
 def test_review_dedup_id_is_bounded_and_snapshot_scoped_for_long_repo_names():
     repo = f"{'o' * 39}/{'r' * 100}"
-    first = rerun._review_dedup_id(11, repo, 7, "head-1")
-    second = rerun._review_dedup_id(11, repo, 7, "head-2")
+    first = rerun_queue.review_dedup_id(11, repo, 7, "head-1")
+    second = rerun_queue.review_dedup_id(11, repo, 7, "head-2")
 
     assert len(first) <= 128
     assert first != second
@@ -307,8 +308,8 @@ def test_review_dedup_id_is_bounded_and_snapshot_scoped_for_long_repo_names():
 
 def test_review_group_is_bounded_per_pr_not_global_per_installation():
     repo = f"{'o' * 39}/{'r' * 100}"
-    first = rerun._review_group_id(11, repo, 7)
-    other_pr = rerun._review_group_id(11, repo, 8)
+    first = rerun_queue.review_group_id(11, repo, 7)
+    other_pr = rerun_queue.review_group_id(11, repo, 8)
 
     assert len(first) <= 128
     assert first != other_pr
@@ -334,8 +335,8 @@ def test_rerun_and_ask_use_separate_bounded_workload_groups(monkeypatch):
 
     rerun_group = sent[0]["MessageGroupId"]
     ask_group = sent[1]["MessageGroupId"]
-    assert rerun_group == rerun._rerun_group_id(11, "myorg/myrepo", 7, "elder")
-    assert ask_group == rerun._ask_group_id(11, "myorg/myrepo", 7)
+    assert rerun_group == rerun_queue.rerun_group_id(11, "myorg/myrepo", 7, "elder")
+    assert ask_group == rerun_queue.ask_group_id(11, "myorg/myrepo", 7)
     assert rerun_group != ask_group
     assert len(rerun_group) <= 128
     assert len(ask_group) <= 128
@@ -1547,9 +1548,38 @@ def test_rerun_raises_on_github_fetch_failure_so_esm_retries():
             rerun.handle_rerun_jobs(_event(_job()))
 
 
-def test_rerun_raises_on_malformed_message():
-    with pytest.raises(json.JSONDecodeError):
-        rerun.handle_rerun_jobs(_event("not json"))  # → DLQ after retries
+@pytest.mark.parametrize(
+    "body",
+    [
+        "not json",
+        _job(schema_version=2),
+        json.dumps({"install_id": 11, "repo": "myorg/myrepo", "pr_number": 7}),
+        _job(kind="teleport"),
+        _job(pr_number="+0,0"),
+    ],
+)
+def test_rerun_rejects_a_malformed_message_once_without_redrive(body, caplog):
+    """grug#584: a body the protocol rejects is logged as `rerun_job_rejected`
+    and returned as handled, so the consumer acks it. A raise would replay
+    the same failure until SQS dead-letters it (#579)."""
+    with patch.object(rerun, "with_install_token_retry") as fetch, \
+            caplog.at_level(logging.ERROR):
+        out = rerun.handle_rerun_jobs(_event(body))
+    assert out == {"records": 1, "dispatched": 0, "skipped": 1}
+    fetch.assert_not_called()
+    rejected = [r for r in caplog.records if r.msg == "rerun_job_rejected"]
+    assert len(rejected) == 1 and rejected[0].reason
+
+
+def test_run_one_hands_kind_handlers_the_decoded_payload(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(ask_job, "run_ask_job", lambda job: seen.update(job) or "asked")
+    body = rerun_queue.encode_ask(
+        install_id=11, repo="myorg/myrepo", pr_number=7, comment_id=5,
+        question="why?",
+    ).body
+    assert rerun._run_one(body) == "asked"
+    assert seen == json.loads(body)
 
 
 def test_rerun_failure_raises_and_never_reenqueues():
@@ -1592,7 +1622,7 @@ def test_run_one_dispatches_guard(monkeypatch):
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("elder must not run")),
     )
     status = rr._run_one(_json.dumps({
-        "install_id": 1, "repo": "o/r", "pr_number": 5, "persona": "guard",
+        "schema_version": 1, "install_id": 1, "repo": "o/r", "pr_number": 5, "persona": "guard",
     }))
     assert status == "dispatched"
     assert called["blocking"] is True
@@ -2034,7 +2064,7 @@ def test_run_one_routes_learn_kind(monkeypatch):
             author=author) or "learned",
     )
     body = json.dumps({
-        "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
+        "schema_version": 1, "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
         "comment_id": 5001, "parent_comment_id": 4000, "reply_text": "hi",
         "author": "teammate",
     })
@@ -2160,7 +2190,7 @@ def test_ask_and_learn_jobs_live_outside_rerun():
 def test_run_one_hands_an_ask_job_to_ask_job(monkeypatch):
     seen = []
     monkeypatch.setattr(ask_job, "run_ask_job", lambda job: seen.append(job) or "answered")
-    body = json.dumps({"kind": "ask", "install_id": 11, "repo": "o/r",
+    body = json.dumps({"schema_version": 1, "kind": "ask", "install_id": 11, "repo": "o/r",
                        "pr_number": 7, "question": "q"})
     assert rerun._run_one(body) == "answered"
     assert seen == [json.loads(body)]
@@ -2172,7 +2202,7 @@ def test_run_one_hands_a_learn_job_to_learn_job(monkeypatch):
         learn_job, "run_learn_job",
         lambda job, **k: seen.append((job, k)) or "learned",
     )
-    body = json.dumps({"kind": "learn", "install_id": 11, "repo": "o/r",
+    body = json.dumps({"schema_version": 1, "kind": "learn", "install_id": 11, "repo": "o/r",
                        "pr_number": 7, "comment_id": 5001})
     assert rerun._run_one(body, receive_count=2, message_id="m-1") == "learned"
     assert seen == [(json.loads(body), {"receive_count": 2, "message_id": "m-1"})]
@@ -2517,7 +2547,7 @@ def test_run_one_learn_not_yet_due_asks_the_consumer_to_hide_it(monkeypatch):
     monkeypatch.setattr(learn_job, "_run_learn",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("too early")))
     body = json.dumps({
-        "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
+        "schema_version": 1, "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
         "comment_id": 5001, "parent_comment_id": 4000, "reply_text": "hi",
         "defer_count": 1, "not_before": 1_900.0, "first_deferred_at": 100.0,
     })
@@ -2531,7 +2561,7 @@ def test_run_one_learn_due_passes_the_deferral_state(monkeypatch):
     monkeypatch.setattr(learn_job, "_now", lambda: 5_000.0)
     monkeypatch.setattr(learn_job, "_run_learn", lambda *a, **k: seen.update(k) or "learned")
     body = json.dumps({
-        "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
+        "schema_version": 1, "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
         "comment_id": 5001, "parent_comment_id": 4000, "reply_text": "hi",
         "defer_count": 2, "not_before": 4_000.0, "first_deferred_at": 100.0,
     })
@@ -2552,7 +2582,7 @@ def test_not_due_learn_seen_again_is_replaced_by_a_fresh_copy(monkeypatch):
     monkeypatch.setattr(learn_job, "_run_learn",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("too early")))
     job = {
-        "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
+        "schema_version": 1, "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
         "comment_id": 5001, "parent_comment_id": 4000, "reply_text": "hi",
         "author": "dev", "defer_count": 2, "not_before": 9_000.0,
         "first_deferred_at": 100.0,
@@ -2579,7 +2609,7 @@ def test_not_due_learn_first_receive_is_hidden_not_copied(monkeypatch):
     monkeypatch.setattr(learn_job, "_now", lambda: 1_000.0)
     monkeypatch.setattr(rerun._sqs, "send_message",
                         lambda **kw: (_ for _ in ()).throw(AssertionError("no copy")))
-    job = {"kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
+    job = {"schema_version": 1, "kind": "learn", "install_id": 11, "repo": "o/r", "pr_number": 7,
            "comment_id": 5001, "defer_count": 1, "not_before": 2_000.0}
     event = {"Records": [{"body": json.dumps(job), "messageId": "m-9",
                           "attributes": {"ApproximateReceiveCount": "1"}}]}
@@ -3634,7 +3664,7 @@ def test_run_ask_reaction_failure_does_not_block_the_answer(monkeypatch):
 def test_run_one_ask_passes_the_command_comment_id(monkeypatch):
     seen = {}
     monkeypatch.setattr(ask_job, "run_ask", lambda *a, **k: seen.update(k) or "answered")
-    body = json.dumps({"kind": "ask", "install_id": 11, "repo": "o/r", "pr_number": 7,
+    body = json.dumps({"schema_version": 1, "kind": "ask", "install_id": 11, "repo": "o/r", "pr_number": 7,
                        "comment_id": 5001, "question": "q", "reply_to_comment_id": 0})
     assert rerun._run_one(body) == "answered"
     assert seen["comment_id"] == 5001
