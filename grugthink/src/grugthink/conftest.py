@@ -739,8 +739,17 @@ def mock_gemini_module(monkeypatch, mock_gemini_api):
     mock_genai.configure = MagicMock()
     mock_genai.GenerativeModel = MagicMock(return_value=mock_model_instance)
 
-    # Patch the module
+    # Patch the module. `import google.generativeai` imports the parent
+    # package first, and nothing in requirements.txt installs a `google`
+    # namespace any more, so stub the parent too when it is absent.
     monkeypatch.setitem(sys.modules, "google.generativeai", mock_genai)
+    try:
+        import google as google_pkg
+    except ImportError:
+        google_pkg = types.ModuleType("google")
+        google_pkg.__path__ = []
+        monkeypatch.setitem(sys.modules, "google", google_pkg)
+    monkeypatch.setattr(google_pkg, "generativeai", mock_genai, raising=False)
 
     return {
         "module": mock_genai,

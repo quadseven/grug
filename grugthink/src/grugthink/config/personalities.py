@@ -18,7 +18,25 @@ log = get_logger(__name__)
 # Restrict ids to a conservative slug; this fullmatch is the sanitizer barrier
 # that clears CodeQL py/path-injection at every personalities/ file sink.
 _SAFE_PERSONALITY_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# Personalities shipped in the image (read-only under readOnlyRootFilesystem).
 _PERSONALITIES_DIR = "personalities"
+
+
+def writable_personalities_dir() -> str:
+    """Directory that API-created personality files are written to.
+
+    GRUGTHINK_PERSONALITIES_DIR wins; otherwise <GRUGBOT_DATA_DIR>/personalities,
+    which is the mounted data volume in the k8s deployment (the image's own
+    personalities/ sits on a read-only root filesystem there). With neither set,
+    as in local dev, it is the shipped personalities/ directory.
+    """
+    explicit = os.getenv("GRUGTHINK_PERSONALITIES_DIR")
+    if explicit:
+        return explicit
+    data_dir = os.getenv("GRUGBOT_DATA_DIR")
+    if data_dir:
+        return os.path.join(data_dir, "personalities")
+    return _PERSONALITIES_DIR
 
 
 def is_safe_personality_id(personality_id: str) -> bool:
@@ -34,7 +52,7 @@ def personality_file_path(personality_id: str) -> str:
     """
     if not is_safe_personality_id(personality_id):
         raise ValueError(f"unsafe personality id: {personality_id!r}")
-    return os.path.join(_PERSONALITIES_DIR, f"{personality_id}.yaml")
+    return os.path.join(writable_personalities_dir(), f"{personality_id}.yaml")
 
 
 # Optional YAML support
@@ -48,10 +66,22 @@ except ImportError:
 
 
 def load_external_personalities() -> Dict[str, Any]:
-    """Load personality configurations from personalities directory."""
-    personalities = {}
-    personalities_dir = "personalities"
+    """Load personality files: the shipped directory, then the writable one.
 
+    A file in the writable directory overrides a shipped one with the same id.
+    """
+    personalities: Dict[str, Any] = {}
+    dirs = [_PERSONALITIES_DIR]
+    writable = writable_personalities_dir()
+    if os.path.abspath(writable) != os.path.abspath(_PERSONALITIES_DIR):
+        dirs.append(writable)
+    for personalities_dir in dirs:
+        personalities.update(_load_personalities_from(personalities_dir))
+    return personalities
+
+
+def _load_personalities_from(personalities_dir: str) -> Dict[str, Any]:
+    personalities: Dict[str, Any] = {}
     if not os.path.exists(personalities_dir):
         log.debug("Personalities directory not found", extra={"dir": personalities_dir})
         return personalities
@@ -94,28 +124,32 @@ def list_personalities(config_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
 
 
 def add_personality(config_manager, personality_id: str, personality_config: Dict[str, Any]) -> bool:
-    """Add a new personality configuration."""
-    personalities = config_manager.config_data.get("personalities", {})
+    """Add a new personality configuration.
+
+    The file is written first and the config saved only once it succeeds, so a
+    failed write leaves the config untouched.
+    """
+    if not save_personality_to_file(personality_id, personality_config):
+        log.error("Personality file write failed; config left unchanged", extra={"personality_id": personality_id})
+        return False
+    personalities = config_manager.get_config("personalities") or {}
     personalities[personality_id] = personality_config
     config_manager.set_config("personalities", personalities)
-    if not save_personality_to_file(personality_id, personality_config):
-        log.error("Personality added to config but file persistence failed", extra={"personality_id": personality_id})
-        return False
     log.info("Added personality", extra={"personality_id": personality_id})
     return True
 
 
 def update_personality(config_manager, personality_id: str, updates: Dict[str, Any]) -> bool:
     """Update a personality configuration."""
-    personalities = config_manager.config_data.get("personalities", {})
+    # get_config returns a deep copy, so nothing changes until set_config.
+    personalities = config_manager.get_config("personalities") or {}
     if personality_id in personalities:
-        personalities[personality_id].update(updates)
-        config_manager.set_config("personalities", personalities)
-        if not save_personality_to_file(personality_id, personalities[personality_id]):
-            log.error(
-                "Personality updated in config but file persistence failed", extra={"personality_id": personality_id}
-            )
+        updated = {**personalities[personality_id], **updates}
+        if not save_personality_to_file(personality_id, updated):
+            log.error("Personality file write failed; config left unchanged", extra={"personality_id": personality_id})
             return False
+        personalities[personality_id] = updated
+        config_manager.set_config("personalities", personalities)
         log.info("Updated personality", extra={"personality_id": personality_id})
         return True
     return False
@@ -133,12 +167,13 @@ def save_personality_to_file(personality_id: str, data: Dict[str, Any]) -> bool:
         log.error("Refusing to save personality with unsafe id", extra={"personality_id": personality_id})
         return False
 
-    os.makedirs(_PERSONALITIES_DIR, exist_ok=True)
+    target_dir = writable_personalities_dir()
     # basename strips any directory component, so the tainted id cannot traverse
     # out of personalities/ (CodeQL py/path-injection sanitizer).
-    file_path = os.path.join(_PERSONALITIES_DIR, os.path.basename(f"{personality_id}.yaml"))
+    file_path = os.path.join(target_dir, os.path.basename(f"{personality_id}.yaml"))
 
     try:
+        os.makedirs(target_dir, exist_ok=True)
         with open(file_path, "w") as f:
             yaml.safe_dump(data, f, indent=2, default_flow_style=False)
         log.debug("Saved personality file", extra={"personality_id": personality_id, "file": file_path})
@@ -162,7 +197,7 @@ def remove_personality(config_manager, personality_id: str) -> bool:
         else:
             # basename strips any directory component so the tainted id cannot
             # traverse out of personalities/ (CodeQL py/path-injection sanitizer).
-            file_path = os.path.join(_PERSONALITIES_DIR, os.path.basename(f"{personality_id}.yaml"))
+            file_path = os.path.join(writable_personalities_dir(), os.path.basename(f"{personality_id}.yaml"))
             try:
                 if os.path.exists(file_path):
                     os.remove(file_path)

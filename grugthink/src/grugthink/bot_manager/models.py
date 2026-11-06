@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from discord.ext import commands
 
@@ -42,6 +42,8 @@ class BotConfig:
     override_google_cse_id: Optional[str] = None
     override_ollama_urls: Optional[str] = None
     override_ollama_models: Optional[str] = None
+    # Extra environment from the create request, applied over the template's.
+    custom_env: Optional[Dict[str, str]] = None
 
     def __post_init__(self):
         if self.created_at is None:

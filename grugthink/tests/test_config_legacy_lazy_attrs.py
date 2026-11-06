@@ -1,14 +1,11 @@
 """Tests for config_legacy.py's __getattr__ dispatch (grug#632).
 
-Imports `config_legacy` directly rather than through `src.grugthink.config`
-(the path `tests/test_config_legacy.py` uses) - that module resolves to an
-unrelated config object (the multi-bot config MANAGER, not this file), which
-is why every test in that file fails with AttributeError regardless of this
-refactor; a pre-existing, separately-tracked breakage, out of scope for #632.
+Imports `config_legacy` directly rather than through `src.grugthink.config`,
+which resolves to the multi-bot config package, not this file.
 
 Each attribute is read fresh via __getattr__ on every access (no caching),
 so these tests vary os.environ per-case against ONE module import rather
-than reloading the module like test_config_legacy.py's (broken) suite does.
+than reloading the module.
 """
 
 import os
