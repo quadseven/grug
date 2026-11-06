@@ -1,11 +1,9 @@
-# grugthink test gate. Until now nothing ran the grugthink suite on PRs; this
-# gates the pgvector memory backend (docs/pgvector-memory.md) against a REAL
-# pgvector Postgres, because the store's semantics -- ON CONFLICT dedup, cosine
-# `<=>` ordering, namespace/server isolation -- are exactly what a fake gets
-# wrong. The service image is pgvector/pgvector:pg18 (stock postgres has no
-# `vector` extension). Scope is the new-backend tests, which import via the
-# `src.grugthink` convention and collect cleanly; the broader legacy suite has a
-# pre-existing import-path inconsistency and is out of scope here.
+# grugthink test gate: the whole tests/ directory. The pgvector memory backend
+# (docs/pgvector-memory.md) runs against a REAL pgvector Postgres, because the
+# store's semantics -- ON CONFLICT dedup, cosine `<=>` ordering,
+# namespace/server isolation -- are exactly what a fake gets wrong. The service
+# image is pgvector/pgvector:pg18 (stock postgres has no `vector` extension).
+# Every other test is pure mocks: no network, no Discord, no model calls.
 name: check.grugthink
 
 on:
@@ -51,15 +49,14 @@ jobs:
       - name: install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest
-      - name: pgvector memory tests (real pgvector Postgres)
-        run: PYTHONPATH=. python -m pytest tests/test_pgvector_store.py tests/test_ollama_embedder.py -v
-      # Chat reply path: the Ollama -> SaaS fallback chain and the reply
-      # parser that once posted a model's verdict trailer instead of its
-      # answer (#1045). Pure mocks, no network, no database.
-      - name: chat reply path tests (fallback chain + reply parsing)
-        run: PYTHONPATH=. python -m pytest tests/test_llm_fallback.py tests/test_llm_api_mocks.py tests/test_llm_response_parsing.py -v
-      # Trust gates (#1632): lore extraction only for trusted authors, and no
-      # unprompted model call on a server at chat frequency 0. Pure mocks.
-      - name: trust gate tests (lore extraction + chat frequency 0)
-        run: PYTHONPATH=. python -m pytest tests/test_bot_trust_gates.py -v
+          pip install -r requirements.txt -r requirements-dev.txt
+      # Includes the pgvector store tests (real Postgres above), the chat reply
+      # path (#1045), the trust gates (#1632), the API routers and the config
+      # package. A test that skips for want of the database fails the gate
+      # below, so the store tests cannot pass by not running.
+      - name: grugthink tests (whole tests/ directory)
+        run: PYTHONPATH=. python -m pytest tests -v -rs
+      - name: pgvector store tests must not skip
+        run: |
+          PYTHONPATH=. python -m pytest tests/test_pgvector_store.py -q -rs | tee pgvector.log
+          if grep -q 'SKIPPED' pgvector.log; then echo "pgvector store tests skipped"; exit 1; fi

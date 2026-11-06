@@ -9,16 +9,6 @@ on:
   push:
     branches:
       - main
-      - 'feat/22-*'
-      - 'feat/23-*'
-      - 'feat/24-*'
-      - 'feat/25-*'
-      - 'feat/26-*'
-      - 'feat/27-*'
-      - 'feat/28-*'
-      - 'feat/29-*'
-      - 'feat/30-*'
-      - 'feat/31-*'
     tags: ['v*']
   pull_request:
     branches: [main]
@@ -73,7 +63,7 @@ jobs:
       - name: 01. Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: 02. Configure AWS via OIDC
-        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
           aws-region: us-east-1
@@ -117,14 +107,6 @@ jobs:
           stack-name: ${{ steps.stack.outputs.stack }}
           cloud-url: ${{ secrets.PULUMI_BACKEND_URL }}
           work-dir: infra/pulumi
-          config-map: |
-            # FROZEN at the last pre-swap SHA (#354 store swap): the source
-            # tree is Postgres-only from the swap commit on, and the Lambdas
-            # have no database URL or network path to the cluster store -
-            # deploying a post-swap image here is an instant outage on live
-            # traffic. Builds still push per-SHA images; the Lambdas just
-            # never advance past this tag. Do NOT unfreeze: the Lambdas
-            # retire at cutover (retirement PR removes this whole pipeline).
       - name: 11. Deploy CF Workers
         run: bash infra/cloudflare/deploy.sh
         env:

@@ -10,6 +10,7 @@ import os
 import sqlite3
 import threading
 
+from .bot_settings import getenv as _bot_getenv
 from .grug_structured_logger import get_logger
 
 # Lazy import globals - only loaded when actually needed
@@ -156,8 +157,8 @@ class GrugDB:
             with self.lock:  # Acquire lock before loading to prevent race conditions
                 if self.embedder is None:  # Double-check inside lock
                     # Check if Ollama embeddings are available (preferred - saves RAM)
-                    ollama_urls = os.getenv("OLLAMA_URLS")
-                    use_ollama_embeddings = os.getenv("USE_OLLAMA_EMBEDDINGS", "true").lower() == "true"
+                    ollama_urls = _bot_getenv("OLLAMA_URLS")
+                    use_ollama_embeddings = _bot_getenv("USE_OLLAMA_EMBEDDINGS", "true").lower() == "true"
 
                     if ollama_urls and use_ollama_embeddings:
                         log.info("Using Ollama for embeddings (GPU-accelerated, saves RAM)")
@@ -172,8 +173,8 @@ class GrugDB:
                             # the gateway doesn't have -> "model not found" -> semantic
                             # search silently disabled. Use the gateway's model (env-
                             # overridable), and match its dimension.
-                            embedding_model = os.getenv("GRUGTHINK_EMBED_MODEL", "nomic-embed-text:v1.5")
-                            dimension = int(os.getenv("GRUGTHINK_EMBED_DIM", "768"))
+                            embedding_model = _bot_getenv("GRUGTHINK_EMBED_MODEL", "nomic-embed-text:v1.5")
+                            dimension = int(_bot_getenv("GRUGTHINK_EMBED_DIM", "768"))
 
                             self.embedder = OllamaEmbedder(
                                 ollama_url=ollama_url, model=embedding_model, dimension=dimension

@@ -53,7 +53,7 @@ jobs:
         # too, so no infra/Pulumi change was needed to add this step; the
         # role's policy already grants ssm:GetParameter* on /infra/llm/*,
         # the same path grug's webhook/consumer read from for years).
-        uses: aws-actions/configure-aws-credentials@cabfdba3510de1431bac9dba27511d97497fc100 # v5
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
           aws-region: us-east-1

@@ -13,12 +13,15 @@
 # unenforced and protective when enforced -- confirm the cluster CNI
 # enforces NetworkPolicy for it to actually bite.
 #
-# Egress is intentionally restricted to PORTS, not CIDRs: grug talks to
-# AWS (SSM/SQS/KMS/S3, 443), GitHub + the LLM backends (443), CNPG
-# Postgres (5432), the Kubernetes API server (6443, see the rule below),
-# and the node-local Datadog agent (DogStatsD 8125 / APM 8126), plus DNS. Pinning destination CIDRs is the follow-up hardening;
-# port-scoping already blocks exfil over non-standard channels without
-# risking an outage from a wrong CIDR.
+# Egress names its destination wherever the destination is an in-cluster
+# workload a selector can match: cluster DNS (kube-dns), CNPG Postgres
+# (the `databases` namespace), spark-gateway and the subscription lane.
+# The rest stays port-scoped: AWS (SSM/SQS/KMS/S3), GitHub and the LLM
+# backends on 443 are outside the cluster with no stable CIDR; the
+# Kubernetes API server endpoint (6443) and the node-local Datadog agent
+# (8125/8126) are host-network addresses no pod or namespace selector can
+# match, and pinning an ipBlock would bake a cluster address into a public
+# manifest. Port-scoping still blocks exfil over non-standard channels.
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -45,12 +48,18 @@ spec:
       - {key: app, operator: In, values: [grug-api, grug-webhook]}
   policyTypes: [Ingress]
   ingress:
-    # Port 8080 only. `from` is omitted so the Cloudflare tunnel
-    # (cloudflared) can reach it regardless of which namespace it runs in;
-    # the real request auth is the CF shared-secret + HMAC/session layers.
-    # Tightening `from` to the tunnel pod is a follow-up once its labels
-    # are pinned.
-    - ports:
+    # Port 8080, from the Cloudflare tunnel connector only (#1634): the
+    # `cloudflared` Deployment in the `cloudflared` namespace, pod label
+    # app=cloudflared (read live). It is the only in-cluster caller of
+    # either Service. Kubelet probes come from the node and are not pod
+    # traffic, so they are unaffected. The request auth itself stays the
+    # CF shared-secret + HMAC/session layers.
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: cloudflared}
+          podSelector:
+            matchLabels: {app: cloudflared}
+      ports:
         - {protocol: TCP, port: 8080}
 ---
 apiVersion: networking.k8s.io/v1
@@ -62,15 +71,26 @@ spec:
   podSelector: {}
   policyTypes: [Egress]
   egress:
-    # DNS resolution.
-    - ports:
+    # DNS resolution: the kube-dns pods the ClusterFirst resolver's
+    # Service DNATs to (an enforcer matches after the DNAT).
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
         - {protocol: UDP, port: 53}
         - {protocol: TCP, port: 53}
     # HTTPS: AWS APIs, GitHub, LLM backends.
     - ports:
         - {protocol: TCP, port: 443}
-    # CNPG Postgres.
-    - ports:
+    # CNPG Postgres: the shared cluster in the `databases` namespace. No pod
+    # selector, so a CNPG failover or a pooler in that namespace still
+    # matches.
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: databases}
+      ports:
         - {protocol: TCP, port: 5432}
     # Kubernetes API server. The webhook and consumer (Smasher launcher SA)
     # and the preview janitor call `kubernetes.default.svc:443`, but an

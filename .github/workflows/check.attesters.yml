@@ -32,6 +32,20 @@ on:
       - 'web/src/rum.ts'
       - 'web/package.json'
       - '.github/workflows/check.attesters.yml'
+      # Every root and file the attesters read (#1626). The list above
+      # predates attesters that read further afield, so a PR touching only
+      # services/_shared/cf_auth.py or infra/cloudflare/deploy.sh landed
+      # without a run and the next unrelated PR went red.
+      # attest_no_vendor_names.py scans these four roots whole.
+      - 'services/**'
+      - 'web/src/**'
+      - 'infra/**'
+      - 'specs/**'
+      # attest_mirror_policy_consistency.py asserts these stay deleted.
+      - 'scripts/check-mirrored-files.sh'
+      - '.github/workflows/check.drift-lint.yml'
+      # scripts/tests/test_workflow_deploy_hygiene.py pins this list against
+      # the paths the attesters read.
   workflow_dispatch:
 
 permissions:

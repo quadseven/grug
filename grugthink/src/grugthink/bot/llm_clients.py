@@ -16,13 +16,13 @@ This module handles communication with different LLM backends:
 """
 
 import json
-import os
 import time
 from typing import Any
 
 import requests
 
 from .. import config_legacy as config
+from ..bot_settings import getenv as _bot_getenv
 from ..logging_config import get_logger
 
 log = get_logger(__name__)
@@ -46,7 +46,7 @@ _DATADOG_SWITCH = "GRUG_DATADOG_ENABLED"
 
 
 def _datadog_enabled() -> bool:
-    return os.getenv(_DATADOG_SWITCH, "").strip().lower() in ("1", "true", "yes", "on")
+    return _bot_getenv(_DATADOG_SWITCH, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class _NoopSpan:
@@ -122,7 +122,7 @@ _READ_CHUNK_BYTES = 8192
 def _ollama_budget_s() -> int:
     """Wall-clock seconds for the primary phase. An unset, unparseable, or
     out-of-range override falls back to the default, never to no limit."""
-    raw = os.getenv(_OLLAMA_BUDGET_ENV, "").strip()
+    raw = _bot_getenv(_OLLAMA_BUDGET_ENV, "").strip()
     if not raw:
         return _OLLAMA_BUDGET_DEFAULT_S
     try:
@@ -285,7 +285,7 @@ def query_ollama_api(
             )
             break
         raw_model = config.OLLAMA_MODELS[idx] if idx < len(config.OLLAMA_MODELS) else config.OLLAMA_MODELS[0]
-        openai_compatible = os.getenv("GRUGTHINK_LLM_API", "ollama").lower() == "openai"
+        openai_compatible = _bot_getenv("GRUGTHINK_LLM_API", "ollama").lower() == "openai"
         span_tags = {"bot_id": str(bot_id or ""), "personality": str(personality_name or "")}
         start_ns = time.monotonic_ns()
         with _llmobs_llm(model_name=raw_model, model_provider="ollama", name=_LLMOBS_NAME) as span:

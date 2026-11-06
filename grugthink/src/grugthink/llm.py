@@ -10,7 +10,7 @@ Endpoints (OpenAI-compatible, how grug's Elder already calls the gateway):
   POST {base}/v1/embeddings         {model, input}
 Unauthenticated in-cluster.
 
-Config (env):
+Config (env, per bot in multi-bot mode via bot_settings):
   SPARK_GATEWAY_URL / GRUGTHINK_LLM_URL - gateway base URL. Falls back to the
     first OLLAMA_URLS entry, then the in-cluster default.
   GRUGTHINK_EMBED_URL   - embeddings base URL, when they do not live behind
@@ -22,10 +22,11 @@ Config (env):
 """
 from __future__ import annotations
 
-import os
 from typing import Iterable, Sequence
 
 import httpx
+
+from .bot_settings import getenv as _getenv
 
 _DEFAULT_GATEWAY = "http://spark-gateway.spark-gateway.svc:8080"
 
@@ -38,9 +39,9 @@ class LLMError(RuntimeError):
 
 def base_url() -> str:
     url = (
-        os.getenv("SPARK_GATEWAY_URL")
-        or os.getenv("GRUGTHINK_LLM_URL")
-        or (os.getenv("OLLAMA_URLS", "").split(",")[0].strip() if os.getenv("OLLAMA_URLS") else "")
+        _getenv("SPARK_GATEWAY_URL")
+        or _getenv("GRUGTHINK_LLM_URL")
+        or (_getenv("OLLAMA_URLS", "").split(",")[0].strip() if _getenv("OLLAMA_URLS") else "")
         or _DEFAULT_GATEWAY
     )
     return url.rstrip("/")
@@ -49,7 +50,7 @@ def base_url() -> str:
 def chat_model() -> str:
     # Shared fleet default. Realtime chat disables long-form thinking in
     # chat(), while coding and review keep their task-specific settings.
-    return os.getenv("GRUGTHINK_LLM_MODEL", "poolside/Laguna-S-2.1-NVFP4")
+    return _getenv("GRUGTHINK_LLM_MODEL", "poolside/Laguna-S-2.1-NVFP4")
 
 
 def embed_base_url() -> str:
@@ -57,17 +58,17 @@ def embed_base_url() -> str:
     chat follows whatever the Sparks have resident, while embeddings need a
     model that is actually an embedder, and those are not always the same
     host."""
-    return os.getenv("GRUGTHINK_EMBED_URL", "").rstrip("/") or base_url()
+    return _getenv("GRUGTHINK_EMBED_URL", "").rstrip("/") or base_url()
 
 
 def embed_model() -> str:
     # Pinned version (was bare "nomic-embed-text").
-    return os.getenv("GRUGTHINK_EMBED_MODEL", "nomic-embed-text:v1.5")
+    return _getenv("GRUGTHINK_EMBED_MODEL", "nomic-embed-text:v1.5")
 
 
 def _timeout() -> float:
     try:
-        return float(os.getenv("GRUGTHINK_LLM_TIMEOUT", "60"))
+        return float(_getenv("GRUGTHINK_LLM_TIMEOUT", "60"))
     except ValueError:
         return 60.0
 
