@@ -3323,7 +3323,7 @@ def test_stack_offers_tests_for_changed_function_without_a_test():
         CodeReviewEvaluation(findings=(), conclusion="success"),
         conclusion="success", test_targets=("pkg/mod.py:1",),
     )
-    assert "changed public function(s) have no test in this PR" in body
+    assert "changed public function(s) are not referenced by any test in this PR" in body
     assert "/grug tests" in body
 
 

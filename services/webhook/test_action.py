@@ -41,7 +41,7 @@ def _fetch_pr_head(token_fn, owner: str, repo: str, pr_number: int) -> dict | No
 
     try:
         return token_fn(fetch)
-    except Exception:  # noqa: BLE001 - unreadable head: commit seam decides
+    except (httpx.HTTPError, OSError):  # unreadable head: commit seam decides
         log.warning("test_generation_head_fetch_failed", extra={"pr": pr_number})
         return None
 
@@ -125,6 +125,83 @@ def _reply(changed: list[str], skipped: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _fork_skip(
+    head: dict | None, *, owner: str, repo: str, pr_number: int, reply,
+) -> dict | None:
+    """The refusal result when the PR head lives in a fork, else None."""
+    if head is None:
+        return None
+    head_repo = str(((head.get("repo") or {}).get("full_name")) or "")
+    if head_repo.lower() == f"{owner}/{repo}".lower():
+        return None
+    reason = (
+        "this PR comes from a fork, and Grug only commits to "
+        "branches in this repo"
+    )
+    skipped = [(f"PR #{pr_number}", reason)]
+    reply(_reply([], skipped))
+    return {"verb": "tests", "status": "skip", "reason": "fork_pr",
+            "skipped": skipped}
+
+
+def _load_contents(
+    paths: list[str], *, fetch_file, token_fn, owner: str, repo: str,
+    head_sha: str,
+) -> dict[str, str]:
+    contents: dict[str, str] = {}
+    for path in paths:
+        text = fetch_file(token_fn, owner, repo, path, head_sha)
+        if text is not None:
+            contents[path] = text
+    # The test file mapped to each changed source is the coverage evidence
+    # and the merge base, whether or not the PR itself touched it.
+    for path in paths:
+        if is_test_file(path):
+            continue
+        test_path = test_path_for(path)
+        if test_path not in contents:
+            text = fetch_file(token_fn, owner, repo, test_path, head_sha)
+            if text is not None:
+                contents[test_path] = text
+    return contents
+
+
+def _commit_changes(
+    changes: dict[str, str], skipped: list[tuple[str, str]], *,
+    apply_commit, token_fn, owner: str, repo: str, head_sha: str,
+    pr_number: int, reply,
+) -> dict:
+    """Land the prepared changes as one commit and report the outcome."""
+    try:
+        new_head = apply_commit(
+            token_fn, owner, repo, head_sha, changes,
+            f"Generate grug unit tests on PR #{pr_number}", pr_number,
+        )
+    except autofix.CommitRefused as exc:
+        new_head = None
+        commit_error = str(exc)
+    except Exception as exc:  # noqa: BLE001 - name every uncommitted file
+        log.warning(
+            "test_generation_commit_failed",
+            extra={"pr": pr_number, "kind": type(exc).__name__},
+        )
+        new_head = None
+        commit_error = f"commit failed ({type(exc).__name__})"
+    else:
+        commit_error = "commit could not be created"
+    if new_head is None:
+        # A fresh list: the files that failed to land come first, each with
+        # the commit's reason; the generation skips keep their own reasons.
+        skipped = [(f"{path}", commit_error) for path in changes] + skipped
+        reply(_reply([], skipped))
+        return {"verb": "tests", "status": "skip", "reason": "commit_failed",
+                "skipped": skipped}
+    changed = sorted(changes)
+    reply(_reply(changed, skipped))
+    return {"verb": "tests", "status": "dispatched", "changed": changed,
+            "skipped": skipped}
+
+
 def run_tests(
     *, install_id: int, owner: str, repo: str, pr_number: int, head_sha: str,
     token_fn, post_reply=None, fetch_diff=None, fetch_file=None,
@@ -144,83 +221,38 @@ def run_tests(
     generate = generate or _generate_tests
     apply_commit = apply_commit or autofix._default_apply_commit
     fetch_pr_head = fetch_pr_head or _fetch_pr_head
-    head = fetch_pr_head(token_fn, owner, repo, pr_number)
-    if head is not None:
-        head_repo = str(((head.get("repo") or {}).get("full_name")) or "")
-        if head_repo.lower() != f"{owner}/{repo}".lower():
-            reason = (
-                "this PR comes from a fork, and Grug only commits to "
-                "branches in this repo"
-            )
-            skipped = [(f"PR #{pr_number}", reason)]
-            reply(_reply([], skipped))
-            return {
-                "verb": "tests", "status": "skip", "reason": "fork_pr",
-                "skipped": skipped,
-            }
+    fork = _fork_skip(
+        fetch_pr_head(token_fn, owner, repo, pr_number),
+        owner=owner, repo=repo, pr_number=pr_number, reply=reply,
+    )
+    if fork is not None:
+        return fork
     try:
         diff = fetch_diff(token_fn, owner, repo, pr_number)
+        paths = sorted({h.file_path for h in parse_diff(diff) if h.file_path.endswith(".py")})
     except (httpx.HTTPError, RuntimeError) as exc:
         reply(_reply([], [(f"PR #{pr_number}", f"could not read PR diff: {exc}")]))
         return {"verb": "tests", "status": "skip", "reason": "diff_unavailable"}
-
-    try:
-        paths = sorted({h.file_path for h in parse_diff(diff) if h.file_path.endswith(".py")})
     except DiffParseError:
         reason = "could not parse PR diff"
         reply(_reply([], [(f"PR #{pr_number}", reason)]))
         return {"verb": "tests", "status": "skip", "reason": "diff_unavailable"}
-    contents: dict[str, str] = {}
-    for path in paths:
-        text = fetch_file(token_fn, owner, repo, path, head_sha)
-        if text is not None:
-            contents[path] = text
-    # The test file mapped to each changed source is the coverage evidence
-    # and the merge base, whether or not the PR itself touched it.
-    for path in paths:
-        if is_test_file(path):
-            continue
-        test_path = test_path_for(path)
-        if test_path not in contents:
-            text = fetch_file(token_fn, owner, repo, test_path, head_sha)
-            if text is not None:
-                contents[test_path] = text
+    contents = _load_contents(
+        paths, fetch_file=fetch_file, token_fn=token_fn, owner=owner,
+        repo=repo, head_sha=head_sha,
+    )
     targets, skipped = find_test_targets(diff, contents)
-    test_contents: dict[str, str | None] = {}
-    for test_path in sorted({t.test_path for t in targets}):
-        if test_path in contents:
-            test_contents[test_path] = contents[test_path]
-        else:
-            test_contents[test_path] = fetch_file(
-                token_fn, owner, repo, test_path, head_sha,
-            )
+    test_contents: dict[str, str | None] = {
+        test_path: contents.get(test_path)
+        for test_path in sorted({t.test_path for t in targets})
+    }
     changes, generation_skips = _prepare(targets, contents, test_contents, generate)
     skipped.extend(generation_skips)
     if not changes:
         reply(_reply([], skipped))
         return {"verb": "tests", "status": "no_op", "changed": [], "skipped": skipped}
-
-    try:
-        new_head = apply_commit(
-            token_fn, owner, repo, head_sha, changes,
-            f"Generate grug unit tests on PR #{pr_number}", pr_number,
-        )
-    except autofix.CommitRefused as exc:
-        new_head = None
-        commit_error = str(exc)
-    except Exception as exc:  # noqa: BLE001 - name every uncommitted file
-        log.warning(
-            "test_generation_commit_failed",
-            extra={"pr": pr_number, "kind": type(exc).__name__},
-        )
-        new_head = None
-        commit_error = f"commit failed ({type(exc).__name__})"
-    else:
-        commit_error = "commit could not be created"
-    if new_head is None:
-        skipped.extend((f"{path}", commit_error) for path in changes)
-        reply(_reply([], skipped))
-        return {"verb": "tests", "status": "skip", "reason": "commit_failed", "skipped": skipped}
-    changed = sorted(changes)
-    reply(_reply(changed, skipped))
-    return {"verb": "tests", "status": "dispatched", "changed": changed, "skipped": skipped}
+    return _commit_changes(
+        changes, skipped, apply_commit=apply_commit, token_fn=token_fn,
+        owner=owner, repo=repo, head_sha=head_sha, pr_number=pr_number,
+        reply=reply,
+    )

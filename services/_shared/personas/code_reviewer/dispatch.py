@@ -2315,8 +2315,8 @@ def _test_offer_lines(
     if targets:
         lines.append(
             f"**Finishing touch:** {len(targets)} changed public "
-            "function(s) have no test in this PR. Run `/grug tests` to "
-            "generate unit tests for them."
+            "function(s) are not referenced by any test in this PR. "
+            "Run `/grug tests` to generate unit tests for them."
         )
     if skips:
         skipped = "; ".join(

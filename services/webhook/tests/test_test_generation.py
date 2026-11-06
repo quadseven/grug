@@ -204,6 +204,22 @@ def test_run_tests_names_a_generation_failure_as_skipped_and_commits_nothing():
     ]
 
 
+def test_run_tests_names_an_http_generation_failure_with_its_real_shape():
+    import httpx
+
+    def boom(*_args):
+        raise httpx.ConnectError("backend down")
+
+    result = _run(
+        fetch_file=lambda *_args: SOURCE if _args[3] == "pkg/mod.py" else None,
+        generate=boom,
+    )
+    assert result["status"] == "no_op"
+    assert result["skipped"] == [
+        ("pkg/mod.py:4 fresh", "generation failed (ConnectError)"),
+    ]
+
+
 def test_run_tests_no_op_when_every_changed_function_is_covered():
     commits = []
     contents = {
