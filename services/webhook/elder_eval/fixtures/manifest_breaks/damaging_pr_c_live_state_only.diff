@@ -1,0 +1,37 @@
+diff --git a/manifests/tenant-ingress/deployment.yaml b/manifests/tenant-ingress/deployment.yaml
+--- a/manifests/tenant-ingress/deployment.yaml
++++ b/manifests/tenant-ingress/deployment.yaml
+@@ -6,10 +6,14 @@
+   labels:
+     app: tenant-ingress
+ spec:
+-  # One node, one hostNetwork listener on :80/:443.
+-  replicas: 1
++  # Two replicas on two labelled ingress nodes. RollingUpdate (maxSurge 0,
++  # maxUnavailable 1) keeps the other node's replica serving.
++  replicas: 2
+   strategy:
+-    type: Recreate
++    type: RollingUpdate
++    rollingUpdate:
++      maxSurge: 0
++      maxUnavailable: 1
+   selector:
+     matchLabels:
+       app: tenant-ingress
+@@ -21,7 +25,14 @@
+       hostNetwork: true
+       dnsPolicy: Default
+       nodeSelector:
+-        kubernetes.io/hostname: worker-b
++        example.com/ingress: "true"
++      affinity:
++        podAntiAffinity:
++          requiredDuringSchedulingIgnoredDuringExecution:
++            - labelSelector:
++                matchLabels:
++                  app: tenant-ingress
++              topologyKey: kubernetes.io/hostname
+       automountServiceAccountToken: false
+       containers:
+         - name: proxy

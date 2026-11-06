@@ -21,6 +21,28 @@ by design vs an exposed admin port). The snippet carries the misconfig KIND +
 the trimmed line - IaC config is not a secret value, so the line is safe to
 publish.
 
+Manifest breaks (#1480). Three Kubernetes changes that take production down
+show in the diff alone, so a file-level pass over each YAML file's hunks
+(context and removed lines too, not just added ones) adds them as candidates:
+
+- a pod affinity or anti-affinity term the PR adds whose labelSelector picks
+  another workload (no value the file uses for its own app or name) and that
+  names no `namespaces` or `namespaceSelector`, so it only matches pods in
+  the pod's own namespace and the placement it promises does nothing;
+- a Deployment whose `Recreate` strategy the PR removes for `RollingUpdate`
+  while `replicas` is 1 and `maxSurge` is not 0, so a singleton writer runs
+  twice during every rollout;
+- an `imagePullSecrets` key on a removed line with no `imagePullSecrets` on
+  any added line of the same file, so a pod pulling from a private registry
+  loses its credentials on the next pull.
+
+Three other shapes from the same audit stay with the LLM review, with the
+written reasons in `elder_eval/fixtures/manifest_breaks/corpus.json`: a
+misspelled broker config key, a two-way broker bridge with no loop guard,
+and docs stating numbers no run produced. Live-state breaks (selectors
+against node labels, secret keys, hostnames) belong to Loom's lane-side
+live-cluster check.
+
 Pure: no IO, no network, no logging - deterministic + unit-tested.
 """
 
@@ -33,7 +55,14 @@ from dataclasses import dataclass
 from .diff_parser import added_lines, DiffHunk
 from .sast import IAC_MISCONFIG, Candidate
 
-__all__ = ["IAC_MISCONFIG", "scan_iac"]
+__all__ = [
+    "AFFINITY_NO_NAMESPACE",
+    "IAC_MISCONFIG",
+    "MANIFEST_BREAK_KINDS",
+    "PULL_SECRET_DROPPED",
+    "SINGLETON_ROLLING_UPDATE",
+    "scan_iac",
+]
 
 # Cost bounds, mirroring secret_scan: cap candidates, skip pathological lines,
 # and stop once the diff's added text exceeds a total byte budget.
@@ -169,7 +198,218 @@ def scan_iac(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
             )
             if len(found) >= _MAX_FINDINGS:
                 return _to_candidates(found)
+    for hit in _scan_manifest_breaks(hunks):
+        key = (hit.file, hit.kind, hit.snippet)
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(hit)
+        if len(found) >= _MAX_FINDINGS:
+            break
     return _to_candidates(found)
+
+
+# --- manifest breaks (#1480) --------------------------------------------------
+
+AFFINITY_NO_NAMESPACE = "pod affinity term selects another workload with no namespaces"
+SINGLETON_ROLLING_UPDATE = "singleton Deployment switched from Recreate to RollingUpdate"
+PULL_SECRET_DROPPED = "imagePullSecrets removed with no re-add in this file"
+MANIFEST_BREAK_KINDS: tuple[str, ...] = (
+    AFFINITY_NO_NAMESPACE,
+    SINGLETON_ROLLING_UPDATE,
+    PULL_SECRET_DROPPED,
+)
+
+_AFFINITY_HEAD_RE = re.compile(r"^(\s*)pod(?:Anti)?Affinity:\s*$")
+_LABEL_SELECTOR_RE = re.compile(r"^(\s*)(?:-\s+)?labelSelector:")
+_NAMESPACES_RE = re.compile(r"^\s*(?:-\s+)?(?:namespaces|namespaceSelector):")
+_OWN_NAME_RE = re.compile(
+    r"(?:^|[\s{,])(?:app|name|app\.kubernetes\.io/name|k8s-app):\s*[\"']?([\w.-]+)"
+)
+_SELECTOR_VALUE_RE = re.compile(r"(?:^|[\s{,])[\w./-]+:\s*[\"']?([\w.-]+)[\"']?\s*(?=[,}]|$)")
+_VALUES_LIST_RE = re.compile(r"^\s*values:\s*\[([^\]]*)\]")
+_LIST_ITEM_RE = re.compile(r"^\s*-\s+[\"']?([\w.-]+)[\"']?\s*$")
+# Term keys whose values are not label values: placement, weight, wrapper.
+_TERM_SCAFFOLD_RE = re.compile(r"^\s*(?:-\s+)?(?:topologyKey|weight|podAffinityTerm|matchLabelKeys|mismatchLabelKeys|key|operator):")
+_SELECTOR_KEYWORDS = frozenset({
+    "matchLabels", "matchExpressions", "labelSelector", "key", "operator",
+    "values", "In", "NotIn", "Exists", "DoesNotExist",
+})
+_RECREATE_RE = re.compile(r"""type:\s*["']?Recreate\b""")
+_ROLLING_RE = re.compile(r"""type:\s*["']?RollingUpdate\b""")
+_REPLICAS_RE = re.compile(r"^\s*replicas:\s*(\d+)\s*(?:#.*)?$")
+_NO_SURGE_RE = re.compile(r"""maxSurge:\s*["']?0+%?["']?(?=[\s,}]|$)""")
+_PULL_SECRETS_RE = re.compile(r"^\s*imagePullSecrets:")
+
+
+@dataclass(frozen=True, slots=True)
+class _Line:
+    """One hunk body line: `op` is "+", "-" or " "; `new` is its new-side
+    number (for a removed line, the new-side line it sits before)."""
+
+    op: str
+    new: int
+    text: str
+
+
+def _walk(hunk: DiffHunk) -> list[_Line]:
+    out: list[_Line] = []
+    lineno = hunk.new_start
+    for raw in hunk.body.splitlines():
+        if raw.startswith(("@@", chr(92))):
+            continue
+        if raw.startswith("+"):
+            out.append(_Line("+", lineno, raw[1:]))
+            lineno += 1
+        elif raw.startswith("-"):
+            out.append(_Line("-", lineno, raw[1:]))
+        else:
+            out.append(_Line(" ", lineno, raw[1:]))
+            lineno += 1
+    return out
+
+
+def _indent(text: str) -> int:
+    return len(text) - len(text.lstrip(" "))
+
+
+def _hit(path: str, line: int, kind: str, text: str) -> _Misconfig:
+    return _Misconfig(file=path, line=line, kind=kind, snippet=text.strip()[:_SNIPPET_MAX])
+
+
+def _selector_values(term: list[_Line]) -> set[str]:
+    values: set[str] = set()
+    for ln in term:
+        text = ln.text
+        if _NAMESPACES_RE.match(text) or _TERM_SCAFFOLD_RE.match(text):
+            continue
+        m = _VALUES_LIST_RE.match(text)
+        if m:
+            values.update(v.strip().strip("\"'") for v in m.group(1).split(",") if v.strip())
+            continue
+        m = _LIST_ITEM_RE.match(text)
+        if m:
+            values.add(m.group(1))
+            continue
+        for v in _SELECTOR_VALUE_RE.findall(text):
+            values.add(v)
+    return {v for v in values - _SELECTOR_KEYWORDS if not v.isdigit()}
+
+
+def _affinity_terms(lines: list[_Line]) -> list[list[_Line]]:
+    """The affinity terms on the new side of one hunk: each the list item
+    holding a labelSelector under a podAffinity/podAntiAffinity key."""
+    new_side = [ln for ln in lines if ln.op != "-"]
+    terms: list[list[_Line]] = []
+    section: int | None = None
+    for i, ln in enumerate(new_side):
+        if not ln.text.strip():
+            continue
+        ind = _indent(ln.text)
+        head = _AFFINITY_HEAD_RE.match(ln.text)
+        if head:
+            section = ind
+            continue
+        if section is not None and ind <= section:
+            section = None
+        if section is None or not _LABEL_SELECTOR_RE.match(ln.text):
+            continue
+        # The term is the enclosing list item: the nearest line above at a
+        # smaller indent that opens an item, or this line if it does.
+        start = i
+        if not ln.text.lstrip().startswith("-"):
+            for j in range(i - 1, -1, -1):
+                prev = new_side[j].text
+                if prev.strip() and _indent(prev) < ind and prev.lstrip().startswith("-"):
+                    start = j
+                    break
+                if prev.strip() and _indent(prev) <= section:
+                    break
+        dash = _indent(new_side[start].text)  # the item's dash column
+        term = [new_side[start]]
+        for nxt in new_side[start + 1:]:
+            if nxt.text.strip() and _indent(nxt.text) <= dash:
+                break
+            term.append(nxt)
+        if term not in terms:
+            terms.append(term)
+    return terms
+
+
+def _own_names(path: str, lines: list[_Line], term_lines: set[int]) -> set[str]:
+    names = {seg for seg in re.split(r"[/.]", path) if seg}
+    for ln in lines:
+        if ln.op == "-" or ln.new in term_lines:
+            continue
+        names.update(_OWN_NAME_RE.findall(ln.text))
+    return names
+
+
+def _scan_affinity(path: str, per_hunk: list[list[_Line]]) -> list[_Misconfig]:
+    terms = [t for lines in per_hunk for t in _affinity_terms(lines)]
+    term_lines = {ln.new for t in terms for ln in t if ln.op == "+"}
+    flat = [ln for lines in per_hunk for ln in lines]
+    own = _own_names(path, flat, term_lines)
+    out: list[_Misconfig] = []
+    for term in terms:
+        added = [ln for ln in term if ln.op == "+"]
+        if not added or any(_NAMESPACES_RE.match(ln.text) for ln in term):
+            continue
+        selected = _selector_values(term)
+        if not selected or selected <= own:
+            continue
+        anchor = next((ln for ln in added if _LABEL_SELECTOR_RE.match(ln.text)), added[0])
+        others = ", ".join(sorted(selected - own))
+        out.append(_hit(path, anchor.new, AFFINITY_NO_NAMESPACE,
+                        f"selects {others}; matches only this pod's own namespace"))
+    return out
+
+
+def _scan_singleton_rolling(path: str, flat: list[_Line]) -> list[_Misconfig]:
+    if not any(ln.op == "-" and _RECREATE_RE.search(ln.text) for ln in flat):
+        return []
+    rolling = next((ln for ln in flat if ln.op == "+" and _ROLLING_RE.search(ln.text)), None)
+    if rolling is None:
+        return []
+    replicas = {int(m.group(1)) for ln in flat if ln.op != "-"
+                for m in [_REPLICAS_RE.match(ln.text)] if m}
+    if replicas != {1}:
+        return []
+    if any(ln.op != "-" and _NO_SURGE_RE.search(ln.text) for ln in flat):
+        return []
+    return [_hit(path, rolling.new, SINGLETON_ROLLING_UPDATE,
+                 f"replicas 1, maxSurge not 0: {rolling.text.strip()}")]
+
+
+def _scan_pull_secret_dropped(path: str, flat: list[_Line]) -> list[_Misconfig]:
+    removed = next((ln for ln in flat if ln.op == "-" and _PULL_SECRETS_RE.match(ln.text)), None)
+    if removed is None or any(ln.op == "+" and "imagePullSecrets" in ln.text for ln in flat):
+        return []
+    added = [ln.new for ln in flat if ln.op == "+"]
+    # Anchor on an added line (Guard's findings must sit on one), the one
+    # nearest the removal; with none, on the line the removal sat before.
+    line = min(added, key=lambda n: abs(n - removed.new)) if added else removed.new
+    return [_hit(path, line, PULL_SECRET_DROPPED, f"removed `{removed.text.strip()}`")]
+
+
+def _scan_manifest_breaks(hunks: tuple[DiffHunk, ...]) -> list[_Misconfig]:
+    """The #1480 manifest-break detectors, one pass per YAML file."""
+    by_file: dict[str, list[list[_Line]]] = {}
+    size: dict[str, int] = {}
+    for hunk in hunks:
+        if not _is_yaml(hunk.file_path):
+            continue
+        size[hunk.file_path] = size.get(hunk.file_path, 0) + len(hunk.body)
+        by_file.setdefault(hunk.file_path, []).append(_walk(hunk))
+    out: list[_Misconfig] = []
+    for path, per_hunk in by_file.items():
+        if size[path] > _MAX_SCAN_BYTES:
+            continue
+        flat = [ln for lines in per_hunk for ln in lines]
+        out.extend(_scan_affinity(path, per_hunk))
+        out.extend(_scan_singleton_rolling(path, flat))
+        out.extend(_scan_pull_secret_dropped(path, flat))
+    return out
 
 
 def _to_candidates(found: list[_Misconfig]) -> tuple[Candidate, ...]:
