@@ -809,3 +809,21 @@ def test_docstrings_routes_to_docstring_action(monkeypatch):
     assert res == {"status": "dispatched", "verb": "docstrings"}
     assert called["head_sha"] == "a" * 40
     assert called["pr_number"] == 9
+
+
+def test_tests_routes_to_test_action(monkeypatch):
+    import test_action
+    called = {}
+
+    def run_tests(**kwargs):
+        called.update(kwargs)
+        return {"status": "dispatched", "verb": "tests"}
+
+    monkeypatch.setattr(test_action, "run_tests", run_tests)
+    res = interactive.run_command(
+        "tests", "", install_id=3, owner="o", repo="r", pr_number=9,
+        comment_id=11, token_fn=_tok, claim=lambda key: True, head_sha="a" * 40,
+    )
+    assert res == {"status": "dispatched", "verb": "tests"}
+    assert called["head_sha"] == "a" * 40
+    assert called["pr_number"] == 9

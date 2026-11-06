@@ -539,6 +539,34 @@ def _run_docstrings(
         return {"status": "skip", "reason": "docstrings_failed", "verb": "docstrings"}
 
 
+def _run_tests(
+    *, install_id: int, owner: str, repo: str, pr_number: int,
+    comment_id: int, token_fn, claim, head_sha: str,
+) -> dict:
+    """`/grug tests` (#1459): generate unit tests for uncovered changed
+    paths and land them in one bot commit."""
+    if not claim(f"grugcmd:{comment_id}"):
+        return {"status": "no_op", "reason": "comment already handled", "verb": "tests"}
+    try:
+        from test_action import run_tests  # type: ignore
+        return run_tests(
+            install_id=install_id, owner=owner, repo=repo,
+            pr_number=pr_number, head_sha=head_sha, token_fn=token_fn,
+        )
+    except Exception as e:  # noqa: BLE001 - claimed: answer, never 500
+        log.warning(
+            "interactive_tests_failed",
+            extra={"repo": f"{owner}/{repo}", "pr": pr_number,
+                   "kind": type(e).__name__},
+        )
+        _reply(
+            token_fn, owner, repo, pr_number,
+            "Grug could not generate unit tests. Nothing was committed. "
+            "Comment `/grug tests` again. So speaks Grug.",
+        )
+        return {"status": "skip", "reason": "tests_failed", "verb": "tests"}
+
+
 def run_command(
     verb: str, arg: str, *, install_id: int, owner: str, repo: str,
     pr_number: int, comment_id: int, token_fn, enqueue=None, enqueue_ask=None,
@@ -594,6 +622,13 @@ def run_command(
 
     if verb == "fix":
         return _run_autofix(
+            install_id=install_id, owner=owner, repo=repo, pr_number=pr_number,
+            comment_id=comment_id, token_fn=token_fn, claim=claim,
+            head_sha=head_sha,
+        )
+
+    if verb == "tests":
+        return _run_tests(
             install_id=install_id, owner=owner, repo=repo, pr_number=pr_number,
             comment_id=comment_id, token_fn=token_fn, claim=claim,
             head_sha=head_sha,

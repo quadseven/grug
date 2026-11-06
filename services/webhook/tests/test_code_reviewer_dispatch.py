@@ -3317,6 +3317,27 @@ def test_stack_offers_docstrings_for_changed_undocumented_public_function():
     assert "/grug docstrings" in body
 
 
+def test_stack_offers_tests_for_changed_function_without_a_test():
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(), conclusion="success"),
+        conclusion="success", test_targets=("pkg/mod.py:1",),
+    )
+    assert "changed public function(s) have no test in this PR" in body
+    assert "/grug tests" in body
+
+
+def test_stack_names_each_test_candidate_skipped_with_its_reason():
+    from personas.code_reviewer.persona import CodeReviewEvaluation
+    body = cr_dispatch._review_stack_body(
+        CodeReviewEvaluation(findings=(), conclusion="success"),
+        conclusion="success",
+        test_skips=(("pkg/`<b>.py", "Python file does not parse"),),
+    )
+    assert f"`{cr_dispatch._md_code_span('pkg/`<b>.py')}`: Python file" in body
+    assert "pkg/`<b>.py" not in body
+
+
 def test_stack_names_each_docstring_candidate_skipped_with_its_reason():
     from personas.code_reviewer.persona import CodeReviewEvaluation
     body = cr_dispatch._review_stack_body(
