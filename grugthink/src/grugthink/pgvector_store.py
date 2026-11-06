@@ -22,6 +22,7 @@ Embeddings come from the owned spark-gateway OllamaEmbedder (nomic-embed-text
 import os
 import threading
 
+from .bot_settings import getenv as _bot_getenv
 from .grug_structured_logger import get_logger
 
 log = get_logger(__name__)
@@ -308,8 +309,8 @@ class PgVectorServerManager:
             if not self.load_embedder:
                 log.info("Embedder loading explicitly disabled.")
                 return None
-            ollama_urls = os.getenv("OLLAMA_URLS")
-            use_ollama = os.getenv("USE_OLLAMA_EMBEDDINGS", "true").lower() == "true"
+            ollama_urls = _bot_getenv("OLLAMA_URLS")
+            use_ollama = _bot_getenv("USE_OLLAMA_EMBEDDINGS", "true").lower() == "true"
             if not (ollama_urls and use_ollama):
                 log.warning("No Ollama embeddings configured; semantic search disabled")
                 return None
@@ -317,7 +318,7 @@ class PgVectorServerManager:
                 from .embedders import OllamaEmbedder
 
                 url = ollama_urls.split(",")[0].strip()
-                model = os.getenv("GRUGTHINK_EMBED_MODEL", "nomic-embed-text:v1.5")
+                model = _bot_getenv("GRUGTHINK_EMBED_MODEL", "nomic-embed-text:v1.5")
                 self._embedder = OllamaEmbedder(ollama_url=url, model=model, dimension=EMBED_DIM)
                 if self._embedder.test_connection():
                     log.info("Ollama embedder ready for pgvector store", extra={"url": url, "model": model})

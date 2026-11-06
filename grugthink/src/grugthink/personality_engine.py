@@ -17,6 +17,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional
 
+from .bot_settings import getenv as _bot_getenv
 from .grug_structured_logger import get_logger
 
 log = get_logger(__name__)
@@ -374,7 +375,7 @@ based on your experiences in this specific Discord server.""",
 
     def _get_expected_personality_name(self) -> Optional[str]:
         """Get the expected personality name based on forced personality."""
-        forced_personality = self.forced_personality or os.getenv("FORCE_PERSONALITY", "")
+        forced_personality = self.forced_personality or _bot_getenv("FORCE_PERSONALITY", "")
         if not forced_personality:
             return None
 
@@ -396,7 +397,7 @@ based on your experiences in this specific Discord server.""",
     def _create_new_personality(self, server_id: str):
         """Create a new personality for a server."""
         # Check for bot-level forced personality first, then environment variable
-        forced_personality = self.forced_personality or os.getenv("FORCE_PERSONALITY", "")
+        forced_personality = self.forced_personality or _bot_getenv("FORCE_PERSONALITY", "")
         forced_personality = forced_personality.lower() if forced_personality else ""
 
         # Handle common aliases for personality names
@@ -415,9 +416,9 @@ based on your experiences in this specific Discord server.""",
             template_name = forced_personality
             log.info(f"Using forced personality: {template_name}", extra={"server_id": server_id})
         else:
-            if os.getenv("FORCE_PERSONALITY"):
+            if _bot_getenv("FORCE_PERSONALITY"):
                 log.warning(
-                    f"Invalid FORCE_PERSONALITY '{os.getenv('FORCE_PERSONALITY')}'. "
+                    f"Invalid FORCE_PERSONALITY '{_bot_getenv('FORCE_PERSONALITY')}'. "
                     f"Available: {list(self.templates.keys())}",
                     extra={"server_id": server_id},
                 )

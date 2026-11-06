@@ -122,9 +122,9 @@ async def verify(interaction, bot: "GrugThinkBot") -> None:
     try:
         # Get the server-specific database
         server_db = bot.get_server_db(interaction)
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, query_model, target, server_db, server_id, bot.personality_engine, bot.get_bot_id()
+        # to_thread copies the context, so query_model reads this bot's settings.
+        result = await asyncio.to_thread(
+            query_model, target, server_db, server_id, bot.personality_engine, bot.get_bot_id()
         )
 
         if result:

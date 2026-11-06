@@ -91,6 +91,37 @@ def test_configure_aws_credentials_uses_one_sha():
     assert len(shas) == 1, shas
 
 
+# The weekly fleet drift report lists any pin behind the fleet majority. These
+# floors hold the pins it last flagged here, so a copy-pasted old step cannot
+# bring one back. Raise a floor when the fleet majority moves; a newer pin
+# always passes.
+_ACTION_VERSION_FLOORS = {
+    "actions/upload-artifact": (7, 0, 2),
+    "aws-actions/configure-aws-credentials": (6, 3, 0),
+}
+
+
+def _version(comment: str) -> tuple[int, ...]:
+    parts = [int(p) for p in comment.lstrip("v").split(".")]
+    return tuple(parts + [0] * (3 - len(parts)))
+
+
+def test_action_pins_meet_the_fleet_floor():
+    pattern = re.compile(r"uses:\s*([\w.-]+/[\w.-]+)@[0-9a-f]{40}\s*#\s*(v[\d.]+)")
+    seen = set()
+    offenders = []
+    for path in _all_workflows():
+        for action, comment in pattern.findall(path.read_text()):
+            floor = _ACTION_VERSION_FLOORS.get(action)
+            if floor is None:
+                continue
+            seen.add(action)
+            if _version(comment) < floor:
+                offenders.append(f"{path.name}: {action} {comment}")
+    assert seen == set(_ACTION_VERSION_FLOORS), seen
+    assert offenders == []
+
+
 def test_tailnet_join_goes_through_the_composite():
     offenders = [
         path.name
