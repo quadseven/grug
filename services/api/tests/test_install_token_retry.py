@@ -24,7 +24,7 @@ def _stub_token(monkeypatch: pytest.MonkeyPatch):
     """Avoid SSM + JWT signing — return a sentinel token per call."""
     counter = {"n": 0}
 
-    def fake_get(installation_id: int, *, force_refresh: bool = False) -> str:
+    def fake_get(installation_id: int, *, force_refresh: bool = False, purpose=None) -> str:
         counter["n"] += 1
         return f"token-{counter['n']}-refresh={force_refresh}"
 

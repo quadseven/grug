@@ -40,7 +40,7 @@ from adapters.install_store import (  # type: ignore
     list_reopen_watch_repos,
 )
 import httpx
-from github_app_auth import with_install_token_retry
+from github_app_auth import TokenPurpose, with_install_token_retry
 from github_budget import NONURGENT_FRACTION, budget_is_low
 from observability import configure_logging
 from personas.code_reviewer.dispatch import deliver_pending_publication
@@ -426,6 +426,9 @@ def _enforcement_reemission_pass(installs: list[int]) -> tuple[int, int, int]:
             emitted, skipped = with_install_token_retry(
                 install_id,
                 lambda token, iid=install_id: _emit_enforcement_for_install(token, iid),
+                # Reading a ruleset's enforcement needs administration:read,
+                # which the review token no longer carries (grug#1577).
+                purpose=TokenPurpose.RULESET,
             ) or (0, 0)
             enforcement_emitted += emitted
             enforcement_skipped += skipped
