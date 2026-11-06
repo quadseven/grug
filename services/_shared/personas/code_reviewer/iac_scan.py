@@ -198,6 +198,14 @@ def scan_iac(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
             )
             if len(found) >= _MAX_FINDINGS:
                 return _to_candidates(found)
+    _merge_manifest_breaks(found, seen, hunks)
+    return _to_candidates(found)
+
+
+def _merge_manifest_breaks(
+    found: list[_Misconfig], seen: set[tuple[str, str, str]], hunks: tuple[DiffHunk, ...],
+) -> None:
+    """Append the #1480 manifest-break hits, deduped and under the cap."""
     for hit in _scan_manifest_breaks(hunks):
         key = (hit.file, hit.kind, hit.snippet)
         if key in seen:
@@ -205,20 +213,24 @@ def scan_iac(hunks: tuple[DiffHunk, ...]) -> tuple[Candidate, ...]:
         seen.add(key)
         found.append(hit)
         if len(found) >= _MAX_FINDINGS:
-            break
-    return _to_candidates(found)
+            return
 
 
 # --- manifest breaks (#1480) --------------------------------------------------
 
 AFFINITY_NO_NAMESPACE = "pod affinity term selects another workload with no namespaces"
 SINGLETON_ROLLING_UPDATE = "singleton Deployment switched from Recreate to RollingUpdate"
-PULL_SECRET_DROPPED = "imagePullSecrets removed with no re-add in this file"
+# A finding label, not a credential.
+PULL_SECRET_DROPPED = "imagePullSecrets removed with no re-add in this file"  # noqa: S105
 MANIFEST_BREAK_KINDS: tuple[str, ...] = (
     AFFINITY_NO_NAMESPACE,
     SINGLETON_ROLLING_UPDATE,
     PULL_SECRET_DROPPED,
 )
+
+# Bounds on the affinity walk, so a crafted manifest cannot make it costly.
+_MAX_TERMS = 50
+_MAX_TERM_LINES = 200
 
 _AFFINITY_HEAD_RE = re.compile(r"^(\s*)pod(?:Anti)?Affinity:\s*$")
 _LABEL_SELECTOR_RE = re.compile(r"^(\s*)(?:-\s+)?labelSelector:")
@@ -296,44 +308,52 @@ def _selector_values(term: list[_Line]) -> set[str]:
     return {v for v in values - _SELECTOR_KEYWORDS if not v.isdigit()}
 
 
-def _affinity_terms(lines: list[_Line]) -> list[list[_Line]]:
-    """The affinity terms on the new side of one hunk: each the list item
-    holding a labelSelector under a podAffinity/podAntiAffinity key."""
-    new_side = [ln for ln in lines if ln.op != "-"]
-    terms: list[list[_Line]] = []
+def _term_starts(new_side: list[_Line]) -> list[int]:
+    """Indices of the list items holding a labelSelector under a
+    podAffinity/podAntiAffinity key, in one linear walk. A stack of open list
+    items (index, dash column) gives each labelSelector its enclosing item
+    without walking back; a set dedupes items holding several selectors."""
+    starts: dict[int, None] = {}
+    open_items: list[tuple[int, int]] = []
     section: int | None = None
+    section_at = -1
     for i, ln in enumerate(new_side):
         if not ln.text.strip():
             continue
         ind = _indent(ln.text)
-        head = _AFFINITY_HEAD_RE.match(ln.text)
-        if head:
-            section = ind
+        while open_items and ind <= open_items[-1][1]:
+            open_items.pop()
+        if ln.text.lstrip().startswith("-"):
+            open_items.append((i, ind))
+        if _AFFINITY_HEAD_RE.match(ln.text):
+            section, section_at = ind, i
             continue
         if section is not None and ind <= section:
             section = None
-        if section is None or not _LABEL_SELECTOR_RE.match(ln.text):
-            continue
-        # The term is the enclosing list item: the nearest line above at a
-        # smaller indent that opens an item, or this line if it does.
-        start = i
-        if not ln.text.lstrip().startswith("-"):
-            for j in range(i - 1, -1, -1):
-                prev = new_side[j].text
-                if prev.strip() and _indent(prev) < ind and prev.lstrip().startswith("-"):
-                    start = j
-                    break
-                if prev.strip() and _indent(prev) <= section:
-                    break
-        dash = _indent(new_side[start].text)  # the item's dash column
-        term = [new_side[start]]
-        for nxt in new_side[start + 1:]:
-            if nxt.text.strip() and _indent(nxt.text) <= dash:
+        # The enclosing item must open inside the affinity key, not around it.
+        in_term = section is not None and open_items and open_items[-1][0] > section_at
+        if in_term and _LABEL_SELECTOR_RE.match(ln.text):
+            starts.setdefault(open_items[-1][0], None)
+            if len(starts) >= _MAX_TERMS:
                 break
-            term.append(nxt)
-        if term not in terms:
-            terms.append(term)
-    return terms
+    return list(starts)
+
+
+def _term_lines(new_side: list[_Line], start: int) -> list[_Line]:
+    """The list item opening at `start`: every line deeper than its dash."""
+    dash = _indent(new_side[start].text)
+    term = [new_side[start]]
+    for nxt in new_side[start + 1:start + _MAX_TERM_LINES]:
+        if nxt.text.strip() and _indent(nxt.text) <= dash:
+            break
+        term.append(nxt)
+    return term
+
+
+def _affinity_terms(lines: list[_Line]) -> list[list[_Line]]:
+    """The affinity terms on the new side of one hunk."""
+    new_side = [ln for ln in lines if ln.op != "-"]
+    return [_term_lines(new_side, i) for i in _term_starts(new_side)]
 
 
 def _own_names(path: str, lines: list[_Line], term_lines: set[int]) -> set[str]:
@@ -386,24 +406,36 @@ def _scan_pull_secret_dropped(path: str, flat: list[_Line]) -> list[_Misconfig]:
     if removed is None or any(ln.op == "+" and "imagePullSecrets" in ln.text for ln in flat):
         return []
     added = [ln.new for ln in flat if ln.op == "+"]
-    # Anchor on an added line (Guard's findings must sit on one), the one
-    # nearest the removal; with none, on the line the removal sat before.
-    line = min(added, key=lambda n: abs(n - removed.new)) if added else removed.new
+    if not added:
+        # Guard's findings must sit on an added line; a removal-only file
+        # has none, so the LLM review keeps that case.
+        return []
+    line = min(added, key=lambda n: abs(n - removed.new))
     return [_hit(path, line, PULL_SECRET_DROPPED, f"removed `{removed.text.strip()}`")]
 
 
 def _scan_manifest_breaks(hunks: tuple[DiffHunk, ...]) -> list[_Misconfig]:
-    """The #1480 manifest-break detectors, one pass per YAML file."""
+    """The #1480 manifest-break detectors, one pass per YAML file.
+
+    One byte budget covers every hunk byte this pass reads, context and
+    removed lines included; a file with a line over `_MAX_LINE_LEN` is
+    skipped whole, as the line rules skip such a line."""
     by_file: dict[str, list[list[_Line]]] = {}
-    size: dict[str, int] = {}
+    skipped: set[str] = set()
+    budget = _MAX_SCAN_BYTES
     for hunk in hunks:
         if not _is_yaml(hunk.file_path):
             continue
-        size[hunk.file_path] = size.get(hunk.file_path, 0) + len(hunk.body)
-        by_file.setdefault(hunk.file_path, []).append(_walk(hunk))
+        budget -= len(hunk.body)
+        if budget < 0:
+            break
+        lines = _walk(hunk)
+        if any(len(ln.text) > _MAX_LINE_LEN for ln in lines):
+            skipped.add(hunk.file_path)
+        by_file.setdefault(hunk.file_path, []).append(lines)
     out: list[_Misconfig] = []
     for path, per_hunk in by_file.items():
-        if size[path] > _MAX_SCAN_BYTES:
+        if path in skipped:
             continue
         flat = [ln for lines in per_hunk for ln in lines]
         out.extend(_scan_affinity(path, per_hunk))

@@ -159,3 +159,37 @@ def test_every_llm_only_class_has_a_written_reason():
 def test_expected_kinds_are_real_detector_kinds():
     for case in _CORPUS["cases"]:
         assert set(case["expected"]) <= set(MANIFEST_BREAK_KINDS)
+
+
+def test_pull_secret_removed_from_a_removal_only_file_is_not_anchored_off_diff():
+    # Guard findings must sit on an added line; a file with only removals
+    # has none, so the detector stays quiet rather than anchor elsewhere.
+    diff = (
+        "diff --git a/m/a.yaml b/m/a.yaml\n--- a/m/a.yaml\n+++ b/m/a.yaml\n"
+        "@@ -1,4 +1,2 @@\n"
+        " spec:\n"
+        "-  imagePullSecrets:\n"
+        "-    - name: registry-pull\n"
+        "   containers: []\n"
+    )
+    assert _break_kinds(diff) == []
+
+
+def test_large_crafted_affinity_manifest_scans_in_bounded_time():
+    import time
+
+    item = [
+        "        - labelSelector:",
+        "            matchLabels: {app: other}",
+    ] + [f"          labelSelector: {{app: x{i}}}" for i in range(50)]
+    lines = ["spec:", "  affinity:", "    podAffinity:", "      required:"]
+    lines += item * 200
+    diff = (
+        "diff --git a/m/big.yaml b/m/big.yaml\nnew file mode 100644\n"
+        "--- /dev/null\n+++ b/m/big.yaml\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{ln}\n" for ln in lines)
+    )
+    hunks = parse_diff(diff)
+    started = time.monotonic()
+    scan_iac(hunks)
+    assert time.monotonic() - started < 2.0
