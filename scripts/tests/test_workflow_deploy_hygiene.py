@@ -92,9 +92,9 @@ def test_configure_aws_credentials_uses_one_sha():
 
 
 # The weekly fleet drift report lists any pin behind the fleet majority. These
-# floors hold the pins it last flagged here, so a
-# copy-pasted old step cannot bring one back. Raise a floor when the fleet
-# majority moves; a newer pin always passes.
+# floors hold the pins it last flagged here, so a copy-pasted old step cannot
+# bring one back. Raise a floor when the fleet majority moves; a newer pin
+# always passes.
 _ACTION_VERSION_FLOORS = {
     "actions/upload-artifact": (7, 0, 2),
     "aws-actions/configure-aws-credentials": (6, 3, 0),
