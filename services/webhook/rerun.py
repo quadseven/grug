@@ -21,8 +21,6 @@ the historical published-neutral completion behavior.
 from __future__ import annotations
 
 import contextlib
-import hashlib
-import json
 import logging
 import os
 import threading
@@ -89,11 +87,16 @@ from review_lifecycle import (
     rerun_pending,
 )
 from rerun_queue import (
+    KIND_ASK,
+    KIND_LEARN,
+    KIND_REVIEW,
+    InvalidJob,
     JobNotDue,
-    ask_group_id as _ask_group_id,
-    learn_group_id as _learn_group_id,
-    rerun_group_id as _rerun_group_id,
-    review_group_id as _review_group_id,
+    decode_job,
+    encode_ask,
+    encode_learn,
+    encode_rerun,
+    encode_review,
 )
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.rerun")
@@ -105,7 +108,6 @@ _sqs = boto3.client("sqs")
 # Queue URL injected by Pulumi (same env the consumer reads). Unset in
 # local/dev/tests -> enqueue raises, surfaced as best-effort by the caller.
 _RERUN_QUEUE_URL = os.getenv("GRUG_RERUN_QUEUE_URL", "")
-SCHEMA_VERSION = 1
 # The review job's decisions (redrive, fail open, hold pending, the skip
 # reason sets and the delivery bound) live in `review_lifecycle` (#1592).
 
@@ -119,29 +121,6 @@ def _now() -> float:
 # `personas.code_reviewer.elder_review`, the one home for the Elder lifecycle.
 _ELDER_CHECK_NAME = CHECK_ELDER
 _ELDER_CHECK_NAMES = frozenset(acceptable_check_names(CHECK_ELDER))
-
-
-_SQS_DEDUP_ID_MAX_LEN = 128
-
-
-def _bounded_dedup_id(plain: str) -> str:
-    """`plain` as the FIFO dedup id while it fits SQS's 128-char limit;
-    past it (a long owner/repo name) a digest of the same content, so the
-    send never fails validation and equal content still collapses."""
-    if len(plain) <= _SQS_DEDUP_ID_MAX_LEN:
-        return plain
-    return "rerun:" + hashlib.sha256(plain.encode("utf-8")).hexdigest()
-
-
-def _review_dedup_id(
-    install_id: int, repo: str, pr_number: int, requested_snapshot_id: str,
-) -> str:
-    """Bounded, full-snapshot FIFO dedup ID."""
-    material = (
-        f"{install_id}\x1f{repo}\x1f{pr_number}\x1felder\x1f"
-        f"{requested_snapshot_id}"
-    )
-    return f"elder-review:{hashlib.sha256(material.encode('utf-8')).hexdigest()}"
 
 
 def enqueue_rerun(
@@ -187,43 +166,19 @@ def enqueue_rerun(
     which bounds the hold."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
-    job: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
-        "install_id": install_id,
-        "repo": repo,
-        "pr_number": pr_number,
-        "persona": persona,
-    }
-    if comment_id:
-        job["comment_id"] = int(comment_id)
-        job["queued_at"] = float(queued_at or _now())
-        if hold_started_at:
-            job["hold_started_at"] = float(hold_started_at)
-        dedup_key = dedup_key or f"cmd{int(comment_id)}"
-    dedup_id = f"{install_id}:{repo}:{pr_number}:{persona}"
-    if not_before > 0:
-        job["not_before"] = float(not_before)
-        # Hash the dedup id: a long owner/repo can push the plain string past
-        # SQS's 128-char limit (the same fix as the learn lane's id).
-        material = f"{dedup_id}\x1fnotbefore{int(not_before)}"
-        if requeue_of:
-            material += f"\x1frequeue{requeue_of}"
-        if dedup_key:
-            material += f"\x1fkey{dedup_key}"
-        dedup_id = "rerun:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
-    elif dedup_key:
-        material = f"{dedup_id}\x1fkey{dedup_key}"
-        dedup_id = "rerun:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
-    else:
-        dedup_id = _bounded_dedup_id(dedup_id)
-    _sqs.send_message(
-        QueueUrl=_RERUN_QUEUE_URL,
-        MessageBody=json.dumps(job),
-        MessageGroupId=_rerun_group_id(
-            install_id, repo, pr_number, persona,
-        ),
-        MessageDeduplicationId=dedup_id,
+    encoded = encode_rerun(
+        install_id=install_id,
+        repo=repo,
+        pr_number=pr_number,
+        persona=persona,
+        not_before=not_before,
+        requeue_of=requeue_of,
+        dedup_key=dedup_key,
+        comment_id=comment_id,
+        queued_at=float(queued_at or _now()) if comment_id else 0.0,
+        hold_started_at=hold_started_at,
     )
+    _sqs.send_message(QueueUrl=_RERUN_QUEUE_URL, **encoded.message_kwargs())
     log.info(
         "rerun_enqueued",
         extra={
@@ -693,25 +648,16 @@ def enqueue_review(
         body=requested_body,
     )
     settle = min(_MAX_ELDER_SETTLE_SECONDS, max(0, int(settle_seconds)))
-    _sqs.send_message(
-        QueueUrl=_RERUN_QUEUE_URL,
-        MessageBody=json.dumps({
-            "schema_version": SCHEMA_VERSION,
-            "kind": "review",
-            "install_id": install_id,
-            "repo": repo,
-            "pr_number": pr_number,
-            "persona": "elder",
-            "requested_head_sha": requested_head_sha,
-            "requested_snapshot_id": requested_snapshot_id,
-            "settle_seconds": settle,
-            "redrive_count": redrive_count,
-        }),
-        MessageGroupId=_review_group_id(install_id, repo, pr_number),
-        MessageDeduplicationId=_review_dedup_id(
-            install_id, repo, pr_number, requested_snapshot_id,
-        ),
+    encoded = encode_review(
+        install_id=install_id,
+        repo=repo,
+        pr_number=pr_number,
+        requested_head_sha=requested_head_sha,
+        requested_snapshot_id=requested_snapshot_id,
+        settle_seconds=settle,
+        redrive_count=redrive_count,
     )
+    _sqs.send_message(QueueUrl=_RERUN_QUEUE_URL, **encoded.message_kwargs())
     log.info(
         "elder_review_enqueued",
         extra={
@@ -751,19 +697,12 @@ def enqueue_ask(*, install_id: int, repo: str, pr_number: int, comment_id: int, 
     thread with its hunk as context. 0 = a plain PR comment (top-level)."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
-    _sqs.send_message(
-        QueueUrl=_RERUN_QUEUE_URL,
-        MessageBody=json.dumps({
-            "schema_version": SCHEMA_VERSION, "kind": "ask",
-            "install_id": install_id, "repo": repo, "pr_number": pr_number,
-            "comment_id": comment_id, "question": question,
-            "reply_to_comment_id": reply_to_comment_id,
-        }),
-        MessageGroupId=_ask_group_id(install_id, repo, pr_number),
-        MessageDeduplicationId=_bounded_dedup_id(
-            f"{install_id}:{repo}:{pr_number}:ask:{comment_id}",
-        ),
+    encoded = encode_ask(
+        install_id=install_id, repo=repo, pr_number=pr_number,
+        comment_id=comment_id, question=question,
+        reply_to_comment_id=reply_to_comment_id,
     )
+    _sqs.send_message(QueueUrl=_RERUN_QUEUE_URL, **encoded.message_kwargs())
     log.info("ask_enqueued", extra={"install_id": install_id, "repo": repo,
                                     "pr": pr_number, "comment_id": comment_id})
 
@@ -787,34 +726,14 @@ def enqueue_learn(
     message id of a not-yet-due copy being replaced by a fresh one."""
     if not _RERUN_QUEUE_URL:
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
-    job: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION, "kind": "learn",
-        "install_id": install_id, "repo": repo, "pr_number": pr_number,
-        "comment_id": comment_id, "parent_comment_id": parent_comment_id,
-        "reply_text": reply_text, "author": author,
-    }
-    dedup_material = f"{install_id}\x1f{repo}\x1f{pr_number}\x1f{comment_id}"
-    if defer_count > 0:
-        job.update({
-            "defer_count": defer_count, "not_before": not_before,
-            "first_deferred_at": first_deferred_at,
-        })
-        # A distinct dedup id per deferral: the original's id is still inside
-        # SQS's 5-minute dedup window when the first deferral is sent, and a
-        # collapsed send would lose the job.
-        dedup_material += f"\x1fdefer{defer_count}"
-    if requeue_of:
-        dedup_material += f"\x1frequeue{requeue_of}"
-    _sqs.send_message(
-        QueueUrl=_RERUN_QUEUE_URL,
-        MessageBody=json.dumps(job),
-        MessageGroupId=_learn_group_id(install_id, repo, pr_number),
-        # Hash the dedup id: a long owner/repo can push the plain string past
-        # SQS's 128-char limit and fail send_message (same fix as the group id).
-        MessageDeduplicationId="learn:" + hashlib.sha256(
-            dedup_material.encode("utf-8")
-        ).hexdigest(),
+    encoded = encode_learn(
+        install_id=install_id, repo=repo, pr_number=pr_number,
+        comment_id=comment_id, parent_comment_id=parent_comment_id,
+        reply_text=reply_text, author=author, defer_count=defer_count,
+        not_before=not_before, first_deferred_at=first_deferred_at,
+        requeue_of=requeue_of,
     )
+    _sqs.send_message(QueueUrl=_RERUN_QUEUE_URL, **encoded.message_kwargs())
     log.info("learn_enqueued", extra={"install_id": install_id, "repo": repo,
                                       "pr": pr_number, "comment_id": comment_id})
 
@@ -934,32 +853,54 @@ def _run_one(
     body: str, *, receive_count: int = 0, message_id: str = "",
     first_received_at: float = 0.0,
 ) -> str:
-    """Re-run ONE job. Raises on a malformed message or an infra fetch failure
-    (-> ESM retry -> DLQ). Returns a short status for the batch summary log.
+    """Re-run ONE job. Raises on an infra fetch failure (-> ESM retry -> DLQ).
+    Returns a short status for the batch summary log.
+
+    A body `decode_job` rejects (malformed JSON, a missing or unknown
+    `schema_version`, an unknown kind, a missing key field) is logged as
+    `rerun_job_rejected` and returns `rejected_invalid`, so the consumer
+    acks it: a retry cannot repair the body, and redriving it only
+    crash-loops it into the DLQ (#579). This is the protocol's one redrive
+    decision; `rerun_queue` documents it.
 
     Keyed by `repo` ("owner/name") - what the Activity row (the trigger) carries
     - NOT a repo_id; the repo_id (for the RepoConfig lookup) is derived from the
     PR's `base.repo.id` in the same fetch."""
-    job = json.loads(body)  # malformed -> JSONDecodeError -> retry -> DLQ
-    install_id = int(job["install_id"])
-    repo_full = str(job["repo"])  # "owner/name"
-    pr_number = int(job["pr_number"])
-    if job.get("kind") == "ask":
+    try:
+        decoded = decode_job(body)
+    except InvalidJob as e:
+        log.error(
+            "rerun_job_rejected",
+            extra={
+                "reason": e.reason,
+                "error_kind": type(e).__name__,
+                "message_id": message_id,
+                "receive_count": receive_count,
+                "body_len": len(body or ""),
+                "redrive": False,
+            },
+        )
+        return "rejected_invalid"
+    job = decoded.payload
+    install_id = decoded.install_id
+    repo_full = decoded.repo  # "owner/name"
+    pr_number = decoded.pr_number
+    if decoded.kind == KIND_ASK:
         # Imported here: ask_job and learn_job import rerun's GitHub helpers
         # and enqueue_learn, so a top-level import would be a cycle (#1592).
         import ask_job  # noqa: PLC0415
         return ask_job.run_ask_job(job)
-    if job.get("kind") == "learn":
+    if decoded.kind == KIND_LEARN:
         import learn_job  # noqa: PLC0415
         return learn_job.run_learn_job(
             job, receive_count=receive_count, message_id=message_id,
         )
-    if job.get("kind") == "review":
+    if decoded.kind == KIND_REVIEW:
         return _run_hot_review(
             job, install_id, repo_full, pr_number, receive_count=receive_count,
             first_received_at=first_received_at,
         )
-    persona = str(job.get("persona", "elder"))
+    persona = decoded.persona
 
     if persona not in _RERUNNABLE:
         # Not an infra failure - don't retry/DLQ a persona we don't drive yet.
@@ -2438,7 +2379,7 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
                 "skipped_persona", "duplicate_snapshot", "stale_snapshot",
                 "draft_skipped", "pr_ineligible", "superseded_at_entry",
                 "intent_drift_exhausted", "replay_already_reviewed",
-                "replay_review_posted",
+                "replay_review_posted", "rejected_invalid",
             }
         ),
     }
