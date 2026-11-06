@@ -125,7 +125,7 @@ def run(monkeypatch):
         monkeypatch.setattr(bc.httpx, "get", gh.get)
         monkeypatch.setattr(bc.httpx, "patch", gh.patch)
         monkeypatch.setattr(
-            tr, "with_install_token_retry", lambda iid, fn: fn("tok"),
+            tr, "with_install_token_retry", lambda iid, fn, **_: fn("tok"),
         )
         return tr.resolve_fixed_threads(
             1, "o", "r", 5, head_sha=HEAD, findings=tuple(findings),
@@ -317,7 +317,7 @@ def test_list_failure_never_raises(monkeypatch, caplog):
     def boom(*a, **k):
         raise httpx.ConnectError("down")
     monkeypatch.setattr(tr.httpx, "post", boom)
-    monkeypatch.setattr(tr, "with_install_token_retry", lambda iid, fn: fn("t"))
+    monkeypatch.setattr(tr, "with_install_token_retry", lambda iid, fn, **_: fn("t"))
     with caplog.at_level("WARNING"):
         assert tr.resolve_fixed_threads(
             1, "o", "r", 5, head_sha=HEAD, findings=(),

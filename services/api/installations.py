@@ -42,7 +42,7 @@ from adapters.install_store import (
 from adapters.user_store import UserIdentity
 from auth.dependencies import require_authenticated
 from fastapi import APIRouter, Depends, HTTPException, status
-from github_app_auth import with_install_token_retry
+from github_app_auth import TokenPurpose, with_install_token_retry
 from github_rest import _GH_API, GitHubMalformedPayload, paginate_all
 from pydantic import BaseModel, ConfigDict, Field
 from rerun_personas import requestable_pattern
@@ -277,6 +277,7 @@ def _toggle_enforcement(
                 lambda token: ensure_enforcement(
                     token, owner, repo_name, default_branch, install_id, repo_id,
                 ),
+                purpose=TokenPurpose.RULESET,
             )
         else:
             with_install_token_retry(
@@ -284,6 +285,7 @@ def _toggle_enforcement(
                 lambda token: remove_enforcement(
                     token, owner, repo_name, install_id, repo_id,
                 ),
+                purpose=TokenPurpose.RULESET,
             )
     except Exception:
         log.warning(
@@ -313,6 +315,7 @@ def _reconcile_required_checks(
             lambda token: reconcile_required_checks(
                 token, owner, repo_name, default_branch, install_id, repo_id,
             ),
+            purpose=TokenPurpose.RULESET,
         )
     except Exception:
         log.warning(
@@ -664,7 +667,7 @@ def get_enforcement(
         return {"repo_id": repo_id, "enforcement_state": state}
 
     try:
-        return with_install_token_retry(install_id, _detect)
+        return with_install_token_retry(install_id, _detect, purpose=TokenPurpose.RULESET)
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         # Resilient fallback (dashboard 429 storm). GitHub rate-limited the
         # LIVE detection even after the client's bounded jittered retries.
@@ -713,7 +716,7 @@ def fix_enforcement(
         return {"repo_id": repo_id, "enforcement_state": state}
 
     try:
-        return with_install_token_retry(install_id, _fix)
+        return with_install_token_retry(install_id, _fix, purpose=TokenPurpose.RULESET)
     except httpx.HTTPStatusError as e:
         # GitHub rejected the ruleset create/update (e.g. 422 validation:
         # duplicate name, invalid rule, or the App lacks administration:write).

@@ -115,7 +115,6 @@ def run_docstrings(
     generate=None, apply_commit=None,
 ) -> dict:
     """Generate eligible docs, report skips, and create at most one commit."""
-    del install_id
     reply = post_reply or (
         lambda body: autofix._default_post_reply(
             token_fn, owner, repo, pr_number, body,
@@ -124,7 +123,7 @@ def run_docstrings(
     fetch_diff = fetch_diff or _fetch_diff
     fetch_file = fetch_file or autofix._default_fetch_file
     generate = generate or _generate_docstring
-    apply_commit = apply_commit or autofix._default_apply_commit
+    apply_commit = apply_commit or autofix.commit_apply(install_id)
     try:
         diff = fetch_diff(token_fn, owner, repo, pr_number)
     except (httpx.HTTPError, RuntimeError) as exc:

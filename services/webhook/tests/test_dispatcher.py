@@ -181,7 +181,7 @@ def test_ensure_enforcement_on_pr_calls_ensure():
          patch("dispatcher.get_repo_config", return_value={}), \
          patch("github_app_auth.with_install_token_retry") as mock_retry, \
          patch("enforcement.ensure_enforcement") as mock_ensure:
-        mock_retry.side_effect = lambda install_id, fn: fn("tok")
+        mock_retry.side_effect = lambda install_id, fn, **_: fn("tok")
         _real_ensure_enforcement_on_pr(1, 2, "o", "r", "main")
     mock_ensure.assert_called_once_with("tok", "o", "r", "main", 1, 2)
 
@@ -730,7 +730,7 @@ def test_pull_request_publish_success_runs_ticket_compliance():
          patch("personas.tpm.persona.evaluate_pull_request") as mock_eval, \
          patch("personas.tpm.persona.publish_tpm_evaluation",
                return_value={"persona": "tpm", "result": "pass"}), \
-         patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn, **_: fn("tok")), \
          patch("personas.tpm.ticket_compliance_run.run_ticket_compliance",
                return_value={"status": "ok"}) as mock_compliance:
         mock_eval.return_value = type("R", (), {"passed": True})()
@@ -829,7 +829,7 @@ def test_review_reply_enqueues_for_write_author():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher._pr_commit_logins", return_value=frozenset({"lane-app[bot]"})), \
-         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "admin"), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn, **_: "admin"), \
          patch("rerun.enqueue_learn") as mock_enq:
         out = dispatch(
             "pull_request_review_comment",
@@ -851,7 +851,7 @@ def test_review_reply_fork_author_without_write_is_blocked():
     )
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
-         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "read"), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn, **_: "read"), \
          patch("rerun.enqueue_learn") as mock_enq:
         out = dispatch("pull_request_review_comment", payload)
     assert out["status"] == "no_op" and "lacks write perm" in out["reason"]
@@ -879,7 +879,7 @@ def test_review_reply_from_non_collaborator_is_blocked():
     payload = _review_reply_payload(sender={"login": "randopublic"})
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
-         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "read"), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn, **_: "read"), \
          patch("rerun.enqueue_learn") as mock_enq:
         out = dispatch("pull_request_review_comment", payload)
     assert out["status"] == "no_op" and "lacks write perm" in out["reason"]
@@ -901,7 +901,7 @@ def test_review_reply_write_collaborator_enqueues():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher._pr_commit_logins", return_value=frozenset()), \
-         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "write"), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn, **_: "write"), \
          patch("rerun.enqueue_learn") as mock_enq:
         out = dispatch("pull_request_review_comment", payload)
     assert out == {"status": "enqueued", "kind": "learn"}
@@ -917,7 +917,7 @@ def test_review_reply_enqueue_sqs_failure_is_skip_not_500():
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher._pr_commit_logins", return_value=frozenset()), \
-         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "write"), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn, **_: "write"), \
          patch("rerun.enqueue_learn", side_effect=_raise_enqueue):
         out = dispatch(
             "pull_request_review_comment",
@@ -994,7 +994,7 @@ def test_issues_dispatches_when_flag_on():
          patch("dispatcher.get_repo_config", return_value={"issue_dor_enabled": True}), \
          patch("personas.tpm.issue_dor.run_issue_dor", _run), \
          patch("github_app_auth.with_install_token_retry",
-               side_effect=lambda iid, fn: fn("tok")):
+               side_effect=lambda iid, fn, **_: fn("tok")):
         out = dispatch("issues", _issue_payload())
     assert out["status"] == "ok"
     assert seen == {"owner": "o", "repo": "r", "number": 7, "body": "bare",
@@ -1037,7 +1037,7 @@ def test_sub_issues_refreshes_the_issue_whose_membership_changed(action, number,
          patch("dispatcher.get_repo_config", return_value={"issue_dor_enabled": True}), \
          patch("personas.tpm.issue_dor.run_issue_dor", _run), \
          patch("github_app_auth.with_install_token_retry",
-               side_effect=lambda iid, fn: fn("tok")):
+               side_effect=lambda iid, fn, **_: fn("tok")):
         out = dispatch("sub_issues", _sub_payload(action))
     assert out["status"] == "ok"
     assert seen == {"number": number, "body": body, "refresh_only": True}
@@ -1066,7 +1066,7 @@ def _ticket_recheck(event, payload, *, prs, issue_dor=False):
          patch("personas.tpm.issue_dor.run_issue_dor",
                return_value={"status": "ok", "reason": "advisory refreshed"}), \
          patch("github_app_auth.with_install_token_retry",
-               side_effect=lambda iid, fn: fn("tok")), \
+               side_effect=lambda iid, fn, **_: fn("tok")), \
          patch("chief_self_heal._list_recent_open_prs", return_value=prs), \
          patch("dispatcher.run_chief_recheck", recheck), \
          patch("dispatcher._recheck_chief_for_ticket",
@@ -1156,7 +1156,7 @@ def test_sub_issues_recheck_caps_prs_and_survives_one_failure():
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={}), \
          patch("github_app_auth.with_install_token_retry",
-               side_effect=lambda iid, fn: fn("tok")), \
+               side_effect=lambda iid, fn, **_: fn("tok")), \
          patch("chief_self_heal._list_recent_open_prs", return_value=prs), \
          patch("dispatcher.run_chief_recheck", recheck), \
          patch("dispatcher._recheck_chief_for_ticket",
@@ -1174,7 +1174,7 @@ def test_sub_issues_recheck_pr_list_failure_never_raises():
          patch("dispatcher.is_persona_enabled", return_value=True), \
          patch("dispatcher.get_repo_config", return_value={}), \
          patch("github_app_auth.with_install_token_retry",
-               side_effect=lambda iid, fn: fn("tok")), \
+               side_effect=lambda iid, fn, **_: fn("tok")), \
          patch("chief_self_heal._list_recent_open_prs", side_effect=_boom), \
          patch("dispatcher._recheck_chief_for_ticket",
                _real_recheck_chief_for_ticket):
@@ -1455,7 +1455,7 @@ def test_fetch_pr_for_rerequest_hits_correct_url_with_real_token_wiring():
         "number": 42, "body": "fetched live", "head": {"sha": "livesha"},
     })
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
-         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: fn("tok")), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn, **_: fn("tok")), \
          patch("httpx.get", return_value=pr_resp) as mock_get, \
          patch("dispatcher.dispatch") as mock_dispatch:
         mock_dispatch.return_value = {"status": "dispatched", "personas": []}
@@ -1502,7 +1502,7 @@ def test_review_thread_question_enqueues_thread_ask_not_learn():
     )
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
-         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "admin"), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn, **_: "admin"), \
          patch("rerun.enqueue_learn") as mock_learn, \
          patch("rerun.enqueue_ask") as mock_ask:
         out = dispatch("pull_request_review_comment", payload)
@@ -1522,7 +1522,7 @@ def test_review_thread_root_question_enqueues_thread_ask():
     payload["comment"]["body"] = "/grug ask what does this hunk do?"
     with patch("dispatcher.is_install_allowlisted", return_value=True), \
          patch("dispatcher.is_persona_enabled", return_value=True), \
-         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn: "admin"), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn, **_: "admin"), \
          patch("rerun.enqueue_ask") as mock_ask:
         out = dispatch("pull_request_review_comment", payload)
     assert out == {"status": "dispatched", "kind": "ask"}
@@ -1572,7 +1572,7 @@ def _run_slash(body: str, enabled: set[str], *, sender_type: str = "User"):
          patch("dispatcher._actor_has_write", return_value=True), \
          patch("dispatcher._defer_if_budget_spent", return_value=None), \
          patch("github_app_auth.with_install_token_retry",
-               side_effect=lambda _i, fn: fn("tok")), \
+               side_effect=lambda _i, fn, **_: fn("tok")), \
          patch("httpx.get", return_value=fake_pr), \
          patch("interactive._post_reply",
                side_effect=lambda _t, _o, _r, _n, b: replies.append(b)), \

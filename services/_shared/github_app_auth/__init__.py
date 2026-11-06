@@ -5,12 +5,14 @@ Per PRD #21 Q17: warm-container module-scope cache. Cold start re-signs.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 
 import httpx
 import jwt
@@ -151,15 +153,122 @@ def get_app_jwt() -> str:
     return token
 
 
-def get_install_token(installation_id: int, *, force_refresh: bool = False) -> str:
-    """Return a fresh installation access token (cached up to ~55min).
+class TokenPurpose(str, Enum):
+    """What a minted installation token is for (grug#1577).
+
+    The App's grant includes `administration: write` (rulesets) and
+    `contents: write` (pushes, thread resolution). A token minted with the
+    full grant lets any call path do both, so each purpose caps the
+    dangerous permissions and leaves the rest at the installation's level.
+    """
+
+    REVIEW = "review"
+    RULESET = "ruleset"
+    COMMIT = "commit"
+
+
+# Ceiling per purpose. Writes are an allowlist: a permission named here is
+# capped at its level, and any other granted permission is capped at "read",
+# so a later grant (secrets, actions, environments) never reaches a token as
+# a write. Reads pass through, so a read the review path depends on is never
+# silently lost. "none" drops the permission.
+_DEFAULT_CEILING = "read"
+_SHARED_WRITES = {
+    "checks": "write", "issues": "write", "pull_requests": "write",
+    "statuses": "write",
+}
+_SHARED_DROPS = {"secrets": "none", "workflows": "none"}
+_PURPOSE_CEILINGS: dict[TokenPurpose, dict[str, str]] = {
+    TokenPurpose.REVIEW: {
+        **_SHARED_WRITES, **_SHARED_DROPS,
+        "administration": "none", "contents": "read",
+    },
+    TokenPurpose.RULESET: {
+        **_SHARED_WRITES, **_SHARED_DROPS,
+        "administration": "write", "contents": "read",
+    },
+    TokenPurpose.COMMIT: {
+        **_SHARED_WRITES, **_SHARED_DROPS,
+        "administration": "none", "contents": "write",
+    },
+}
+_GRANT_TTL_SECONDS = 55 * 60
+
+
+def purpose_permissions(purpose: TokenPurpose, granted: dict) -> dict[str, str]:
+    """The permissions to request for `purpose`: each granted permission at
+    the lower of its granted level and the purpose's ceiling. Requesting
+    only what the installation holds means an install without
+    `administration` gets a ruleset token without it, not a 422."""
+    ceiling = _PURPOSE_CEILINGS[TokenPurpose(purpose)]
+    wanted: dict[str, str] = {}
+    for name, level in (granted or {}).items():
+        cap = ceiling.get(name, _DEFAULT_CEILING)
+        if _permission_rank(cap) < _permission_rank(level):
+            level = cap
+        if _permission_rank(level) > 0:
+            wanted[name] = str(level)
+    return wanted
+
+
+def _installation_grant(installation_id: int, *, force_refresh: bool = False) -> dict:
+    """The installation's granted permissions, read with the App JWT and
+    cached with the token TTL. A refresh after a 401/403 re-reads it so a
+    permission change takes effect without a restart."""
+    key = f"install_grant:{installation_id}"
+    if force_refresh:
+        _cache.invalidate(key)
+    else:
+        cached = _cache.get(key)
+        if cached:
+            return json.loads(cached.value)
+    resp = httpx.get(
+        f"{_GH_API}/app/installations/{installation_id}",
+        headers={
+            "Authorization": f"Bearer {get_app_jwt()}",
+            "Accept": "application/vnd.github+json",
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    try:
+        payload = resp.json()
+        granted = payload["permissions"]
+        if not isinstance(granted, dict) or not granted:
+            raise TypeError("permissions is empty or not an object")
+    except (ValueError, KeyError, TypeError) as e:
+        log.warning(
+            "install_grant_malformed_response",
+            extra={"installation_id": installation_id, "error": type(e).__name__},
+        )
+        raise RuntimeError(
+            "GitHub returned no usable permission grant "
+            f"(installation {installation_id}): {type(e).__name__}"
+        ) from e
+    _record_install_permissions(installation_id, payload, force=force_refresh)
+    _cache.put(key, json.dumps(granted), ttl_seconds=_GRANT_TTL_SECONDS)
+    return granted
+
+
+def get_install_token(
+    installation_id: int,
+    *,
+    force_refresh: bool = False,
+    purpose: TokenPurpose = TokenPurpose.REVIEW,
+) -> str:
+    """Return a fresh installation access token for `purpose` (cached up to
+    ~55min per installation and purpose).
 
     GitHub installation tokens last 1hr; cache for 55min to leave skew.
     Pass `force_refresh=True` after observing a 401 from GitHub to skip
     the cache (Codex post-review #50). Use `with_install_token_retry`
     instead of calling this directly when wrapping API calls.
+
+    The token is down-scoped to `purpose_permissions(purpose, grant)`
+    (grug#1577): a review token cannot write rulesets or push.
     """
-    key = f"install_token:{installation_id}"
+    purpose = TokenPurpose(purpose)
+    key = f"install_token:{installation_id}:{purpose.value}"
     if force_refresh:
         _cache.invalidate(key)
     else:
@@ -167,12 +276,20 @@ def get_install_token(installation_id: int, *, force_refresh: bool = False) -> s
         if cached:
             return cached.value
 
+    granted = _installation_grant(installation_id, force_refresh=force_refresh)
+    permissions = purpose_permissions(purpose, granted)
+    if not permissions:
+        # An empty `permissions` body would not narrow anything; never send it.
+        raise RuntimeError(
+            f"installation {installation_id} grants nothing usable for {purpose.value}"
+        )
     resp = httpx.post(
         f"{_GH_API}/app/installations/{installation_id}/access_tokens",
         headers={
             "Authorization": f"Bearer {get_app_jwt()}",
             "Accept": "application/vnd.github+json",
         },
+        json={"permissions": permissions},
         timeout=10,
     )
     resp.raise_for_status()
@@ -196,7 +313,6 @@ def get_install_token(installation_id: int, *, force_refresh: bool = False) -> s
             "GitHub returned a 200 without a usable installation token "
             f"(installation {installation_id}): {type(e).__name__}"
         ) from e
-    _record_install_permissions(installation_id, payload, force=force_refresh)
     # GitHub returns expires_at ISO; default 1hr from creation.
     _cache.put(key, token, ttl_seconds=55 * 60)
     return token
@@ -408,8 +524,14 @@ def core_rate_limit(token: str) -> tuple[int, int, int] | None:
         return None
 
 
-def with_install_token_retry(installation_id: int, fn):
+def with_install_token_retry(
+    installation_id: int, fn, *, purpose: TokenPurpose = TokenPurpose.REVIEW,
+):
     """Run `fn(token)`, retrying transient failures.
+
+    `purpose` picks the down-scoped token (grug#1577). The default review
+    token cannot write rulesets or push; ruleset writers pass
+    `TokenPurpose.RULESET` and branch writers `TokenPurpose.COMMIT`.
 
     On httpx 401, or a 403 that is not a rate limit, invalidate the cached
     token and retry once - GitHub
@@ -425,7 +547,7 @@ def with_install_token_retry(installation_id: int, fn):
     PERMANENT - the identical request would fail identically forever, so
     retrying it only wastes the same budget grug#770 exists to protect.
     """
-    token = get_install_token(installation_id)
+    token = get_install_token(installation_id, purpose=purpose)
     refreshed_401 = False
     for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
         try:
@@ -457,7 +579,9 @@ def with_install_token_retry(installation_id: int, fn):
                 and e.response.headers.get("X-RateLimit-Remaining") != "0"
             ):
                 refreshed_401 = True
-                token = get_install_token(installation_id, force_refresh=True)
+                token = get_install_token(
+                    installation_id, force_refresh=True, purpose=purpose,
+                )
                 continue
             if attempt < _RETRY_MAX_ATTEMPTS and _is_retryable_github_error(e.response):
                 sleep_seconds = _retry_sleep_seconds(attempt, e.response)

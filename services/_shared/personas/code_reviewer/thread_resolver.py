@@ -35,7 +35,7 @@ from typing import Any
 
 import httpx
 from bot_identity import is_own_login
-from github_app_auth import with_install_token_retry
+from github_app_auth import TokenPurpose, with_install_token_retry
 
 from personas import board, board_client
 from personas.code_reviewer import deferred_ruff
@@ -291,6 +291,9 @@ def _resolve_or_collapse(
         with_install_token_retry(
             installation_id,
             lambda tok: _graphql(tok, _RESOLVE_MUTATION, {"thread": thread_id}),
+            # resolveReviewThread needs contents:write, which the review
+            # token no longer carries (grug#1577, docs/app-permissions.md).
+            purpose=TokenPurpose.COMMIT,
         )
         return "resolved"
     except GraphQLError as e:
