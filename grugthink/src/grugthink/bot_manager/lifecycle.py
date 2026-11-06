@@ -237,12 +237,15 @@ def create_bot_environment(bot_manager, config) -> dict:
     if bot_manager.config_manager and discord_token:
         template_id = getattr(config, "template_id", "evolution_bot")
 
+        # The bot's own settings win over a same-named custom_env key.
+        overrides = {
+            **(config.custom_env or {}),
+            "LOG_LEVEL": config.log_level,
+            "GRUGBOT_DATA_DIR": os.path.join(config.data_dir, config.bot_id),
+            "LOAD_EMBEDDER": str(config.load_embedder),
+        }
         env = bot_manager.config_manager.create_bot_env(
-            template_id=template_id,
-            discord_token=discord_token,
-            LOG_LEVEL=config.log_level,
-            GRUGBOT_DATA_DIR=os.path.join(config.data_dir, config.bot_id),
-            LOAD_EMBEDDER=str(config.load_embedder),
+            template_id=template_id, discord_token=discord_token, **overrides
         )
 
         # Apply bot-specific overrides
@@ -271,6 +274,7 @@ def create_bot_environment(bot_manager, config) -> dict:
         env["GRUGBOT_DATA_DIR"] = os.path.join(config.data_dir, config.bot_id)
         env["LOG_LEVEL"] = config.log_level
         env["LOAD_EMBEDDER"] = str(config.load_embedder)
+        env.update(config.custom_env or {})
 
         # Legacy API key handling
         if config.override_gemini_key:

@@ -1,11 +1,12 @@
 """Bot management API endpoints."""
 
 import logging
+from dataclasses import fields as dataclass_fields
 from typing import Any, Dict, List, Union
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
-from ...bot_manager import BotManager
+from ...bot_manager import BotConfig, BotManager
 from ...config.manager import ConfigManager
 from ...logging_config import get_logger
 from ..dependencies import admin_required, get_bot_manager, get_config_manager
@@ -14,6 +15,21 @@ from ..models import BotActionResponse, CreateBotRequest, UpdateBotRequest
 
 router = APIRouter(prefix="/api/bots", tags=["bots"])
 log = get_logger(__name__)
+
+# Request field name -> BotConfig field name, for the names that differ.
+_REQUEST_TO_BOT_CONFIG = {
+    "gemini_api_key": "override_gemini_key",
+    "google_api_key": "override_google_api_key",
+    "google_cse_id": "override_google_cse_id",
+    "ollama_urls": "override_ollama_urls",
+    "ollama_models": "override_ollama_models",
+}
+_BOT_CONFIG_FIELDS = {f.name for f in dataclass_fields(BotConfig)}
+
+
+def _to_bot_config_fields(values: Dict[str, Any]) -> Dict[str, Any]:
+    """Rename request fields to BotConfig fields and drop unset (None) values."""
+    return {_REQUEST_TO_BOT_CONFIG.get(k, k): v for k, v in values.items() if v is not None}
 
 
 @router.get("", response_model=List[Dict[str, Any]], dependencies=[Depends(admin_required)])
@@ -51,23 +67,17 @@ async def create_bot(
                 status_code=400, detail=f"Discord token with ID '{request.discord_token_id}' not found or inactive."
             )
 
-        # Create bot environment from template
+        # Build the environment once up front: it fails fast on a template or
+        # custom_env the bot could not start with, before any config is saved.
         config_manager.create_bot_env(request.template_id, discord_token, **request.custom_env)
 
-        # Override with specific values if provided
-        overrides = {}
-        if request.gemini_api_key:
-            overrides["gemini_api_key"] = request.gemini_api_key
-        if request.ollama_urls:
-            overrides["ollama_urls"] = request.ollama_urls
-        if request.ollama_models:
-            overrides["ollama_models"] = request.ollama_models
-        if request.google_api_key:
-            overrides["google_api_key"] = request.google_api_key
-        if request.google_cse_id:
-            overrides["google_cse_id"] = request.google_cse_id
-        if request.trusted_user_ids:
-            overrides["trusted_user_ids"] = request.trusted_user_ids
+        # custom_env is kept on the BotConfig so the start path applies it too;
+        # an empty dict is dropped like any other unset field.
+        overrides = _to_bot_config_fields(
+            request.model_dump(exclude={"name", "template_id", "discord_token_id", "custom_env"})
+        )
+        if request.custom_env:
+            overrides["custom_env"] = dict(request.custom_env)
 
         # Extract template settings
         template_dict = template if isinstance(template, dict) else template.__dict__
@@ -97,10 +107,10 @@ async def create_bot(
 async def update_bot(bot_id: str, request: UpdateBotRequest, bot_manager: BotManager = Depends(get_bot_manager)):
     """Update bot configuration."""
     try:
-        updates = {}
-        for field, value in request.model_dump(exclude_unset=True).items():
-            if value is not None:
-                updates[field] = value
+        updates = _to_bot_config_fields(request.model_dump(exclude_unset=True))
+        unsupported = sorted(k for k in updates if k not in _BOT_CONFIG_FIELDS)
+        if unsupported:
+            raise HTTPException(status_code=400, detail=f"Fields cannot be updated here: {', '.join(unsupported)}")
 
         success = bot_manager.update_bot_config(bot_id, **updates)
         if not success:

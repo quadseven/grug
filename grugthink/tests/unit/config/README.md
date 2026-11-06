@@ -89,7 +89,7 @@ Contains 25 tests covering new features introduced with the ConfigManager system
 
 ## Key Changes from Legacy Tests
 
-The new tests differ from the old `test_config.py` (now `test_config_legacy.py`) in several important ways:
+The new tests differ from the old `test_config.py` (later `test_config_legacy.py`, since removed) in several important ways:
 
 1. **No Import-Time Validation:** The new ConfigManager doesn't validate configuration at import time, but rather stores values and validates them when used.
 
@@ -125,7 +125,7 @@ All tests use common fixtures defined in each test file:
 
 ## Migration Notes
 
-The old `test_config.py` has been archived as `test_config_legacy.py`. It tests the old `config.py` module which has been refactored into the `config/` package. The legacy tests are kept for reference but should not be run as part of the regular test suite.
+The old `test_config.py`, later `test_config_legacy.py`, tested import-time validation that the `config/` package no longer does, and was removed. `tests/test_config_legacy_lazy_attrs.py` covers `config_legacy.py` as it is today, and CI runs the whole `tests/` directory.
 
 ## Future Improvements
 

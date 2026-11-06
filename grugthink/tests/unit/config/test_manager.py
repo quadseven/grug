@@ -118,8 +118,11 @@ class TestConfigValidation:
 
         config_manager.stop()
 
-    def test_invalid_gemini_api_key(self, temp_config_file, mock_watcher):
+    def test_invalid_gemini_api_key(self, temp_config_file, mock_watcher, monkeypatch):
         """Test that invalid Gemini API key is stored without validation."""
+        # get_env_var reads os.environ first, where the session conftest sets a
+        # default GEMINI_API_KEY; clear it so the config file value is read.
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         config_data = {
             "version": "2.0",
             "environment": {"GEMINI_API_KEY": "invalid key with spaces"},
