@@ -24,7 +24,7 @@ log = get_logger(__name__)
 
 _ALLOWED_SCHEMES = ("http", "https")
 
-# quadseven/infra#1768/#1770/#1773: realtime priority and a caller tag for the gateway.
+# Realtime priority and a caller tag for the model gateway (tracked in the infrastructure repo).
 _HEADERS = {"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-embed"}
 
 _BATCH_UNSUPPORTED = object()
