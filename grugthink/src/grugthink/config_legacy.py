@@ -1,6 +1,8 @@
 import os
 import re
 
+from .bot_settings import getenv as _bot_getenv
+
 # --- Discord Configuration ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -11,8 +13,7 @@ if not DISCORD_TOKEN and not os.getenv("GRUGTHINK_MULTIBOT_MODE") and not os.get
     raise ValueError("Missing DISCORD_TOKEN")
 
 # --- Google Search Configuration ---
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+# GOOGLE_API_KEY and GOOGLE_CSE_ID are lazy attributes (see _LAZY_ATTRS below).
 
 # --- GrugBot Configuration ---
 DATA_DIR = os.getenv("GRUGBOT_DATA_DIR", os.path.dirname(__file__))
@@ -50,7 +51,7 @@ def _parse_trusted_ids(raw: str) -> list:
     return ids
 
 
-TRUSTED_USER_IDS = _parse_trusted_ids(os.getenv("TRUSTED_USER_IDS", ""))
+# TRUSTED_USER_IDS is a lazy attribute (see _LAZY_ATTRS below).
 
 # Whether to load the heavy embedding model at startup. Set to 'False' for lightweight deployments.
 LOAD_EMBEDDER = os.getenv("LOAD_EMBEDDER", "True").lower() == "true"
@@ -74,22 +75,18 @@ def is_valid_url(url):
     return re.match(regex, url) is not None
 
 
-# --- LLM Configuration ---
-# CRITICAL FIX: Use __getattr__ to lazy-load these values from os.environ at RUNTIME
-# This fixes Issue #47 where multi-bot mode sets environment variables AFTER module import
-#
-# Problem: In multi-bot mode, lifecycle.py sets os.environ["OLLAMA_URLS"] = "http://..." AFTER
-# config_legacy.py has already been imported. If we cache OLLAMA_URLS at import time, it will
-# be empty and query_ollama_api() will hang (empty for loop, returns None, no error).
-#
-# Solution: Use Python 3.7+ module __getattr__ to read from os.environ on every access.
+# --- Per-bot configuration ---
+# Module __getattr__ reads these on every access through bot_settings.getenv:
+# the running bot's own settings in multi-bot mode (grug#1667), else the
+# process environment. Caching them at import time would freeze whichever
+# values the process held when this module first loaded (Issue #47).
 
 
 def _lazy_ollama_urls():
     import logging
 
     _log = logging.getLogger(__name__)
-    raw_value = os.getenv("OLLAMA_URLS", "")
+    raw_value = _bot_getenv("OLLAMA_URLS", "")
     urls = [url.strip() for url in raw_value.split(",") if url.strip()]
 
     # Log what we're returning for debugging
@@ -99,7 +96,7 @@ def _lazy_ollama_urls():
             "raw_env_value": raw_value,
             "parsed_urls": urls,
             "count": len(urls),
-            "source": "os.environ" if "OLLAMA_URLS" in os.environ else "default",
+            "source": "settings" if _bot_getenv("OLLAMA_URLS") is not None else "default",
         },
     )
 
@@ -122,7 +119,7 @@ def _lazy_ollama_models():
     import logging
 
     _log = logging.getLogger(__name__)
-    raw_value = os.getenv("OLLAMA_MODELS", "llama3.2:3b")
+    raw_value = _bot_getenv("OLLAMA_MODELS", "llama3.2:3b")
     models = [model.strip() for model in raw_value.split(",") if model.strip()]
 
     _log.debug(
@@ -138,14 +135,14 @@ def _lazy_ollama_models():
 
 
 def _lazy_gemini_api_key():
-    key = os.getenv("GEMINI_API_KEY")
+    key = _bot_getenv("GEMINI_API_KEY")
     if key and not re.match(r"^[\w\-]+$", key):
         raise ValueError("Invalid GEMINI_API_KEY")
     return key
 
 
 def _lazy_gemini_model():
-    return os.getenv("GEMINI_MODEL", "gemini-pro")
+    return _bot_getenv("GEMINI_MODEL", "gemini-pro")
 
 
 def _lazy_use_gemini():
@@ -162,16 +159,36 @@ def _lazy_poolside_api_key():
     # resolved from SSM at DEPLOY time (grugthink.deploy.yml) and
     # injected here as an already-decrypted literal, same convention
     # as GEMINI_API_KEY/DISCORD_TOKEN/SESSION_SECRET.
-    return os.getenv("POOLSIDE_API_KEY")
+    return _bot_getenv("POOLSIDE_API_KEY")
 
 
 def _lazy_openrouter_api_key():
     # See _lazy_poolside_api_key above - same deploy-time-resolved convention.
-    return os.getenv("OPENROUTER_API_KEY")
+    return _bot_getenv("OPENROUTER_API_KEY")
+
+
+def _lazy_google_api_key():
+    return _bot_getenv("GOOGLE_API_KEY")
+
+
+def _lazy_google_cse_id():
+    return _bot_getenv("GOOGLE_CSE_ID")
 
 
 def _lazy_can_search():
-    return bool(GOOGLE_API_KEY and GOOGLE_CSE_ID)
+    return bool(_lazy_google_api_key() and _lazy_google_cse_id())
+
+
+def _lazy_trusted_user_ids():
+    return _parse_trusted_ids(_bot_getenv("TRUSTED_USER_IDS", "") or "")
+
+
+def _lazy_public_base_url():
+    # Externally reachable base URL of the dashboard (for example
+    # https://grug.example.com). None when unset, so callers omit the link
+    # rather than print one that only works on the bot's own host (grug#1689).
+    raw = (_bot_getenv("PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+    return raw or None
 
 
 # Name -> zero-arg loader, one per branch __getattr__ used to hand-dispatch
@@ -187,14 +204,18 @@ _LAZY_ATTRS = {
     "POOLSIDE_API_KEY": _lazy_poolside_api_key,
     "OPENROUTER_API_KEY": _lazy_openrouter_api_key,
     "CAN_SEARCH": _lazy_can_search,
+    "GOOGLE_API_KEY": _lazy_google_api_key,
+    "GOOGLE_CSE_ID": _lazy_google_cse_id,
+    "TRUSTED_USER_IDS": _lazy_trusted_user_ids,
+    "PUBLIC_BASE_URL": _lazy_public_base_url,
 }
 
 
 def __getattr__(name):
-    """Lazy-load configuration values from environment at runtime.
+    """Read a per-bot configuration value at access time.
 
-    This allows multi-bot mode to set environment variables AFTER module import.
-    Without this, cached values would be empty/defaults from import time.
+    Each read goes through bot_settings.getenv, so in multi-bot mode every bot
+    sees its own value and single-bot mode sees the process environment.
     """
     try:
         loader = _LAZY_ATTRS[name]
@@ -214,7 +235,7 @@ def log_initial_settings():
             "variant": GRUGBOT_VARIANT,
             "use_gemini": __getattr__("USE_GEMINI"),
             "can_search": __getattr__("CAN_SEARCH"),
-            "trusted_users_count": len(TRUSTED_USER_IDS),
+            "trusted_users_count": len(__getattr__("TRUSTED_USER_IDS")),
             "log_level": LOG_LEVEL_STR,
         },
     )

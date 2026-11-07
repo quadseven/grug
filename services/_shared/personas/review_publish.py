@@ -14,7 +14,7 @@ an underscore-private name from another persona's module:
     the check run, the log and the feed cannot tell different stories ("no
     lies", ADR-0003).
 
-Rendering of the Elder-voiced review body stays in `code_reviewer.dispatch`.
+Rendering of the Elder-voiced review body lives in `code_reviewer.markings` (#1591).
 """
 from __future__ import annotations
 

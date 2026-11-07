@@ -122,9 +122,9 @@ async def verify(interaction, bot: "GrugThinkBot") -> None:
     try:
         # Get the server-specific database
         server_db = bot.get_server_db(interaction)
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, query_model, target, server_db, server_id, bot.personality_engine, bot.get_bot_id()
+        # to_thread copies the context, so query_model reads this bot's settings.
+        result = await asyncio.to_thread(
+            query_model, target, server_db, server_id, bot.personality_engine, bot.get_bot_id()
         )
 
         if result:
@@ -317,7 +317,10 @@ async def what_know(interaction, bot, page: int = 1, search: str = None) -> None
         total_desc = f"I know {total_facts} facts"
 
     title = f"{base_title} ({server_name}) - Page {page}/{total_pages}"
-    description = f"{total_desc}\n🌐 **[View & Edit All Memories](http://localhost:8080)**"
+    description = total_desc
+    dashboard_url = config.PUBLIC_BASE_URL
+    if dashboard_url:
+        description += f"\n🌐 **[View & Edit All Memories]({dashboard_url})**"
 
     # Build fact list for this page
     MAX_FACT_LENGTH = 120  # Max length per individual fact
@@ -581,7 +584,9 @@ async def list_memory_managers(interaction, bot: "GrugThinkBot") -> None:
 
     embed = discord.Embed(title="📝 Memory Managers", description="\n".join(managers), color=discord.Color.blue())
     embed.add_field(name="Total Managers", value=str(len(managers)), inline=True)
-    embed.add_field(name="Web Interface", value="[Manage Memories](http://localhost:8080)", inline=True)
+    dashboard_url = config.PUBLIC_BASE_URL
+    if dashboard_url:
+        embed.add_field(name="Web Interface", value=f"[Manage Memories]({dashboard_url})", inline=True)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 

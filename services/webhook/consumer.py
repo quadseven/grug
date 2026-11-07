@@ -42,7 +42,7 @@ from typing import Any, Callable
 import boto3
 from botocore.config import Config as _BotoConfig
 
-from rerun_queue import JobNotDue
+from rerun_queue import KIND_REVIEW, InvalidJob, JobNotDue, decode_job
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.consumer")
 
@@ -375,10 +375,11 @@ def _is_durable_review(spec: QueueSpec, message: dict[str, Any]) -> bool:
     if spec.kind != "rerun-jobs":
         return False
     try:
-        body = json.loads(str(message.get("Body", "")))
-    except json.JSONDecodeError:
+        job = decode_job(str(message.get("Body", "")))
+    except InvalidJob:
+        # The handler rejects and acks it at once: no long pass to lease.
         return False
-    return isinstance(body, dict) and body.get("kind") == "review"
+    return job.kind == KIND_REVIEW
 
 
 def _extend_review_visibility(
@@ -859,10 +860,13 @@ def _announce_terminal_failure(spec: QueueSpec, message: dict, error: Exception)
     `neutral` in WARN mode. A mode that cannot be read (the same outage
     that dead-lettered the job) fails closed."""
     try:
-        body = json.loads(message.get("Body", "") or "{}")
-        if body.get("kind") != "review" or body.get("persona") != "elder":
+        try:
+            job = decode_job(str(message.get("Body", "")))
+        except InvalidJob:
             return
-        owner, _, repo_name = str(body.get("repo", "")).partition("/")
+        if job.kind != KIND_REVIEW or job.persona != "elder":
+            return
+        owner, _, repo_name = job.repo.partition("/")
         # local: avoids import cycle
         from rerun import _complete_elder_check_open, elder_blocking_for
         from personas.code_reviewer.degraded_gate import (
@@ -870,15 +874,15 @@ def _announce_terminal_failure(spec: QueueSpec, message: dict, error: Exception)
             lead_with_degraded_line,
         )
 
-        install_id = int(body.get("install_id", 0))
-        pr_number = int(body.get("pr_number", 0))
+        install_id = job.install_id
+        pr_number = job.pr_number
         blocking = elder_blocking_for(install_id, owner, repo_name, pr_number)
         _complete_elder_check_open(
             install_id=install_id,
             owner=owner,
             repo_name=repo_name,
             pr_number=pr_number,
-            head_sha=str(body.get("requested_head_sha", "")),
+            head_sha=str(job.payload.get("requested_head_sha", "")),
             title="Elder could not review this diff",
             summary=lead_with_degraded_line(
                 "Grug tried and failed. The review job exhausted its retries "

@@ -27,7 +27,7 @@ async def get_admin_settings(config_manager: ConfigManager = Depends(get_config_
         "LOG_LEVEL": env_vars.get("LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")),
         "GRUGBOT_VARIANT": env_vars.get("GRUGBOT_VARIANT", "dev"),
         "MULTIBOT_API_PORT": env_vars.get("MULTIBOT_API_PORT", os.getenv("API_PORT", "8080")),
-        "GRUGBOT_DATA_DIR": env_vars.get("GRUGBOT_DATA_DIR", "/data"),
+        "GRUGBOT_DATA_DIR": env_vars.get("GRUGBOT_DATA_DIR", os.getenv("GRUGBOT_DATA_DIR", "./data")),
         "LOAD_EMBEDDER": env_vars.get("LOAD_EMBEDDER", "True"),
         "GEMINI_MODEL": env_vars.get("GEMINI_MODEL", "gemma-3-27b-it"),
         "OLLAMA_BASE_URL": env_vars.get("OLLAMA_BASE_URL", ""),

@@ -162,6 +162,23 @@ def _default_apply_commit(
         return None
 
 
+def commit_apply(install_id: int):
+    """`_default_apply_commit` on a commit-purpose token (grug#1577).
+
+    The command's own `token_fn` carries the review token, which cannot
+    push. Only the branch write gets the `contents: write` token; the
+    replies and file reads around it stay on the review token."""
+    def _apply(_review_token_fn, *args):
+        from github_app_auth import TokenPurpose, with_install_token_retry  # type: ignore
+
+        def commit_token_fn(fn):
+            return with_install_token_retry(install_id, fn, purpose=TokenPurpose.COMMIT)
+
+        return _default_apply_commit(commit_token_fn, *args)
+
+    return _apply
+
+
 def _do_commit(
     token: str, owner: str, repo: str, head_sha: str,
     changes: dict[str, str], message: str, pr_number: int, _req,
@@ -393,7 +410,7 @@ def run_fix(
     if fetch_file is None:
         fetch_file = _default_fetch_file
     if apply_commit is None:
-        apply_commit = _default_apply_commit
+        apply_commit = commit_apply(install_id)
     reply = post_reply or (
         lambda body: _default_post_reply(
             token_fn, owner, repo, pr_number, body,

@@ -14,9 +14,16 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _stub_secret(monkeypatch):
-    """Avoid real SSM in unit tests by stubbing the state secret loader."""
+def _stub_secret(monkeypatch, request):
+    """Avoid real SSM in unit tests by stubbing the state secret loader.
+
+    Tests that exercise the real `_state_secret` resolution request the
+    `real_state_secret` fixture instead and stub only the SSM read.
+    """
     monkeypatch.setenv("GITHUB_APP_WEBHOOK_SECRET_SSM", "/test/secret")
+    if "real_state_secret" in request.fixturenames:
+        yield
+        return
     with patch(
         "auth.github_oauth._state_secret",
         return_value="unit-test-secret-do-not-deploy",
@@ -79,3 +86,140 @@ def test_csrf_state_still_3_parts_unaffected():
     state = _make_state()
     assert state.count(".") == 2
     assert _verify_state(state) is True
+
+
+# --- Signing-key resolution (#1627) -----------------------------------
+
+_DEDICATED = "/test/session-signing"
+_WEBHOOK = "/test/secret"
+
+
+@pytest.fixture
+def real_state_secret(monkeypatch):
+    """The real `_state_secret`, with a scripted SSM read and a clean cache."""
+    import auth.github_oauth as mod
+    import secrets_loader
+
+    calls: list[str] = []
+    script: dict[str, list[object]] = {}
+
+    def fake_read(name: str) -> str:
+        calls.append(name)
+        outcome = script[name].pop(0) if len(script[name]) > 1 else script[name][0]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return str(outcome)
+
+    monkeypatch.setattr(secrets_loader, "_get_ssm_secure_string", fake_read)
+    monkeypatch.setattr(mod, "_signing_secret_cache", None)
+    script[_WEBHOOK] = ["webhook"]
+    yield mod, calls, script
+    mod._signing_secret_cache = None
+
+
+def _not_found() -> Exception:
+    from botocore.exceptions import ClientError
+
+    return ClientError(
+        {"Error": {"Code": "ParameterNotFound", "Message": "missing"}},
+        "GetParameter",
+    )
+
+
+def _client_error(code: str) -> Exception:
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": code, "Message": code}}, "GetParameter")
+
+
+def test_failed_dedicated_read_is_not_cached_and_retries(real_state_secret, monkeypatch):
+    """A transient failure must not pin the pod to the webhook secret."""
+    from fastapi import HTTPException
+
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [_client_error("ThrottlingException"), "dedicated"]
+
+    with pytest.raises(HTTPException) as exc:
+        mod._state_secret()
+    assert exc.value.status_code == 503
+    assert mod._state_secret() == "dedicated"
+    assert _WEBHOOK not in calls
+
+
+def test_successful_dedicated_read_is_cached(real_state_secret, monkeypatch):
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = ["dedicated"]
+
+    for _ in range(5):
+        assert mod._state_secret() == "dedicated"
+    assert calls == [_DEDICATED]
+
+
+def test_unset_env_falls_back_to_webhook_secret(real_state_secret, monkeypatch, caplog):
+    """Local dev: no dedicated param configured, so the webhook key signs."""
+    mod, calls, _script = real_state_secret
+    monkeypatch.delenv("GRUG_SESSION_SIGNING_SECRET_SSM", raising=False)
+
+    with caplog.at_level("WARNING", logger="grug.api.auth"):
+        assert mod._state_secret() == "webhook"
+        assert mod._state_secret() == "webhook"
+    assert calls == [_WEBHOOK]
+    assert "session_signing_secret_unconfigured_using_fallback" in caplog.text
+
+
+def test_unprovisioned_dedicated_param_falls_back(real_state_secret, monkeypatch):
+    """ParameterNotFound is config, not a fault: every pod sees it the same
+    way, so the documented migration fallback still applies."""
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [_not_found()]
+
+    assert mod._state_secret() == "webhook"
+    assert mod._state_secret() == "webhook"
+    assert calls == [_DEDICATED, _WEBHOOK]
+
+
+def test_session_signing_outage_returns_503_from_me(real_state_secret, monkeypatch):
+    """The route fails closed instead of signing with another key."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [_client_error("AccessDeniedException")]
+    app = FastAPI()
+    app.include_router(mod.router)
+
+    client = TestClient(app)
+    client.cookies.set("grug_session", "a.1.2.sig")
+    resp = client.get("/api/v1/me")
+    assert resp.status_code == 503
+    assert _WEBHOOK not in calls
+
+
+def test_network_fault_on_dedicated_read_returns_503(real_state_secret, monkeypatch):
+    from botocore.exceptions import EndpointConnectionError
+    from fastapi import HTTPException
+
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [EndpointConnectionError(endpoint_url="https://ssm.invalid")]
+
+    with pytest.raises(HTTPException) as exc:
+        mod._state_secret()
+    assert exc.value.status_code == 503
+    assert _WEBHOOK not in calls
+
+
+def test_loader_bug_is_not_masked_as_outage(real_state_secret, monkeypatch):
+    """A code bug in the loader surfaces as itself, not as a 503."""
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [AttributeError("loader bug")]
+
+    with pytest.raises(AttributeError):
+        mod._state_secret()
+    assert _WEBHOOK not in calls
+    assert mod._signing_secret_cache is None

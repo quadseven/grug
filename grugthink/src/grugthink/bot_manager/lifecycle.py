@@ -12,11 +12,32 @@ import time
 import discord
 from discord.ext import commands
 
+from .. import bot_settings
 from ..grug_db import make_server_manager
 from ..grug_structured_logger import get_logger
 from ..personality_engine import PersonalityEngine
 
 log = get_logger(__name__)
+
+
+def watch_bot_task(instance) -> None:
+    """Flip the bot to error when its client task dies after startup.
+
+    Cancellation is the normal stop path and is ignored, as is a task that has
+    since been replaced by a restart.
+    """
+    task = instance.task
+
+    def _on_done(done_task: asyncio.Task) -> None:
+        if done_task.cancelled() or instance.task is not done_task:
+            return
+        exception = done_task.exception()
+        if exception is None:
+            return
+        instance.logger.error("Bot client task died", extra={"error": str(exception)}, exc_info=exception)
+        instance.runtime_status = "error"
+
+    task.add_done_callback(_on_done)
 
 
 async def start_bot(bot_manager, bot_id: str) -> bool:
@@ -38,14 +59,10 @@ async def start_bot(bot_manager, bot_id: str) -> bool:
         instance.logger.warning("Bot is disabled in configuration")
         return False
 
-    # Bind before the try so the except handler can always restore os.environ,
-    # even if create_bot_environment (or later setup) raises before we populate it.
-    original_env = {}
     try:
         instance.runtime_status = "starting"
         instance.logger.info("Starting bot", extra={"bot_name": config.name})
 
-        # Create bot-specific environment and set it immediately
         bot_env = create_bot_environment(bot_manager, config)
 
         # DEBUG: Log what keys are in bot_env
@@ -54,83 +71,11 @@ async def start_bot(bot_manager, bot_id: str) -> bool:
             extra={"bot_name": config.name, "env_keys": sorted(bot_env.keys()), "has_ollama": "OLLAMA_URLS" in bot_env},
         )
 
-        # Set environment variables before importing any bot modules
-        for key, value in bot_env.items():
-            original_env[key] = os.environ.get(key)
-            os.environ[key] = value
-
-        # Log initial settings for this bot instance
-        instance.logger.info("Bot starting up", extra={"bot_name": config.name})
-        if bot_env.get("GEMINI_API_KEY"):
-            instance.logger.info(
-                "Using Gemini for generation", extra={"model": bot_env.get("GEMINI_MODEL", "gemma-3-27b-it")}
-            )
-        elif bot_env.get("OLLAMA_URLS"):
-            instance.logger.info(
-                "Using Ollama for generation",
-                extra={"urls": bot_env.get("OLLAMA_URLS"), "models": bot_env.get("OLLAMA_MODELS")},
-            )
-        if bot_env.get("GOOGLE_API_KEY"):
-            instance.logger.info("Google Search is enabled.")
-        else:
-            instance.logger.warning("Google Search is disabled. Bot cannot learn new things from the internet.")
-        if bot_env.get("TRUSTED_USER_IDS"):
-            instance.logger.info("Trusted users configured", extra={"users": bot_env.get("TRUSTED_USER_IDS")})
-        else:
-            instance.logger.warning("No trusted users configured. /learn command will be disabled for all.")
-
-        # Initialize bot components
-        data_dir = os.path.join(config.data_dir, bot_id)
-        os.makedirs(data_dir, exist_ok=True)
-
-        # Initialize personality engine with configured personality (prefer new 'personality' field)
-        bot_personality = getattr(config, "personality", None) or config.force_personality
-        personality_engine = PersonalityEngine(
-            db_path=os.path.join(data_dir, "personalities.db"), forced_personality=bot_personality
-        )
-        instance.personality_engine = personality_engine
-
-        # Store the personality for this bot instance
-        instance.forced_personality = bot_personality
-
-        # Initialize server manager for this bot (each bot gets its own data directory)
-        # Get load_embedder from environment (defaults to "true" if not set, converts to boolean)
-        load_embedder_env = bot_env.get("LOAD_EMBEDDER", "true").lower() in ("true", "1", "yes")
-        server_manager = make_server_manager(
-            base_db_path=os.path.join(data_dir, "facts.db"),
-            model_name="all-MiniLM-L6-v2",
-            load_embedder=load_embedder_env,
-        )
-        instance.server_manager = server_manager
-
-        # Create Discord client
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.guilds = True
-        intents.members = True
-
-        # discord.py 2.0 removed the Client/Bot `loop=` parameter (asyncio.run
-        # owns the loop now); passing it raises TypeError and the bot never starts.
-        client = commands.Bot(command_prefix="/", intents=intents)
-        instance.client = client
-
-        # Import and setup bot commands
-        await setup_bot_commands(instance, bot_env)
-
-        # Start the bot in a separate task - get token from environment
-        discord_token = bot_env.get("DISCORD_TOKEN")
-        if not discord_token:
-            raise ValueError(f"No Discord token available for bot {config.bot_id}")
-        instance.task = asyncio.create_task(client.start(discord_token))
-
-        # Give it a moment to start
-        await asyncio.sleep(2)
-
-        # Check if the task failed
-        if instance.task.done():
-            exception = instance.task.exception()
-            if exception:
-                raise exception
+        # The bot's settings live in a context variable, not os.environ, so a
+        # second bot cannot overwrite them (grug#1667). The client task created
+        # inside the block copies the context and keeps them for the bot's life.
+        with bot_settings.activate(bot_env):
+            await _start_with_settings(instance, bot_id, config, bot_env)
 
         instance.runtime_status = "running"
         instance.last_heartbeat = time.time()
@@ -138,7 +83,7 @@ async def start_bot(bot_manager, bot_id: str) -> bool:
         instance.consecutive_failures = 0
 
         instance.logger.info(
-            "Bot started successfully", extra={"bot_name": config.name, "guild_count": len(client.guilds)}
+            "Bot started successfully", extra={"bot_name": config.name, "guild_count": len(instance.client.guilds)}
         )
 
         return True
@@ -148,17 +93,88 @@ async def start_bot(bot_manager, bot_id: str) -> bool:
         instance.consecutive_failures += 1
         instance.logger.error("Failed to start bot", extra={"error": str(e), "failures": instance.consecutive_failures})
 
-        # Restore original environment variables on error
-        try:
-            for key, value in original_env.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-        except Exception:
-            pass  # Don't let env cleanup crash the error handling
-
         return False
+
+
+async def _start_with_settings(instance, bot_id: str, config, bot_env: dict) -> None:
+    """Build the bot's components and start its Discord client task.
+
+    Runs with the bot's settings active, so everything built here and the
+    client task it creates read this bot's values.
+    """
+    # Log initial settings for this bot instance
+    instance.logger.info("Bot starting up", extra={"bot_name": config.name})
+    if bot_env.get("GEMINI_API_KEY"):
+        instance.logger.info(
+            "Using Gemini for generation", extra={"model": bot_env.get("GEMINI_MODEL", "gemma-3-27b-it")}
+        )
+    elif bot_env.get("OLLAMA_URLS"):
+        instance.logger.info(
+            "Using Ollama for generation",
+            extra={"urls": bot_env.get("OLLAMA_URLS"), "models": bot_env.get("OLLAMA_MODELS")},
+        )
+    if bot_env.get("GOOGLE_API_KEY"):
+        instance.logger.info("Google Search is enabled.")
+    else:
+        instance.logger.warning("Google Search is disabled. Bot cannot learn new things from the internet.")
+    if bot_env.get("TRUSTED_USER_IDS"):
+        instance.logger.info("Trusted users configured", extra={"users": bot_env.get("TRUSTED_USER_IDS")})
+    else:
+        instance.logger.warning("No trusted users configured. /learn command will be disabled for all.")
+
+    # Initialize bot components
+    data_dir = os.path.join(config.data_dir, bot_id)
+    os.makedirs(data_dir, exist_ok=True)
+
+    # Initialize personality engine with configured personality (prefer new 'personality' field)
+    bot_personality = getattr(config, "personality", None) or config.force_personality
+    personality_engine = PersonalityEngine(
+        db_path=os.path.join(data_dir, "personalities.db"), forced_personality=bot_personality
+    )
+    instance.personality_engine = personality_engine
+
+    # Store the personality for this bot instance
+    instance.forced_personality = bot_personality
+
+    # Initialize server manager for this bot (each bot gets its own data directory)
+    # Get load_embedder from environment (defaults to "true" if not set, converts to boolean)
+    load_embedder_env = bot_env.get("LOAD_EMBEDDER", "true").lower() in ("true", "1", "yes")
+    server_manager = make_server_manager(
+        base_db_path=os.path.join(data_dir, "facts.db"),
+        model_name="all-MiniLM-L6-v2",
+        load_embedder=load_embedder_env,
+    )
+    instance.server_manager = server_manager
+
+    # Create Discord client
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.guilds = True
+    intents.members = True
+
+    # discord.py 2.0 removed the Client/Bot `loop=` parameter (asyncio.run
+    # owns the loop now); passing it raises TypeError and the bot never starts.
+    client = commands.Bot(command_prefix="/", intents=intents)
+    instance.client = client
+
+    # Import and setup bot commands
+    await setup_bot_commands(instance, bot_env)
+
+    # Start the bot in a separate task - get token from environment
+    discord_token = bot_env.get("DISCORD_TOKEN")
+    if not discord_token:
+        raise ValueError(f"No Discord token available for bot {config.bot_id}")
+    instance.task = asyncio.create_task(client.start(discord_token))
+    watch_bot_task(instance)
+
+    # Give it a moment to start
+    await asyncio.sleep(2)
+
+    # Check if the task failed
+    if instance.task.done():
+        exception = instance.task.exception()
+        if exception:
+            raise exception
 
 
 async def stop_bot(bot_manager, bot_id: str) -> bool:

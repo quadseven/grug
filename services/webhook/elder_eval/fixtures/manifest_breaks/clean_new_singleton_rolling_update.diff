@@ -1,0 +1,25 @@
+diff --git a/manifests/web/deployment.yaml b/manifests/web/deployment.yaml
+new file mode 100644
+--- /dev/null
++++ b/manifests/web/deployment.yaml
+@@ -0,0 +1,20 @@
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: web
++  namespace: web
++spec:
++  replicas: 1
++  strategy:
++    type: RollingUpdate
++  selector:
++    matchLabels:
++      app: web
++  template:
++    metadata:
++      labels:
++        app: web
++    spec:
++      containers:
++        - name: web
++          image: registry.example.com/web:5.0.0

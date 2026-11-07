@@ -1,0 +1,14 @@
+diff --git a/manifests/home/light-controller.yaml b/manifests/home/light-controller.yaml
+--- a/manifests/home/light-controller.yaml
++++ b/manifests/home/light-controller.yaml
+@@ -6,7 +6,9 @@
+   labels: {app: light-controller}
+ spec:
+   replicas: 1
+-  strategy: {type: Recreate}
++  strategy:
++    type: RollingUpdate
++    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+   selector:
+     matchLabels: {app: light-controller}
+   template:

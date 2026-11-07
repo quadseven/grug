@@ -11,12 +11,11 @@ api Lambda is 15s and can't run the review itself, so it hands off to the
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 
 import boto3
-from rerun_queue import rerun_group_id
+from rerun_queue import encode_rerun, rerun_group_id  # noqa: F401 - re-export for tests
 
 log = logging.getLogger("grug.api.rerun")
 
@@ -25,8 +24,6 @@ _sqs = boto3.client("sqs")
 # Queue URL injected by Pulumi. Unset in local/dev/tests; the endpoint surfaces
 # a 503 (a real misconfig) rather than silently dropping the re-run.
 _RERUN_QUEUE_URL = os.getenv("GRUG_RERUN_QUEUE_URL", "")
-
-SCHEMA_VERSION = 1
 
 
 def enqueue_rerun(
@@ -45,19 +42,10 @@ def enqueue_rerun(
         raise RuntimeError("GRUG_RERUN_QUEUE_URL not configured")
     _sqs.send_message(
         QueueUrl=_RERUN_QUEUE_URL,
-        MessageBody=json.dumps(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "install_id": install_id,
-                "repo": repo,
-                "pr_number": pr_number,
-                "persona": persona,
-            }
-        ),
-        MessageGroupId=rerun_group_id(
-            install_id, repo, pr_number, persona,
-        ),
-        MessageDeduplicationId=f"{install_id}:{repo}:{pr_number}:{persona}",
+        **encode_rerun(
+            install_id=install_id, repo=repo, pr_number=pr_number,
+            persona=persona,
+        ).message_kwargs(),
     )
     log.info(
         "rerun_enqueued",

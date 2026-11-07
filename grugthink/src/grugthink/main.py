@@ -101,21 +101,31 @@ class GrugThinkContainer:
         self.running = False
         self.tasks = []
 
-        # Setup signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        self._shutdown_task = None
 
         log.info("GrugThink Container initialized")
 
-    def _signal_handler(self, signum, frame):
-        """Handle shutdown signals."""
+    def _install_signal_handlers(self):
+        """Register shutdown signals on the running loop so shutdown() runs on it."""
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, self._request_shutdown, sig)
+            except NotImplementedError:
+                # Windows loops lack add_signal_handler; hop back onto the loop.
+                signal.signal(sig, lambda signum, frame: loop.call_soon_threadsafe(self._request_shutdown, signum))
+
+    def _request_shutdown(self, signum):
+        """Schedule shutdown() on the running loop (idempotent)."""
         log.info("Received shutdown signal", extra={"signal": signum})
-        asyncio.create_task(self.shutdown())
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.get_running_loop().create_task(self.shutdown())
 
     async def start(self, start_bots: bool = True, api_port: int = 8080):
         """Start the container system."""
         try:
             self.running = True
+            self._install_signal_handlers()
             log.info("Starting GrugThink Container", extra={"start_bots": start_bots, "api_port": api_port})
 
             # Start configuration change monitoring
@@ -238,6 +248,11 @@ class GrugThinkContainer:
     async def shutdown(self):
         """Gracefully shutdown the container."""
         if not self.running:
+            # A signal-triggered shutdown may still be in flight; wait for it so
+            # the process does not exit mid-cleanup.
+            pending = self._shutdown_task
+            if pending is not None and pending is not asyncio.current_task():
+                await pending
             return
 
         log.info("Shutting down GrugThink Container")
@@ -361,7 +376,7 @@ async def create_demo_configuration():
         for bot_id, name in created_bots:
             print(f"  - {name} (ID: {bot_id})")
         print("\nStart the container with: python main.py")
-        print("Then visit http://localhost:8080 to manage your bots!")
+        print("Then open the dashboard on the API port (8080 by default) to manage your bots!")
 
     except Exception as e:
         log.error("Failed to create demo configuration", extra={"error": str(e)})
