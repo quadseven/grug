@@ -56,7 +56,7 @@ async def test_what_know_link_uses_setting(monkeypatch, interaction, bot):
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://grug.example.com")
     await bot_commands.what_know(interaction, bot)
     desc = _sent_embed(interaction.followup.send).description
-    assert "https://grug.example.com" in desc
+    assert desc.endswith("**[View & Edit All Memories](https://grug.example.com)**")
     assert "localhost" not in desc
 
 
@@ -74,7 +74,7 @@ async def test_managers_link_uses_setting_or_is_omitted(monkeypatch, interaction
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://grug.example.com")
     await bot_commands.list_memory_managers(interaction, bot)
     values = [f.value for f in _sent_embed(interaction.response.send_message).fields]
-    assert any("https://grug.example.com" in v for v in values)
+    assert "[Manage Memories](https://grug.example.com)" in values
 
     monkeypatch.delenv("PUBLIC_BASE_URL")
     await bot_commands.list_memory_managers(interaction, bot)
