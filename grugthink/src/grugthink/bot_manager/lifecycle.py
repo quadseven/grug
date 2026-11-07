@@ -20,6 +20,26 @@ from ..personality_engine import PersonalityEngine
 log = get_logger(__name__)
 
 
+def watch_bot_task(instance) -> None:
+    """Flip the bot to error when its client task dies after startup.
+
+    Cancellation is the normal stop path and is ignored, as is a task that has
+    since been replaced by a restart.
+    """
+    task = instance.task
+
+    def _on_done(done_task: asyncio.Task) -> None:
+        if done_task.cancelled() or instance.task is not done_task:
+            return
+        exception = done_task.exception()
+        if exception is None:
+            return
+        instance.logger.error("Bot client task died", extra={"error": str(exception)}, exc_info=exception)
+        instance.runtime_status = "error"
+
+    task.add_done_callback(_on_done)
+
+
 async def start_bot(bot_manager, bot_id: str) -> bool:
     """Start a specific bot instance."""
     if bot_id not in bot_manager.bots:
@@ -145,6 +165,7 @@ async def _start_with_settings(instance, bot_id: str, config, bot_env: dict) -> 
     if not discord_token:
         raise ValueError(f"No Discord token available for bot {config.bot_id}")
     instance.task = asyncio.create_task(client.start(discord_token))
+    watch_bot_task(instance)
 
     # Give it a moment to start
     await asyncio.sleep(2)
