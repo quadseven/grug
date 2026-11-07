@@ -6,8 +6,8 @@ executes; this just recognizes the command, so the recognition has a
 unit-test seam.
 
 Supported verbs (all default-safe - none mutate code, except `learnings
-delete` which forgets a taught preference and `fix` which commits to the
-PR branch). The second column is the per-repo persona toggle the verb
+delete` which forgets a taught preference and `fix`, `docstrings` and
+`tests` which commit to the PR branch). The second column is the per-repo persona toggle the verb
 needs (`VERB_PERSONA`, grug#1624); with that persona off the command is
 refused with a reply naming it, and the other personas' toggles do not
 matter:
@@ -23,6 +23,7 @@ matter:
   /grug walkthrough    walkthrough    opt in to Teller walkthrough on this PR
   /grug fix            code_reviewer  apply all unresolved committable suggestions as one bot commit
   /grug docstrings     code_reviewer  generate docs for changed public functions as one bot commit
+  /grug tests          code_reviewer  generate unit tests for uncovered changed paths as one bot commit
 """
 
 from __future__ import annotations
@@ -34,14 +35,14 @@ from dataclasses import dataclass
 # line in a longer comment; the verb is a known token, everything after is
 # the arg (only `ask`, `learnings` and `accept-removal` consume it). Case-insensitive.
 _CMD_RE = re.compile(
-    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings|accept-removal|accept_removal|walkthrough|fix|docstrings)\b[ \t]*(.*)$",
+    r"^\s*/grug\s+(recheck|improve|ask|test-gaps|test_gaps|resume|review|learnings|accept-removal|accept_removal|walkthrough|fix|docstrings|tests)\b[ \t]*(.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 
 _CANON = {"test_gaps": "test-gaps", "accept_removal": "accept-removal"}
 VERBS = frozenset({
     "recheck", "improve", "ask", "test-gaps", "resume", "review", "learnings",
-    "accept-removal", "walkthrough", "fix", "docstrings",
+    "accept-removal", "walkthrough", "fix", "docstrings", "tests",
 })
 
 # The persona toggle (`<persona>_enabled` in the repo config) each verb
@@ -61,6 +62,7 @@ VERB_PERSONA: dict[str, str] = {
     "walkthrough": "walkthrough",
     "fix": "code_reviewer",
     "docstrings": "code_reviewer",
+    "tests": "code_reviewer",
 }
 
 # The verbs that start an ELDER re-run. They are the ones that must not

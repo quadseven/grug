@@ -178,7 +178,7 @@ _TIER1_ADVISORY = {
     "inline_1": "0073265db3a9dccffe42e905144bf6d66ac1741ef3c644ab19be074c87a49126",
     "review_body": "ab9a7ad05178a51a6903e3323e581d1e2f1c3bf26c8590ccb854cea3309e3f78",
     "review_event": "71772a68c6d1eeb195691104b12656353e37dc9c3079cd85c555515a78aac90b",
-    "stack_body": "7dfab6dbce24692ddee4c130cca5f1befc5f81e3a97dcc1d575e81a924120ef6",
+    "stack_body": "18442d54d0fff878c2591ad20cd15d2b04943365b185d36ffc4ccdca15ce08f0",
     "stack_create_if_absent": "3cbc87c7681f34db4617feaa2c8801931bc5e42d8d0f560e756dd4cd92885f18",
 }
 
@@ -190,7 +190,7 @@ _TIER1_BLOCKING = {
     "inline_1": "0073265db3a9dccffe42e905144bf6d66ac1741ef3c644ab19be074c87a49126",
     "review_body": "ab9a7ad05178a51a6903e3323e581d1e2f1c3bf26c8590ccb854cea3309e3f78",
     "review_event": "fded070eb4e135b74ab7cde2e12cfb321cf73c032f0132c03403b9d41982cae5",
-    "stack_body": "f80021759c1700b9ca491349b55d786ccdcc56c6caad2a46dcc18fddbbf5f798",
+    "stack_body": "c17d54f7be4cae427ae108f28488f546b91f2225a362d6920022984514582f33",
     "stack_create_if_absent": "3cbc87c7681f34db4617feaa2c8801931bc5e42d8d0f560e756dd4cd92885f18",
 }
 
