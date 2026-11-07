@@ -24,6 +24,11 @@ log = get_logger(__name__)
 
 _ALLOWED_SCHEMES = ("http", "https")
 
+# quadseven/infra#1768/#1770/#1773: realtime priority and a caller tag for the gateway.
+_HEADERS = {"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-embed"}
+
+_BATCH_UNSUPPORTED = object()
+
 
 def _is_valid_ollama_url(url: str) -> bool:
     """Minimal scheme/host check to guard against SSRF via unvalidated URLs."""
@@ -72,7 +77,7 @@ class OllamaEmbedder:
 
         Args:
             texts: Single text string or list of text strings
-            batch_size: Ignored (kept for API compatibility with SentenceTransformer)
+            batch_size: Texts per /api/embed request; falls back to per-text calls on 404
             show_progress_bar: Ignored (kept for API compatibility)
 
         Returns:
@@ -85,9 +90,82 @@ class OllamaEmbedder:
         if not texts:
             return np.array([])
 
+        size = max(1, int(batch_size))
+        embeddings: List[List[float]] = []
+        failed_count = 0
+        use_batch = True
+
+        for start in range(0, len(texts), size):
+            chunk = texts[start : start + size]
+            if use_batch:
+                vectors = self._embed_batch(chunk)
+                if vectors is _BATCH_UNSUPPORTED:
+                    use_batch = False
+                else:
+                    embeddings.extend(vectors)
+                    failed_count += sum(1 for v in vectors if not any(v))
+                    continue
+            vectors, failed = self._embed_each(chunk)
+            embeddings.extend(vectors)
+            failed_count += failed
+
+        if failed_count > 0:
+            failure_rate = f"{failed_count / len(texts) * 100:.1f}%"
+            log.warning(
+                "Some embeddings failed to generate",
+                extra={"failed": failed_count, "total": len(texts), "failure_rate": failure_rate},
+            )
+
+        result = np.array(embeddings, dtype=np.float32)
+
+        log.debug(
+            "Generated embeddings",
+            extra={"count": len(texts), "shape": result.shape, "failed": failed_count},
+        )
+
+        return result
+
+    def _embed_batch(self, texts: List[str]):
+        """Post a list to /api/embed. Returns one vector per text, or _BATCH_UNSUPPORTED on 404.
+
+        Any other failure yields zero vectors for the chunk so order and count hold.
+        """
+        zeros = [[0.0] * self.dimension for _ in texts]
+        try:
+            response = requests.post(
+                f"{self.ollama_url}/api/embed",
+                json={"model": self.model, "input": texts, "keep_alive": -1},
+                headers=_HEADERS,
+                timeout=self.timeout,
+            )
+            if response.status_code == 404:
+                log.warning("Ollama batch embed endpoint missing, using per-text path", extra={"url": self.ollama_url})
+                return _BATCH_UNSUPPORTED
+            if response.status_code != 200:
+                log.error(
+                    "Ollama batch embedding request failed",
+                    extra={"status_code": response.status_code, "response": response.text, "count": len(texts)},
+                )
+                return zeros
+            vectors = response.json().get("embeddings")
+            if not isinstance(vectors, list) or len(vectors) != len(texts):
+                log.error(
+                    "Ollama batch embedding returned wrong vector count",
+                    extra={"expected": len(texts), "got": len(vectors) if isinstance(vectors, list) else None},
+                )
+                return zeros
+            return [v if v else [0.0] * self.dimension for v in vectors]
+        except requests.exceptions.Timeout:
+            log.error("Ollama batch embedding request timed out", extra={"timeout": self.timeout, "count": len(texts)})
+            return zeros
+        except Exception as e:
+            log.error("Error generating batch embeddings", extra={"error": str(e), "count": len(texts)})
+            return zeros
+
+    def _embed_each(self, texts: List[str]):
+        """Per-text /api/embeddings path. Returns (vectors, failed_count)."""
         embeddings = []
         failed_count = 0
-
         for text in texts:
             try:
                 response = requests.post(
@@ -111,7 +189,7 @@ class OllamaEmbedder:
                     # metrics instead of an anonymous python client. Harmless
                     # if ollama_url ever points straight at a Spark instead
                     # of the gateway - Ollama ignores unknown headers.
-                    headers={"X-Spark-Priority": "realtime", "X-Spark-Caller": "grugthink-embed"},
+                    headers=_HEADERS,
                     timeout=self.timeout,
                 )
 
@@ -156,21 +234,7 @@ class OllamaEmbedder:
                 embeddings.append([0.0] * self.dimension)
                 failed_count += 1
 
-        if failed_count > 0:
-            failure_rate = f"{failed_count / len(texts) * 100:.1f}%"
-            log.warning(
-                "Some embeddings failed to generate",
-                extra={"failed": failed_count, "total": len(texts), "failure_rate": failure_rate},
-            )
-
-        result = np.array(embeddings, dtype=np.float32)
-
-        log.debug(
-            "Generated embeddings",
-            extra={"count": len(texts), "shape": result.shape, "failed": failed_count},
-        )
-
-        return result
+        return embeddings, failed_count
 
     def test_connection(self) -> bool:
         """
