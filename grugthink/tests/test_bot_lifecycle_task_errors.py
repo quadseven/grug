@@ -110,3 +110,38 @@ def test_signal_handler_runs_shutdown_on_the_loop(monkeypatch):
 
     asyncio.run(scenario())
     assert ran == [True]
+
+
+def test_client_start_failing_after_startup_window_sets_error(monkeypatch, tmp_path):
+    """Drive the real start path: client.start dies only after _start_with_settings returned."""
+    instance = SimpleNamespace(runtime_status="starting", logger=MagicMock(), task=None, client=None)
+    config = SimpleNamespace(name="grug", bot_id="b1", data_dir=str(tmp_path), personality=None, force_personality=None)
+
+    class FakeBot:
+        def __init__(self, *args, **kwargs):
+            self.release = asyncio.Event()
+
+        async def start(self, token):
+            await self.release.wait()
+            raise RuntimeError("gateway closed after startup")
+
+    async def no_commands(instance, bot_env):
+        return None
+
+    monkeypatch.setattr(lifecycle.commands, "Bot", FakeBot)
+    monkeypatch.setattr(lifecycle, "PersonalityEngine", lambda **kw: MagicMock())
+    monkeypatch.setattr(lifecycle, "make_server_manager", lambda **kw: MagicMock())
+    monkeypatch.setattr(lifecycle, "setup_bot_commands", no_commands, raising=False)
+
+    async def scenario():
+        await lifecycle._start_with_settings(instance, "b1", config, {"DISCORD_TOKEN": "fake_token"})
+        # Startup succeeded; start_bot would now report running.
+        assert not instance.task.done()
+        instance.runtime_status = "running"
+        instance.client.release.set()
+        await _settle()
+
+    asyncio.run(scenario())
+
+    assert instance.runtime_status == "error"
+    instance.logger.error.assert_called_once()
