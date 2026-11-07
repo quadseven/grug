@@ -183,6 +183,14 @@ def _lazy_trusted_user_ids():
     return _parse_trusted_ids(_bot_getenv("TRUSTED_USER_IDS", "") or "")
 
 
+def _lazy_public_base_url():
+    # Externally reachable base URL of the dashboard (for example
+    # https://grug.example.com). None when unset, so callers omit the link
+    # rather than print one that only works on the bot's own host (grug#1689).
+    raw = (_bot_getenv("PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+    return raw or None
+
+
 # Name -> zero-arg loader, one per branch __getattr__ used to hand-dispatch
 # (grug#632: that function alone measured cyclomatic 20 / cognitive 58, both
 # well over cap). Each loader keeps its own logic and log lines byte-for-byte
@@ -199,6 +207,7 @@ _LAZY_ATTRS = {
     "GOOGLE_API_KEY": _lazy_google_api_key,
     "GOOGLE_CSE_ID": _lazy_google_cse_id,
     "TRUSTED_USER_IDS": _lazy_trusted_user_ids,
+    "PUBLIC_BASE_URL": _lazy_public_base_url,
 }
 
 

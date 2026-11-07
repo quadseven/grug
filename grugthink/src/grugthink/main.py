@@ -376,7 +376,7 @@ async def create_demo_configuration():
         for bot_id, name in created_bots:
             print(f"  - {name} (ID: {bot_id})")
         print("\nStart the container with: python main.py")
-        print("Then visit http://localhost:8080 to manage your bots!")
+        print("Then open the dashboard on the API port (8080 by default) to manage your bots!")
 
     except Exception as e:
         log.error("Failed to create demo configuration", extra={"error": str(e)})
