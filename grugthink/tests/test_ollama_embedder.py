@@ -58,7 +58,7 @@ class TestOllamaEmbedderTimeout:
 
         resp = MagicMock()
         resp.status_code = 200
-        resp.json.return_value = {"embedding": [0.0] * 768}
+        resp.json.return_value = {"embeddings": [[0.0] * 768]}
 
         with patch(
             "src.grugthink.embedders.ollama_embedder.requests.post", return_value=resp
@@ -81,7 +81,7 @@ class TestOllamaEmbedderPriorityAndKeepAlive:
 
         resp = MagicMock()
         resp.status_code = 200
-        resp.json.return_value = {"embedding": [0.0] * 768}
+        resp.json.return_value = {"embeddings": [[0.0] * 768]}
 
         with patch(
             "src.grugthink.embedders.ollama_embedder.requests.post", return_value=resp
@@ -99,7 +99,7 @@ class TestOllamaEmbedderPriorityAndKeepAlive:
 
         resp = MagicMock()
         resp.status_code = 200
-        resp.json.return_value = {"embedding": [0.0] * 768}
+        resp.json.return_value = {"embeddings": [[0.0] * 768]}
 
         with patch(
             "src.grugthink.embedders.ollama_embedder.requests.post", return_value=resp
@@ -125,3 +125,82 @@ class TestOllamaEmbedderUrlValidation:
     def test_constructor_rejects_invalid_url(self):
         with pytest.raises(ValueError):
             OllamaEmbedder("ftp://gateway")
+
+
+def _resp(status, payload=None):
+    resp = MagicMock()
+    resp.status_code = status
+    resp.json.return_value = payload or {}
+    resp.text = ""
+    return resp
+
+
+class _FakeOllama:
+    """Faked HTTP layer: /api/embed (batch) and /api/embeddings (single).
+
+    The vector for a text is [float(len(text)), 0.0], so order is checkable.
+    """
+
+    def __init__(self, batch_supported=True):
+        self.batch_supported = batch_supported
+        self.calls = []
+
+    def post(self, url, json=None, **kwargs):
+        self.calls.append((url, json))
+        if url.endswith("/api/embed"):
+            if not self.batch_supported:
+                return _resp(404)
+            return _resp(200, {"embeddings": [[float(len(t)), 0.0] for t in json["input"]]})
+        return _resp(200, {"embedding": [float(len(json["prompt"])), 0.0]})
+
+
+class TestOllamaEmbedderBatching:
+    """quadseven/grug#1688: encode batches via /api/embed, chunked by batch_size."""
+
+    def _encode(self, fake, texts, **kwargs):
+        embedder = OllamaEmbedder("http://gateway:11434", dimension=2)
+        with patch("src.grugthink.embedders.ollama_embedder.requests.post", side_effect=fake.post):
+            return embedder.encode(texts, **kwargs)
+
+    def test_ten_texts_use_one_call_at_default_batch_size(self):
+        fake = _FakeOllama()
+        texts = ["x" * n for n in range(1, 11)]
+
+        result = self._encode(fake, texts)
+
+        assert len(fake.calls) == 1
+        url, body = fake.calls[0]
+        assert url == "http://gateway:11434/api/embed"
+        assert body["input"] == texts
+        assert body["keep_alive"] == -1
+        assert result.shape == (10, 2)
+
+    def test_order_preserved_across_chunks(self):
+        fake = _FakeOllama()
+        texts = ["x" * n for n in range(1, 8)]
+
+        result = self._encode(fake, texts, batch_size=3)
+
+        assert [c[0].rsplit("/", 1)[1] for c in fake.calls] == ["embed"] * 3
+        assert [len(c[1]["input"]) for c in fake.calls] == [3, 3, 1]
+        assert result[:, 0].tolist() == [float(n) for n in range(1, 8)]
+
+    def test_404_falls_back_to_per_text_in_order(self):
+        fake = _FakeOllama(batch_supported=False)
+        texts = ["x" * n for n in range(1, 6)]
+
+        result = self._encode(fake, texts, batch_size=2)
+
+        urls = [c[0].rsplit("/", 1)[1] for c in fake.calls]
+        # One probe of the batch endpoint, then one call per text.
+        assert urls == ["embed"] + ["embeddings"] * 5
+        assert result.shape == (5, 2)
+        assert result[:, 0].tolist() == [float(n) for n in range(1, 6)]
+
+    def test_wrong_vector_count_yields_zero_vectors_not_misalignment(self):
+        embedder = OllamaEmbedder("http://gateway:11434", dimension=2)
+        bad = _resp(200, {"embeddings": [[1.0, 1.0]]})
+        with patch("src.grugthink.embedders.ollama_embedder.requests.post", return_value=bad):
+            result = embedder.encode(["a", "b", "c"])
+        assert result.shape == (3, 2)
+        assert result.sum() == 0.0
