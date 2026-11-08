@@ -33,6 +33,7 @@ from .bot import (  # noqa: E402
     review_relay,
     task_relay,
 )
+from .bot.llm_clients import backend_ladder, last_served_backend  # noqa: E402
 from .bot.prompts import (  # noqa: E402
     get_personality_engine,
     is_rate_limited,
@@ -816,9 +817,11 @@ class GrugThinkBot(commands.Cog):
             extra={
                 "bot_id": bot_id,
                 "server_id": server_id,
-                "use_gemini": config.USE_GEMINI,
-                "has_gemini_key": bool(config.GEMINI_API_KEY),
-                "ollama_urls": config.OLLAMA_URLS if not config.USE_GEMINI else "N/A",
+                "backends": [
+                    f"{b.name}:{'configured' if b.configured else 'not configured'}" for b in backend_ladder()
+                ],
+                "last_served_backend": last_served_backend(bot_id),
+                "ollama_urls": config.OLLAMA_URLS,
             },
         )
         try:
@@ -829,12 +832,11 @@ class GrugThinkBot(commands.Cog):
                 extra={"bot_id": bot_id, "error": str(error), "error_type": type(error).__name__},
             )
         try:
-            if config.USE_GEMINI and not config.GEMINI_API_KEY:
-                message_text = "\u274c Gemini API key not configured. Please set GEMINI_API_KEY."
-            elif config.USE_GEMINI:
-                message_text = "\u274c Gemini API unavailable. Please check configuration or try again later."
-            elif not config.OLLAMA_URLS:
-                message_text = "\u274c No AI service configured. Please configure Gemini or Ollama."
+            # Which failure message fits depends on the whole ladder, not
+            # on any one backend: only when NO rung is configured is this
+            # a configuration problem (#1693).
+            if not any(b.configured for b in backend_ladder()):
+                message_text = "\u274c No AI service configured. Configure: Ollama, Poolside, OpenRouter, or Gemini."
             else:
                 message_text = f"\u2753 {self.personality_engine.get_error_message(server_id)}"
             await message.channel.send(message_text)
