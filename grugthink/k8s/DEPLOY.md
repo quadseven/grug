@@ -102,6 +102,28 @@ In the dashboard: add each Discord bot token (they're in SSM at
 (Grug, Big Rob, ...), and Start. The gateway serves the LLM; the PVC persists
 config + memory across restarts.
 
+## Dashboard access and `DISABLE_OAUTH`
+
+`deployment.yaml` sets `DISABLE_OAUTH=true`, so every caller of the API is
+treated as the admin. That is allowed in production only while the
+`grugthink` Service stays cluster-internal (ClusterIP, no Ingress or
+LoadBalancer) and the only outside path is the reverse proxy on the private
+network. Decision recorded on grug#1631.
+
+What this still protects without a login:
+
+- No config read returns a secret. `GET /api/config` and
+  `GET /api/admin/settings` pass through `api/redaction.py`, which masks
+  every bot token, API key, the OAuth client secret and the session secret
+  as `***REDACTED***`; a settings save that sends the mask back keeps the
+  stored value.
+- There is no unauthenticated debug or test route; the route list sits
+  behind the admin dependency.
+
+To require Discord login instead, set `DISABLE_OAUTH` to `false` and seed
+`DISCORD_CLIENT_ID` and `DISCORD_CLIENT_SECRET`. Do that before exposing
+the Service any wider than above.
+
 ## Notes
 
 - Chat fallback (Poolside/OpenRouter): bounded, single-shot, short-timeout -
