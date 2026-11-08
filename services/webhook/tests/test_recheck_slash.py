@@ -548,13 +548,31 @@ def test_recheck_and_webhook_both_check_an_operator_agent_pr(_tpm_only):
     assert recheck_out["result"] == "fail"
 
 
-def test_recheck_and_webhook_skip_an_agent_pr_from_a_non_operator(_tpm_only):
-    extra = {**_OPERATOR_FOOTER_NO_WHY, "author_association": "CONTRIBUTOR"}
+def test_recheck_and_webhook_skip_an_agent_pr_from_an_app_author(_tpm_only):
+    extra = {
+        **_OPERATOR_FOOTER_NO_WHY,
+        "user": {"login": "lane[bot]", "type": "Bot"},
+        "author_association": "NONE",
+    }
     _, webhook_eval, _, recheck_eval = _run_both_paths(
         _fake_github(pr_extra=extra), pr_extra=extra,
     )
     assert webhook_eval.conclusion == recheck_eval.conclusion == "neutral"
     assert webhook_eval.rule == tpm_persona.RULE_SKIP_NOT_OPERATOR
+
+
+def test_recheck_and_webhook_check_an_outside_human_with_a_marker(_tpm_only):
+    """grug#1629: a fork contributor pastes a session link; both paths run
+    the full Hunt Plan and the missing `## Why` fails."""
+    extra = {**_OPERATOR_FOOTER_NO_WHY, "author_association": "CONTRIBUTOR"}
+    _, webhook_eval, _, recheck_eval = _run_both_paths(
+        _fake_github(
+            issue_7="## Acceptance criteria\n- [x] done\n", pr_extra=extra,
+        ),
+        pr_extra=extra,
+    )
+    assert webhook_eval.conclusion == recheck_eval.conclusion == "failure"
+    assert webhook_eval.rule == recheck_eval.rule == tpm_persona.RULE_CHECKED
 
 
 def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
@@ -568,7 +586,8 @@ def test_run_chief_recheck_evaluates_then_publishes(monkeypatch):
     monkeypatch.setattr(fetchers, "build_merged_siblings_fetcher", lambda **kw: "S")
 
     def _eval(body, fetch_issue=None, fetch_issue_facts=None, author_trusted=False,
-              fetch_changed_files=None, advisory_checks=None, fetch_siblings=None):
+              fetch_changed_files=None, advisory_checks=None, fetch_siblings=None,
+              author_outsider=False):
         seen["eval"] = (body, fetch_issue, fetch_issue_facts, fetch_changed_files,
                         advisory_checks)
         seen["siblings"] = fetch_siblings

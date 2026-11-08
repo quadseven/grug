@@ -175,18 +175,46 @@ def is_trusted_operator(pr: Mapping[str, Any] | None) -> bool:
     return pr.get("author_association") in _OPERATOR_ASSOCIATIONS
 
 
-def chief_rule(pr_body: str, *, author_trusted: bool) -> str:
+def is_outside_human(pr: Mapping[str, Any] | None) -> bool:
+    """True when the PR's author is a human WITHOUT write-level standing.
+
+    A `User` whose `author_association` is known and is not owner, member
+    or collaborator (a fork contributor, a first-time contributor, none).
+    Such an author cannot skip the Hunt Plan with an agent marker or a
+    Loom footer: anyone can paste those into a body (grug#1629). App
+    authors (`Bot`) and an unreadable PR object are not outside humans, so
+    the fleet's App-authored PRs keep their skip.
+    """
+    if not isinstance(pr, Mapping):
+        return False
+    user = pr.get("user")
+    if not isinstance(user, Mapping) or user.get("type") != "User":
+        return False
+    association = pr.get("author_association")
+    if not isinstance(association, str) or not association:
+        return False
+    return association not in _OPERATOR_ASSOCIATIONS
+
+
+def chief_rule(
+    pr_body: str, *, author_trusted: bool, author_outsider: bool = False,
+) -> str:
     """Pure: which Chief rule applies to this PR body and author.
 
-    No agent marker -> checked. With a marker: the explicit opt-out skips
-    for anyone. A Loom footer skips too, except a footer naming lane
+    No agent marker -> checked. An outside human author (`is_outside_human`)
+    is always checked: a marker, the opt-out or a Loom footer is text any
+    fork contributor can paste, so none of them skips the check for that
+    author (grug#1629). Otherwise, with a marker: the explicit opt-out
+    skips. A Loom footer skips too, except a footer naming lane
     `operator-session` on a trusted operator's PR, which is checked
     (#1318); an untrusted author cannot use that lane name to get checked.
-    Otherwise a trusted operator's PR is checked and anyone else's is
+    Otherwise a trusted operator's PR is checked and an App author's is
     skipped (grug#1251).
     """
     body = pr_body or ""
     if not is_agent_authored(body):
+        return RULE_CHECKED
+    if author_outsider:
         return RULE_CHECKED
     if _OPT_OUT_RE.search(body):
         return RULE_SKIP_OPT_OUT
@@ -327,6 +355,7 @@ def evaluate_pull_request(
     fetch_changed_files: Callable[[], list[str]] | None = None,
     fetch_siblings: SiblingFetcher | None = None,
     author_trusted: bool = False,
+    author_outsider: bool = False,
     advisory_checks: frozenset[str] = _ADVISORY_CHECKS,
 ) -> TpmEvaluation:
     """Pure: run all 9 DoR rules over pr_body and return the rollup.
@@ -338,6 +367,8 @@ def evaluate_pull_request(
     the PR object at the impure call site; the default False keeps the
     pre-#1251 skip for a caller that cannot say. A trusted operator's
     footer naming lane `operator-session` is checked, not skipped (#1318).
+    `author_outsider` comes from `is_outside_human`: an outside human's
+    PR is checked whatever markers its body carries (grug#1629).
 
     No network IO, no AWS calls, no logging side-effects. Callers wrap
     the result in `publish_tpm_evaluation(...)` to POST the check-run.
@@ -358,7 +389,9 @@ def evaluate_pull_request(
     in-scope); org/repo config can pass a smaller set to promote `in-scope`
     to blocking alongside the existing strict mode.
     """
-    rule = chief_rule(pr_body, author_trusted=author_trusted)
+    rule = chief_rule(
+        pr_body, author_trusted=author_trusted, author_outsider=author_outsider,
+    )
     if rule not in (RULE_CHECKED, RULE_OPERATOR_CHECKED):
         # No check runs, no issue fetch: the skip is decided on the body
         # and the author flag alone, so it stays pure and identical on the

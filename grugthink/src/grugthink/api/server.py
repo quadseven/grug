@@ -259,19 +259,8 @@ def create_app(bot_manager: BotManager, config_manager: ConfigManager) -> FastAP
             return JSONResponse(status_code=401, content={"error": "Not authenticated"})
         return user
 
-    @app.get("/simple-admin")
-    async def simple_admin():
-        """Simple admin endpoint without dependencies."""
-        return {"message": "Simple admin endpoint working"}
-
-    # Debug route list endpoint
-    @app.get("/api/debug/routes")
-    async def list_all_routes():
-        routes = []
-        for route in app.routes:
-            if hasattr(route, "path") and hasattr(route, "methods"):
-                routes.append({"path": route.path, "methods": list(route.methods) if route.methods else []})
-        return {"routes": routes}
+    # No unauthenticated debug or test routes: the route list is served by
+    # the admin-gated `/api/debug/routes` in routers/system.py (grug#1631).
 
     # Setup static file serving for web dashboard with caching
     try:

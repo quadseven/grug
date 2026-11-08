@@ -9,6 +9,7 @@ from ...logging_config import get_logger
 from ..dependencies import admin_required, get_config_manager
 from ..middleware import cache_response, clear_cache
 from ..models import AddDiscordTokenRequest, ConfigUpdateRequest, SetApiKeyRequest
+from ..redaction import redact_secrets
 
 router = APIRouter(prefix="/api", tags=["config"])
 log = get_logger(__name__)
@@ -16,8 +17,8 @@ log = get_logger(__name__)
 
 @router.get("/config", dependencies=[Depends(admin_required)])
 async def get_config(config_manager: ConfigManager = Depends(get_config_manager)):
-    """Get current configuration."""
-    return config_manager.get_config()
+    """Get current configuration, with every secret value redacted (grug#1631)."""
+    return redact_secrets(config_manager.get_config())
 
 
 @router.put("/config", response_model=Dict[str, str], dependencies=[Depends(admin_required)])
