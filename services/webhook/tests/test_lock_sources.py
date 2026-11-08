@@ -150,6 +150,27 @@ def test_an_unchanged_virtual_root_is_not_flagged():
     assert _scan("uv.lock", head=_UV_BASE, base=_UV_BASE) == ()
 
 
+def test_a_new_uv_lock_with_its_own_virtual_root_is_clean():
+    """A new uv project's lock adds its own root entry; that is not a source."""
+    assert _scan("uv.lock", head=_UV_BASE, base=None) == ()
+
+
+def test_adding_a_dependency_rewrites_the_root_and_stays_clean():
+    root = _ROOT_UV.replace('source = { virtual = "." }',
+                            'source = { editable = "." }\ndependencies = [{ name = "idna" }]')
+    assert _scan("uv.lock", head=root + _IDNA_36, base=_UV_BASE) == ()
+
+
+@pytest.mark.parametrize("source", [
+    'source = { virtual = "../other" }',
+    'source = { editable = "./libs/x" }',
+])
+def test_a_root_kind_naming_another_directory_is_still_flagged(source):
+    root = _ROOT_UV.replace('source = { virtual = "." }', source)
+    found = _scan("uv.lock", head=root + _IDNA_36, base=_UV_BASE)
+    assert len(found) == 1
+
+
 @pytest.mark.parametrize("source", [
     'source = { git = "https://github.com/a/b?rev=1#abc" }',
     'source = { path = "../vendored" }',
