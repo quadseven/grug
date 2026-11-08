@@ -88,6 +88,28 @@ PATTERNS: list[tuple[str, str, str]] = [
         "a Kubernetes worker-node name",
     ),
     (
+        "aws-key-id-fragment",
+        # An AWS key id is a 4-char prefix + 16 base32 chars. The prefix plus
+        # 4 or more catches a TRUNCATED id (#1637's shape: a key's head quoted
+        # in a note), not only the full 20. The prefix is what makes 4 chars
+        # safe; a bare uppercase run is not, so re.I is switched off here and
+        # the trailing run must hold a digit - without that, uppercase prose
+        # like ASIAPACIFIC is a hit, and a guard that fires on prose gets
+        # bypassed within a day. The webhook's own secret-scan fixtures hold
+        # canonical fake key ids; this runs on a staged DIFF, so they are only
+        # rescanned by a commit that edits those lines, which then needs a
+        # `leak-guard-allow` marker.
+        #
+        # DOCUMENTED NON-RULE: a key fragment with the prefix stripped (a bare
+        # trailing suffix) and a bare numeric account id have NO distinguishing
+        # shape - any rule for them fires on ordinary hex, ids and version
+        # numbers. Those go in the layer-2 deny-list when a specific value must
+        # be blocked. AGENTS.md forbids writing either by hand regardless.
+        r"\b(?-i:(?:AKIA|ASIA|AROA|AIDA|ANPA|ANVA|APKA|ABIA|ACCA)"
+        r"(?=[0-9A-Z]*[0-9])[0-9A-Z]{4,})",
+        "an AWS access key id, whole or truncated",
+    ),
+    (
         "private-issue-ref",
         # A `name` + `#` + number cross-repo ref. A bare issue number with no
         # prefix is this repo's own and always fine.
