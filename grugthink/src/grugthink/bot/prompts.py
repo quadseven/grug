@@ -20,7 +20,7 @@ import requests
 
 from .. import config_legacy as config
 from ..bot import cross_bot
-from ..bot.llm_clients import query_gemini_api, query_ollama_api, query_openrouter_api, query_poolside_api
+from ..bot.llm_clients import backend_ladder, record_last_served_backend
 from ..bot.lore import extract_lore_from_response
 from ..bot.utils import LRUCache, clean_statement, get_cache_key
 from ..bot_settings import getenv as _bot_getenv
@@ -372,50 +372,51 @@ def _query_fallback_chain(
     personality_name: str,
     current_bot_id: Optional[str],
 ) -> Optional[str]:
-    """Try the owned model, then each bounded fallback exactly once."""
-    result = query_ollama_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
-    if _is_usable_result(result):
-        return result
-    if result:
-        log.error("Ollama/Cave returned an error result", extra={"bot_id": current_bot_id, "error_message": result})
-    log.warning(
-        "Ollama/Cave primary produced no usable reply - engaging bounded fallback chain",
-        extra={"bot_id": current_bot_id, "cache_key": cache_key},
-    )
+    """Try each configured backend in ladder order, exactly once.
 
-    result = query_poolside_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
-    if _is_usable_result(result):
-        log.info("Fallback engaged: Poolside answered after Ollama/Cave failure", extra={"bot_id": current_bot_id})
-        return result
-
-    result = query_openrouter_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
-    if _is_usable_result(result):
-        log.info(
-            "Fallback engaged: OpenRouter answered after Ollama/Cave + Poolside failure",
-            extra={"bot_id": current_bot_id},
-        )
-        return result
-
-    if config.USE_GEMINI:
-        result = query_gemini_api(prompt_text, cache_key, server_db, personality_name, current_bot_id)
-        if _is_usable_result(result):
+    The ladder - order plus which rungs are configured - is
+    llm_clients.backend_ladder(), the same definition /diagnose prints,
+    so what an operator sees there is what happens here (#1693). The
+    rung that serves the reply is recorded for /diagnose.
+    """
+    tried: list[str] = []
+    for backend in backend_ladder():
+        if not backend.configured:
             log.info(
-                "Fallback engaged: Gemini answered after Ollama/Cave + Poolside + OpenRouter failure",
-                extra={"bot_id": current_bot_id},
+                "Skipping unconfigured backend",
+                extra={"bot_id": current_bot_id, "backend": backend.name, "cache_key": cache_key},
             )
+            continue
+        tried.append(backend.name)
+        result = backend.query(prompt_text, cache_key, server_db, personality_name, current_bot_id)
+        if _is_usable_result(result):
+            record_last_served_backend(current_bot_id, backend.name)
+            if len(tried) > 1:
+                log.info(
+                    "Fallback engaged: " + backend.name + " answered after " + " + ".join(tried[:-1]) + " failure",
+                    extra={"bot_id": current_bot_id, "backend": backend.name},
+                )
             return result
         if result:
             log.error(
-                "Gemini fallback returned an error result",
-                extra={"bot_id": current_bot_id, "error_message": result},
+                "Backend returned an error result",
+                extra={"bot_id": current_bot_id, "backend": backend.name, "error_message": result},
             )
+        log.warning(
+            "Backend produced no usable reply - trying the next rung of the ladder",
+            extra={"bot_id": current_bot_id, "backend": backend.name, "cache_key": cache_key},
+        )
 
-    log.error(
-        "All backends failed (Ollama/Cave + Poolside + OpenRouter"
-        + (" + Gemini" if config.USE_GEMINI else "")
-        + ")",
-        extra={"bot_id": current_bot_id, "cache_key": cache_key},
-    )
+    if tried:
+        log.error(
+            "All backends failed (" + " + ".join(tried) + ")",
+            extra={"bot_id": current_bot_id, "cache_key": cache_key},
+        )
+    else:
+        log.error(
+            "No LLM backend is configured - every rung of the ladder is unconfigured",
+            extra={"bot_id": current_bot_id, "cache_key": cache_key},
+        )
     return None
 
 
