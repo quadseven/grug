@@ -107,3 +107,20 @@ def test_redact_secrets_does_not_modify_its_input():
     assert src["api_keys"]["gemini"]["primary"] == "k"
     assert out["api_keys"]["gemini"]["primary"] == REDACTED
     assert out["bots"]["b"]["discord_token_id"] == "1"
+
+
+def test_redact_secrets_leaves_ordinary_values_unchanged():
+    """Negative case: nothing that is not a secret is altered."""
+    src = {
+        "environment": {
+            "LOG_LEVEL": "INFO",
+            "GRUGBOT_VARIANT": "prod | a",
+            "DISCORD_CLIENT_ID": "12345",
+            "TRUSTED_USER_IDS": "1,2",
+            "SESSION_SECRET": "",
+        },
+        "bots": {"b": {"name": "Grug | the | cave", "default_gemini_key": True, "discord_token_id": "1"}},
+        "api_keys": {"discord": {"tokens": [{"id": "1", "name": "Dev bot", "active": True, "added_at": 1.5}]}},
+        "numbers": [1, 2.5, None, "plain text with token-like words: a b | c"],
+    }
+    assert redact_secrets(src) == src
