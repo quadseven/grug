@@ -41,6 +41,7 @@ from personas.code_reviewer.precedent import (
 from personas import board
 from personas.code_reviewer.suggestion import checked_suggestion
 from personas.code_reviewer.docstrings import find_docstring_targets
+from personas.code_reviewer.test_generation import find_test_targets
 from personas.code_reviewer.line_refs import repair_where_refs
 from markdown_safety import neutralize_mentions
 from personas.code_reviewer.repo_config import (
@@ -1231,6 +1232,40 @@ def _docstring_offer_lines(
     return lines
 
 
+def _test_offer(
+    diff_text: str, file_contents: dict[str, str] | None,
+) -> dict[str, tuple[Any, ...]]:
+    """`_review_stack_body` keywords for the test-generation offer. Every
+    build of the stack goes through here: each one replaces the whole
+    comment, so a build without them would erase the offer and its skip
+    reasons."""
+    targets, skips = find_test_targets(diff_text, file_contents or {})
+    return {
+        "test_targets": tuple(f"{t.path}:{t.line}" for t in targets),
+        "test_skips": tuple(skips),
+    }
+
+
+def _test_offer_lines(
+    targets: tuple[str, ...], skips: tuple[tuple[str, str], ...],
+) -> list[str]:
+    """The stack's test-generation offer and every candidate skipped with
+    its reason."""
+    lines: list[str] = []
+    if targets:
+        lines.append(
+            f"**Finishing touch:** {len(targets)} changed public "
+            "function(s) are not referenced by any test in this PR. "
+            "Run `/grug tests` to generate unit tests for them."
+        )
+    if skips:
+        skipped = "; ".join(
+            f"`{_md_code_span(path)}`: {reason}" for path, reason in skips
+        )
+        lines.append(f"**Test-generation candidates skipped:** {skipped}.")
+    return lines
+
+
 def _review_stack_body(
     evaluation: CodeReviewEvaluation,
     *,
@@ -1244,6 +1279,8 @@ def _review_stack_body(
     file_contents: dict[str, str] | None = None,
     docstring_targets: tuple[str, ...] = (),
     docstring_skips: tuple[tuple[str, str], ...] = (),
+    test_targets: tuple[str, ...] = (),
+    test_skips: tuple[tuple[str, str], ...] = (),
     linked_issues: tuple[int, ...] = (),
     muted: dict[str, ClassPrecision] | None = None,
     held_note: str = "",
@@ -1309,6 +1346,7 @@ def _review_stack_body(
             "can be applied together with `/grug fix`."
         )
     parts.extend(_docstring_offer_lines(docstring_targets, docstring_skips))
+    parts.extend(_test_offer_lines(test_targets, test_skips))
     # Phase, Status and Check-run used to live in the fold. All three were cut:
     # Status restated the summary line verbatim, Phase ("Tier-1 coder arm") is
     # internal vocabulary that means nothing to the author, and the check-run
@@ -1588,6 +1626,7 @@ def project(finished: FinishedPass) -> Markings:
             base_sha=finished.base_sha,
             file_contents=finished.file_contents,
             **_docstring_offer(finished.diff_text, finished.file_contents),
+            **_test_offer(finished.diff_text, finished.file_contents),
             linked_issues=finished.linked_issues,
             muted=finished.muted,
             held_note=finished.held_note,

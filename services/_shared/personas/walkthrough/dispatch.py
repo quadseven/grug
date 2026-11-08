@@ -19,7 +19,7 @@ from urllib.parse import quote
 import httpx
 from activity_log import record_check_verdict
 from github_app_auth import with_install_token_retry
-from github_checks_client import CheckRunResult, post_check_run
+from github_checks_client import CheckRunResult, patch_check_run, post_check_run
 
 from personas import hunt_recorder
 from personas.tribe import CHECK_TELLER
@@ -109,6 +109,104 @@ def _fetch_pr_files(
     return out, truncated
 
 
+def _external_id(owner: str, repo: str, pull_number: int, head_sha: str) -> str:
+    return f"grug-teller:{owner}/{repo}#{pull_number}:{head_sha}"
+
+
+_PLACEHOLDER_TITLE = "Teller walking the diff"
+_PLACEHOLDER_SUMMARY = (
+    "Grug read the files. Teller now walks the diff and writes the summary. "
+    "This check updates in place when Teller is done."
+)
+
+
+def _start_check_run(
+    installation_id: int,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    head_sha: str,
+) -> int | None:
+    """Post the `Grug - Teller` check run as `in_progress` before the slow
+    summary call (grug#695), so the PR shows Teller working instead of
+    nothing. Returns the new run's id, which the final publish PATCHes in
+    place, or None when the post failed or returned no id: the final
+    publish then creates the run as before. Never raises; the placeholder is
+    a courtesy, the walkthrough is the work."""
+    try:
+        created = with_install_token_retry(
+            installation_id,
+            lambda token: post_check_run(
+                token, owner, repo,
+                CheckRunResult(
+                    name=CHECK_TELLER, head_sha=head_sha, status="in_progress",
+                    conclusion=None, title=_PLACEHOLDER_TITLE,
+                    summary=_PLACEHOLDER_SUMMARY,
+                ),
+                external_id=_external_id(owner, repo, pull_number, head_sha),
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
+        log.warning(
+            "walkthrough_placeholder_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+        return None
+    run_id = created.get("id") if isinstance(created, dict) else None
+    if isinstance(run_id, int) and not isinstance(run_id, bool):
+        return run_id
+    log.warning(
+        "walkthrough_placeholder_no_id",
+        extra={"installation_id": installation_id, "pr": f"{owner}/{repo}#{pull_number}"},
+    )
+    return None
+
+
+def _settle_placeholder(
+    installation_id: int,
+    owner: str,
+    repo: str,
+    pull_number: int,
+    head_sha: str,
+    run_id: int | None,
+    *,
+    conclusion: str,
+    title: str,
+    summary: str,
+) -> None:
+    """Resolve an in-progress placeholder to a terminal state on a path that
+    publishes no walkthrough, so the check never sits on "walking" (grug#695
+    criterion 5's rule, applied to Teller). Never raises: the check-run
+    reconciler's stuck sweep is the backstop when this PATCH fails too."""
+    if run_id is None:
+        return
+    try:
+        with_install_token_retry(
+            installation_id,
+            lambda token: patch_check_run(
+                token, owner, repo, run_id,
+                CheckRunResult(
+                    name=CHECK_TELLER, head_sha=head_sha, status="completed",
+                    conclusion=conclusion,  # type: ignore[arg-type]
+                    title=title, summary=summary,
+                ),
+            ),
+        )
+    except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
+        log.warning(
+            "walkthrough_placeholder_settle_failed",
+            extra={
+                "installation_id": installation_id,
+                "pr": f"{owner}/{repo}#{pull_number}",
+                "kind": type(e).__name__,
+            },
+        )
+
+
 def _publish_check_run(
     token: str,
     owner: str,
@@ -117,14 +215,19 @@ def _publish_check_run(
     head_sha: str,
     title: str,
     body: str,
+    run_id: int | None = None,
 ) -> None:
+    result = CheckRunResult(
+        name=CHECK_TELLER, head_sha=head_sha, status="completed",
+        conclusion="success", title=title, summary=body,
+    )
+    if run_id is not None:
+        # Update the placeholder in place: one Teller run per head, not two.
+        patch_check_run(token, owner, repo, run_id, result)
+        return
     post_check_run(
-        token, owner, repo,
-        CheckRunResult(
-            name=CHECK_TELLER, head_sha=head_sha, status="completed",
-            conclusion="success", title=title, summary=body,
-        ),
-        external_id=f"grug-teller:{owner}/{repo}#{pull_number}:{head_sha}",
+        token, owner, repo, result,
+        external_id=_external_id(owner, repo, pull_number, head_sha),
     )
 
 
@@ -306,6 +409,8 @@ def dispatch_walkthrough_review(
         )
 
     lines_changed = sum(f.additions + f.deletions for f in files)
+    # grug#695: show Teller working before the slow summary call.
+    run_id = _start_check_run(installation_id, owner, repo_name, pull_number, head_sha)
     degraded = False
     llm_summary = None
     try:
@@ -399,6 +504,12 @@ def dispatch_walkthrough_review(
             "walkthrough_skipped_closed",
             extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
         )
+        _settle_placeholder(
+            installation_id, owner, repo_name, pull_number, head_sha, run_id,
+            conclusion="skipped",
+            title="Teller skipped: pull request closed",
+            summary="The pull request closed before Teller finished, so no walkthrough.",
+        )
         return {"persona": "walkthrough", "result": "skipped_closed"}
 
     board_body = walkthrough_body(
@@ -427,6 +538,7 @@ def dispatch_walkthrough_review(
             installation_id,
             lambda token: _publish_check_run(
                 token, owner, repo_name, pull_number, head_sha, title, body,
+                run_id=run_id,
             ),
         )
     except (httpx.HTTPStatusError, httpx.RequestError, RuntimeError) as e:
@@ -437,6 +549,12 @@ def dispatch_walkthrough_review(
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "kind": type(e).__name__,
             },
+        )
+        _settle_placeholder(
+            installation_id, owner, repo_name, pull_number, head_sha, run_id,
+            conclusion="neutral",
+            title="Teller could not publish",
+            summary="Teller could not publish its walkthrough. A retry is queued.",
         )
         _self_recover(installation_id, owner, repo_name, pull_number)
         return {"persona": "walkthrough", "result": "publish_failed"}

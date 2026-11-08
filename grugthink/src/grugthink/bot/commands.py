@@ -23,6 +23,7 @@ import discord
 from discord import app_commands
 
 from .. import config_legacy as config
+from ..bot.llm_clients import backend_ladder, last_served_backend
 from ..bot.prompts import is_rate_limited, query_model
 from ..logging_config import get_logger
 
@@ -317,7 +318,10 @@ async def what_know(interaction, bot, page: int = 1, search: str = None) -> None
         total_desc = f"I know {total_facts} facts"
 
     title = f"{base_title} ({server_name}) - Page {page}/{total_pages}"
-    description = f"{total_desc}\n🌐 **[View & Edit All Memories](http://localhost:8080)**"
+    description = total_desc
+    dashboard_url = config.PUBLIC_BASE_URL
+    if dashboard_url:
+        description += f"\n🌐 **[View & Edit All Memories]({dashboard_url})**"
 
     # Build fact list for this page
     MAX_FACT_LENGTH = 120  # Max length per individual fact
@@ -581,7 +585,9 @@ async def list_memory_managers(interaction, bot: "GrugThinkBot") -> None:
 
     embed = discord.Embed(title="📝 Memory Managers", description="\n".join(managers), color=discord.Color.blue())
     embed.add_field(name="Total Managers", value=str(len(managers)), inline=True)
-    embed.add_field(name="Web Interface", value="[Manage Memories](http://localhost:8080)", inline=True)
+    dashboard_url = config.PUBLIC_BASE_URL
+    if dashboard_url:
+        embed.add_field(name="Web Interface", value=f"[Manage Memories]({dashboard_url})", inline=True)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -965,14 +971,17 @@ async def diagnose(interaction, bot: "GrugThinkBot") -> None:
     # Check various configurations
     diagnostics = []
 
-    # Check Gemini API
-    if config.USE_GEMINI:
-        diagnostics.append(f"✅ Using Gemini API (Model: {config.GEMINI_MODEL})")
-        has_key = bool(config.GEMINI_API_KEY)
-        diagnostics.append(f"{'✅' if has_key else '❌'} Gemini API Key: {'Present' if has_key else 'Missing'}")
-    else:
-        diagnostics.append("✅ Using Ollama API")
-        diagnostics.append(f"Ollama URLs: {', '.join(config.OLLAMA_URLS)}")
+    # LLM backends, in the fallback order replies actually use. The list
+    # comes from llm_clients.backend_ladder() - the same definition the
+    # fallback chain walks - so this can never again claim the bot "uses"
+    # one backend while another rung is configured or serving (#1693).
+    diagnostics.append("LLM backends (fallback order):")
+    for backend in backend_ladder():
+        state = "configured" if backend.configured else "not configured"
+        diagnostics.append(f"{'✅' if backend.configured else '❌'} {backend.name}: {state}")
+    diagnostics.append(f"Ollama URLs: {', '.join(config.OLLAMA_URLS)}")
+    last_served = last_served_backend(bot.get_bot_id())
+    diagnostics.append(f"Last reply served by: {last_served if last_served else 'none yet'}")
 
     # Check bot configuration
     personality = bot.personality_engine.get_personality(server_id)
@@ -1004,13 +1013,6 @@ async def diagnose(interaction, bot: "GrugThinkBot") -> None:
                 diagnostics.append("📁 Database file missing")
         except Exception as db_detail_error:
             diagnostics.append(f"📁 Cannot check database file: {str(db_detail_error)}")
-
-    # Test API call
-    try:
-        # Gemini is intentionally removed in v2 - see requirements.txt
-        diagnostics.append("ℹ️ Gemini API Test: Skipped (disabled in v2)")
-    except Exception as e:
-        diagnostics.append(f"❌ API Test Failed: {str(e)}")
 
     diagnostic_text = "\n".join(diagnostics)
     await interaction.response.send_message(f"🔍 **Bot Diagnostics**\n```\n{diagnostic_text}\n```", ephemeral=True)

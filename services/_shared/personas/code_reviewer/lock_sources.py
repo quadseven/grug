@@ -125,12 +125,23 @@ def _urls(*urls: object) -> Iterator[str]:
 # probe for whether an entry carries an integrity hash.
 
 
+# How uv.lock names the project the lock belongs to: `virtual` for a
+# non-package project, `editable` for an installable one. Only the value "."
+# (the lock's own directory) is the root; any other path is a dependency.
+_UV_ROOT_KINDS = frozenset({"virtual", "editable"})
+
+
 def _uv_sources(pkg: Mapping[str, Any]) -> Iterator[str]:
     source = pkg.get("source")
     if isinstance(source, Mapping):
         for kind, value in source.items():
             if kind == "registry":
                 yield from _urls(value)
+            elif kind in _UV_ROOT_KINDS and value == ".":
+                # The lock's own project (the directory holding uv.lock), not
+                # a dependency: every new uv project and every dependency
+                # added to one rewrites this entry.
+                continue
             else:
                 yield f"non-registry source `{kind} = {value}`"
     for art in [pkg.get("sdist"), *(pkg.get("wheels") or [])]:

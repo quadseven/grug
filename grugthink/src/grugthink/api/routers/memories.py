@@ -104,6 +104,8 @@ async def get_bot_memories(
                 for srv_id, srv_db in await run_in_threadpool(_snapshot_server_dbs):
                     srv_facts = await run_in_threadpool(srv_db.get_all_facts)
                     total_memories += len(srv_facts)
+                    # One lookup per server, not per fact (grug#1686).
+                    srv_name = await _get_server_name(bot, srv_id)
 
                     # Add server context to each fact
                     for i, fact in enumerate(srv_facts):
@@ -112,7 +114,7 @@ async def get_bot_memories(
                                 "id": len(all_memories),
                                 "content": fact,
                                 "server_id": srv_id,
-                                "server_name": await _get_server_name(bot, srv_id),
+                                "server_name": srv_name,
                             }
                         )
 

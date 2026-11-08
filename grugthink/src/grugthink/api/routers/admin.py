@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from ...config.manager import ConfigManager
 from ...logging_config import get_logger
 from ..dependencies import admin_required, get_config_manager
+from ..redaction import REDACTED, redact_secrets
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 log = get_logger(__name__)
@@ -27,7 +28,7 @@ async def get_admin_settings(config_manager: ConfigManager = Depends(get_config_
         "LOG_LEVEL": env_vars.get("LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")),
         "GRUGBOT_VARIANT": env_vars.get("GRUGBOT_VARIANT", "dev"),
         "MULTIBOT_API_PORT": env_vars.get("MULTIBOT_API_PORT", os.getenv("API_PORT", "8080")),
-        "GRUGBOT_DATA_DIR": env_vars.get("GRUGBOT_DATA_DIR", "/data"),
+        "GRUGBOT_DATA_DIR": env_vars.get("GRUGBOT_DATA_DIR", os.getenv("GRUGBOT_DATA_DIR", "./data")),
         "LOAD_EMBEDDER": env_vars.get("LOAD_EMBEDDER", "True"),
         "GEMINI_MODEL": env_vars.get("GEMINI_MODEL", "gemma-3-27b-it"),
         "OLLAMA_BASE_URL": env_vars.get("OLLAMA_BASE_URL", ""),
@@ -42,7 +43,9 @@ async def get_admin_settings(config_manager: ConfigManager = Depends(get_config_
     }
     # Include any extra unknown keys (forward-compatibility)
     merged = {**env_vars, **defaults}
-    return merged
+    # The raw environment section carries the OAuth client secret and any
+    # other secret an operator stored there; never send a value (grug#1631).
+    return redact_secrets(merged)
 
 
 @router.put("/settings", dependencies=[Depends(admin_required)])
@@ -51,7 +54,9 @@ async def update_admin_settings(settings: Dict[str, str], config_manager: Config
     try:
         # Update environment settings in config
         for key, value in settings.items():
-            if value is not None:
+            # A form that round-trips the redacted GET must not overwrite the
+            # stored secret with the mask (grug#1631).
+            if value is not None and value != REDACTED:
                 config_manager.set_env_var(key, str(value))
 
         log.info("Admin settings updated", extra={"settings_count": len(settings)})

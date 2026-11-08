@@ -77,15 +77,20 @@ def make_server_manager(base_db_path, model_name="all-MiniLM-L6-v2", load_embedd
     return GrugServerManager(base_db_path, model_name=model_name, load_embedder=load_embedder)
 
 
-# String interning cache for performance (common server IDs, personalities, etc.)
+# String interning cache for performance (common server IDs, personalities, etc.).
+# Bounded (grug#1686): past the cap a new string is returned as-is, so the cache
+# cannot grow for the life of the process.
+_STRING_CACHE_MAX = 1024
 _string_cache = {}
 
 
 def _intern_string(s):
     """Intern frequently used strings to reduce memory and improve comparison speed."""
-    if s in _string_cache:
-        return _string_cache[s]
-    _string_cache[s] = s
+    cached = _string_cache.get(s)
+    if cached is not None:
+        return cached
+    if len(_string_cache) < _STRING_CACHE_MAX:
+        _string_cache[s] = s
     return s
 
 

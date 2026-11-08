@@ -17,7 +17,7 @@ This module handles communication with different LLM backends:
 
 import json
 import time
-from typing import Any
+from typing import Any, Callable, NamedTuple
 
 import requests
 
@@ -228,6 +228,58 @@ def _ollama_reply_text(body: Any, openai_compatible: bool) -> str:
     if openai_compatible:
         return _extract_chat_message(body)
     return (body.get("response") or "").strip()
+
+
+# --- The backend ladder: ONE definition for the chain and /diagnose -------
+#
+# The fallback chain (bot/prompts.py's _query_fallback_chain) and the
+# /diagnose command both read this list, so the order an operator sees in
+# /diagnose is the order replies actually fall back in, and a backend can
+# never be served-but-unlisted or listed-but-never-tried (#1693 - /diagnose
+# used to branch on config.USE_GEMINI and report only Gemini or Ollama,
+# hiding the Poolside/OpenRouter tiers entirely). This is also the only
+# place outside config_legacy that consults config.USE_GEMINI: the Gemini
+# rung's configured flag is exactly that derived value.
+
+
+class Backend(NamedTuple):
+    """One rung of the fallback ladder: display name, whether it is
+    configured right now, and the client call that serves it."""
+
+    name: str
+    configured: bool
+    query: Callable[..., str | None]
+
+
+def backend_ladder() -> list[Backend]:
+    """Every reply backend in fallback order - Ollama, Poolside,
+    OpenRouter, Gemini - with its configured state read live from config
+    (per-bot in multi-bot mode, via config_legacy's lazy attributes)."""
+    return [
+        Backend("Ollama", bool(config.OLLAMA_URLS), query_ollama_api),
+        Backend("Poolside", bool(config.POOLSIDE_API_KEY), query_poolside_api),
+        Backend("OpenRouter", bool(config.OPENROUTER_API_KEY), query_openrouter_api),
+        Backend("Gemini", bool(config.USE_GEMINI), query_gemini_api),
+    ]
+
+
+# Which backend served the most recent reply, per bot id. In-memory only -
+# same lifetime as prompts.py's response_cache. Recorded by the fallback
+# chain at the moment a backend's reply is accepted, read by /diagnose so
+# an operator sees which rung actually answered last, not just which
+# rungs could.
+_last_served_backend: dict[str, str] = {}
+
+
+def record_last_served_backend(bot_id: str | None, backend_name: str) -> None:
+    """Note that `backend_name` served a reply for `bot_id`."""
+    _last_served_backend[bot_id or ""] = backend_name
+
+
+def last_served_backend(bot_id: str | None) -> str | None:
+    """The backend that served `bot_id`'s most recent reply, or None if
+    no reply has been served since startup."""
+    return _last_served_backend.get(bot_id or "")
 
 
 def query_ollama_api(

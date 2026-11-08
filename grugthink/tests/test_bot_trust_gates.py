@@ -20,6 +20,7 @@ import pytest
 # test_llm_fallback.py for the same guard).
 os.environ.setdefault("DISCORD_TOKEN", "fake_token")
 
+from src.grugthink.bot import llm_clients as llm_clients_module  # noqa: E402
 from src.grugthink.bot import prompts as prompts_module  # noqa: E402
 
 TRUSTED_ID = 111
@@ -67,7 +68,11 @@ def _run_query(statement, author_id):
     extract = MagicMock()
     with (
         patch.object(prompts_module.config, "TRUSTED_USER_IDS", [TRUSTED_ID]),
-        patch.object(prompts_module, "query_ollama_api", side_effect=fake_backend),
+        # The chain resolves its backends through llm_clients.backend_ladder()
+        # (#1693), so the stub lands on llm_clients - and OLLAMA_URLS must be
+        # non-empty or the ladder reads Ollama as unconfigured and skips it.
+        patch.object(llm_clients_module, "query_ollama_api", side_effect=fake_backend),
+        patch.object(llm_clients_module.config, "OLLAMA_URLS", ["http://localhost:11434"]),
         patch.object(prompts_module, "extract_lore_from_response", extract),
         patch.object(prompts_module, "store_bot_response_for_cross_reference"),
     ):

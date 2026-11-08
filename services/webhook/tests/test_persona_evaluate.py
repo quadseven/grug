@@ -959,3 +959,63 @@ def test_failed_operator_title_says_it_was_checked():
     title = _publish_title(persona.evaluate_pull_request(body, author_trusted=True))
     assert title.startswith("Hunt Plan hold - ")
     assert title.endswith(" - operator PR, agent footer checked")
+
+
+# --- grug#1629: an outside human cannot skip the Hunt Plan with a marker ---
+
+_OUTSIDER_PRS = [
+    {"user": {"login": "stranger", "type": "User"}, "author_association": a}
+    for a in ("CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE")
+]
+
+
+@pytest.mark.parametrize("pr", _OUTSIDER_PRS)
+def test_outside_human_is_an_outsider(pr):
+    assert persona.is_outside_human(pr) is True
+
+
+@pytest.mark.parametrize("pr", [
+    {"user": {"login": "op", "type": "User"}, "author_association": "OWNER"},
+    {"user": {"login": "op", "type": "User"}, "author_association": "MEMBER"},
+    {"user": {"login": "op", "type": "User"}, "author_association": "COLLABORATOR"},
+    {"user": {"login": "lane[bot]", "type": "Bot"}, "author_association": "NONE"},
+    {"user": {"login": "op", "type": "User"}},
+    {"user": {"login": "op", "type": "User"}, "author_association": ""},
+    {},
+    None,
+])
+def test_operator_app_or_unknown_author_is_not_an_outsider(pr):
+    assert persona.is_outside_human(pr) is False
+
+
+@pytest.mark.parametrize("body", [
+    _AGENT_BODY_NO_PLAN,
+    "x\nhttps://claude.ai/code/session_01abc\n",
+    "x\n<!-- grug:agent-authored -->\n",
+    "x\n<!-- grug:agent-authored -->\nhttps://claude.ai/code/session_01abc\n",
+    _AGENT_BODY_NO_PLAN + _LOOM_FOOTER,
+    _AGENT_BODY_NO_PLAN + "\nLoom ticket #7, lane operator-session, model opus\n",
+])
+@pytest.mark.parametrize("pr", _OUTSIDER_PRS)
+def test_outside_human_with_any_marker_gets_the_full_check(body, pr):
+    """The bypass #1629 closes: an outside contributor pasted a fake session
+    link (or the opt-out, or a Loom footer) and Chief concluded neutral."""
+    assert persona.chief_rule(
+        body, author_trusted=persona.is_trusted_operator(pr),
+        author_outsider=persona.is_outside_human(pr),
+    ) == persona.RULE_CHECKED
+    evaluation = persona.evaluate_pull_request(
+        body, author_trusted=False, author_outsider=True,
+    )
+    assert evaluation.rule == persona.RULE_CHECKED
+    assert evaluation.conclusion != "neutral"
+    assert evaluation.passed is False
+
+
+def test_app_author_with_marker_still_skips():
+    """App-authored fleet PRs keep their neutral skip (grug#1251)."""
+    pr = {"user": {"login": "lane[bot]", "type": "Bot"}, "author_association": "NONE"}
+    assert persona.chief_rule(
+        _AGENT_BODY_NO_PLAN, author_trusted=persona.is_trusted_operator(pr),
+        author_outsider=persona.is_outside_human(pr),
+    ) == persona.RULE_SKIP_NOT_OPERATOR
