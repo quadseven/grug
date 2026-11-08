@@ -44,6 +44,14 @@ def _empty_comments_response() -> httpx.Response:
     return r
 
 
+def _check_run_response(run_id: int) -> httpx.Response:
+    r = MagicMock(spec=httpx.Response)
+    r.status_code = 201
+    r.raise_for_status = MagicMock()
+    r.json = MagicMock(return_value={"id": run_id})
+    return r
+
+
 def _marker_comment_response(comment_id: int) -> httpx.Response:
     r = MagicMock(spec=httpx.Response)
     r.status_code = 200
@@ -134,9 +142,10 @@ def test_dispatch_records_the_walkthrough_in_the_canonical_review_session(monkey
     assert kw["model"] == "deterministic-fallback"
 
 
-def test_dispatch_posts_nothing_when_the_pr_closed_before_publish(monkeypatch):
+def test_dispatch_publishes_no_walkthrough_when_the_pr_closed_before_publish(monkeypatch):
     """A lane pull request got its walkthrough 6.5 minutes after the merge
-    (2026-10-18), one more email with nothing left to review."""
+    (2026-10-18), one more email with nothing left to review. The in-progress
+    placeholder (grug#695) is settled as skipped, never left walking."""
     monkeypatch.setattr(
         wt_dispatch, "with_install_token_retry",
         lambda inst_id, fn: fn("tok"),
@@ -155,15 +164,19 @@ def test_dispatch_posts_nothing_when_the_pr_closed_before_publish(monkeypatch):
         return _diff_response()
 
     with patch("httpx.get", side_effect=fake_get), \
-         patch("httpx.post") as mock_post, \
-         patch("httpx.patch") as mock_patch, \
-         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("httpx.post", return_value=_check_run_response(4242)) as mock_post, \
+         patch("httpx.patch", return_value=_check_run_response(4242)) as mock_patch, \
+         patch("personas.walkthrough.dispatch.record_check_verdict") as mock_rcv, \
          patch("llm_client.summarize_pr", return_value=None):
         out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
 
     assert out == {"persona": "walkthrough", "result": "skipped_closed"}
-    mock_post.assert_not_called()
-    mock_patch.assert_not_called()
+    [post_call] = mock_post.call_args_list
+    assert post_call.kwargs["json"]["status"] == "in_progress"
+    [patch_call] = mock_patch.call_args_list
+    assert patch_call.args[0].endswith("/check-runs/4242")
+    assert patch_call.kwargs["json"]["conclusion"] == "skipped"
+    mock_rcv.assert_not_called()
 
 
 def test_dispatch_still_posts_when_the_state_read_fails(monkeypatch):
@@ -595,8 +608,10 @@ def test_self_recover_failure_is_swallowed_never_escalates(monkeypatch, caplog):
 
 
 def _run_capturing(monkeypatch, *, llm_summary):
-    """One dispatch with every write captured: -> (comment POSTs, check-run
-    JSON bodies, review-session recordings, dispatch result)."""
+    """One dispatch with every write captured: -> (comment POSTs, final
+    check-run JSON bodies, review-session recordings, dispatch result). The
+    Teller placeholder (grug#695) is created in_progress and PATCHed in place,
+    so the final check-run body is the PATCH, not a second POST."""
     monkeypatch.setattr(
         wt_dispatch, "with_install_token_retry",
         lambda inst_id, fn: fn("tok"),
@@ -613,14 +628,24 @@ def _run_capturing(monkeypatch, *, llm_summary):
         return _diff_response()
 
     def fake_post(url, **kwargs):
-        (checks if url.endswith("/check-runs") else comments).append(kwargs["json"])
+        if url.endswith("/check-runs"):
+            if kwargs["json"]["status"] == "completed":
+                checks.append(kwargs["json"])
+            return _check_run_response(4242)
+        comments.append(kwargs["json"])
         r = MagicMock(spec=httpx.Response)
         r.raise_for_status = MagicMock()
         r.json = MagicMock(return_value={})
         return r
 
+    def fake_patch(url, **kwargs):
+        assert url.endswith("/check-runs/4242"), url
+        checks.append(kwargs["json"])
+        return _check_run_response(4242)
+
     with patch("httpx.get", side_effect=fake_get), \
          patch("httpx.post", side_effect=fake_post), \
+         patch("httpx.patch", side_effect=fake_patch), \
          patch("personas.walkthrough.dispatch.record_check_verdict"), \
          patch.object(
              wt_dispatch.hunt_recorder, "record_walkthrough",
@@ -696,3 +721,114 @@ def test_related_hunts_go_to_the_check_run_and_not_twice_on_the_board(monkeypatc
     assert "#101 Fix the thing" in checks[0]["output"]["summary"]
     assert "Possibly related hunts" not in recorded[0]["text"]
     assert recorded[0]["related"] == ("#101 Fix the thing (touched x.py)",)
+
+
+# grug#695 criterion 1: Teller shows an in-progress placeholder within seconds,
+# then the same check run is updated in place to the final walkthrough.
+
+
+def _single_file_get(url, **kwargs):
+    if url.endswith("/files"):
+        return _files_response([{"filename": "x.py", "additions": 3, "deletions": 1}])
+    if "/comments" in url:
+        return _empty_comments_response()
+    return _diff_response()
+
+
+def test_teller_placeholder_posts_before_the_summary_call_and_is_patched_in_place(monkeypatch):
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+    events: list[tuple] = []
+
+    def fake_post(url, **kwargs):
+        events.append(("post", url, kwargs["json"]))
+        return _check_run_response(4242)
+
+    def fake_patch(url, **kwargs):
+        events.append(("patch", url, kwargs["json"]))
+        return _check_run_response(4242)
+
+    def fake_summarize(*a, **kw):
+        events.append(("summarize",))
+        return _llm_summary()
+
+    with patch("httpx.get", side_effect=_single_file_get), \
+         patch("httpx.post", side_effect=fake_post), \
+         patch("httpx.patch", side_effect=fake_patch), \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", side_effect=fake_summarize):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "pass"}
+    assert [e[0] for e in events] == ["post", "summarize", "patch"]
+    _, post_url, placeholder = events[0]
+    assert post_url.endswith("/check-runs")
+    assert placeholder["name"] == "Grug - Teller"
+    assert placeholder["status"] == "in_progress"
+    assert "conclusion" not in placeholder
+    assert placeholder["external_id"] == "grug-teller:o/r#7:" + "a" * 40
+    _, patch_url, final = events[2]
+    assert patch_url.endswith("/repos/o/r/check-runs/4242")
+    assert final["status"] == "completed" and final["conclusion"] == "success"
+    assert "Adds a null guard to x.py." in final["output"]["summary"]
+
+
+def test_teller_placeholder_failure_still_publishes_by_creating_the_run(monkeypatch, caplog):
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+    posts: list[dict] = []
+
+    def fake_post(url, **kwargs):
+        posts.append(kwargs["json"])
+        if kwargs["json"]["status"] == "in_progress":
+            raise httpx.ConnectError("blip")
+        return _check_run_response(5151)
+
+    with patch("httpx.get", side_effect=_single_file_get), \
+         patch("httpx.post", side_effect=fake_post), \
+         patch("httpx.patch") as mock_patch, \
+         patch("personas.walkthrough.dispatch.record_check_verdict"), \
+         patch("llm_client.summarize_pr", return_value=_llm_summary()), \
+         caplog.at_level("WARNING", logger="grug.persona.walkthrough"):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "pass"}
+    assert [p["status"] for p in posts] == ["in_progress", "completed"]
+    assert posts[1]["conclusion"] == "success"
+    mock_patch.assert_not_called()
+    assert "walkthrough_placeholder_failed" in caplog.text
+
+
+def test_teller_publish_failure_settles_the_placeholder_instead_of_leaving_it_walking(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        wt_dispatch, "with_install_token_retry",
+        lambda inst_id, fn: fn("tok"),
+    )
+    patches: list[dict] = []
+
+    def fake_patch(url, **kwargs):
+        patches.append(kwargs["json"])
+        if kwargs["json"]["conclusion"] == "success":
+            raise httpx.ConnectError("dns down")
+        return _check_run_response(4242)
+
+    with patch("httpx.get", side_effect=_single_file_get), \
+         patch("httpx.post", return_value=_check_run_response(4242)) as mock_post, \
+         patch("httpx.patch", side_effect=fake_patch), \
+         patch("rerun.enqueue_rerun") as mock_rerun, \
+         patch("personas.walkthrough.dispatch.record_check_verdict") as mock_rcv, \
+         patch("llm_client.summarize_pr", return_value=_llm_summary()):
+        out = wt_dispatch.dispatch_walkthrough_review(_payload(), blocking=False)
+
+    assert out == {"persona": "walkthrough", "result": "publish_failed"}
+    assert mock_post.call_count == 1  # the placeholder only; no second run
+    assert [p["conclusion"] for p in patches] == ["success", "neutral"]
+    assert "retry is queued" in patches[1]["output"]["summary"]
+    mock_rerun.assert_called_once()
+    mock_rcv.assert_not_called()
