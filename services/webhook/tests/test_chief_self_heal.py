@@ -75,7 +75,7 @@ def test_missing_chief_is_republished_via_recheck_path(world, caplog):
     assert world.rechecks == [{
         "installation_id": 99, "owner": "o", "repo": "r",
         "head_sha": "sha001xxxx", "pr_number": 1, "pr_body": "body 1",
-        "author_trusted": False,
+        "author_trusted": False, "author_outsider": False,
     }]
     rec = next(r for r in caplog.records if r.getMessage() == "chief_self_heal_published")
     assert rec.repo == "o/r" and rec.pr == 1
@@ -91,6 +91,17 @@ def test_operator_pr_is_rechecked_as_trusted(world):
     world.prs = [pr]
     assert heal.self_heal_installs([99]) == (1, 0)
     assert world.rechecks[0]["author_trusted"] is True
+
+
+def test_outside_human_pr_is_rechecked_as_outsider(world):
+    """grug#1629: the self-heal path passes the outsider flag, so a fork
+    contributor's marker does not skip Chief there either."""
+    pr = _pr(1)
+    pr["user"] = {"login": "stranger", "type": "User"}
+    pr["author_association"] = "CONTRIBUTOR"
+    world.prs = [pr]
+    assert heal.self_heal_installs([99]) == (1, 0)
+    assert world.rechecks[0]["author_outsider"] is True
 
 
 def test_pr_with_chief_is_skipped(world):
