@@ -40,7 +40,8 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
             build_issue_fetcher, build_merged_siblings_fetcher,
         )
         from personas.tpm.persona import (  # type: ignore
-            _ADVISORY_CHECKS, evaluate_pull_request, is_trusted_operator,
+            _ADVISORY_CHECKS, evaluate_pull_request, is_outside_human,
+            is_trusted_operator,
             publish_tpm_evaluation,
         )
         # The fetcher is the only impure boundary of the evaluation:
@@ -96,6 +97,9 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
                 owner=ctx.owner, repo=ctx.repo_name, pr_number=ctx.pr_number,
             ),
             author_trusted=is_trusted_operator(
+                (ctx.payload or {}).get("pull_request"),
+            ),
+            author_outsider=is_outside_human(
                 (ctx.payload or {}).get("pull_request"),
             ),
             advisory_checks=advisory_checks,

@@ -826,7 +826,9 @@ def _recheck_chief_on_pr(
     """Re-run Chief on one PR through `run_chief_recheck`. Returns whether it
     published; never raises, so one PR cannot stop the rest."""
     from personas.publish_check import PUBLISH_FAILED  # type: ignore
-    from personas.tpm.persona import is_trusted_operator  # type: ignore
+    from personas.tpm.persona import (  # type: ignore
+        is_outside_human, is_trusted_operator,
+    )
 
     pr_number = int(pr["number"])
     head_sha = str(pr["head"]["sha"])
@@ -836,6 +838,7 @@ def _recheck_chief_on_pr(
             head_sha=head_sha, pr_number=pr_number,
             pr_body=pr.get("body") or "",
             author_trusted=is_trusted_operator(pr),
+            author_outsider=is_outside_human(pr),
         )
         if result_map.get("result") == PUBLISH_FAILED:
             raise RuntimeError("chief publish failed")
@@ -1510,11 +1513,14 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     # /grug recheck silently do nothing. Mirror the pull_request
     # handler's containment: log with coords, return a skip.
     try:
-        from personas.tpm.persona import is_trusted_operator  # type: ignore
+        from personas.tpm.persona import (  # type: ignore
+            is_outside_human, is_trusted_operator,
+        )
         evaluation, result_map = run_chief_recheck(
             installation_id=int(installation_id), owner=owner,
             repo=repo_name, head_sha=head_sha, pr_number=int(pr_number),
             pr_body=pr_body, author_trusted=is_trusted_operator(pr),
+            author_outsider=is_outside_human(pr),
         )
         # Subscript INSIDE the guard: a seam regression returning a map
         # without "result" must land here (skip + coords), not 500 the
@@ -1564,12 +1570,15 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
 def run_chief_recheck(
     *, installation_id: int, owner: str, repo: str, head_sha: str,
     pr_number: int, pr_body: str, author_trusted: bool = False,
+    author_outsider: bool = False,
 ) -> tuple[Any, dict[str, str]]:
     """Evaluate Chief's DoR checks for a PR and publish the check-run.
 
     `author_trusted` is `is_trusted_operator(pr)` on the caller's PR object
     (grug#1251): it decides whether an agent footer on an operator's PR
-    still gets the plan checks. Both callers hold the PR object already.
+    still gets the plan checks. `author_outsider` is `is_outside_human(pr)`:
+    an outside human's marker never skips the check (grug#1629). Both
+    callers hold the PR object already.
 
     The ONE implementation behind `/grug recheck` and the poller's Chief
     self-heal pass (a second copy would drift). Returns
@@ -1616,6 +1625,7 @@ def run_chief_recheck(
             pr_number=pr_number,
         ),
         author_trusted=author_trusted,
+        author_outsider=author_outsider,
         advisory_checks=advisory_checks,
     )
     # publish_tpm_evaluation never raises on a failed publish since #550:
