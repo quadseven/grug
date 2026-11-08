@@ -75,6 +75,28 @@ def test_catches_cross_repo_issue_reference():
 
 # --- the false positives that would get the guard disabled ----------------
 
+def test_catches_a_whole_aws_access_key_id():
+    # Concatenated on purpose: an invented-but-whole key id written as one
+    # literal is the shape push protection blocks, and this is a public repo.
+    key = "AKIA" + "EXAMPLE1KEY2ID3Z"
+    assert "aws-key-id-fragment" in _names(f"rotated away from {key} today")
+
+
+def test_catches_a_truncated_aws_access_key_id():
+    assert "aws-key-id-fragment" in _names("the old key ended " + "ASIA" + "7Q4F")
+
+
+def test_ignores_uppercase_prose_that_starts_like_a_key_prefix():
+    # The non-rule's whole point: no digit in the run, so not a key fragment.
+    assert _names("the ASIAPACIFIC region and the AROADMAP doc") == set()
+
+
+def test_ignores_a_bare_key_suffix_and_a_bare_account_id(): # leak-guard-allow: documents the non-rule
+    # Documented NON-RULE, asserted so a later "improvement" that starts
+    # flagging these has to delete a test that says why they are not flagged.
+    assert _names("the suffix was 7Q4FZK2M and the account is 123456789012") == set()
+
+
 def test_ignores_this_repos_own_issue_refs():
     assert _names("fixed in #101 and #102") == set()
 
