@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from ...config.manager import ConfigManager
 from ...logging_config import get_logger
 from ..dependencies import admin_required, get_config_manager
+from ..redaction import REDACTED, redact_secrets
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 log = get_logger(__name__)
@@ -42,7 +43,9 @@ async def get_admin_settings(config_manager: ConfigManager = Depends(get_config_
     }
     # Include any extra unknown keys (forward-compatibility)
     merged = {**env_vars, **defaults}
-    return merged
+    # The raw environment section carries the OAuth client secret and any
+    # other secret an operator stored there; never send a value (grug#1631).
+    return redact_secrets(merged)
 
 
 @router.put("/settings", dependencies=[Depends(admin_required)])
@@ -51,7 +54,9 @@ async def update_admin_settings(settings: Dict[str, str], config_manager: Config
     try:
         # Update environment settings in config
         for key, value in settings.items():
-            if value is not None:
+            # A form that round-trips the redacted GET must not overwrite the
+            # stored secret with the mask (grug#1631).
+            if value is not None and value != REDACTED:
                 config_manager.set_env_var(key, str(value))
 
         log.info("Admin settings updated", extra={"settings_count": len(settings)})
