@@ -7,6 +7,7 @@ The engine transforms the bot from character-bound to personality-agnostic,
 allowing organic personality development unique to each Discord server.
 """
 
+import contextlib
 import json
 import os
 import random
@@ -106,20 +107,20 @@ class PersonalityEngine:
             db_dir = os.path.dirname(self.db_path)
             if db_dir:  # Only create directory if db_path has a directory component
                 os.makedirs(db_dir, exist_ok=True)
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            cursor = conn.cursor()
+            # closing() releases the connection even when a statement raises (grug#1686).
+            with contextlib.closing(sqlite3.connect(self.db_path, check_same_thread=False)) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS personalities (
-                    server_id TEXT PRIMARY KEY,
-                    personality_data TEXT NOT NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS personalities (
+                        server_id TEXT PRIMARY KEY,
+                        personality_data TEXT NOT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
 
-            conn.commit()
-            conn.close()
+                conn.commit()
             log.info("Personality database initialized", extra={"db_path": self.db_path})
 
         except Exception as e:
@@ -615,22 +616,21 @@ based on your experiences in this specific Discord server.""",
     def _save_personality(self, personality: PersonalityState):
         """Save personality to database."""
         try:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            cursor = conn.cursor()
+            with contextlib.closing(sqlite3.connect(self.db_path, check_same_thread=False)) as conn:
+                cursor = conn.cursor()
 
-            personality_json = json.dumps(asdict(personality))
+                personality_json = json.dumps(asdict(personality))
 
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO personalities
-                (server_id, personality_data, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-            """,
-                (personality.server_id, personality_json),
-            )
+                cursor.execute(
+                    """
+                    INSERT OR REPLACE INTO personalities
+                    (server_id, personality_data, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                """,
+                    (personality.server_id, personality_json),
+                )
 
-            conn.commit()
-            conn.close()
+                conn.commit()
 
         except Exception as e:
             log.error("Error saving personality", extra={"server_id": personality.server_id, "error": str(e)})
@@ -638,22 +638,21 @@ based on your experiences in this specific Discord server.""",
     def _load_all_personalities(self):
         """Load all personalities from database."""
         try:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            cursor = conn.cursor()
+            with contextlib.closing(sqlite3.connect(self.db_path, check_same_thread=False)) as conn:
+                cursor = conn.cursor()
 
-            cursor.execute("SELECT server_id, personality_data FROM personalities")
-            rows = cursor.fetchall()
+                cursor.execute("SELECT server_id, personality_data FROM personalities")
+                rows = cursor.fetchall()
 
-            for server_id, personality_json in rows:
-                try:
-                    personality_dict = json.loads(personality_json)
-                    personality = PersonalityState(**personality_dict)
-                    self.personalities[server_id] = personality
+                for server_id, personality_json in rows:
+                    try:
+                        personality_dict = json.loads(personality_json)
+                        personality = PersonalityState(**personality_dict)
+                        self.personalities[server_id] = personality
 
-                except Exception as e:
-                    log.error("Error loading personality", extra={"server_id": server_id, "error": str(e)})
+                    except Exception as e:
+                        log.error("Error loading personality", extra={"server_id": server_id, "error": str(e)})
 
-            conn.close()
             log.info("Loaded personalities", extra={"count": len(self.personalities)})
 
         except Exception as e:

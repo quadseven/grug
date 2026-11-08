@@ -32,6 +32,19 @@ log = get_logger(__name__)
 # Module-level caches and state
 response_cache = LRUCache(max_size=100, ttl_seconds=300)
 user_cooldowns = {}
+# Seconds a user (or user and bot) waits between replies.
+COOLDOWN_SECONDS = 5
+# Past this many entries, expired cooldowns are dropped (grug#1686), so the
+# dict holds only users seen inside the window instead of everyone ever seen.
+_COOLDOWN_PRUNE_AT = 1024
+
+
+def _prune_cooldowns(now: float) -> None:
+    if len(user_cooldowns) < _COOLDOWN_PRUNE_AT:
+        return
+    for key in [k for k, t in user_cooldowns.items() if now - t >= COOLDOWN_SECONDS]:
+        del user_cooldowns[key]
+
 
 _personality_engine_instance = None
 
@@ -197,17 +210,18 @@ def is_rate_limited(user_id: int, bot_id: Optional[str] = None) -> bool:
         ...     pass
     """
     now = time.time()
+    _prune_cooldowns(now)
 
     if bot_id:
         # Check per-bot rate limiting (allows multiple bots to respond)
         key = f"{user_id}:{bot_id}"
-        if key in user_cooldowns and now - user_cooldowns[key] < 5:
+        if key in user_cooldowns and now - user_cooldowns[key] < COOLDOWN_SECONDS:
             return True
         user_cooldowns[key] = now
         return False
     else:
         # Global rate limiting (legacy behavior)
-        if user_id in user_cooldowns and now - user_cooldowns[user_id] < 5:
+        if user_id in user_cooldowns and now - user_cooldowns[user_id] < COOLDOWN_SECONDS:
             return True
         user_cooldowns[user_id] = now
         return False
