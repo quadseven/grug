@@ -81,7 +81,9 @@ def _reset_personality_engine() -> None:
     _personality_engine_instance = None
 
 
-def build_personality_context(statement: str, server_db, server_id: str, personality_engine) -> str:
+def build_personality_context(
+    statement: str, server_db, server_id: str, personality_engine, external_info: str = ""
+) -> str:
     """Build personality context with semantically relevant lore for this server.
 
     Retrieves the personality for the given server and enriches it with relevant
@@ -93,6 +95,7 @@ def build_personality_context(statement: str, server_db, server_id: str, persona
         server_db: The server database instance containing facts and lore.
         server_id: The unique identifier for the Discord server.
         personality_engine: The personality engine instance managing personalities.
+        external_info: Optional external text placed in the base context, before the lore.
 
     Returns:
         str: The complete personality context including base context and relevant lore,
@@ -110,7 +113,7 @@ def build_personality_context(statement: str, server_db, server_id: str, persona
 
     # Use the engine so canonical identity is restored for persisted personalities
     # created from an older template.
-    base_context = personality_engine.get_context_prompt(server_id)
+    base_context = personality_engine.get_context_prompt(server_id, external_info)
 
     # Find lore relevant to the current statement from this server's knowledge
     relevant_lore = server_db.search_facts(statement, k=5)
@@ -159,11 +162,7 @@ def build_personality_prompt(
         ...     external_info="Weather data confirms clear skies"
         ... )
     """
-    personality_context = build_personality_context(statement, server_db, server_id, personality_engine)
-
-    # Add external info using personality engine
-    if external_info:
-        personality_context = personality_engine.get_context_prompt(server_id, external_info)
+    personality_context = build_personality_context(statement, server_db, server_id, personality_engine, external_info)
 
     return f"""{personality_context}
 
