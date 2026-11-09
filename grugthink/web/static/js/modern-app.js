@@ -1874,16 +1874,25 @@ class GrugThinkApp {
         set('analytics-running-bots', this.formatNumber(bots.filter(b => b.status === 'running').length));
         const table = document.getElementById('analytics-bot-table');
         if (!table || bots.length === 0) return;
-        table.innerHTML = bots.map(b => {
+        table.replaceChildren(...bots.map(b => {
             const last = b.last_bot_message ? new Date(b.last_bot_message * 1000).toLocaleString() : 'never';
-            return `<tr class="border-b border-border">
-                <td class="py-3 px-4 text-primary">${this.escapeHtml(b.name)}</td>
-                <td class="py-3 px-4">${this.formatNumber(b.messages)}</td>
-                <td class="py-3 px-4">${this.formatNumber(b.channels)}</td>
-                <td class="py-3 px-4">${this.escapeHtml(last)}</td>
-                <td class="py-3 px-4">${this.escapeHtml(b.status)}</td>
-            </tr>`;
-        }).join('');
+            const row = document.createElement('tr');
+            row.className = 'border-b border-border';
+            const cells = [
+                [b.name, 'py-3 px-4 text-primary'],
+                [this.formatNumber(b.messages), 'py-3 px-4'],
+                [this.formatNumber(b.channels), 'py-3 px-4'],
+                [last, 'py-3 px-4'],
+                [b.status, 'py-3 px-4'],
+            ];
+            for (const [text, cls] of cells) {
+                const td = document.createElement('td');
+                td.className = cls;
+                td.textContent = String(text ?? '');
+                row.appendChild(td);
+            }
+            return row;
+        }));
     }
     
     // ==========================================================================

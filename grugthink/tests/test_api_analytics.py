@@ -92,3 +92,13 @@ def test_dashboard_has_no_coming_soon_stubs():
         "exportTokens",
     ):
         assert handler not in js and handler not in html
+
+
+def test_analytics_table_is_built_without_an_html_sink():
+    from pathlib import Path
+
+    js = (Path(__file__).resolve().parents[1] / "web/static/js/modern-app.js").read_text()
+    start = js.index("updateAnalytics(data) {")
+    body = js[start : js.index("SYSTEM LOGS PAGE", start)]
+    assert "innerHTML" not in body
+    assert "textContent" in body
