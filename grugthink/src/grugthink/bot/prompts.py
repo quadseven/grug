@@ -18,7 +18,7 @@ from typing import Optional
 
 import requests
 
-from .. import config_legacy as config
+from .. import runtime_config as config
 from ..bot import cross_bot
 from ..bot.llm_clients import backend_ladder, record_last_served_backend
 from ..bot.lore import extract_lore_from_response

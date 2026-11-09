@@ -20,14 +20,14 @@ import traceback
 import discord
 from discord.ext import commands
 
-# The same config_legacy module the bot/ package imports, so both check one
-# trusted-id list (grug#1667).
-from . import config_legacy as config  # noqa: E402
-
 # Lazy import of commands module to avoid loading Discord command decorators at module import time
 # cross_bot can be imported normally as it doesn't have decorator issues
 # from .bot import commands as bot_commands  # Imported lazily in __init__
 from . import llm  # noqa: E402  (v2 spark-gateway LLM engine)
+
+# The same runtime_config module the bot/ package imports, so both check one
+# trusted-id list (grug#1667).
+from . import runtime_config as config  # noqa: E402
 from .bot import (  # noqa: E402
     cross_bot,
     review_relay,

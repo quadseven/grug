@@ -38,7 +38,7 @@ def main():
         asyncio.run(multi_main())
     else:
         # Single bot mode (default)
-        from grugthink.bot import main as bot_main
+        from grugthink.discord_bot import main as bot_main
 
         bot_main()
 
