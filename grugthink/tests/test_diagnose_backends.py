@@ -16,7 +16,7 @@ Coverage:
 
 import os
 
-# config_legacy.py raises at IMPORT time if DISCORD_TOKEN is unset - same
+# runtime_config.py raises at IMPORT time if DISCORD_TOKEN is unset - same
 # guard test_llm_fallback.py / test_bot_commands.py use.
 os.environ.setdefault("DISCORD_TOKEN", "fake_token")
 

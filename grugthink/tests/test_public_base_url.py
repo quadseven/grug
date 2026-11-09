@@ -10,7 +10,7 @@ import pytest
 
 os.environ.setdefault("DISCORD_TOKEN", "fake_token")
 
-from src.grugthink import config_legacy  # noqa: E402
+from src.grugthink import runtime_config  # noqa: E402
 from src.grugthink.bot import commands as bot_commands  # noqa: E402
 
 ADMIN_ID = 777
@@ -46,9 +46,9 @@ def _sent_embed(mock):
 
 def test_config_reads_public_base_url_at_access_time(monkeypatch):
     monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
-    assert config_legacy.PUBLIC_BASE_URL is None
+    assert runtime_config.PUBLIC_BASE_URL is None
     monkeypatch.setenv("PUBLIC_BASE_URL", " https://grug.example.com/ ")
-    assert config_legacy.PUBLIC_BASE_URL == "https://grug.example.com"
+    assert runtime_config.PUBLIC_BASE_URL == "https://grug.example.com"
 
 
 @pytest.mark.asyncio

@@ -14,7 +14,7 @@ import pytest
 from discord import User
 from discord.ext import commands
 
-# config_legacy.py raises at import time without DISCORD_TOKEN (same guard as
+# runtime_config.py raises at import time without DISCORD_TOKEN (same guard as
 # test_bot_trust_gates.py and test_llm_fallback.py).
 os.environ.setdefault("DISCORD_TOKEN", "fake_token")
 
@@ -24,7 +24,7 @@ TRUSTED_ID = 12345
 
 
 def _load_bot_module():
-    path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "grugthink", "bot.py"))
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "grugthink", "discord_bot.py"))
     spec = importlib.util.spec_from_file_location("src.grugthink.bot_commands_test_module", path)
     module = importlib.util.module_from_spec(spec)
     module.__package__ = "src.grugthink"

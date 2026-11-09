@@ -13,11 +13,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# config_legacy.py raises at import time without DISCORD_TOKEN (same guard as
+# runtime_config.py raises at import time without DISCORD_TOKEN (same guard as
 # test_bot_trust_gates.py).
 os.environ.setdefault("DISCORD_TOKEN", "fake_token")
 
-from src.grugthink import bot_settings, config_legacy, llm  # noqa: E402
+from src.grugthink import bot_settings, llm, runtime_config  # noqa: E402
 from src.grugthink.bot_manager import lifecycle  # noqa: E402
 
 _REAL_SLEEP = asyncio.sleep
@@ -51,8 +51,8 @@ def _config(bot_id, values, tmp_path):
 
 def _read_settings():
     return {
-        "trusted": config_legacy.TRUSTED_USER_IDS,
-        "ollama": config_legacy.OLLAMA_URLS,
+        "trusted": runtime_config.TRUSTED_USER_IDS,
+        "ollama": runtime_config.OLLAMA_URLS,
         "gateway": llm.base_url(),
         "personality": bot_settings.getenv("FORCE_PERSONALITY"),
     }
@@ -130,12 +130,12 @@ async def test_two_bots_keep_their_own_settings(tmp_path, clean_env):
         for where in ("task", "task_after_other_started", "thread"):
             assert seen[bot_id][where] == _expected(values), (bot_id, where)
     # Outside any bot, the process environment is the only source.
-    assert config_legacy.TRUSTED_USER_IDS == []
+    assert runtime_config.TRUSTED_USER_IDS == []
     assert bot_settings.current() is None
 
 
 def _load_bot_module():
-    path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "grugthink", "bot.py"))
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "grugthink", "discord_bot.py"))
     spec = importlib.util.spec_from_file_location("src.grugthink.bot_settings_isolation_module", path)
     module = importlib.util.module_from_spec(spec)
     module.__package__ = "src.grugthink"
