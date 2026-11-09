@@ -349,10 +349,6 @@ class GrugThinkApp {
                             <i data-lucide="file-text" class="w-3 h-3"></i>
                             Logs
                         </button>
-                        <button class="btn btn-ghost flex-1 text-xs" onclick="app.manageBotSettings('${bot.bot_id}')">
-                            <i data-lucide="settings" class="w-3 h-3"></i>
-                            Config
-                        </button>
                     </div>
                 </div>
             </div>
@@ -833,11 +829,6 @@ class GrugThinkApp {
         }
     }
     
-    manageBotSettings(botId) {
-        console.log('Manage settings for bot:', botId);
-        this.showToast('Coming Soon', 'Bot settings will be available in Phase 2');
-    }
-    
     // ==========================================================================
     // BOT INSTANCES PAGE
     // ==========================================================================
@@ -984,10 +975,6 @@ class GrugThinkApp {
                             <i data-lucide="file-text" class="w-4 h-4"></i>
                             Logs
                         </button>
-                        <button class="btn btn-ghost text-sm" onclick="app.configureBotInstance('${bot.bot_id}')">
-                            <i data-lucide="settings" class="w-4 h-4"></i>
-                            Config
-                        </button>
                     </div>
                 </div>
             </div>
@@ -1055,11 +1042,6 @@ class GrugThinkApp {
         } catch (error) {
             this.showToast('Error', `Failed to ${action} bot: ${error.message}`, 'danger');
         }
-    }
-    
-    configureBotInstance(botId) {
-        console.log('Configure bot instance:', botId);
-        this.showToast('Coming Soon', 'Bot configuration panel will be available soon', 'info');
     }
     
     createNewBot() {
@@ -1163,10 +1145,6 @@ class GrugThinkApp {
                             <i data-lucide="plus-circle" class="w-4 h-4"></i>
                             Create Bot
                         </button>
-                        <button class="btn btn-ghost text-sm" onclick="app.editTemplate('${template.id}')">
-                            <i data-lucide="edit" class="w-4 h-4"></i>
-                            Edit
-                        </button>
                     </div>
                 </div>
             </div>
@@ -1185,11 +1163,7 @@ class GrugThinkApp {
                             <i data-lucide="user-circle" class="w-8 h-8 text-muted"></i>
                         </div>
                         <h3 class="font-medium text-primary mb-2">No templates found</h3>
-                        <p class="text-muted text-sm mb-4">Create your first bot template to get started</p>
-                        <button class="btn btn-primary" onclick="app.createCustomTemplate()">
-                            <i data-lucide="plus"></i>
-                            Create Template
-                        </button>
+                        <p class="text-muted text-sm mb-4">Add template files to the server to get started</p>
                     </div>
                 </div>
             </div>
@@ -1235,16 +1209,6 @@ class GrugThinkApp {
         } catch (error) {
             this.showError('Creation Failed', `Failed to create bot: ${error.message}`);
         }
-    }
-    
-    editTemplate(templateId) {
-        console.log('Edit template:', templateId);
-        this.showInfo('Coming Soon', 'Template editor will be available in the next update');
-    }
-    
-    createCustomTemplate() {
-        console.log('Create custom template');
-        this.showInfo('Coming Soon', 'Custom template creator will be available in the next update');
     }
     
     // ==========================================================================
@@ -1784,9 +1748,6 @@ class GrugThinkApp {
                     <span class="badge ${token.status === 'active' ? 'badge-success' : 'badge-danger'}">
                         ${token.status}
                     </span>
-                    <button class="btn btn-ghost btn-sm" onclick="app.editToken('${token.id}')">
-                        <i data-lucide="edit" class="w-4 h-4"></i>
-                    </button>
                     <button class="btn btn-ghost btn-sm text-danger" onclick="app.deleteToken('${token.id}')">
                         <i data-lucide="trash-2" class="w-4 h-4"></i>
                     </button>
@@ -1874,16 +1835,15 @@ class GrugThinkApp {
         document.getElementById('new-token-personality').value = 'grug';
     }
     
-    editToken(tokenId) {
-        this.showInfo('Coming Soon', 'Token editing will be available in the next update');
-    }
-    
-    deleteToken(tokenId) {
-        this.showInfo('Coming Soon', 'Token deletion will be available in the next update');
-    }
-    
-    exportTokens() {
-        this.showInfo('Coming Soon', 'Token export will be available in the next update');
+    async deleteToken(tokenId) {
+        if (!confirm('Delete this Discord token? Bots using it will stop working.')) return;
+        try {
+            await this.fetchApi(`/api/discord-tokens/${encodeURIComponent(tokenId)}`, { method: 'DELETE' });
+            this.showSuccess('Token Deleted', 'The Discord token was removed');
+            this.loadTokens();
+        } catch (error) {
+            this.showError('Delete Failed', `Failed to delete token: ${error.message}`);
+        }
     }
     
     // ==========================================================================
@@ -1902,18 +1862,37 @@ class GrugThinkApp {
     }
     
     updateAnalytics(data) {
-        if (!data) {
-            document.getElementById('analytics-total-messages').textContent = '0';
-            document.getElementById('analytics-active-hours').textContent = '0';
-            document.getElementById('analytics-response-rate').textContent = '0%';
-            document.getElementById('analytics-peak-users').textContent = '0';
-            return;
-        }
-        
-        document.getElementById('analytics-total-messages').textContent = this.formatNumber(data.total_messages || 0);
-        document.getElementById('analytics-active-hours').textContent = this.formatNumber(data.active_hours || 0);
-        document.getElementById('analytics-response-rate').textContent = (data.response_rate || 0) + '%';
-        document.getElementById('analytics-peak-users').textContent = this.formatNumber(data.peak_users || 0);
+        const set = (id, value) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = value;
+        };
+        const d = data || { total_messages: 0, response_rate: 0, active_channels: 0, bots: [] };
+        const bots = d.bots || [];
+        set('analytics-total-messages', this.formatNumber(d.total_messages || 0));
+        set('analytics-response-rate', (d.response_rate || 0) + '%');
+        set('analytics-active-channels', this.formatNumber(d.active_channels || 0));
+        set('analytics-running-bots', this.formatNumber(bots.filter(b => b.status === 'running').length));
+        const table = document.getElementById('analytics-bot-table');
+        if (!table || bots.length === 0) return;
+        table.replaceChildren(...bots.map(b => {
+            const last = b.last_bot_message ? new Date(b.last_bot_message * 1000).toLocaleString() : 'never';
+            const row = document.createElement('tr');
+            row.className = 'border-b border-border';
+            const cells = [
+                [b.name, 'py-3 px-4 text-primary'],
+                [this.formatNumber(b.messages), 'py-3 px-4'],
+                [this.formatNumber(b.channels), 'py-3 px-4'],
+                [last, 'py-3 px-4'],
+                [b.status, 'py-3 px-4'],
+            ];
+            for (const [text, cls] of cells) {
+                const td = document.createElement('td');
+                td.className = cls;
+                td.textContent = String(text ?? '');
+                row.appendChild(td);
+            }
+            return row;
+        }));
     }
     
     // ==========================================================================
@@ -1987,7 +1966,14 @@ class GrugThinkApp {
     }
     
     exportLogs() {
-        this.showInfo('Coming Soon', 'Log export will be available in the next update');
+        const container = document.getElementById('log-container');
+        const text = container ? container.innerText : '';
+        const blob = new Blob([text], { type: 'text/plain' });
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `grugthink-logs-${new Date().toISOString().slice(0, 19)}.txt`;
+        link.click();
+        URL.revokeObjectURL(link.href);
     }
 }
 
