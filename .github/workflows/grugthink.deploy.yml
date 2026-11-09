@@ -122,7 +122,7 @@ jobs:
         # next redeploy without a manual `kubectl delete secret`.
         #
         # Tolerant of a genuinely MISSING parameter (never provisioned) -
-        # an empty key is exactly what config_legacy.py's POOLSIDE_API_KEY/
+        # an empty key is exactly what runtime_config.py's POOLSIDE_API_KEY/
         # OPENROUTER_API_KEY already treat as "tier not configured, skip
         # cleanly" (see llm_clients.py's _query_saas_fallback) - but a
         # throttle/auth/network failure fetching a param that DOES exist is

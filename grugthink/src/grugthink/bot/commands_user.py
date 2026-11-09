@@ -186,6 +186,52 @@ async def get_chat_frequency(interaction, bot: "GrugThinkBot") -> None:
     )
 
 
+_FACTS_PER_PAGE = 15
+_MAX_FACT_LENGTH = 120  # Max length per individual fact
+
+
+def _no_facts_message(personality, bot_name: str, search: str | None) -> str:
+    """Text sent when the fact list (or search result) is empty."""
+    if search:
+        return f"No facts found matching '{search}'"
+    if personality.response_style == "caveman":
+        return f"{bot_name} know nothing in this cave."
+    if personality.response_style == "british_working_class":
+        return "dont know nuffin yet mate, simple as"
+    return "I don't know any facts yet."
+
+
+def _page_heading(personality, bot_name: str, search: str | None, total_facts: int) -> tuple[str, str]:
+    """Return (base_title, total_description) for the what-know embed."""
+    if search:
+        return f"Search: '{search}'", f"Found {total_facts} matching facts"
+    if personality.response_style == "caveman":
+        return f"{bot_name}'s Memories", f"{bot_name} knows {total_facts} things in this cave"
+    if personality.response_style == "british_working_class":
+        return "wot i know", f"got {total_facts} fings in me ed, nuff said"
+    return "Knowledge Base", f"I know {total_facts} facts"
+
+
+def _nav_hints(page: int, total_pages: int, search: str | None) -> list[str]:
+    """Navigation hints shown under the fact list."""
+    hints = []
+    if page > 1:
+        hints.append(f"Previous: `/what-know page:{page - 1}`")
+    if page < total_pages:
+        hints.append(f"Next: `/what-know page:{page + 1}`")
+    hints.append("All facts: `/what-know`" if search else "Search: `/what-know search:term`")
+    return hints
+
+
+def _format_fact_list(page_facts, start_idx: int) -> str:
+    """Numbered, length-truncated lines for one page of facts."""
+    lines = []
+    for i, fact in enumerate(page_facts, start=start_idx + 1):
+        display_fact = fact[:_MAX_FACT_LENGTH] + "..." if len(fact) > _MAX_FACT_LENGTH else fact
+        lines.append(f"{i}. {display_fact}")
+    return "\n".join(lines)
+
+
 async def what_know(interaction, bot, page: int = 1, search: str = None) -> None:
     """Display the bot's knowledge base with pagination and search capabilities.
 
@@ -204,107 +250,37 @@ async def what_know(interaction, bot, page: int = 1, search: str = None) -> None
     """
     await interaction.response.defer(ephemeral=True)  # Tell Discord bot is thinking
 
-    # Get personality info
     server_id = str(interaction.guild_id) if interaction.guild_id else "dm"
     personality = bot.personality_engine.get_personality(server_id)
     bot_name = personality.chosen_name or personality.name
-
-    # Get the server-specific database
     server_db = bot.get_server_db(interaction)
 
-    # Handle search vs all facts
     if search:
         all_facts = server_db.search_facts(search, k=50)  # Search with higher limit
-        search_mode = True
     else:
         all_facts = server_db.get_all_facts()
-        search_mode = False
 
     if not all_facts:
-        if search_mode:
-            message = f"No facts found matching '{search}'"
-        elif personality.response_style == "caveman":
-            message = f"{bot_name} know nothing in this cave."
-        elif personality.response_style == "british_working_class":
-            message = "dont know nuffin yet mate, simple as"
-        else:
-            message = "I don't know any facts yet."
-
-        await interaction.followup.send(message, ephemeral=True)
+        await interaction.followup.send(_no_facts_message(personality, bot_name, search), ephemeral=True)
         return
 
-    # Pagination setup
-    FACTS_PER_PAGE = 15
     total_facts = len(all_facts)
-    total_pages = max(1, (total_facts + FACTS_PER_PAGE - 1) // FACTS_PER_PAGE)
+    total_pages = max(1, (total_facts + _FACTS_PER_PAGE - 1) // _FACTS_PER_PAGE)
+    page = min(max(page, 1), total_pages)
+    start_idx = (page - 1) * _FACTS_PER_PAGE
+    page_facts = all_facts[start_idx : min(start_idx + _FACTS_PER_PAGE, total_facts)]
 
-    # Validate page number
-    if page < 1:
-        page = 1
-    elif page > total_pages:
-        page = total_pages
-
-    # Calculate start and end indices for this page
-    start_idx = (page - 1) * FACTS_PER_PAGE
-    end_idx = min(start_idx + FACTS_PER_PAGE, total_facts)
-    page_facts = all_facts[start_idx:end_idx]
-
-    # Create a Discord embed for better formatting
     server_name = interaction.guild.name if interaction.guild else "DM"
-
-    # Build title based on mode
-    if search_mode:
-        base_title = f"Search: '{search}'"
-        total_desc = f"Found {total_facts} matching facts"
-    elif personality.response_style == "caveman":
-        base_title = f"{bot_name}'s Memories"
-        total_desc = f"{bot_name} knows {total_facts} things in this cave"
-    elif personality.response_style == "british_working_class":
-        base_title = "wot i know"
-        total_desc = f"got {total_facts} fings in me ed, nuff said"
-    else:
-        base_title = "Knowledge Base"
-        total_desc = f"I know {total_facts} facts"
-
+    base_title, description = _page_heading(personality, bot_name, search, total_facts)
     title = f"{base_title} ({server_name}) - Page {page}/{total_pages}"
-    description = total_desc
     dashboard_url = config.PUBLIC_BASE_URL
     if dashboard_url:
-        description += f"\n🌐 **[View & Edit All Memories]({dashboard_url})**"
+        description += f"\n\U0001f310 **[View & Edit All Memories]({dashboard_url})**"
 
-    # Build fact list for this page
-    MAX_FACT_LENGTH = 120  # Max length per individual fact
-    fact_lines = []
+    fact_list = _format_fact_list(page_facts, start_idx)
+    fact_list += f"\n\n\U0001f4dd {' | '.join(_nav_hints(page, total_pages, search))}"
 
-    for i, fact in enumerate(page_facts, start=start_idx + 1):
-        # Truncate long facts
-        display_fact = fact[:MAX_FACT_LENGTH] + "..." if len(fact) > MAX_FACT_LENGTH else fact
-        fact_lines.append(f"{i}. {display_fact}")
-
-    # Create the fact list string
-    fact_list = "\n".join(fact_lines)
-
-    # Add navigation hints
-    nav_hints = []
-    if page > 1:
-        nav_hints.append(f"Previous: `/what-know page:{page - 1}`")
-    if page < total_pages:
-        nav_hints.append(f"Next: `/what-know page:{page + 1}`")
-    if search_mode:
-        nav_hints.append("All facts: `/what-know`")
-    else:
-        nav_hints.append("Search: `/what-know search:term`")
-
-    if nav_hints:
-        fact_list += f"\n\n📝 {' | '.join(nav_hints)}"
-
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=discord.Color.blue(),
-    )
-
-    # Use appropriate field name - for pagination we always show "Facts"
+    embed = discord.Embed(title=title, description=description, color=discord.Color.blue())
     embed.add_field(name="Facts", value=fact_list or "No facts to display", inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
