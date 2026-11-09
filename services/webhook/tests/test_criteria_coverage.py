@@ -280,6 +280,44 @@ def test_test_and_doc_criteria_can_be_met_without_runtime_hunks():
     assert not _by_rule(findings, "intent-mismatch")
 
 
+def test_a_criterion_naming_a_prose_path_is_met_without_runtime_hunks():
+    # #1711: the doc exemption fired only on doc VOCABULARY (readme, docs,
+    # guide), so a criterion naming a prose file whose path carries none of
+    # those words was read as demanding runtime behavior, and a docs-only
+    # change to a passive standard could never clear intent-mismatch.
+    hunks, contents = _helper_only_diff()
+    criteria = (
+        LinkedCriterion(
+            436, 1,
+            "`skills/standard-example/SKILL.md` carries a section for the "
+            "fleet-of-repositories direction, citing the tickets by number",
+        ),
+        LinkedCriterion(436, 2, "AGENTS.md states the rule for a public repo"),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert not _by_rule(findings, "intent-mismatch")
+
+
+def test_a_criterion_naming_a_code_path_still_demands_runtime():
+    # The other direction of #1711: widening the doc exemption must not
+    # excuse a criterion about code an uncalled helper cannot satisfy.
+    hunks, contents = _helper_only_diff()
+    criteria = (
+        LinkedCriterion(
+            436, 1,
+            "`services/webhook/verify.py` picks up a shipped ticket whose "
+            "verify run is due",
+        ),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    mismatch = _by_rule(findings, "intent-mismatch")
+    assert len(mismatch) == 1 and mismatch[0].severity == "high"
+
+
 def test_declared_entry_point_is_not_dead_and_counts_as_runtime():
     hunks, contents = _helper_only_diff()
     body = _BODY + "\n\n`verify_due` is an exported API for the station plugin."
