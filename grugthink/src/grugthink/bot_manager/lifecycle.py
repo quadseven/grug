@@ -325,8 +325,7 @@ async def setup_bot_commands(instance, env: dict):
     @client.event
     async def on_ready():
         try:
-            # Import GrugThinkBot from main package (not from ..bot which is a package)
-            # The bot/ package shadows bot.py module, so we import from grugthink instead
+            # GrugThinkBot lives in grugthink.discord_bot; the package re-exports it lazily
             import traceback
 
             try:

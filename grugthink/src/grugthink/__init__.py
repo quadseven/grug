@@ -41,31 +41,8 @@ def __getattr__(name: str):
         _bot = importlib.import_module(".bot", __name__)
         return _bot
     elif name == "GrugThinkBot":
-        # GrugThinkBot is in bot.py but shadowed by bot/ package
-        # Import using a sys.modules hack to load bot.py under an alternate name
-        import importlib.util
-        import os
-        import sys
+        from .discord_bot import GrugThinkBot
 
-        # Check if already loaded under alternate name
-        alt_name = "grugthink.bot_module"
-        if alt_name in sys.modules:
-            return sys.modules[alt_name].GrugThinkBot
-
-        # Load bot.py under alternate module name to avoid bot/ package conflict
-        bot_py_path = os.path.join(os.path.dirname(__file__), "bot.py")
-        spec = importlib.util.spec_from_file_location(alt_name, bot_py_path)
-        if spec and spec.loader:
-            bot_module = importlib.util.module_from_spec(spec)
-            # Register under alternate name BEFORE executing to handle circular imports
-            sys.modules[alt_name] = bot_module
-            try:
-                spec.loader.exec_module(bot_module)
-                # Also cache under the expected name for future imports
-                return bot_module.GrugThinkBot
-            except Exception:
-                # Clean up on failure
-                sys.modules.pop(alt_name, None)
-                raise
+        return GrugThinkBot
 
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

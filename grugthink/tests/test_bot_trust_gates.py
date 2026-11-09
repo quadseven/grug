@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# config_legacy.py raises at import time without DISCORD_TOKEN (see
+# runtime_config.py raises at import time without DISCORD_TOKEN (see
 # test_llm_fallback.py for the same guard).
 os.environ.setdefault("DISCORD_TOKEN", "fake_token")
 
@@ -30,7 +30,7 @@ UNTRUSTED_ID = 222
 def _load_bot_module():
     """Load bot.py (shadowed by the bot/ package) without building a real
     server manager, so the test touches no database or embedder."""
-    path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "grugthink", "bot.py"))
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src", "grugthink", "discord_bot.py"))
     spec = importlib.util.spec_from_file_location("src.grugthink.bot_trust_gates_module", path)
     module = importlib.util.module_from_spec(spec)
     module.__package__ = "src.grugthink"
