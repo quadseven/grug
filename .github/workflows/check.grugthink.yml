@@ -54,8 +54,21 @@ jobs:
       # path (#1045), the trust gates (#1632), the API routers and the config
       # package. A test that skips for want of the database fails the gate
       # below, so the store tests cannot pass by not running.
-      - name: grugthink tests (whole tests/ directory)
-        run: PYTHONPATH=. python -m pytest tests -v -rs
+      # Coverage covers grugthink/src. The floor is the value measured after
+      # the bot manager, personality engine, router and middleware tests landed
+      # (55.3% without the database tests); raising it is a separate change.
+      - name: grugthink tests (whole tests/ directory, coverage floor)
+        run: >-
+          PYTHONPATH=. python -m pytest tests -v -rs
+          --cov=src/grugthink --cov-report=term --cov-report=xml
+          --cov-fail-under=55
+      - name: upload coverage report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: grugthink-coverage
+          path: grugthink/coverage.xml
+          if-no-files-found: ignore
       - name: pgvector store tests must not skip
         run: |
           PYTHONPATH=. python -m pytest tests/test_pgvector_store.py -q -rs | tee pgvector.log
