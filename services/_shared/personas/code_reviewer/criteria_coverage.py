@@ -85,6 +85,13 @@ _DOC_CRITERION_RE = re.compile(
     r"|runbooks?|guide|guidance|playbooks?|docstrings?)\b",
     re.IGNORECASE,
 )
+# A criterion that names a prose file by path ("`skills/x/SKILL.md` carries
+# a section ..."): that file IS the deliverable, so a doc hunk meets it. The
+# vocabulary above cannot see this, because a path like SKILL.md or AGENTS.md
+# carries none of those words, and the criterion was then read as demanding
+# runtime behavior a docs-only diff can never show (#1711). A named data file
+# (.txt) is exempt for the same reason: changing it is the deliverable.
+_PATH_TOKEN_RE = re.compile(r"[\w./-]+\.[A-Za-z]{2,5}\b")
 # A criterion about the pull request itself (it lands, its checks pass, its
 # threads are answered, an older one is closed): the review process meets
 # it, not a hunk.
@@ -516,11 +523,18 @@ def _hunk_changes_runtime(
     return any(n in runtime[hunk.file_path] for n, _ in added)
 
 
+def _names_doc_path(text: str) -> bool:
+    """Whether the criterion names a file this module already reads as a
+    doc, reusing `_is_doc_path` so a doc path has one definition (#1711)."""
+    return any(_is_doc_path(m.group(0)) for m in _PATH_TOKEN_RE.finditer(text))
+
+
 def _is_runtime_criterion(text: str) -> bool:
     return not (
         _LIVE_RE.match(text)
         or _TEST_CRITERION_RE.search(text)
         or _DOC_CRITERION_RE.search(text)
+        or _names_doc_path(text)
         or _PROCESS_CRITERION_RE.search(text)
     )
 
