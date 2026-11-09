@@ -48,7 +48,7 @@ kubectl create secret generic grugthink-secrets -n grugthink \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Chat fallback keys (Poolside/OpenRouter) - same /infra/llm/* params grug's
-# own webhook/consumer read. Empty is fine (config_legacy.py treats an unset
+# own webhook/consumer read. Empty is fine (runtime_config.py treats an unset
 # key as "skip this fallback tier cleanly"), so this never blocks a deploy.
 kubectl create secret generic grugthink-llm-fallback -n grugthink \
   --from-literal=POOLSIDE_API_KEY="$(aws ssm get-parameter \

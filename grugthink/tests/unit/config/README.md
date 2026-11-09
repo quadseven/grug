@@ -125,7 +125,7 @@ All tests use common fixtures defined in each test file:
 
 ## Migration Notes
 
-The old `test_config.py`, later `test_config_legacy.py`, tested import-time validation that the `config/` package no longer does, and was removed. `tests/test_config_legacy_lazy_attrs.py` covers `config_legacy.py` as it is today, and CI runs the whole `tests/` directory.
+The old `test_config.py`, later `test_config_legacy.py`, tested import-time validation that the `config/` package no longer does, and was removed. `tests/test_runtime_config_lazy_attrs.py` covers `runtime_config.py` as it is today, and CI runs the whole `tests/` directory.
 
 ## Future Improvements
 

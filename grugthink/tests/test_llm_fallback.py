@@ -15,7 +15,7 @@ fallback at all - a Cave/spark-gateway failure just returned None):
 import json as json_module
 import os
 
-# config_legacy.py raises at IMPORT time if DISCORD_TOKEN is unset (module
+# runtime_config.py raises at IMPORT time if DISCORD_TOKEN is unset (module
 # import happens at pytest COLLECTION time, before the setup_test_environment
 # autouse fixture in src/grugthink/conftest.py has a chance to run) - same
 # guard test_bot_commands.py uses ahead of its own module-level bot import.

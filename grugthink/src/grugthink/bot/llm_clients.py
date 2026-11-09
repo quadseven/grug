@@ -21,7 +21,7 @@ from typing import Any, Callable, NamedTuple
 
 import requests
 
-from .. import config_legacy as config
+from .. import runtime_config as config
 from ..bot_settings import getenv as _bot_getenv
 from ..logging_config import get_logger
 
@@ -238,7 +238,7 @@ def _ollama_reply_text(body: Any, openai_compatible: bool) -> str:
 # never be served-but-unlisted or listed-but-never-tried (#1693 - /diagnose
 # used to branch on config.USE_GEMINI and report only Gemini or Ollama,
 # hiding the Poolside/OpenRouter tiers entirely). This is also the only
-# place outside config_legacy that consults config.USE_GEMINI: the Gemini
+# place outside runtime_config that consults config.USE_GEMINI: the Gemini
 # rung's configured flag is exactly that derived value.
 
 
@@ -254,7 +254,7 @@ class Backend(NamedTuple):
 def backend_ladder() -> list[Backend]:
     """Every reply backend in fallback order - Ollama, Poolside,
     OpenRouter, Gemini - with its configured state read live from config
-    (per-bot in multi-bot mode, via config_legacy's lazy attributes)."""
+    (per-bot in multi-bot mode, via runtime_config's lazy attributes)."""
     return [
         Backend("Ollama", bool(config.OLLAMA_URLS), query_ollama_api),
         Backend("Poolside", bool(config.POOLSIDE_API_KEY), query_poolside_api),
