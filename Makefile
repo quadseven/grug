@@ -36,7 +36,7 @@ test: webhook-test api-test scripts-test
 # psycopg because chief_check imports Chief's persona, whose publish seam
 # pulls the activity log's Postgres store in at import time.
 scripts-test:
-	uv run --with pytest --with boto3 --with moto --with httpx --with pyjwt --with cryptography --with pyyaml --with 'psycopg[binary,pool]' pytest scripts/tests/ -q
+	uv run --python 3.13 --with pytest --with boto3 --with moto --with httpx --with pyjwt --with cryptography --with pyyaml --with 'psycopg[binary,pool]' pytest scripts/tests/ tests/ -q
 
 # Chief's Hunt Plan checks on a PR body, before the PR exists (#1327). Same
 # evaluator Chief runs; reads tickets with your gh login. Exit 1 = Chief
@@ -46,7 +46,7 @@ scripts-test:
 chief-check:
 	@if [ -z "$(REPO)" ] || { [ -z "$(BODY)" ] && [ -z "$(PR)" ]; }; then \
 		echo "usage: make chief-check REPO=owner/name BODY=pr.md  (or PR=N)"; exit 2; fi
-	uv run --with httpx --with pyjwt --with cryptography --with boto3 --with 'psycopg[binary,pool]' \
+	uv run --python 3.13 --with httpx --with pyjwt --with cryptography --with boto3 --with 'psycopg[binary,pool]' \
 		python scripts/chief_check.py --repo $(REPO) $(if $(PR),--pr $(PR),--body-file $(BODY))
 
 # webhook-test / api-test are hermetic against your ~/.aws: the shared
@@ -56,12 +56,12 @@ webhook-test:
 		echo "FATAL: store-backed tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
 	@if [ -n "$$CI" ] && ! command -v opengrep >/dev/null 2>&1 && ! command -v semgrep >/dev/null 2>&1; then \
 		echo "FATAL: SAST engine-backed rule tests (test_sast_rules.py, test_sast.py) would SKIP in CI (no opengrep/semgrep on PATH) - a skipped gate is a silent pass, the same shape as the ruff evidence layer sitting dead for weeks (#859)"; exit 1; fi
-	cd services/webhook && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' --with 'ruff>=0.16,<0.17' pytest tests/ -q
+	cd services/webhook && uv run --python 3.13 --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with fastapi --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' --with 'datadog-lambda>=6.107,<7' --with 'ruff>=0.16,<0.17' pytest tests/ -q
 
 api-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
 		echo "FATAL: store-backed tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
-	cd services/api && uv run --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with 'psycopg[binary,pool]' pytest tests/ -q
+	cd services/api && uv run --python 3.13 --with pytest --with httpx --with pyjwt --with cryptography --with boto3 --with moto --with pydantic --with fastapi --with 'psycopg[binary,pool]' pytest tests/ -q
 
 # Real-Postgres store tests (#354). REQUIRE a reachable Postgres via
 # GRUG_TEST_DATABASE_URL (CI: workflow service container) - they skip
@@ -69,7 +69,7 @@ api-test:
 pg-test:
 	@if [ -n "$$CI" ] && [ -z "$$GRUG_TEST_DATABASE_URL" ]; then \
 		echo "FATAL: pg tests would SKIP in CI (GRUG_TEST_DATABASE_URL unset) - a skipped gate is a silent pass (audit H4)"; exit 1; fi
-	cd services/api && uv run --with pytest --with "psycopg[binary,pool]" --with boto3 --with cryptography pytest tests/test_pg_stores.py -q -rs
+	cd services/api && uv run --python 3.13 --with pytest --with "psycopg[binary,pool]" --with boto3 --with cryptography pytest tests/test_pg_stores.py -q -rs
 
 pulumi-preview:
 	cd infra/pulumi && uv sync && pulumi preview --stack dev
@@ -114,7 +114,7 @@ rebuild: tear-down
 	@echo ">> step 4/5: CF Workers re-deploy + admin re-seed"
 	bash infra/cloudflare/deploy.sh
 	@test -n "$(GRUG_ADMIN_USER_ID)" || { echo "FATAL: set GRUG_ADMIN_USER_ID (and GRUG_ADMIN_LOGIN/GRUG_ADMIN_INSTALL_ID) to YOUR own GitHub identity before seeding admin"; exit 1; }
-	uv run --with 'psycopg[binary]' python infra/scripts/seed-admin.py \
+	uv run --python 3.13 --with 'psycopg[binary]' python infra/scripts/seed-admin.py \
 	  --github-user-id $(GRUG_ADMIN_USER_ID) \
 	  --login $(GRUG_ADMIN_LOGIN) \
 	  --install-id $(GRUG_ADMIN_INSTALL_ID)
@@ -159,7 +159,7 @@ docker-build-webhook:
 #   make sast-benchmark ARGS=--check   # exit 1 on regression vs baseline
 # The pure scoring core is covered by `make webhook-test` (no LLM, no keys).
 sast-benchmark:
-	cd services/webhook && PYTHONPATH=../_shared uv run --with httpx --with pyjwt --with cryptography \
+	cd services/webhook && PYTHONPATH=../_shared uv run --python 3.13 --with httpx --with pyjwt --with cryptography \
 		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
 		--with 'datadog-lambda>=6.107,<7' python -m sast_benchmark $(ARGS)
 
@@ -168,7 +168,7 @@ sast-benchmark:
 #   make review-latency
 #   make review-latency ARGS='--levels 1,2,4 --json /tmp/lat.json'
 review-latency:
-	cd services/webhook && PYTHONPATH=../_shared uv run --with httpx \
+	cd services/webhook && PYTHONPATH=../_shared uv run --python 3.13 --with httpx \
 		python -m review_latency $(ARGS)
 
 # Elder replay eval harness (#361 slice 2, #537). Replays Elder over the
@@ -183,7 +183,7 @@ review-latency:
 #   make elder-eval ARGS=--check   # exit 1 on regression vs baseline
 # The pure corpus/scoring core is covered by `make webhook-test` (no LLM).
 elder-eval:
-	cd services/webhook && PYTHONPATH=../_shared uv run --with httpx --with pyjwt --with cryptography \
+	cd services/webhook && PYTHONPATH=../_shared uv run --python 3.13 --with httpx --with pyjwt --with cryptography \
 		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
 		--with 'datadog-lambda>=6.107,<7' python -m elder_eval $(ARGS)
 
@@ -193,6 +193,6 @@ elder-eval:
 # GRUG_BENCH_{OPENROUTER,POOLSIDE}_KEY and/or GRUG_BENCH_CAVE_URL+MODEL.
 #   make elder-eval-column
 elder-eval-column:
-	cd services/webhook && PYTHONPATH=../_shared uv run --with httpx --with pyjwt --with cryptography \
+	cd services/webhook && PYTHONPATH=../_shared uv run --python 3.13 --with httpx --with pyjwt --with cryptography \
 		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
 		--with 'datadog-lambda>=6.107,<7' python -m elder_eval.column_type_mismatch $(ARGS)
