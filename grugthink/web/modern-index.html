@@ -144,13 +144,6 @@
                     
                     <!-- Top Right Actions -->
                     <div class="flex items-center gap-3">
-                        
-                        <!-- Notifications -->
-                        <button type="button" class="btn btn-ghost p-2 relative">
-                            <i data-lucide="bell"></i>
-                            <span class="absolute -top-1 -right-1 w-2 h-2 bg-danger rounded-full"></span>
-                        </button>
-                        
                         <!-- Theme Toggle -->
                         <button type="button" onclick="toggleTheme()" class="btn btn-ghost p-2" id="theme-toggle">
                             <i data-lucide="moon"></i>
@@ -368,10 +361,6 @@
                                 <h1 class="text-3xl font-bold text-primary mb-2">Bot Templates</h1>
                                 <p class="text-secondary">Pre-configured personality templates for creating new bot instances</p>
                             </div>
-                            <button type="button" class="btn btn-primary" onclick="app.createCustomTemplate()">
-                                <i data-lucide="plus"></i>
-                                Create Template
-                            </button>
                         </div>
                     </div>
                     
@@ -491,12 +480,6 @@
                                         </div>
                                         <button type="button" class="toggle-switch" id="setting-backup-tokens" onclick="app.toggleSetting('backup-tokens')">
                                             <span class="toggle-slider"></span>
-                                        </button>
-                                    </div>
-                                    <div class="border-t border-border pt-4">
-                                        <button type="button" class="btn btn-secondary w-full" onclick="app.exportTokens()">
-                                            <i data-lucide="download" class="w-4 h-4"></i>
-                                            Export Token Config
                                         </button>
                                     </div>
                                 </div>
@@ -725,18 +708,16 @@
                                     <i data-lucide="message-circle" class="w-4 h-4 text-accent-primary"></i>
                                 </div>
                                 <div class="text-2xl font-bold text-primary" id="analytics-total-messages">0</div>
-                                <div class="text-xs text-success">↗ +12% vs last week</div>
                             </div>
                         </div>
                         
                         <div class="card">
                             <div class="card-body">
                                 <div class="flex items-center justify-between mb-2">
-                                    <h3 class="text-sm font-medium text-muted">Active Hours</h3>
+                                    <h3 class="text-sm font-medium text-muted">Active Channels</h3>
                                     <i data-lucide="clock" class="w-4 h-4 text-accent-primary"></i>
                                 </div>
-                                <div class="text-2xl font-bold text-primary" id="analytics-active-hours">0</div>
-                                <div class="text-xs text-success">↗ +5.2% vs last week</div>
+                                <div class="text-2xl font-bold text-primary" id="analytics-active-channels">0</div>
                             </div>
                         </div>
                         
@@ -747,59 +728,20 @@
                                     <i data-lucide="zap" class="w-4 h-4 text-accent-primary"></i>
                                 </div>
                                 <div class="text-2xl font-bold text-primary" id="analytics-response-rate">0%</div>
-                                <div class="text-xs text-muted">Average response time</div>
+                                <div class="text-xs text-muted">Channels with a bot reply</div>
                             </div>
                         </div>
                         
                         <div class="card">
                             <div class="card-body">
                                 <div class="flex items-center justify-between mb-2">
-                                    <h3 class="text-sm font-medium text-muted">Peak Users</h3>
+                                    <h3 class="text-sm font-medium text-muted">Running Bots</h3>
                                     <i data-lucide="users" class="w-4 h-4 text-accent-primary"></i>
                                 </div>
-                                <div class="text-2xl font-bold text-primary" id="analytics-peak-users">0</div>
-                                <div class="text-xs text-success">↗ Peak at 3:00 PM</div>
+                                <div class="text-2xl font-bold text-primary" id="analytics-running-bots">0</div>
                             </div>
                         </div>
                     </div>
-                    
-                    <!-- Charts Row -->
-                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
-                        
-                        <!-- Message Activity Chart -->
-                        <div class="card">
-                            <div class="card-header">
-                                <h2 class="font-semibold text-lg text-primary">Message Activity</h2>
-                                <p class="text-sm text-muted">Bot activity over the last 7 days</p>
-                            </div>
-                            <div class="card-body">
-                                <div class="h-64 flex items-center justify-center bg-muted/10 rounded-lg">
-                                    <div class="text-center">
-                                        <i data-lucide="bar-chart-3" class="w-12 h-12 text-muted mx-auto mb-2"></i>
-                                        <p class="text-muted">Chart will display when bot data is available</p>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <!-- Response Time Chart -->
-                        <div class="card">
-                            <div class="card-header">
-                                <h2 class="font-semibold text-lg text-primary">Response Performance</h2>
-                                <p class="text-sm text-muted">Average response times by bot</p>
-                            </div>
-                            <div class="card-body">
-                                <div class="h-64 flex items-center justify-center bg-muted/10 rounded-lg">
-                                    <div class="text-center">
-                                        <i data-lucide="trending-up" class="w-12 h-12 text-muted mx-auto mb-2"></i>
-                                        <p class="text-muted">Performance metrics will appear here</p>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                    </div>
-                    
                     <!-- Bot Performance Table -->
                     <div class="card">
                         <div class="card-header">
@@ -813,8 +755,8 @@
                                         <tr class="border-b border-border">
                                             <th class="text-left py-3 px-4 font-medium text-muted">Bot Name</th>
                                             <th class="text-left py-3 px-4 font-medium text-muted">Messages</th>
-                                            <th class="text-left py-3 px-4 font-medium text-muted">Avg Response</th>
-                                            <th class="text-left py-3 px-4 font-medium text-muted">Uptime</th>
+                                            <th class="text-left py-3 px-4 font-medium text-muted">Channels</th>
+                                            <th class="text-left py-3 px-4 font-medium text-muted">Last Reply</th>
                                             <th class="text-left py-3 px-4 font-medium text-muted">Status</th>
                                         </tr>
                                     </thead>

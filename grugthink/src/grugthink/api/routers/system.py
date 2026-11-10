@@ -78,6 +78,47 @@ async def get_system_stats(bot_manager: BotManager = Depends(get_bot_manager)):
     )
 
 
+def _bot_activity(bot_id: str, instance) -> dict:
+    """Sum the per-channel activity a bot's chat cog already tracks in memory."""
+    client = getattr(instance, "client", None)
+    cogs = getattr(client, "cogs", None) or {}
+    activity: dict = {}
+    for cog in cogs.values():
+        if hasattr(cog, "channel_activity"):
+            activity = dict(cog.channel_activity)
+            break
+    last_replies = [a.get("last_bot_message", 0) for a in activity.values() if a.get("last_bot_message", 0)]
+    return {
+        "bot_id": bot_id,
+        "name": instance.config.name,
+        "status": instance.runtime_status,
+        "messages": sum(a.get("message_count", 0) for a in activity.values()),
+        "channels": len(activity),
+        "replied_channels": len(last_replies),
+        "last_bot_message": max(last_replies) if last_replies else None,
+    }
+
+
+@router.get("/analytics", dependencies=[Depends(admin_required)])
+async def get_analytics(bot_manager: BotManager = Depends(get_bot_manager)):
+    """Message counts, reply rate and per-bot activity since each bot started.
+
+    Built only from the in-memory channel activity the bots already record.
+    response_rate is the percent of tracked channels where a bot has replied.
+    """
+    with bot_manager._lock:
+        snapshot = list(bot_manager.bots.items())
+    bots = [_bot_activity(bot_id, inst) for bot_id, inst in snapshot]
+    channels = sum(b["channels"] for b in bots)
+    replied = sum(b["replied_channels"] for b in bots)
+    return {
+        "total_messages": sum(b["messages"] for b in bots),
+        "response_rate": round(replied / channels * 100, 1) if channels else 0.0,
+        "active_channels": channels,
+        "bots": bots,
+    }
+
+
 @router.get("/system/logs", dependencies=[Depends(admin_required)])
 async def get_system_logs():
     """Get recent system logs."""
