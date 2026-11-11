@@ -25,7 +25,8 @@ Two findings, both anchored on a diff line:
   unmet. One finding names them all, because findings dedup on
   (file, line, rule). Criteria starting "Live:" are checked after deploy
   and are exempt, as are criteria about tests or docs, which test and
-  doc hunks can meet.
+  doc hunks can meet, and criteria that leave something alone ("is not
+  edited", "stays unchanged"), which no hunk can fail or meet (#1726).
 
 A new script or module that no other non-test file in the diff imports,
 runs or names (#1364) cannot change runtime behavior either: nothing
@@ -92,6 +93,16 @@ _DOC_CRITERION_RE = re.compile(
 # runtime behavior a docs-only diff can never show (#1711). A named data file
 # (.txt) is exempt for the same reason: changing it is the deliverable.
 _PATH_TOKEN_RE = re.compile(r"[\w./-]+\.[A-Za-z]{2,5}\b")
+# A criterion that says something is left alone ("the prompt module is not
+# edited", "the response is unchanged"): a diff meets it by the ABSENCE of a
+# hunk, so no hunk can satisfy it and a docs-only diff meets it trivially. Read
+# as runtime behavior it blocked a docs-only change that promised not to touch
+# a module (#1726).
+_PRESERVE_RE = re.compile(
+    r"\b(?:not|never)\s+(?:be\s+)?(?:edited|changed|modified|touched|altered)\b"
+    r"|\b(?:unchanged|untouched|unmodified)\b",
+    re.IGNORECASE,
+)
 # A criterion about the pull request itself (it lands, its checks pass, its
 # threads are answered, an older one is closed): the review process meets
 # it, not a hunk.
@@ -535,6 +546,7 @@ def _is_runtime_criterion(text: str) -> bool:
         or _TEST_CRITERION_RE.search(text)
         or _DOC_CRITERION_RE.search(text)
         or _names_doc_path(text)
+        or _PRESERVE_RE.search(text)
         or _PROCESS_CRITERION_RE.search(text)
     )
 

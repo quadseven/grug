@@ -318,6 +318,70 @@ def test_a_criterion_naming_a_code_path_still_demands_runtime():
     assert len(mismatch) == 1 and mismatch[0].severity == "high"
 
 
+def _docs_only_diff() -> tuple[tuple[DiffHunk, ...], dict[str, str]]:
+    """A docs file plus its unit test: no production hunk at all."""
+    hunks = (
+        _hunk("AGENTS.md", 170, ["Write American English spelling."]),
+        _hunk("tests/test_rule.py", 1, _TEST_ADDED),
+    )
+    contents = {
+        "AGENTS.md": "Write American English spelling.\n",
+        "tests/test_rule.py": "\n".join(_TEST_ADDED) + "\n",
+    }
+    return hunks, contents
+
+
+def test_a_preservation_criterion_is_met_by_leaving_the_thing_alone():
+    # #1726: "X is not edited" / "stays unchanged" is met by the ABSENCE of a
+    # hunk, so no hunk can "satisfy" it and a docs-only diff meets it
+    # trivially. It was read as demanding runtime behavior, and a docs-only
+    # change whose ticket promised not to touch a prompt module was blocked.
+    hunks, contents = _docs_only_diff()
+    criteria = (
+        LinkedCriterion(
+            1724, 3,
+            "The Elder review system prompt module is not edited, so the "
+            "evaluation baseline hash stays the same.",
+        ),
+        LinkedCriterion(1724, 4, "The webhook response is unchanged for existing callers"),
+        LinkedCriterion(1724, 5, "The scoring table is left untouched"),
+        LinkedCriterion(1724, 6, "The config schema is never modified by this change"),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert not _by_rule(findings, "intent-mismatch")
+
+
+def test_a_preservation_criterion_does_not_excuse_a_positive_runtime_one():
+    # The other direction of #1726: the exemption is per criterion. A
+    # positive runtime criterion beside a preservation one is still unmet by
+    # a docs-only diff, and the finding names only that one.
+    hunks, contents = _docs_only_diff()
+    criteria = (
+        LinkedCriterion(1724, 3, "The prompt module is not edited"),
+        LinkedCriterion(1724, 7, "A ticket whose verify run fails is reopened"),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    mismatch = _by_rule(findings, "intent-mismatch")
+    assert len(mismatch) == 1 and mismatch[0].severity == "high"
+    assert "criterion 7" in mismatch[0].message
+    assert "criterion 3" not in mismatch[0].message
+
+
+def test_a_live_criterion_about_unchanged_state_is_still_checked():
+    # A `Live:` criterion keeps its handling: with nothing in the diff that
+    # runs, no deploy can make it true, preservation wording or not.
+    hunks, contents = _docs_only_diff()
+    criteria = (LinkedCriterion(1724, 8, "Live: the host config is unchanged after deploy"),)
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert len(_by_rule(findings, "intent-mismatch")) == 1
+
+
 def test_declared_entry_point_is_not_dead_and_counts_as_runtime():
     hunks, contents = _helper_only_diff()
     body = _BODY + "\n\n`verify_due` is an exported API for the station plugin."
