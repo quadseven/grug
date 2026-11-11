@@ -11,7 +11,8 @@ delete` which forgets a taught preference and `fix`, `docstrings` and
 needs (`VERB_PERSONA`, grug#1624); with that persona off the command is
 refused with a reply naming it, and the other personas' toggles do not
 matter:
-  /grug recheck        tpm            re-run Chief's DoR check (NOT Elder - use improve)
+  /grug recheck        tpm            re-run Chief's DoR check (NOT Elder - use improve);
+                                      the PR author, a write collaborator or an allowed App bot (#1722)
   /grug improve        code_reviewer  Elder re-reviews and re-posts its findings
   /grug ask <question> code_reviewer  scoped Q&A over the PR diff, answered as a reply
   /grug test-gaps      code_reviewer  the pr-test lens on demand
@@ -71,6 +72,12 @@ VERB_PERSONA: dict[str, str] = {
 # the GitHub budget's reset) instead of dropped when the installation's
 # hourly budget is spent (grug#1270).
 ELDER_RERUN_VERBS = frozenset({"improve", "resume", "review"})
+
+# The verbs an allowed App bot may run on a pull request it did not author
+# (grug#1445, grug#1722): the Elder re-runs, plus `recheck`, the one cheap
+# Chief rerun that clears a stale plan verdict. A refusal of any of these is
+# answered on the pull request. Every other verb keeps the author-or-write gate.
+BOT_RERUN_VERBS = ELDER_RERUN_VERBS | {"recheck"}
 
 
 @dataclass(frozen=True)

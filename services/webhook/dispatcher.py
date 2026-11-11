@@ -1164,7 +1164,7 @@ def _refuse_rerun_command(
     reason: str, *, installation_id: int, owner: str, repo_name: str,
     pr_number: int, verb: str,
 ) -> None:
-    """Tell the commenter once why an Elder re-run command was refused.
+    """Tell the commenter once why an Elder re-run or recheck command was refused.
 
     A refused command that vanishes looks like one that worked (grug#1270),
     so the reader is told why and invited to comment again. Best-effort: a
@@ -1176,7 +1176,8 @@ def _refuse_rerun_command(
         lambda fn: with_install_token_retry(int(installation_id), fn),
         owner, repo_name, int(pr_number),
         f"Grug refused `/grug {verb}`: {reason}. Only the PR author, a "
-        f"write collaborator, or an allowed App bot can re-run Elder here. "
+        f"write collaborator, or an allowed App bot can re-run "
+        f"{'Chief' if verb == 'recheck' else 'Elder'} here. "
         f"Comment `/grug {verb}` again.",
     )
 
@@ -1224,7 +1225,9 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
     comment = payload.get("comment") or {}
     body = comment.get("body") or ""
     comment_id = comment.get("id")
-    from grug_commands import ELDER_RERUN_VERBS, VERB_PERSONA, parse_command  # type: ignore
+    from grug_commands import (  # type: ignore
+        BOT_RERUN_VERBS, ELDER_RERUN_VERBS, VERB_PERSONA, parse_command,
+    )
     cmd = parse_command(body)
     if cmd is None:
         return {"status": "no_op", "reason": "no /grug command trigger"}
@@ -1340,9 +1343,9 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
             # grug#1445: an allowed App Bot runs Elder re-run commands like a
             # write collaborator. It has no collaborator permission record, so
             # the lookup would fail (404) - short circuit it instead. Only
-            # improve / resume / review are opened to bots; recheck and the
-            # other verbs keep the strict author-or-write gate.
-            if cmd.verb in ELDER_RERUN_VERBS and _sender_is_allowed_app_bot(
+            # improve / resume / review and recheck (grug#1722) are opened to
+            # bots; the other verbs keep the strict author-or-write gate.
+            if cmd.verb in BOT_RERUN_VERBS and _sender_is_allowed_app_bot(
                 sender_type, sender_login
             ):
                 has_write = True
@@ -1371,7 +1374,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 owner=owner, repo_name=repo_name, pr_number=int(pr_number),
                 comment_id=comment_id,
             )
-        elif cmd.verb in ELDER_RERUN_VERBS:
+        elif cmd.verb in BOT_RERUN_VERBS:
             _refuse_rerun_command(
                 "the permission lookup failed", installation_id=int(installation_id),
                 owner=owner, repo_name=repo_name, pr_number=int(pr_number),
@@ -1395,7 +1398,7 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 comment_id=comment_id, permission=perm,
                 association=str(comment.get("author_association") or ""),
             )
-        elif cmd.verb in ELDER_RERUN_VERBS:
+        elif cmd.verb in BOT_RERUN_VERBS:
             _refuse_rerun_command(
                 "the sender has no write role on this repo",
                 installation_id=int(installation_id), owner=owner,
