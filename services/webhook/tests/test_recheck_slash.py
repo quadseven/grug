@@ -929,5 +929,5 @@ def test_deployed_allowed_app_bot_logins_is_not_empty():
     assert {"loom-brain[bot]", "loom-station[bot]", "loom-lanes[bot]",
             "agent-anthropic-claude-code[bot]", "agent-meta-muse[bot]",
             "agent-openai-dot[bot]", "agent-openai-codex-luna[bot]",
-            "agent-google-gemini[bot]"} <= logins
+            "agent-google-gemini[bot]", "agent-xai-grok[bot]"} <= logins
 
