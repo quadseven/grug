@@ -22,6 +22,7 @@ AMERICAN_ENGLISH_RULE = (
 
 
 def _repo_specific_section() -> str:
+    """Return the text of AGENTS.md after the repo-specific marker."""
     text = _AGENTS.read_text(encoding="utf-8")
     if _MARKER not in text:
         raise AssertionError("AGENTS.md is missing the repo-specific marker")
@@ -29,4 +30,5 @@ def _repo_specific_section() -> str:
 
 
 def test_the_rule_is_in_the_repo_specific_agents_section():
+    """The repo-specific section carries the American English spelling rule."""
     assert AMERICAN_ENGLISH_RULE in _repo_specific_section()
