@@ -92,6 +92,7 @@ FLEET_AGENT_APP_LOGINS = frozenset((
     "agent-openai-dot[bot]",
     "agent-openai-codex-luna[bot]",
     "agent-google-gemini[bot]",
+    "agent-xai-grok[bot]",
 ))
 
 

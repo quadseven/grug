@@ -741,7 +741,7 @@ def test_fleet_agent_apps_count_as_replies_by_default():
     for login in (
         "loom-brain[bot]", "loom-station[bot]", "loom-lanes[bot]",
         "agent-anthropic-claude-code[bot]", "agent-meta-muse[bot]",
-        "agent-openai-dot[bot]",
+        "agent-openai-dot[bot]", "agent-xai-grok[bot]",
     ):
         assert login in default
     assert "some-unlisted-app[bot]" not in default
