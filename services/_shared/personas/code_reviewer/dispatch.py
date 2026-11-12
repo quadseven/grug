@@ -2477,7 +2477,7 @@ def dispatch_code_review(
         labels=labels, author_family=author_family or "",
         config=repr(base_repo_config),
     )
-    # AI-REVIEW 2026-11-12 [gpt-6.1-sol/code-review] 1730-R1 (issue #1730):
+    # AI-REVIEW 2026-11-12 [gpt-6.1-sol/code-review] 1730-R1 (PR #1731; issue #1730):
     # The carry probe and fallback share this invocation's immutable pinned diff.
     # Cache successes only; a failed fetch can still retry through normal handling.
     full_pr_diff = functools.cache(functools.partial(

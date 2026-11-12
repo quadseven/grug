@@ -25,7 +25,10 @@ Two findings, both anchored on a diff line:
   unmet. One finding names them all, because findings dedup on
   (file, line, rule). Criteria starting "Live:" are checked after deploy
   and are exempt, as are criteria about tests or docs, which test and
-  doc hunks can meet.
+  doc hunks can meet, and criteria that leave something alone ("is not
+  edited", "stays unchanged"), which no hunk can fail or meet (#1726). A
+  guard that says WHEN the thing stays as it was ("never modified when
+  the call fails") is runtime behavior and stays checked.
 
 A new script or module that no other non-test file in the diff imports,
 runs or names (#1364) cannot change runtime behavior either: nothing
@@ -92,6 +95,48 @@ _DOC_CRITERION_RE = re.compile(
 # runtime behavior a docs-only diff can never show (#1711). A named data file
 # (.txt) is exempt for the same reason: changing it is the deliverable.
 _PATH_TOKEN_RE = re.compile(r"[\w./-]+\.[A-Za-z]{2,5}\b")
+# A criterion that says something is left alone ("the prompt module is not
+# edited", "README.md is left untouched"): a diff meets it by the ABSENCE of a
+# hunk, so no hunk can satisfy it and a docs-only diff meets it trivially. Read
+# as runtime behavior it blocked a docs-only change that promised not to touch
+# a module (#1726).
+#
+# The exemption is fail-safe: a word list of runtime triggers could never be
+# complete (each review round found another verb), so a criterion is exempt
+# only when its whole text is ONE clause: a plain subject, then a preservation
+# predicate, then at most a change scope ("in this PR", "by this diff"). A
+# comma or semicolon, a conjunction, a relative pronoun or a runtime verb in
+# the subject, or anything after the predicate makes it checked. A missed
+# preservation criterion costs one false finding; a missed runtime criterion
+# ships unmet behavior.
+_PRESERVE_ONLY_RE = re.compile(
+    r"^\s*(?P<subject>.*?)\s*\b(?:"
+    r"(?:is|are|was|were|must|should|will|shall|can|may|does|do)\s*(?:n't|\s+not|\s+never)"
+    r"(?:\s+be)?\s+(?:"
+    r"edited|edit|changed|change|modified|modify|touched|touch|altered|alter"
+    r")"
+    r"|never\s+(?:be\s+)?(?:"
+    r"edited|edits|changed|changes|modified|modifies|touched|touches|altered|alters"
+    r")"
+    r"|(?:is|are|stays|stay|remains|remain|is\s+left|are\s+left|is\s+kept|are\s+kept"
+    r"|must\s+stay|must\s+remain|must\s+be\s+left|should\s+stay|should\s+remain)"
+    r"\s+(?:unchanged|untouched|unmodified|unedited|the\s+same|as\s+it\s+is)"
+    r")"
+    r"(?:\s+(?:in|by|for)\s+this\s+(?:pr|pull\s+request|diff|change|patch))?"
+    r"\s*\.?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+# What the subject may not hold: a clause boundary, a conjunction, a relative
+# pronoun, or a verb that names runtime behavior.
+_PRESERVE_SUBJECT_BAR_RE = re.compile(
+    r"[,;:()]"
+    r"|\b(?:and|or|but|nor|so|then|when|whenever|if|unless|after|before|once"
+    r"|while|during|upon|until|since|because|whereas|that|which|who|whom|whose"
+    r"|where"
+    r"|returns?|returning|responds?|responding|rejects?|rejecting|sends?|sending"
+    r"|writes?|writing|fails?|failing|accepts?|accepting|leaves?|leaving)\b",
+    re.IGNORECASE,
+)
 # A criterion about the pull request itself (it lands, its checks pass, its
 # threads are answered, an older one is closed): the review process meets
 # it, not a hunk.
@@ -529,12 +574,36 @@ def _names_doc_path(text: str) -> bool:
     return any(_is_doc_path(m.group(0)) for m in _PATH_TOKEN_RE.finditer(text))
 
 
+# AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness (codex), PR #1727] HIGH R1,
+# HIGH R3, HIGH R4: an adjective ("an unchanged request"), a scope phrase, a
+# relative subject or an earlier subordinate clause hid a top-level runtime
+# requirement. The exemption is now fail-safe (one plain clause, nothing else).
+# MEDIUM R2 and R5 (relative-subject preservation flagged) are declined by
+# operator decision: a false positive is cheap, a false negative is not.
+def _is_preservation_only(text: str) -> bool:
+    """True when the criterion only says something is left alone (#1726).
+
+    Fail-safe: the whole criterion must be one clause, a plain subject and a
+    preservation predicate ("is not edited", "must not change", "stays
+    unchanged", "is left untouched"), with at most a change scope ("in this
+    PR", "by this diff") after it. A subject holding a comma, a conjunction, a
+    relative pronoun ("the module that formats prompts is not edited") or a
+    runtime verb is checked as runtime behavior, as is anything else after
+    the predicate.
+    """
+    found = _PRESERVE_ONLY_RE.match(text)
+    if found is None:
+        return False
+    return _PRESERVE_SUBJECT_BAR_RE.search(found.group("subject")) is None
+
+
 def _is_runtime_criterion(text: str) -> bool:
     return not (
         _LIVE_RE.match(text)
         or _TEST_CRITERION_RE.search(text)
         or _DOC_CRITERION_RE.search(text)
         or _names_doc_path(text)
+        or _is_preservation_only(text)
         or _PROCESS_CRITERION_RE.search(text)
     )
 
