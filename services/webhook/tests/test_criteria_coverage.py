@@ -386,6 +386,10 @@ _PRESERVE_GUARDS = (
     "handler.py returns 404 when the request is unchanged",
     "The filter drops an unmodified message in this diff",
     "The record is never modified by this PR when the call fails",
+    # Review of c18e5b33: a relative clause qualifies the subject; the
+    # top-level verb after it is still the requirement.
+    "The endpoint that handles requests returns 404 and leaves the response unchanged",
+    "The endpoint which serves users fails the call and leaves the row unchanged",
 )
 
 
@@ -435,6 +439,8 @@ def test_a_trigger_inside_the_subject_does_not_make_a_preservation_criterion_run
         LinkedCriterion(1724, 3, "The module that formats prompts when a request arrives is not edited"),
         LinkedCriterion(1724, 4, "The module which formats prompts after a request arrives stays unchanged"),
         LinkedCriterion(1724, 5, "The prompt module is not edited"),
+        LinkedCriterion(1724, 6, "The module that handles requests is not edited"),
+        LinkedCriterion(1724, 7, "The module that returns prompts is not edited"),
     )
     findings = scan_criteria_coverage(
         hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,

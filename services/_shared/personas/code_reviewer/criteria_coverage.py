@@ -128,6 +128,16 @@ _PRESERVE_TRIGGER_RE = re.compile(
 # A relative clause in the subject ("the module that formats prompts when a
 # request arrives") says WHICH thing is left alone, not when.
 _RELATIVE_RE = re.compile(r"\b(?:that|which|who|whose)\b", re.IGNORECASE)
+# Triggers that open a subordinate clause. Inside a relative clause one only
+# says which thing is meant; the other triggers are verbs, which inside the
+# relative clause can only be its own verb ("the module that returns prompts").
+_PRESERVE_CONJUNCTIONS = frozenset({
+    "when", "whenever", "if", "unless", "after", "before", "once", "while",
+    "during", "upon", "on",
+})
+# A coordinated verb phrase ("returns 404 and leaves the response unchanged")
+# puts what precedes it at the top level, beside the predicate.
+_COORDINATOR_RE = re.compile(r"\b(?:and|or|but|then)\b", re.IGNORECASE)
 _CLAUSE_SPLIT_RE = re.compile(r"[,;:]|\bso\b|\bthen\b", re.IGNORECASE)
 _WORD_RE = re.compile(r"[A-Za-z']+")
 # A criterion about the pull request itself (it lands, its checks pass, its
@@ -567,6 +577,9 @@ def _names_doc_path(text: str) -> bool:
     return any(_is_doc_path(m.group(0)) for m in _PATH_TOKEN_RE.finditer(text))
 
 
+# AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness (codex), PR #1727] HIGH R1:
+# "returns 404 for an unchanged request in this PR" was exempt; an adjective is
+# no preservation predicate and a scope phrase no longer skips the trigger check.
 def _preservation_predicate(clause: str) -> re.Match[str] | None:
     """The match where the clause says something is left alone, or None.
 
@@ -605,10 +618,43 @@ def _is_preservation_only(text: str) -> bool:
         if _PRESERVE_TRIGGER_RE.search(clause, found.end()):
             return False
         before = clause[:found.start()]
-        trigger = _PRESERVE_TRIGGER_RE.search(before)
-        if trigger and not _RELATIVE_RE.search(before[:trigger.start()]):
-            return False
+        for trigger in _PRESERVE_TRIGGER_RE.finditer(before):
+            if not _trigger_in_relative_subject(before, trigger):
+                return False
     return True
+
+
+# AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness (codex), PR #1727] MEDIUM R2
+# and HIGH R3: a trigger inside a relative subject ("the module that formats
+# prompts when a request arrives is not edited") stays exempt, but a top-level
+# verb after the relative ("the endpoint that handles requests returns 404 and
+# leaves the response unchanged") is still checked.
+def _trigger_in_relative_subject(before: str, trigger: re.Match[str]) -> bool:
+    """True when a trigger before the predicate only qualifies the subject.
+
+    "The module that formats prompts when a request arrives is not edited":
+    "when" sits in the relative clause that says which module (#1726). Not so
+    in "the endpoint that handles requests returns 404 and leaves the response
+    unchanged": "returns" is a top-level verb beside the predicate, and only
+    code that runs can meet it. A trigger qualifies the subject only when a
+    relative pronoun precedes it, no coordinator joins it to the predicate,
+    and, for a verb, it is the relative clause's own verb (the first word after
+    the pronoun) or sits in a subordinate clause opened inside that relative.
+    """
+    head = before[:trigger.start()]
+    relatives = list(_RELATIVE_RE.finditer(head))
+    if not relatives:
+        return False
+    if _COORDINATOR_RE.search(before, trigger.end()):
+        return False
+    if trigger.group(0).lower() in _PRESERVE_CONJUNCTIONS:
+        return True
+    inside = head[relatives[-1].end():]
+    if not _WORD_RE.search(inside):
+        return True
+    return any(
+        w.group(0).lower() in _PRESERVE_CONJUNCTIONS for w in _WORD_RE.finditer(inside)
+    )
 
 
 def _is_runtime_criterion(text: str) -> bool:
