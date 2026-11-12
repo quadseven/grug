@@ -318,6 +318,163 @@ def test_a_criterion_naming_a_code_path_still_demands_runtime():
     assert len(mismatch) == 1 and mismatch[0].severity == "high"
 
 
+def _docs_only_diff() -> tuple[tuple[DiffHunk, ...], dict[str, str]]:
+    """A docs file plus its unit test: no production hunk at all."""
+    hunks = (
+        _hunk("AGENTS.md", 170, ["Write American English spelling."]),
+        _hunk("tests/test_rule.py", 1, _TEST_ADDED),
+    )
+    contents = {
+        "AGENTS.md": "Write American English spelling.\n",
+        "tests/test_rule.py": "\n".join(_TEST_ADDED) + "\n",
+    }
+    return hunks, contents
+
+
+def _intent_mismatches(text: str) -> int:
+    hunks, contents = _docs_only_diff()
+    findings = scan_criteria_coverage(
+        hunks, contents,
+        criteria=(LinkedCriterion(1724, 3, text),),
+        pr_title=_TITLE, pr_body=_BODY,
+    )
+    return len(_by_rule(findings, "intent-mismatch"))
+
+
+# One plain clause that only says something is left alone: a docs-only diff
+# meets it by not touching the thing (#1726).
+_PRESERVE_ONLY = (
+    "The prompt module is not edited",
+    "README.md is left untouched",
+    "is not edited by this PR",
+    "stays unchanged in this diff",
+    "The Elder prompt module is not edited by this PR",
+    "services/webhook/main.py stays unchanged in this diff",
+    "The scoring table is left untouched",
+    "The config schema is never modified by this change",
+    "The scoring table must not change",
+    "The scoring table must not be changed",
+    "The prompt module never changes",
+    "The prompt module never edits.",
+)
+
+
+def test_a_plain_preservation_criterion_is_met_by_leaving_the_thing_alone():
+    # #1726: "X is not edited" / "stays unchanged" is met by the ABSENCE of a
+    # hunk, so no hunk can "satisfy" it. It was read as runtime behavior, and a
+    # docs-only change that promised not to touch a prompt module was blocked.
+    for text in _PRESERVE_ONLY:
+        assert _intent_mismatches(text) == 0, text
+
+
+
+def test_a_preservation_criterion_does_not_excuse_a_positive_runtime_one():
+    # The other direction of #1726: the exemption is per criterion. A
+    # positive runtime criterion beside a preservation one is still unmet by
+    # a docs-only diff, and the finding names only that one.
+    hunks, contents = _docs_only_diff()
+    criteria = (
+        LinkedCriterion(1724, 3, "The prompt module is not edited"),
+        LinkedCriterion(1724, 7, "A ticket whose verify run fails is reopened"),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    mismatch = _by_rule(findings, "intent-mismatch")
+    assert len(mismatch) == 1 and mismatch[0].severity == "high"
+    assert "criterion 7" in mismatch[0].message
+    assert "criterion 3" not in mismatch[0].message
+
+
+# Runtime guards that use preservation words. Each says what the code must
+# leave alone WHEN something happens, so only a runtime hunk can meet it (#1726).
+
+
+# Anything but one plain preservation clause is checked (fail-safe, #1727).
+# Each round of review found another runtime verb a word list missed, so the
+# exemption admits only the plain shape and every other wording stays checked.
+_STILL_CHECKED = (
+    # Runtime guards with a trigger clause.
+    "The record is never modified when the call fails",
+    "The row must not be changed when validation fails",
+    "The row must not change when validation fails",
+    "The endpoint returns 404 and leaves the response unchanged",
+    "The cache stays untouched if the upstream times out",
+    "The stored token is not altered after a refused login",
+    "The record is never modified by this PR when the call fails",
+    "The scoring table must not change when a rule fails",
+    # R1: an adjective is no predicate, a scope phrase excuses nothing.
+    "handler.py returns 404 for an unchanged request in this PR",
+    "handler.py returns 404 when the request is unchanged",
+    "The filter drops an unmodified message in this diff",
+    # R3 and R4: a relative subject or an earlier subordinate clause hides a
+    # top-level runtime requirement.
+    "The endpoint that handles requests returns 404 and leaves the response unchanged",
+    "The endpoint which serves users fails the call and leaves the row unchanged",
+    "The endpoint that handles requests when available returns 404 with the response unchanged",
+    # The operator's matrix for the fail-safe rule.
+    "The service that accepts uploads rejects files over 10 MB and leaves the quota unchanged",
+    "The worker which sends emails writes the audit row and is not edited",
+    "The gateway that rejects bad tokens sends a 401 and is not modified",
+    "The handler that rejects bad input leaves the schema unchanged",
+    # Declined R2 and R5: a relative subject is checked even when the
+    # sentence only preserves a module; a false finding is the cheap mistake.
+    "The module that formats prompts when a request arrives is not edited",
+    "The module that handles requests is not edited",
+    "The module that returns responses and handles requests is not edited",
+    "The module that handles requests and returns responses is not edited",
+    # More than one clause, or a qualifier after the predicate.
+    "The prompt module is not edited, so the baseline hash stays the same",
+    "The webhook response is unchanged for existing callers",
+)
+
+
+def test_anything_but_one_plain_preservation_clause_is_still_checked():
+    for text in _STILL_CHECKED:
+        assert _intent_mismatches(text) == 1, text
+
+
+
+# A participle in the subject states runtime behavior ("the module serving
+# requests"), and a long subject is no plain noun phrase. The subject bar is
+# structural, not a verb list: any -ing word outside a short noun allowlist,
+# an infinitive "to", or more than six words makes the criterion checked
+# (Elder review 5874151160 on #1727).
+_PARTICIPLE_SUBJECTS = (
+    "The module serving requests is not edited",
+    "The module handling uploads is not edited",
+    "The worker running jobs stays unchanged",
+    "The job processing refunds must not change",
+    "The module to serve requests is not edited",
+    "The shared helper module for every webhook request path is not edited",
+)
+_PLAIN_SUBJECTS = (
+    "The prompt module is not edited",
+    "README.md is left untouched",
+    "The schema file is not modified",
+    "The scoring table is left untouched",
+    "The logging config is not edited",
+)
+
+
+def test_a_subject_with_a_participle_or_a_clause_is_still_checked():
+    for text in _PARTICIPLE_SUBJECTS:
+        assert _intent_mismatches(text) == 1, text
+    for text in _PLAIN_SUBJECTS:
+        assert _intent_mismatches(text) == 0, text
+
+
+def test_a_live_criterion_about_unchanged_state_is_still_checked():
+    # A `Live:` criterion keeps its handling: with nothing in the diff that
+    # runs, no deploy can make it true, preservation wording or not.
+    hunks, contents = _docs_only_diff()
+    criteria = (LinkedCriterion(1724, 8, "Live: the host config is unchanged after deploy"),)
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert len(_by_rule(findings, "intent-mismatch")) == 1
+
+
 def test_declared_entry_point_is_not_dead_and_counts_as_runtime():
     hunks, contents = _helper_only_diff()
     body = _BODY + "\n\n`verify_due` is an exported API for the station plugin."
