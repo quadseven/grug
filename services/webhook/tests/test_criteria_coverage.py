@@ -371,6 +371,69 @@ def test_a_preservation_criterion_does_not_excuse_a_positive_runtime_one():
     assert "criterion 3" not in mismatch[0].message
 
 
+# Runtime guards that use preservation words. Each says what the code must
+# leave alone WHEN something happens, so only a runtime hunk can meet it (#1726).
+_PRESERVE_GUARDS = (
+    "The record is never modified when the call fails",
+    "The row must not be changed when validation fails",
+    "The row must not change when validation fails",
+    "The endpoint returns 404 and leaves the response unchanged",
+    "The cache stays untouched if the upstream times out",
+    "The stored token is not altered after a refused login",
+)
+
+
+def test_a_preservation_guard_with_a_trigger_clause_is_still_checked():
+    # The review of #1727: the exemption must not cover a runtime guard just
+    # because it says "never modified" or "unchanged". A trigger clause (when,
+    # if, after, returns) makes it behavior, and a docs-only diff cannot meet it.
+    hunks, contents = _docs_only_diff()
+    for text in _PRESERVE_GUARDS:
+        findings = scan_criteria_coverage(
+            hunks, contents,
+            criteria=(LinkedCriterion(1724, 3, text),),
+            pr_title=_TITLE, pr_body=_BODY,
+        )
+        mismatch = _by_rule(findings, "intent-mismatch")
+        assert len(mismatch) == 1, text
+        assert "criterion 3" in mismatch[0].message, text
+
+
+def test_equivalent_preservation_wording_is_judged_the_same():
+    # "must not change" and "must not be changed" mean the same thing, so a
+    # criterion worded either way gets the same verdict with or without a
+    # trigger clause.
+    hunks, contents = _docs_only_diff()
+
+    def mismatches(text: str) -> int:
+        findings = scan_criteria_coverage(
+            hunks, contents,
+            criteria=(LinkedCriterion(1724, 3, text),),
+            pr_title=_TITLE, pr_body=_BODY,
+        )
+        return len(_by_rule(findings, "intent-mismatch"))
+
+    assert mismatches("The scoring table must not change") == 0
+    assert mismatches("The scoring table must not be changed") == 0
+    assert mismatches("The scoring table must not change when a rule fails") == 1
+    assert mismatches("The scoring table must not be changed when a rule fails") == 1
+
+
+def test_a_scoped_preservation_criterion_is_met_by_leaving_the_file_alone():
+    # A criterion scoped to this change ("by this PR", "in this diff") is about
+    # the diff itself, so a trigger-looking word does not make it runtime.
+    hunks, contents = _docs_only_diff()
+    criteria = (
+        LinkedCriterion(1724, 3, "The Elder prompt module is not edited by this PR"),
+        LinkedCriterion(1724, 4, "services/webhook/main.py stays unchanged in this diff"),
+        LinkedCriterion(1724, 5, "The prompt module is not edited by this PR, so the baseline hash stays the same"),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert not _by_rule(findings, "intent-mismatch")
+
+
 def test_a_live_criterion_about_unchanged_state_is_still_checked():
     # A `Live:` criterion keeps its handling: with nothing in the diff that
     # runs, no deploy can make it true, preservation wording or not.

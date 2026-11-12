@@ -26,7 +26,9 @@ Two findings, both anchored on a diff line:
   (file, line, rule). Criteria starting "Live:" are checked after deploy
   and are exempt, as are criteria about tests or docs, which test and
   doc hunks can meet, and criteria that leave something alone ("is not
-  edited", "stays unchanged"), which no hunk can fail or meet (#1726).
+  edited", "stays unchanged"), which no hunk can fail or meet (#1726). A
+  guard that says WHEN the thing stays as it was ("never modified when
+  the call fails") is runtime behavior and stays checked.
 
 A new script or module that no other non-test file in the diff imports,
 runs or names (#1364) cannot change runtime behavior either: nothing
@@ -99,10 +101,29 @@ _PATH_TOKEN_RE = re.compile(r"[\w./-]+\.[A-Za-z]{2,5}\b")
 # as runtime behavior it blocked a docs-only change that promised not to touch
 # a module (#1726).
 _PRESERVE_RE = re.compile(
-    r"\b(?:not|never)\s+(?:be\s+)?(?:edited|changed|modified|touched|altered)\b"
+    r"\b(?:not|never)\s+(?:be\s+)?"
+    r"(?:edited|edit|changed|change|modified|modify|touched|touch|altered|alter)\b"
     r"|\b(?:unchanged|untouched|unmodified)\b",
     re.IGNORECASE,
 )
+# What makes a preservation criterion runtime behavior after all: it says WHEN
+# the thing stays as it was ("is never modified when the call fails", "returns
+# 404 and leaves the response unchanged"), and only code that runs can meet a
+# guard like that. A clause with one of these words is never exempt.
+_PRESERVE_TRIGGER_RE = re.compile(
+    r"\b(?:when|whenever|if|unless|after|before|once|while|during|upon|on"
+    r"|returns?|returning|responds?|responding|fails?|failing|failure|errors?)\b",
+    re.IGNORECASE,
+)
+# A preservation clause scoped to the change itself ("is not edited by this
+# PR", "stays unchanged in this diff") is about the diff, so a trigger-looking
+# word in it ("on every run") does not make it runtime.
+_PRESERVE_SCOPE_RE = re.compile(
+    r"\b(?:by|in|within|across)\s+this\s+"
+    r"(?:pr|pull\s+request|diff|change|patch|commit|branch)\b",
+    re.IGNORECASE,
+)
+_CLAUSE_SPLIT_RE = re.compile(r"[,;:]|\b(?:and|but|so|then)\b", re.IGNORECASE)
 # A criterion about the pull request itself (it lands, its checks pass, its
 # threads are answered, an older one is closed): the review process meets
 # it, not a hunk.
@@ -540,13 +561,33 @@ def _names_doc_path(text: str) -> bool:
     return any(_is_doc_path(m.group(0)) for m in _PATH_TOKEN_RE.finditer(text))
 
 
+def _is_preservation_only(text: str) -> bool:
+    """True when the criterion only says something is left alone (#1726).
+
+    The exemption is per clause, not per criterion. A clause that says a thing
+    is not edited or stays unchanged is exempt when it names no trigger, or is
+    scoped to this change. Every other clause must name no trigger either: a
+    guard like "never modified when the call fails" or "returns 404 and leaves
+    the response unchanged" is runtime behavior and stays checked.
+    """
+    clauses = [c for c in _CLAUSE_SPLIT_RE.split(text) if c and c.strip()]
+    if not any(_PRESERVE_RE.search(c) for c in clauses):
+        return False
+    for clause in clauses:
+        if _PRESERVE_RE.search(clause) and _PRESERVE_SCOPE_RE.search(clause):
+            continue
+        if _PRESERVE_TRIGGER_RE.search(clause):
+            return False
+    return True
+
+
 def _is_runtime_criterion(text: str) -> bool:
     return not (
         _LIVE_RE.match(text)
         or _TEST_CRITERION_RE.search(text)
         or _DOC_CRITERION_RE.search(text)
         or _names_doc_path(text)
-        or _PRESERVE_RE.search(text)
+        or _is_preservation_only(text)
         or _PROCESS_CRITERION_RE.search(text)
     )
 
