@@ -100,7 +100,19 @@ _PATH_TOKEN_RE = re.compile(r"[\w./-]+\.[A-Za-z]{2,5}\b")
 # a module (#1726).
 _PRESERVE_RE = re.compile(
     r"\b(?:not|never)\s+(?:be\s+)?(?:edited|changed|modified|touched|altered)\b"
-    r"|\b(?:unchanged|untouched|unmodified)\b",
+    # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness] R1 (PR #1727):
+    # An unchanged input is not a promise to preserve existing behavior.
+    r"|\b(?:is|are|was|were|stays?|remains?|left|kept)\s+"
+    r"(?:unchanged|untouched|unmodified)\b",
+    re.IGNORECASE,
+)
+# A preservation predicate inside an input condition or relative clause does
+# not describe the criterion's main promise. Keep ambiguous clauses runtime.
+_PRESERVE_SUBORDINATE_RE = re.compile(
+    r"\b(?:if|when(?:ever)?|unless|while|where)\b", re.IGNORECASE,
+)
+_PRESERVE_RELATIVE_RE = re.compile(
+    r"\b(?:that|which)\s+(?:(?:is|are|was|were|stays?|remains?)\s+)?$",
     re.IGNORECASE,
 )
 # A criterion about the pull request itself (it lands, its checks pass, its
@@ -540,13 +552,27 @@ def _names_doc_path(text: str) -> bool:
     return any(_is_doc_path(m.group(0)) for m in _PATH_TOKEN_RE.finditer(text))
 
 
+def _is_preservation_criterion(text: str) -> bool:
+    """Recognize a main preservation promise, not an input's condition."""
+    match = _PRESERVE_RE.search(text)
+    # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness] R2 (PR #1727):
+    # "returns 404 when the request is not modified" still demands behavior.
+    if match is None:
+        return False
+    prefix = text[:match.start()]
+    return not (
+        _PRESERVE_SUBORDINATE_RE.search(prefix)
+        or _PRESERVE_RELATIVE_RE.search(prefix)
+    )
+
+
 def _is_runtime_criterion(text: str) -> bool:
     return not (
         _LIVE_RE.match(text)
         or _TEST_CRITERION_RE.search(text)
         or _DOC_CRITERION_RE.search(text)
         or _names_doc_path(text)
-        or _PRESERVE_RE.search(text)
+        or _is_preservation_criterion(text)
         or _PROCESS_CRITERION_RE.search(text)
     )
 

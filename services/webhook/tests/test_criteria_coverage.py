@@ -371,6 +371,66 @@ def test_a_preservation_criterion_does_not_excuse_a_positive_runtime_one():
     assert "criterion 3" not in mismatch[0].message
 
 
+def test_unchanged_input_does_not_exempt_a_positive_runtime_criterion():
+    hunks, contents = _docs_only_diff()
+    criteria = (
+        LinkedCriterion(1726, 1, "handler.py returns 404 for an unchanged request"),
+        LinkedCriterion(1726, 2, "handler.py rejects an untouched record"),
+        LinkedCriterion(1726, 3, "handler.py rejects an unmodified payload"),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    mismatch = _by_rule(findings, "intent-mismatch")
+    assert len(mismatch) == 1 and mismatch[0].severity == "high"
+    for criterion in criteria:
+        assert f"criterion {criterion.number}" in mismatch[0].message
+
+
+def test_a_preserved_input_condition_does_not_excuse_runtime_behavior():
+    hunks, contents = _docs_only_diff()
+    criteria = (
+        LinkedCriterion(1726, 1, "handler.py returns 404 when the request is unchanged"),
+        LinkedCriterion(1726, 2, "handler.py returns 404 when the request is not modified"),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    mismatch = _by_rule(findings, "intent-mismatch")
+    assert len(mismatch) == 1 and mismatch[0].severity == "high"
+    for criterion in criteria:
+        assert f"criterion {criterion.number}" in mismatch[0].message
+
+
+def test_a_relative_subject_can_make_a_main_preservation_promise():
+    hunks, contents = _docs_only_diff()
+    criteria = (
+        LinkedCriterion(1726, 1, "The module that formats prompts is not edited"),
+        LinkedCriterion(1726, 2, "handler.py returns 404 for a request that is unchanged"),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    mismatch = _by_rule(findings, "intent-mismatch")
+    assert len(mismatch) == 1 and mismatch[0].severity == "high"
+    assert "criterion 1" not in mismatch[0].message
+    assert "criterion 2" in mismatch[0].message
+
+
+def test_a_conditional_relative_subject_can_make_a_preservation_promise():
+    hunks, contents = _docs_only_diff()
+    criteria = (
+        LinkedCriterion(
+            1726, 1,
+            "The module that formats prompts when a request arrives is not edited",
+        ),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert not _by_rule(findings, "intent-mismatch")
+
+
 def test_a_live_criterion_about_unchanged_state_is_still_checked():
     # A `Live:` criterion keeps its handling: with nothing in the diff that
     # runs, no deploy can make it true, preservation wording or not.
