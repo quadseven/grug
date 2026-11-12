@@ -203,7 +203,11 @@ def test_non_author_with_write_perm_authorized(_no_install_lookups):
     assert out["result"] == "fail"
 
 
-def test_non_author_with_read_perm_rejected(_no_install_lookups):
+def test_non_author_with_read_perm_rejected(_no_install_lookups, monkeypatch):
+    import interactive
+
+    # The refusal is answered (grug#1722): keep that reply off the network.
+    monkeypatch.setattr(interactive, "httpx", _InteractiveHttp())
     payload = _comment_payload(body="/grug recheck", sender_login="random", pr_author="alice")
 
     def _httpx_get(*args, **kwargs):
@@ -241,22 +245,38 @@ def test_tpm_disabled_per_repo_no_ops(monkeypatch):
     assert "tpm disabled" in out["reason"]
 
 
-def test_perm_lookup_transport_error_returns_skip(_no_install_lookups, mock_transport_client):
-    """async-blocker-hunter F-01: transport error during perm lookup
-    must return skip + log, not 500.
+@pytest.mark.parametrize(
+    ("verb", "persona"), [("recheck", "Chief"), ("improve", "Elder"), ("fix", None)],
+)
+def test_perm_lookup_transport_error_answers_only_rerun_commands(
+    verb, persona, _no_install_lookups, mock_transport_client, monkeypatch,
+):
+    """A real permission transport failure answers reruns without authorizing them."""
+    import interactive
 
-    Real-transport-backed (issue #105): ConnectError comes from
-    httpx.MockTransport handler raising.
-    """
-    payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="alice")
-    client = mock_transport_client(raise_exc=httpx.ConnectError("DNS failure"))
+    replies = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", replies)
+    monkeypatch.setattr("adapters.pg_install_store.claim_delivery", lambda key: True)
+    monkeypatch.setenv("GRUG_ALLOWED_APP_BOT_LOGINS", "allowed-app[bot]")
+    payload = _recheck_payload(sender_login="unlisted-app[bot]", verb=verb)
+    client = mock_transport_client(raise_exc=httpx.ConnectError("fixture transport failure"))
 
-    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
-        with patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)):
-            out = d.dispatch("issue_comment", payload)
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=client.get) as lookup, \
+         patch("personas.tpm.persona.evaluate_pull_request") as evaluate:
+        out = d.dispatch("issue_comment", payload)
 
-    assert out["status"] == "skip"
-    assert "transport" in out["reason"]
+    assert out == {"status": "skip", "reason": "perm_lookup_transport_failed"}
+    lookup.assert_called_once()
+    assert "/collaborators/unlisted-app%5Bbot%5D/permission" in lookup.call_args.args[0]
+    evaluate.assert_not_called()
+    if persona is None:
+        assert replies.posts == []
+    else:
+        assert len(replies.posts) == 1
+        assert "permission lookup failed" in replies.posts[0]["body"]
+        assert f"/grug {verb}" in replies.posts[0]["body"]
+        assert persona in replies.posts[0]["body"]
 
 
 def test_pr_fetch_transport_error_returns_skip(_no_install_lookups, mock_transport_client):
@@ -911,6 +931,129 @@ def test_unknown_app_bot_is_refused_with_a_reply(
     assert len(http.posts) == 1
     body = str(http.posts[0].get("body", ""))
     assert "refused" in body and "/grug improve" in body
+
+
+# --- grug#1722: recheck is answered, and an allowed App bot may run it ------
+
+
+def _recheck_payload(*, sender_login: str, sender_type: str = "Bot", verb: str = "recheck") -> dict:
+    payload = _improve_payload(sender_login=sender_login, sender_type=sender_type)
+    payload["comment"] = {"body": f"/grug {verb}", "id": 778}
+    return payload
+
+
+class _FakeResult:
+    passed = True
+
+
+def test_allowed_app_bot_recheck_runs_chief_with_no_collaborator_lookup(
+    _no_install_lookups, monkeypatch,
+):
+    """#1722: an allowed App bot (not the PR author, no collaborator record)
+    starts a Chief run with /grug recheck, like it does an Elder re-run."""
+    monkeypatch.setenv("GRUG_ALLOWED_APP_BOT_LOGINS", "loom-brain[bot], loom-station[bot]")
+    urls: list[str] = []
+
+    def _get(url, **_kw):
+        urls.append(url)
+        return _pr_response()
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=_get), \
+         patch("personas.tpm.persona.evaluate_pull_request", return_value=_FakeResult()) as ev, \
+         patch("personas.tpm.persona.publish_tpm_evaluation"):
+        out = d.dispatch("issue_comment", _recheck_payload(sender_login="loom-brain[bot]"))
+
+    assert out["status"] == "dispatched"
+    assert out["trigger"] == "recheck"
+    ev.assert_called_once()
+    assert not any("/collaborators/" in u for u in urls), urls
+
+
+def test_unlisted_app_bot_recheck_is_refused_with_a_reply(
+    _no_install_lookups, monkeypatch, mock_transport_client,
+):
+    """#1722: a bot off the allowed list is still refused, and the refusal is
+    answered on the pull request instead of dropped."""
+    import interactive
+
+    monkeypatch.setenv("GRUG_ALLOWED_APP_BOT_LOGINS", "loom-brain[bot]")
+    http = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", http)
+    monkeypatch.setattr("adapters.pg_install_store.claim_delivery", lambda key: True)
+    client = mock_transport_client(status_codes=[404], json_bodies=[{}])
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)), \
+         patch("personas.tpm.persona.evaluate_pull_request") as ev:
+        out = d.dispatch("issue_comment", _recheck_payload(sender_login="random-bot[bot]"))
+
+    assert out["status"] == "skip"
+    assert out["reason"] == "perm_lookup_failed"
+    ev.assert_not_called()
+    assert len(http.posts) == 1
+    body = str(http.posts[0].get("body", ""))
+    assert "refused" in body and "/grug recheck" in body
+    assert "the permission lookup failed" in body
+    assert "Chief" in body and "re-run Elder" not in body
+
+
+def test_recheck_from_a_user_without_write_is_refused_with_a_reply(
+    _no_install_lookups, monkeypatch,
+):
+    """#1722: a human who is neither the author nor a write collaborator is
+    told why, once, as the Elder re-run verbs already are."""
+    import interactive
+
+    http = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", http)
+    monkeypatch.setattr("adapters.pg_install_store.claim_delivery", lambda key: True)
+
+    class _Perm:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"permission": "read"}
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", return_value=_Perm()):
+        out = d.dispatch(
+            "issue_comment",
+            _recheck_payload(sender_login="random", sender_type="User"),
+        )
+
+    assert out["status"] == "no_op"
+    assert "lacks write perm" in out["reason"]
+    assert len(http.posts) == 1
+    body = str(http.posts[0].get("body", ""))
+    assert "refused" in body and "/grug recheck" in body
+    assert "no write role" in body
+
+
+def test_allowed_app_bot_keeps_the_strict_gate_for_other_verbs(
+    _no_install_lookups, monkeypatch, mock_transport_client,
+):
+    """#1722: the bot shortcut opens `recheck` and the Elder re-run verbs and
+    nothing else. `fix` commits to the PR branch, so it still takes the
+    author-or-write gate: the lookup runs, fails for an App, and it skips."""
+    monkeypatch.setenv("GRUG_ALLOWED_APP_BOT_LOGINS", "loom-brain[bot]")
+    client = mock_transport_client(status_codes=[404], json_bodies=[{}])
+    urls: list[str] = []
+
+    def _get(url, *a, **kw):
+        urls.append(url)
+        return client.get(url, *a, **kw)
+
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=_get):
+        out = d.dispatch(
+            "issue_comment", _recheck_payload(sender_login="loom-brain[bot]", verb="fix"),
+        )
+
+    assert out["status"] == "skip"
+    assert out["reason"] == "perm_lookup_failed"
+    assert any("/collaborators/" in u for u in urls), urls
 
 
 # --- production wiring --------------------------------------------------------
