@@ -245,22 +245,38 @@ def test_tpm_disabled_per_repo_no_ops(monkeypatch):
     assert "tpm disabled" in out["reason"]
 
 
-def test_perm_lookup_transport_error_returns_skip(_no_install_lookups, mock_transport_client):
-    """async-blocker-hunter F-01: transport error during perm lookup
-    must return skip + log, not 500.
+@pytest.mark.parametrize(
+    ("verb", "persona"), [("recheck", "Chief"), ("improve", "Elder"), ("fix", None)],
+)
+def test_perm_lookup_transport_error_answers_only_rerun_commands(
+    verb, persona, _no_install_lookups, mock_transport_client, monkeypatch,
+):
+    """A real permission transport failure answers reruns without authorizing them."""
+    import interactive
 
-    Real-transport-backed (issue #105): ConnectError comes from
-    httpx.MockTransport handler raising.
-    """
-    payload = _comment_payload(body="/grug recheck", sender_login="bob", pr_author="alice")
-    client = mock_transport_client(raise_exc=httpx.ConnectError("DNS failure"))
+    replies = _InteractiveHttp()
+    monkeypatch.setattr(interactive, "httpx", replies)
+    monkeypatch.setattr("adapters.pg_install_store.claim_delivery", lambda key: True)
+    monkeypatch.setenv("GRUG_ALLOWED_APP_BOT_LOGINS", "allowed-app[bot]")
+    payload = _recheck_payload(sender_login="unlisted-app[bot]", verb=verb)
+    client = mock_transport_client(raise_exc=httpx.ConnectError("fixture transport failure"))
 
-    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")):
-        with patch("httpx.get", side_effect=lambda *a, **kw: client.get(*a, **kw)):
-            out = d.dispatch("issue_comment", payload)
+    with patch("github_app_auth.with_install_token_retry", side_effect=lambda _i, fn: fn("tok")), \
+         patch("httpx.get", side_effect=client.get) as lookup, \
+         patch("personas.tpm.persona.evaluate_pull_request") as evaluate:
+        out = d.dispatch("issue_comment", payload)
 
-    assert out["status"] == "skip"
-    assert "transport" in out["reason"]
+    assert out == {"status": "skip", "reason": "perm_lookup_transport_failed"}
+    lookup.assert_called_once()
+    assert "/collaborators/unlisted-app%5Bbot%5D/permission" in lookup.call_args.args[0]
+    evaluate.assert_not_called()
+    if persona is None:
+        assert replies.posts == []
+    else:
+        assert len(replies.posts) == 1
+        assert "permission lookup failed" in replies.posts[0]["body"]
+        assert f"/grug {verb}" in replies.posts[0]["body"]
+        assert persona in replies.posts[0]["body"]
 
 
 def test_pr_fetch_transport_error_returns_skip(_no_install_lookups, mock_transport_client):

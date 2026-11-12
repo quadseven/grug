@@ -1362,6 +1362,14 @@ def _handle_issue_comment(payload: dict[str, Any]) -> dict[str, str]:
                 owner=owner, repo_name=repo_name, pr_number=int(pr_number),
                 comment_id=comment_id,
             )
+        # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness] R1 (PR #1728):
+        # Transport failures must answer reruns just like failed HTTP lookups.
+        elif cmd.verb in BOT_RERUN_VERBS:
+            _refuse_rerun_command(
+                "the permission lookup failed", installation_id=int(installation_id),
+                owner=owner, repo_name=repo_name, pr_number=int(pr_number),
+                verb=cmd.verb,
+            )
         log.warning(
             "perm_lookup_transport_failed",
             extra={"sender": sender_login, "kind": type(e).__name__},
