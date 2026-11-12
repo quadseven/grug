@@ -137,6 +137,18 @@ _PRESERVE_SUBJECT_BAR_RE = re.compile(
     r"|writes?|writing|fails?|failing|accepts?|accepting|leaves?|leaving)\b",
     re.IGNORECASE,
 )
+# The subject must also be a short plain noun phrase, judged by shape rather
+# than a verb list: a participle ("the module serving requests") or an
+# infinitive ("the module to serve requests") states runtime behavior, and a
+# long subject is no plain noun phrase. Nouns that end in -ing are allowed
+# only from this short list (#1727).
+_PRESERVE_SUBJECT_MAX_WORDS = 6
+_PRESERVE_ING_NOUNS = frozenset({
+    "thing", "something", "nothing", "anything", "everything", "string",
+    "scoring", "logging", "routing", "pricing", "billing", "mapping",
+    "setting", "building", "spring",
+})
+_PRESERVE_SUBJECT_WORD_RE = re.compile(r"[\w./-]+")
 # A criterion about the pull request itself (it lands, its checks pass, its
 # threads are answered, an older one is closed): the review process meets
 # it, not a hunk.
@@ -580,6 +592,9 @@ def _names_doc_path(text: str) -> bool:
 # requirement. The exemption is now fail-safe (one plain clause, nothing else).
 # MEDIUM R2 and R5 (relative-subject preservation flagged) are declined by
 # operator decision: a false positive is cheap, a false negative is not.
+# AI-REVIEW 2026-11-12 [grug-elder, PR #1727, review 5874151160] MEDIUM: a
+# participle subject ("the module serving requests") passed the verb bar.
+# Fixed structurally in _is_plain_noun_phrase, not by adding one more verb.
 def _is_preservation_only(text: str) -> bool:
     """True when the criterion only says something is left alone (#1726).
 
@@ -594,7 +609,26 @@ def _is_preservation_only(text: str) -> bool:
     found = _PRESERVE_ONLY_RE.match(text)
     if found is None:
         return False
-    return _PRESERVE_SUBJECT_BAR_RE.search(found.group("subject")) is None
+    subject = found.group("subject")
+    if _PRESERVE_SUBJECT_BAR_RE.search(subject):
+        return False
+    return _is_plain_noun_phrase(subject)
+
+
+def _is_plain_noun_phrase(subject: str) -> bool:
+    """True when the subject is a short noun phrase with no verb form in it.
+
+    At most _PRESERVE_SUBJECT_MAX_WORDS words, no infinitive "to", and no
+    word ending in -ing outside _PRESERVE_ING_NOUNS ("the module serving
+    requests" is runtime behavior, "the scoring table" is a noun phrase).
+    """
+    words = [w.lower() for w in _PRESERVE_SUBJECT_WORD_RE.findall(subject)]
+    if len(words) > _PRESERVE_SUBJECT_MAX_WORDS or "to" in words:
+        return False
+    return not any(
+        w.endswith("ing") and len(w) > 4 and w not in _PRESERVE_ING_NOUNS
+        for w in words
+    )
 
 
 def _is_runtime_criterion(text: str) -> bool:

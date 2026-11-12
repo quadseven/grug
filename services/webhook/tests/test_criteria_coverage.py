@@ -435,6 +435,35 @@ def test_anything_but_one_plain_preservation_clause_is_still_checked():
 
 
 
+# A participle in the subject states runtime behavior ("the module serving
+# requests"), and a long subject is no plain noun phrase. The subject bar is
+# structural, not a verb list: any -ing word outside a short noun allowlist,
+# an infinitive "to", or more than six words makes the criterion checked
+# (Elder review 5874151160 on #1727).
+_PARTICIPLE_SUBJECTS = (
+    "The module serving requests is not edited",
+    "The module handling uploads is not edited",
+    "The worker running jobs stays unchanged",
+    "The job processing refunds must not change",
+    "The module to serve requests is not edited",
+    "The shared helper module for every webhook request path is not edited",
+)
+_PLAIN_SUBJECTS = (
+    "The prompt module is not edited",
+    "README.md is left untouched",
+    "The schema file is not modified",
+    "The scoring table is left untouched",
+    "The logging config is not edited",
+)
+
+
+def test_a_subject_with_a_participle_or_a_clause_is_still_checked():
+    for text in _PARTICIPLE_SUBJECTS:
+        assert _intent_mismatches(text) == 1, text
+    for text in _PLAIN_SUBJECTS:
+        assert _intent_mismatches(text) == 0, text
+
+
 def test_a_live_criterion_about_unchanged_state_is_still_checked():
     # A `Live:` criterion keeps its handling: with nothing in the diff that
     # runs, no deploy can make it true, preservation wording or not.
