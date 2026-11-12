@@ -380,6 +380,12 @@ _PRESERVE_GUARDS = (
     "The endpoint returns 404 and leaves the response unchanged",
     "The cache stays untouched if the upstream times out",
     "The stored token is not altered after a refused login",
+    # Review of 5d4b2c30: an adjective is not a preservation predicate, and a
+    # scope phrase does not excuse a trigger.
+    "handler.py returns 404 for an unchanged request in this PR",
+    "handler.py returns 404 when the request is unchanged",
+    "The filter drops an unmodified message in this diff",
+    "The record is never modified by this PR when the call fails",
 )
 
 
@@ -417,6 +423,23 @@ def test_equivalent_preservation_wording_is_judged_the_same():
     assert mismatches("The scoring table must not be changed") == 0
     assert mismatches("The scoring table must not change when a rule fails") == 1
     assert mismatches("The scoring table must not be changed when a rule fails") == 1
+
+
+def test_a_trigger_inside_the_subject_does_not_make_a_preservation_criterion_runtime():
+    # The review of 5d4b2c30: in "the module that formats prompts when a
+    # request arrives is not edited" the relative clause describes WHICH module
+    # is left alone. The top-level requirement is the absence of an edit, the
+    # same as "the prompt module is not edited", so it is judged the same.
+    hunks, contents = _docs_only_diff()
+    criteria = (
+        LinkedCriterion(1724, 3, "The module that formats prompts when a request arrives is not edited"),
+        LinkedCriterion(1724, 4, "The module which formats prompts after a request arrives stays unchanged"),
+        LinkedCriterion(1724, 5, "The prompt module is not edited"),
+    )
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert not _by_rule(findings, "intent-mismatch")
 
 
 def test_a_scoped_preservation_criterion_is_met_by_leaving_the_file_alone():

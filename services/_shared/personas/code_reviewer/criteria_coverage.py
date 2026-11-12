@@ -106,24 +106,30 @@ _PRESERVE_RE = re.compile(
     r"|\b(?:unchanged|untouched|unmodified)\b",
     re.IGNORECASE,
 )
+# "unchanged" is a preservation predicate ("the response is unchanged") only
+# when nothing it could modify follows it. Before a noun it is an adjective
+# ("returns 404 for an unchanged request"), part of a behavior requirement.
+_PRESERVE_ADJECTIVE_RE = re.compile(r"^(?:unchanged|untouched|unmodified)$", re.IGNORECASE)
+_PRESERVE_CLOSERS = frozenset({
+    "for", "by", "in", "within", "across", "to", "so", "and", "but", "or",
+    "when", "whenever", "if", "unless", "after", "before", "once", "while",
+    "during", "upon", "on", "at", "from", "with", "until", "since", "because",
+    "as", "that", "which",
+})
 # What makes a preservation criterion runtime behavior after all: it says WHEN
 # the thing stays as it was ("is never modified when the call fails", "returns
 # 404 and leaves the response unchanged"), and only code that runs can meet a
-# guard like that. A clause with one of these words is never exempt.
+# guard like that.
 _PRESERVE_TRIGGER_RE = re.compile(
     r"\b(?:when|whenever|if|unless|after|before|once|while|during|upon|on"
     r"|returns?|returning|responds?|responding|fails?|failing|failure|errors?)\b",
     re.IGNORECASE,
 )
-# A preservation clause scoped to the change itself ("is not edited by this
-# PR", "stays unchanged in this diff") is about the diff, so a trigger-looking
-# word in it ("on every run") does not make it runtime.
-_PRESERVE_SCOPE_RE = re.compile(
-    r"\b(?:by|in|within|across)\s+this\s+"
-    r"(?:pr|pull\s+request|diff|change|patch|commit|branch)\b",
-    re.IGNORECASE,
-)
-_CLAUSE_SPLIT_RE = re.compile(r"[,;:]|\b(?:and|but|so|then)\b", re.IGNORECASE)
+# A relative clause in the subject ("the module that formats prompts when a
+# request arrives") says WHICH thing is left alone, not when.
+_RELATIVE_RE = re.compile(r"\b(?:that|which|who|whose)\b", re.IGNORECASE)
+_CLAUSE_SPLIT_RE = re.compile(r"[,;:]|\bso\b|\bthen\b", re.IGNORECASE)
+_WORD_RE = re.compile(r"[A-Za-z']+")
 # A criterion about the pull request itself (it lands, its checks pass, its
 # threads are answered, an older one is closed): the review process meets
 # it, not a hunk.
@@ -561,22 +567,46 @@ def _names_doc_path(text: str) -> bool:
     return any(_is_doc_path(m.group(0)) for m in _PATH_TOKEN_RE.finditer(text))
 
 
+def _preservation_predicate(clause: str) -> re.Match[str] | None:
+    """The match where the clause says something is left alone, or None.
+
+    "unchanged", "untouched" and "unmodified" count only as a predicate: one
+    that a noun follows is an adjective ("for an unchanged request") (#1726).
+    """
+    for found in _PRESERVE_RE.finditer(clause):
+        if _PRESERVE_ADJECTIVE_RE.match(found.group(0)):
+            follower = _WORD_RE.search(clause, found.end())
+            if follower and follower.group(0).lower() not in _PRESERVE_CLOSERS:
+                continue
+        return found
+    return None
+
+
 def _is_preservation_only(text: str) -> bool:
     """True when the criterion only says something is left alone (#1726).
 
-    The exemption is per clause, not per criterion. A clause that says a thing
-    is not edited or stays unchanged is exempt when it names no trigger, or is
-    scoped to this change. Every other clause must name no trigger either: a
-    guard like "never modified when the call fails" or "returns 404 and leaves
-    the response unchanged" is runtime behavior and stays checked.
+    Read clause by clause. A clause that says a thing is not edited or stays
+    unchanged is exempt when no trigger follows that predicate ("never modified
+    when the call fails") and any trigger before it sits in a relative clause
+    of its subject ("the module that formats prompts when a request arrives
+    is not edited"). Every other clause must name no trigger: "returns 404
+    and leaves the response unchanged" is runtime behavior and stays checked,
+    scope phrase or not.
     """
     clauses = [c for c in _CLAUSE_SPLIT_RE.split(text) if c and c.strip()]
-    if not any(_PRESERVE_RE.search(c) for c in clauses):
+    if not any(_preservation_predicate(c) for c in clauses):
         return False
     for clause in clauses:
-        if _PRESERVE_RE.search(clause) and _PRESERVE_SCOPE_RE.search(clause):
+        found = _preservation_predicate(clause)
+        if found is None:
+            if _PRESERVE_TRIGGER_RE.search(clause):
+                return False
             continue
-        if _PRESERVE_TRIGGER_RE.search(clause):
+        if _PRESERVE_TRIGGER_RE.search(clause, found.end()):
+            return False
+        before = clause[:found.start()]
+        trigger = _PRESERVE_TRIGGER_RE.search(before)
+        if trigger and not _RELATIVE_RE.search(before[:trigger.start()]):
             return False
     return True
 
