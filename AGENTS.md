@@ -170,6 +170,8 @@ Several AI brains work this repo beside the operator: Claude Code, Muse, Dot and
 
 `grug` is an AGPL-3.0 GitHub App that reviews pull requests. Each persona posts its own result: Chief checks the plan, Elder reviews the code by LLM, Guard scans for security problems. It reviews this repo too, using the deployed version, so a change to a persona does not apply to its own PR.
 
+Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.
+
 Layout:
 
 - `services/webhook/`: `grug-webhook`, `grug-consumer` (Elder from SQS) and `grug-poller`. Slash commands are in `grug_commands.py`.
