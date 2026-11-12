@@ -331,26 +331,41 @@ def _docs_only_diff() -> tuple[tuple[DiffHunk, ...], dict[str, str]]:
     return hunks, contents
 
 
-def test_a_preservation_criterion_is_met_by_leaving_the_thing_alone():
-    # #1726: "X is not edited" / "stays unchanged" is met by the ABSENCE of a
-    # hunk, so no hunk can "satisfy" it and a docs-only diff meets it
-    # trivially. It was read as demanding runtime behavior, and a docs-only
-    # change whose ticket promised not to touch a prompt module was blocked.
+def _intent_mismatches(text: str) -> int:
     hunks, contents = _docs_only_diff()
-    criteria = (
-        LinkedCriterion(
-            1724, 3,
-            "The Elder review system prompt module is not edited, so the "
-            "evaluation baseline hash stays the same.",
-        ),
-        LinkedCriterion(1724, 4, "The webhook response is unchanged for existing callers"),
-        LinkedCriterion(1724, 5, "The scoring table is left untouched"),
-        LinkedCriterion(1724, 6, "The config schema is never modified by this change"),
-    )
     findings = scan_criteria_coverage(
-        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+        hunks, contents,
+        criteria=(LinkedCriterion(1724, 3, text),),
+        pr_title=_TITLE, pr_body=_BODY,
     )
-    assert not _by_rule(findings, "intent-mismatch")
+    return len(_by_rule(findings, "intent-mismatch"))
+
+
+# One plain clause that only says something is left alone: a docs-only diff
+# meets it by not touching the thing (#1726).
+_PRESERVE_ONLY = (
+    "The prompt module is not edited",
+    "README.md is left untouched",
+    "is not edited by this PR",
+    "stays unchanged in this diff",
+    "The Elder prompt module is not edited by this PR",
+    "services/webhook/main.py stays unchanged in this diff",
+    "The scoring table is left untouched",
+    "The config schema is never modified by this change",
+    "The scoring table must not change",
+    "The scoring table must not be changed",
+    "The prompt module never changes",
+    "The prompt module never edits.",
+)
+
+
+def test_a_plain_preservation_criterion_is_met_by_leaving_the_thing_alone():
+    # #1726: "X is not edited" / "stays unchanged" is met by the ABSENCE of a
+    # hunk, so no hunk can "satisfy" it. It was read as runtime behavior, and a
+    # docs-only change that promised not to touch a prompt module was blocked.
+    for text in _PRESERVE_ONLY:
+        assert _intent_mismatches(text) == 0, text
+
 
 
 def test_a_preservation_criterion_does_not_excuse_a_positive_runtime_one():
@@ -373,94 +388,51 @@ def test_a_preservation_criterion_does_not_excuse_a_positive_runtime_one():
 
 # Runtime guards that use preservation words. Each says what the code must
 # leave alone WHEN something happens, so only a runtime hunk can meet it (#1726).
-_PRESERVE_GUARDS = (
+
+
+# Anything but one plain preservation clause is checked (fail-safe, #1727).
+# Each round of review found another runtime verb a word list missed, so the
+# exemption admits only the plain shape and every other wording stays checked.
+_STILL_CHECKED = (
+    # Runtime guards with a trigger clause.
     "The record is never modified when the call fails",
     "The row must not be changed when validation fails",
     "The row must not change when validation fails",
     "The endpoint returns 404 and leaves the response unchanged",
     "The cache stays untouched if the upstream times out",
     "The stored token is not altered after a refused login",
-    # Review of 5d4b2c30: an adjective is not a preservation predicate, and a
-    # scope phrase does not excuse a trigger.
+    "The record is never modified by this PR when the call fails",
+    "The scoring table must not change when a rule fails",
+    # R1: an adjective is no predicate, a scope phrase excuses nothing.
     "handler.py returns 404 for an unchanged request in this PR",
     "handler.py returns 404 when the request is unchanged",
     "The filter drops an unmodified message in this diff",
-    "The record is never modified by this PR when the call fails",
-    # Review of c18e5b33: a relative clause qualifies the subject; the
-    # top-level verb after it is still the requirement.
+    # R3 and R4: a relative subject or an earlier subordinate clause hides a
+    # top-level runtime requirement.
     "The endpoint that handles requests returns 404 and leaves the response unchanged",
     "The endpoint which serves users fails the call and leaves the row unchanged",
+    "The endpoint that handles requests when available returns 404 with the response unchanged",
+    # The operator's matrix for the fail-safe rule.
+    "The service that accepts uploads rejects files over 10 MB and leaves the quota unchanged",
+    "The worker which sends emails writes the audit row and is not edited",
+    "The gateway that rejects bad tokens sends a 401 and is not modified",
+    "The handler that rejects bad input leaves the schema unchanged",
+    # Declined R2 and R5: a relative subject is checked even when the
+    # sentence only preserves a module; a false finding is the cheap mistake.
+    "The module that formats prompts when a request arrives is not edited",
+    "The module that handles requests is not edited",
+    "The module that returns responses and handles requests is not edited",
+    "The module that handles requests and returns responses is not edited",
+    # More than one clause, or a qualifier after the predicate.
+    "The prompt module is not edited, so the baseline hash stays the same",
+    "The webhook response is unchanged for existing callers",
 )
 
 
-def test_a_preservation_guard_with_a_trigger_clause_is_still_checked():
-    # The review of #1727: the exemption must not cover a runtime guard just
-    # because it says "never modified" or "unchanged". A trigger clause (when,
-    # if, after, returns) makes it behavior, and a docs-only diff cannot meet it.
-    hunks, contents = _docs_only_diff()
-    for text in _PRESERVE_GUARDS:
-        findings = scan_criteria_coverage(
-            hunks, contents,
-            criteria=(LinkedCriterion(1724, 3, text),),
-            pr_title=_TITLE, pr_body=_BODY,
-        )
-        mismatch = _by_rule(findings, "intent-mismatch")
-        assert len(mismatch) == 1, text
-        assert "criterion 3" in mismatch[0].message, text
+def test_anything_but_one_plain_preservation_clause_is_still_checked():
+    for text in _STILL_CHECKED:
+        assert _intent_mismatches(text) == 1, text
 
-
-def test_equivalent_preservation_wording_is_judged_the_same():
-    # "must not change" and "must not be changed" mean the same thing, so a
-    # criterion worded either way gets the same verdict with or without a
-    # trigger clause.
-    hunks, contents = _docs_only_diff()
-
-    def mismatches(text: str) -> int:
-        findings = scan_criteria_coverage(
-            hunks, contents,
-            criteria=(LinkedCriterion(1724, 3, text),),
-            pr_title=_TITLE, pr_body=_BODY,
-        )
-        return len(_by_rule(findings, "intent-mismatch"))
-
-    assert mismatches("The scoring table must not change") == 0
-    assert mismatches("The scoring table must not be changed") == 0
-    assert mismatches("The scoring table must not change when a rule fails") == 1
-    assert mismatches("The scoring table must not be changed when a rule fails") == 1
-
-
-def test_a_trigger_inside_the_subject_does_not_make_a_preservation_criterion_runtime():
-    # The review of 5d4b2c30: in "the module that formats prompts when a
-    # request arrives is not edited" the relative clause describes WHICH module
-    # is left alone. The top-level requirement is the absence of an edit, the
-    # same as "the prompt module is not edited", so it is judged the same.
-    hunks, contents = _docs_only_diff()
-    criteria = (
-        LinkedCriterion(1724, 3, "The module that formats prompts when a request arrives is not edited"),
-        LinkedCriterion(1724, 4, "The module which formats prompts after a request arrives stays unchanged"),
-        LinkedCriterion(1724, 5, "The prompt module is not edited"),
-        LinkedCriterion(1724, 6, "The module that handles requests is not edited"),
-        LinkedCriterion(1724, 7, "The module that returns prompts is not edited"),
-    )
-    findings = scan_criteria_coverage(
-        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
-    )
-    assert not _by_rule(findings, "intent-mismatch")
-
-
-def test_a_scoped_preservation_criterion_is_met_by_leaving_the_file_alone():
-    # A criterion scoped to this change ("by this PR", "in this diff") is about
-    # the diff itself, so a trigger-looking word does not make it runtime.
-    hunks, contents = _docs_only_diff()
-    criteria = (
-        LinkedCriterion(1724, 3, "The Elder prompt module is not edited by this PR"),
-        LinkedCriterion(1724, 4, "services/webhook/main.py stays unchanged in this diff"),
-        LinkedCriterion(1724, 5, "The prompt module is not edited by this PR, so the baseline hash stays the same"),
-    )
-    findings = scan_criteria_coverage(
-        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
-    )
-    assert not _by_rule(findings, "intent-mismatch")
 
 
 def test_a_live_criterion_about_unchanged_state_is_still_checked():

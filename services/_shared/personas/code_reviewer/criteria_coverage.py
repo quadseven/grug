@@ -96,50 +96,47 @@ _DOC_CRITERION_RE = re.compile(
 # (.txt) is exempt for the same reason: changing it is the deliverable.
 _PATH_TOKEN_RE = re.compile(r"[\w./-]+\.[A-Za-z]{2,5}\b")
 # A criterion that says something is left alone ("the prompt module is not
-# edited", "the response is unchanged"): a diff meets it by the ABSENCE of a
+# edited", "README.md is left untouched"): a diff meets it by the ABSENCE of a
 # hunk, so no hunk can satisfy it and a docs-only diff meets it trivially. Read
 # as runtime behavior it blocked a docs-only change that promised not to touch
 # a module (#1726).
-_PRESERVE_RE = re.compile(
-    r"\b(?:not|never)\s+(?:be\s+)?"
-    r"(?:edited|edit|changed|change|modified|modify|touched|touch|altered|alter)\b"
-    r"|\b(?:unchanged|untouched|unmodified)\b",
+#
+# The exemption is fail-safe: a word list of runtime triggers could never be
+# complete (each review round found another verb), so a criterion is exempt
+# only when its whole text is ONE clause: a plain subject, then a preservation
+# predicate, then at most a change scope ("in this PR", "by this diff"). A
+# comma or semicolon, a conjunction, a relative pronoun or a runtime verb in
+# the subject, or anything after the predicate makes it checked. A missed
+# preservation criterion costs one false finding; a missed runtime criterion
+# ships unmet behavior.
+_PRESERVE_ONLY_RE = re.compile(
+    r"^\s*(?P<subject>.*?)\s*\b(?:"
+    r"(?:is|are|was|were|must|should|will|shall|can|may|does|do)\s*(?:n't|\s+not|\s+never)"
+    r"(?:\s+be)?\s+(?:"
+    r"edited|edit|changed|change|modified|modify|touched|touch|altered|alter"
+    r")"
+    r"|never\s+(?:be\s+)?(?:"
+    r"edited|edits|changed|changes|modified|modifies|touched|touches|altered|alters"
+    r")"
+    r"|(?:is|are|stays|stay|remains|remain|is\s+left|are\s+left|is\s+kept|are\s+kept"
+    r"|must\s+stay|must\s+remain|must\s+be\s+left|should\s+stay|should\s+remain)"
+    r"\s+(?:unchanged|untouched|unmodified|unedited|the\s+same|as\s+it\s+is)"
+    r")"
+    r"(?:\s+(?:in|by|for)\s+this\s+(?:pr|pull\s+request|diff|change|patch))?"
+    r"\s*\.?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+# What the subject may not hold: a clause boundary, a conjunction, a relative
+# pronoun, or a verb that names runtime behavior.
+_PRESERVE_SUBJECT_BAR_RE = re.compile(
+    r"[,;:()]"
+    r"|\b(?:and|or|but|nor|so|then|when|whenever|if|unless|after|before|once"
+    r"|while|during|upon|until|since|because|whereas|that|which|who|whom|whose"
+    r"|where"
+    r"|returns?|returning|responds?|responding|rejects?|rejecting|sends?|sending"
+    r"|writes?|writing|fails?|failing|accepts?|accepting|leaves?|leaving)\b",
     re.IGNORECASE,
 )
-# "unchanged" is a preservation predicate ("the response is unchanged") only
-# when nothing it could modify follows it. Before a noun it is an adjective
-# ("returns 404 for an unchanged request"), part of a behavior requirement.
-_PRESERVE_ADJECTIVE_RE = re.compile(r"^(?:unchanged|untouched|unmodified)$", re.IGNORECASE)
-_PRESERVE_CLOSERS = frozenset({
-    "for", "by", "in", "within", "across", "to", "so", "and", "but", "or",
-    "when", "whenever", "if", "unless", "after", "before", "once", "while",
-    "during", "upon", "on", "at", "from", "with", "until", "since", "because",
-    "as", "that", "which",
-})
-# What makes a preservation criterion runtime behavior after all: it says WHEN
-# the thing stays as it was ("is never modified when the call fails", "returns
-# 404 and leaves the response unchanged"), and only code that runs can meet a
-# guard like that.
-_PRESERVE_TRIGGER_RE = re.compile(
-    r"\b(?:when|whenever|if|unless|after|before|once|while|during|upon|on"
-    r"|returns?|returning|responds?|responding|fails?|failing|failure|errors?)\b",
-    re.IGNORECASE,
-)
-# A relative clause in the subject ("the module that formats prompts when a
-# request arrives") says WHICH thing is left alone, not when.
-_RELATIVE_RE = re.compile(r"\b(?:that|which|who|whose)\b", re.IGNORECASE)
-# Triggers that open a subordinate clause. Inside a relative clause one only
-# says which thing is meant; the other triggers are verbs, which inside the
-# relative clause can only be its own verb ("the module that returns prompts").
-_PRESERVE_CONJUNCTIONS = frozenset({
-    "when", "whenever", "if", "unless", "after", "before", "once", "while",
-    "during", "upon", "on",
-})
-# A coordinated verb phrase ("returns 404 and leaves the response unchanged")
-# puts what precedes it at the top level, beside the predicate.
-_COORDINATOR_RE = re.compile(r"\b(?:and|or|but|then)\b", re.IGNORECASE)
-_CLAUSE_SPLIT_RE = re.compile(r"[,;:]|\bso\b|\bthen\b", re.IGNORECASE)
-_WORD_RE = re.compile(r"[A-Za-z']+")
 # A criterion about the pull request itself (it lands, its checks pass, its
 # threads are answered, an older one is closed): the review process meets
 # it, not a hunk.
@@ -577,84 +574,27 @@ def _names_doc_path(text: str) -> bool:
     return any(_is_doc_path(m.group(0)) for m in _PATH_TOKEN_RE.finditer(text))
 
 
-# AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness (codex), PR #1727] HIGH R1:
-# "returns 404 for an unchanged request in this PR" was exempt; an adjective is
-# no preservation predicate and a scope phrase no longer skips the trigger check.
-def _preservation_predicate(clause: str) -> re.Match[str] | None:
-    """The match where the clause says something is left alone, or None.
-
-    "unchanged", "untouched" and "unmodified" count only as a predicate: one
-    that a noun follows is an adjective ("for an unchanged request") (#1726).
-    """
-    for found in _PRESERVE_RE.finditer(clause):
-        if _PRESERVE_ADJECTIVE_RE.match(found.group(0)):
-            follower = _WORD_RE.search(clause, found.end())
-            if follower and follower.group(0).lower() not in _PRESERVE_CLOSERS:
-                continue
-        return found
-    return None
-
-
+# AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness (codex), PR #1727] HIGH R1,
+# HIGH R3, HIGH R4: an adjective ("an unchanged request"), a scope phrase, a
+# relative subject or an earlier subordinate clause hid a top-level runtime
+# requirement. The exemption is now fail-safe (one plain clause, nothing else).
+# MEDIUM R2 and R5 (relative-subject preservation flagged) are declined by
+# operator decision: a false positive is cheap, a false negative is not.
 def _is_preservation_only(text: str) -> bool:
     """True when the criterion only says something is left alone (#1726).
 
-    Read clause by clause. A clause that says a thing is not edited or stays
-    unchanged is exempt when no trigger follows that predicate ("never modified
-    when the call fails") and any trigger before it sits in a relative clause
-    of its subject ("the module that formats prompts when a request arrives
-    is not edited"). Every other clause must name no trigger: "returns 404
-    and leaves the response unchanged" is runtime behavior and stays checked,
-    scope phrase or not.
+    Fail-safe: the whole criterion must be one clause, a plain subject and a
+    preservation predicate ("is not edited", "must not change", "stays
+    unchanged", "is left untouched"), with at most a change scope ("in this
+    PR", "by this diff") after it. A subject holding a comma, a conjunction, a
+    relative pronoun ("the module that formats prompts is not edited") or a
+    runtime verb is checked as runtime behavior, as is anything else after
+    the predicate.
     """
-    clauses = [c for c in _CLAUSE_SPLIT_RE.split(text) if c and c.strip()]
-    if not any(_preservation_predicate(c) for c in clauses):
+    found = _PRESERVE_ONLY_RE.match(text)
+    if found is None:
         return False
-    for clause in clauses:
-        found = _preservation_predicate(clause)
-        if found is None:
-            if _PRESERVE_TRIGGER_RE.search(clause):
-                return False
-            continue
-        if _PRESERVE_TRIGGER_RE.search(clause, found.end()):
-            return False
-        before = clause[:found.start()]
-        for trigger in _PRESERVE_TRIGGER_RE.finditer(before):
-            if not _trigger_in_relative_subject(before, trigger):
-                return False
-    return True
-
-
-# AI-REVIEW 2026-11-12 [gpt-6.1-sol/native correctness (codex), PR #1727] MEDIUM R2
-# and HIGH R3: a trigger inside a relative subject ("the module that formats
-# prompts when a request arrives is not edited") stays exempt, but a top-level
-# verb after the relative ("the endpoint that handles requests returns 404 and
-# leaves the response unchanged") is still checked.
-def _trigger_in_relative_subject(before: str, trigger: re.Match[str]) -> bool:
-    """True when a trigger before the predicate only qualifies the subject.
-
-    "The module that formats prompts when a request arrives is not edited":
-    "when" sits in the relative clause that says which module (#1726). Not so
-    in "the endpoint that handles requests returns 404 and leaves the response
-    unchanged": "returns" is a top-level verb beside the predicate, and only
-    code that runs can meet it. A trigger qualifies the subject only when a
-    relative pronoun precedes it, no coordinator joins it to the predicate,
-    and, for a verb, it is the relative clause's own verb (the first word after
-    the pronoun) or sits in a subordinate clause opened inside that relative.
-    """
-    head = before[:trigger.start()]
-    relatives = list(_RELATIVE_RE.finditer(head))
-    if not relatives:
-        return False
-    if _COORDINATOR_RE.search(before, trigger.end()):
-        return False
-    if trigger.group(0).lower() in _PRESERVE_CONJUNCTIONS:
-        return True
-    inside = head[relatives[-1].end():]
-    if not _WORD_RE.search(inside):
-        return True
-    return any(
-        w.group(0).lower() in _PRESERVE_CONJUNCTIONS for w in _WORD_RE.finditer(inside)
-    )
+    return _PRESERVE_SUBJECT_BAR_RE.search(found.group("subject")) is None
 
 
 def _is_runtime_criterion(text: str) -> bool:
