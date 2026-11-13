@@ -178,6 +178,9 @@ from personas.code_reviewer.finding_funnel import (
 from personas.code_reviewer.elder_review import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward, carry_verdict, hunt_link, living_review
 from personas.hunt_recorder import PrRef, now as hunt_now
+from personas.code_reviewer.outage_advisory import (
+    ADVISORY_TITLE, advisory_summary, observe as _observe_outage,
+)
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion, gate_sentence, lead_with_degraded_line,
 )
@@ -1048,6 +1051,18 @@ def _enrich_claim_check_sources(
 # findings forward and withdraws a block it clears like any re-review
 # (grug#1581: without it a clean `/grug improve` left the block standing).
 _RE_REVIEW_ACTIONS = {"synchronize", "reopened", "review", "rerun"}
+
+
+def observe_outage(
+    evaluation: CodeReviewEvaluation, *, blocking: bool, record: bool = True,
+):
+    """ADR-0027: is this degraded BLOCK-mode review part of a sustained
+    backend outage? `record` moves the install's outage streak; the deep
+    append only reads it."""
+    return _observe_outage(
+        evaluation.degraded_reason, evaluation.coverage,
+        blocking=blocking, record=record,
+    )
 
 
 def _carry_into_check(
@@ -3182,8 +3197,10 @@ def dispatch_code_review(
         )
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
+    outage = observe_outage(evaluation, blocking=blocking)
     outcome = plan_publish(
         evaluation, mode=mode, degraded_fails_closed=True,
+        outage_advisory=outage.advisory,
     )
     conclusion, event = outcome.conclusion, outcome.event
     depth_now = os.getenv("GRUG_REVIEW_DEPTH", "tiered").strip().lower()
@@ -3201,7 +3218,7 @@ def dispatch_code_review(
         living_delta_empty=living_delta_empty,
         review_phase=tier1_phase,
         defensive_dropped_count=defensive_dropped_count,
-        blocking=blocking,
+        blocking=blocking and not outage.advisory,
         muted=muted,
     )
     if lock_check.unreviewed and conclusion == "success":
@@ -3247,6 +3264,9 @@ def dispatch_code_review(
         summary, evaluation, head_sha=head_sha, linked_issues=pinned_issues,
     )
     summary = _lead_if_degraded(summary, evaluation)
+    if outage.advisory:
+        title = ADVISORY_TITLE
+        summary = advisory_summary(outage, summary)
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
@@ -4677,6 +4697,9 @@ def _publish_deep_review(
         review_evaluation=deep_eval,
         conclusion=plan_publish(
             combined_eval, mode=mode, degraded_fails_closed=True,
+            outage_advisory=observe_outage(
+                combined_eval, blocking=mode == "blocking", record=False,
+            ).advisory,
         ).conclusion,
         event=event,
         review_phase="deep",
@@ -5074,7 +5097,11 @@ def _async_deep_append_if_needed(
     # ground the deep arm never finished walking.
     combined = with_degradation(combined, deep_eval)
 
-    outcome = plan_publish(combined, mode=mode, degraded_fails_closed=True)
+    outage = observe_outage(combined, blocking=blocking, record=False)
+    outcome = plan_publish(
+        combined, mode=mode, degraded_fails_closed=True,
+        outage_advisory=outage.advisory,
+    )
     conclusion, event = outcome.conclusion, outcome.event
     title, summary = _summary_markdown(
         combined,
@@ -5083,12 +5110,12 @@ def _async_deep_append_if_needed(
         living_baseline_rejected=living_baseline_rejected,
         living_delta_empty=living_delta_empty,
         review_phase="deep",
-        blocking=blocking,
+        blocking=blocking and not outage.advisory,
         muted=_muted_classes_for(f"{owner}/{repo_name}", repo_config),
     )
     summary = _intent_paragraph(pr_context) + summary
     summary += config_note
-    title = f"{title} (deep append)"
+    title = f"{ADVISORY_TITLE if outage.advisory else title} (deep append)"
     # The author-facing distinction #848 asks for: "the reasoner ran and
     # found nothing" and "the reasoner did not run" are different news, and
     # this preamble says which one this is even when `_summary_markdown`'s
@@ -5110,6 +5137,8 @@ def _async_deep_append_if_needed(
         summary, combined, head_sha=head_sha, linked_issues=pinned_issues,
     )
     summary = _lead_if_degraded(summary, combined)
+    if outage.advisory:
+        summary = advisory_summary(outage, summary)
     superseded = _newer_elder_verdict_on_head(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,

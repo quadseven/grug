@@ -1002,6 +1002,23 @@ First steps:
    the chain. A single `missed` among `caught` runs is model variance, not an
    outage.
 
+### Elder advisory during an outage (ADR-0027)
+
+In BLOCK mode a degraded Elder review fails closed (ADR-0023). If the review
+backends stay down, the check turns advisory by itself: conclusion `neutral`,
+title `Elder advisory: review backends down`, a summary that names the failed
+backends and since when. It is not an `Elder clear`, and nothing was reviewed.
+
+- Trigger: consecutive backend-outage results across the install for
+  `GRUG_ELDER_OUTAGE_MINUTES` (default 20). The first results still fail closed.
+- It restores itself: the next completed review ends the streak, and the next
+  degraded one blocks again. Push or comment `/grug improve` to re-review.
+- Switch off with `GRUG_ELDER_OUTAGE_ADVISORY=0` (ADR-0023 exactly). The streak
+  is the `outage` kind in `shared_benches` (`grug_kv`, pk `ELDER_BENCH`); a
+  stuck one ends by itself after `GRUG_ELDER_OUTAGE_GAP_MINUTES` (60).
+- Find advisories: check runs titled `Elder advisory: review backends down`.
+  After the outage, re-run any PR that merged on one.
+
 ## LLM backend unusable
 
 The `[grug] LLM backend unusable` monitor fires when a review backend answers
