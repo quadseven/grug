@@ -1868,6 +1868,12 @@ def _delta_is_empty(diff_text: str) -> bool:
     return not parse_diff(diff_text) and not removed_paths(diff_text)
 
 
+def _delta_is_excluded_metadata_only(diff_text: str) -> bool:
+    """A nonempty delta whose hunks the canonical metadata filter excludes (#1730)."""
+    hunks = parse_diff(diff_text)
+    return bool(hunks) and not removed_paths(diff_text) and not split_reviewable_hunks(hunks)[0]
+
+
 def _is_lock_only(diff_text: str) -> bool:
     """Every changed file, both sides of a rename included, is a listed
     lock file (#1649). An empty diff is not lock-only."""
@@ -2387,6 +2393,7 @@ def dispatch_code_review(
     # grug#1644: set to the delta range when that delta held no change and
     # the full PR diff was reviewed instead. Named in the check summary.
     living_delta_empty = ""
+    living_delta_metadata = ""
     try:
         from adapters.install_store import get_elder_last_reviewed
 
@@ -2470,10 +2477,13 @@ def dispatch_code_review(
         labels=labels, author_family=author_family or "",
         config=repr(base_repo_config),
     )
-    full_pr_diff = functools.partial(
+    # AI-REVIEW 2026-11-12 [gpt-6.1-sol/code-review] 1730-R1 (PR #1731; issue #1730):
+    # The carry probe and fallback share this invocation's immutable pinned diff.
+    # Cache successes only; a failed fetch can still retry through normal handling.
+    full_pr_diff = functools.cache(functools.partial(
         _fetch_full_pr_diff, installation_id, owner, repo_name, pull_number,
         base_sha=base_sha, head_sha=head_sha,
-    )
+    ))
     carried = carry_verdict.carry_if_unchanged(carry_request, fetch_pr_diff=full_pr_diff)
     if carried is not None:
         return carried
@@ -2520,10 +2530,7 @@ def dispatch_code_review(
             living_range = ""
         if living_prior_sha and _delta_is_empty(diff_text):
             living_delta_empty, living_prior_sha, living_range = living_range, "", ""
-            diff_text = _fetch_full_pr_diff(
-                installation_id, owner, repo_name, pull_number,
-                base_sha=base_sha, head_sha=head_sha,
-            )
+            diff_text = full_pr_diff()
         elif living_prior_sha and _is_lock_only(diff_text):
             # #1649: a lock-only delta is judged on the whole base..head
             # diff, never on the increment alone.
@@ -2532,10 +2539,10 @@ def dispatch_code_review(
                 extra={"pr": f"{owner}/{repo_name}#{pull_number}", "range": living_range},
             )
             living_prior_sha, living_range = "", ""
-            diff_text = _fetch_full_pr_diff(
-                installation_id, owner, repo_name, pull_number,
-                base_sha=base_sha, head_sha=head_sha,
-            )
+            diff_text = full_pr_diff()
+        elif living_prior_sha and _delta_is_excluded_metadata_only(diff_text):
+            living_delta_metadata, living_prior_sha, living_range = living_range, "", ""
+            diff_text = full_pr_diff()
         pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
         # The lane-work checks (#1179, #1363) judge the WHOLE diff, so they
@@ -2576,6 +2583,12 @@ def dispatch_code_review(
             hunks, pr, installation_id, owner, repo_name,
             config=base_repo_config,
         )
+        if living_delta_metadata:
+            config_note += (
+                "\n\nLiving Hunt: the delta contained only excluded metadata in `"
+                + living_delta_metadata
+                + "`, so Elder reviewed the full PR diff on this head instead."
+            )
         # A hunk bigger than a whole cohort can never be reviewed - the
         # planner will not truncate it (line anchors), so it becomes a solo
         # cohort that is auto-failed, flips the check to `partial_review`,
