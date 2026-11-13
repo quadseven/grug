@@ -113,6 +113,19 @@ def _forget_guideline_files() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _forget_outage_streak() -> Iterator[None]:
+    """ADR-0027: the Elder outage streak is module state; one test's degraded
+    reviews must not age into the next test's advisory."""
+    mod = sys.modules.get("personas.code_reviewer.outage_advisory")
+    if mod is not None:
+        mod.reset_for_tests()
+    yield
+    mod = sys.modules.get("personas.code_reviewer.outage_advisory")
+    if mod is not None:
+        mod.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     """grug#1225: the LLM provider breaker is module state, and a shell's
     GRUG_DISABLED_BACKENDS must not reach a test. Without the reset, one test

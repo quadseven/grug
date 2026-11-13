@@ -51,7 +51,8 @@ TTL_SLACK_S = 60
 # The kinds llm_client shares: the 4xx bench and the slow bench per
 # (backend, model), the provider breaker per (backend, pool), and the
 # OpenCode Go usage-limit breaker.
-KINDS = frozenset({"bench", "slow", "provider", "go"})
+# "outage" is the Elder outage streak (ADR-0027, outage_advisory.py).
+KINDS = frozenset({"bench", "slow", "provider", "go", "outage"})
 
 # The snapshot and the queue change together under one lock, so a re-read
 # of the table can never drop an entry whose write is still queued.
