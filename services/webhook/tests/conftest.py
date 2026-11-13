@@ -118,11 +118,11 @@ def _forget_outage_streak() -> Iterator[None]:
     reviews must not age into the next test's advisory."""
     mod = sys.modules.get("personas.code_reviewer.outage_advisory")
     if mod is not None:
-        mod.reset_for_tests()
+        mod._local = None  # noqa: SLF001
     yield
     mod = sys.modules.get("personas.code_reviewer.outage_advisory")
     if mod is not None:
-        mod.reset_for_tests()
+        mod._local = None  # noqa: SLF001
 
 
 @pytest.fixture(autouse=True)

@@ -32,6 +32,7 @@ their own, so the streak is written as two such entries:
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -41,6 +42,8 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 import shared_benches
+
+log = logging.getLogger("grug.code_reviewer.outage_advisory")
 
 ADVISORY_TITLE = "Elder advisory: review backends down"
 
@@ -180,12 +183,6 @@ _lock = threading.Lock()
 _local: Streak | None = None
 
 
-def reset_for_tests() -> None:
-    global _local
-    with _lock:
-        _local = None
-
-
 def _read(gap_s: float, now: float) -> Streak | None:
     if shared_benches.enabled():
         last_until = shared_benches.blocked_until("outage", "last", _KEY)
@@ -238,6 +235,9 @@ def observe(
             now=stamp, failed=names,
         )
     except Exception:  # noqa: BLE001 - the streak store must never break a review
+        # Fail closed (ADR-0023), but loudly: a bug here must not hide as an
+        # ordinary blocking review.
+        log.exception("elder_outage_streak_failed")
         return OutageVerdict(False)
 
 
@@ -257,6 +257,6 @@ def failed_backends(coverage: Any) -> tuple[str, ...]:
             ):
                 names.append(f"{backend.value} (breaker open)")
     except Exception:  # noqa: BLE001 - naming is best effort
-        pass
+        log.warning("elder_outage_backend_naming_failed", exc_info=True)
     names.extend(getattr(coverage, "failed_models", ()) or ())
     return tuple(dict.fromkeys(names))

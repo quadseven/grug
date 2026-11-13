@@ -167,12 +167,24 @@ def test_peek_does_not_move_the_streak():
     assert _obs("all_failed", 25 * MIN).advisory is False
 
 
-def test_a_broken_store_fails_closed(monkeypatch):
+def test_a_broken_store_fails_closed_and_says_so(monkeypatch, caplog):
     def boom(*_a):
         raise RuntimeError("down")
 
     monkeypatch.setattr(oa, "_read", boom)
-    assert _obs("all_failed", 0.0).advisory is False
+    with caplog.at_level("WARNING", logger="grug.code_reviewer.outage_advisory"):
+        assert _obs("all_failed", 0.0).advisory is False
+    assert "elder_outage_streak_failed" in caplog.text
+
+
+def test_backend_naming_failure_is_logged_not_silent(monkeypatch, caplog):
+    import llm_client as lc
+
+    monkeypatch.delattr(lc, "_BACKEND_CONFIGS")
+    with caplog.at_level("WARNING", logger="grug.code_reviewer.outage_advisory"):
+        names = oa.failed_backends(None)
+    assert names == ()
+    assert "elder_outage_backend_naming_failed" in caplog.text
 
 
 def test_advisory_summary_is_distinguishable_and_names_since_and_backends():
