@@ -191,6 +191,9 @@ def _verify_state(state: str) -> bool:
 # user. (Codex P1 review of Slice 7 #28.)
 _SESSION_TTL_SECONDS = 86400 * 7  # 7 days
 _SESSION_GEN_CACHE_TTL_SECONDS = 60.0
+# One entry per distinct signed-in user id; bounded so a flood of ids cannot
+# grow the cache without limit.
+_SESSION_GEN_CACHE_MAX_ENTRIES = 10_000
 _session_gen_cache: dict[str, tuple[int, float]] = {}
 _session_gen_cache_lock = threading.Lock()
 
@@ -216,7 +219,14 @@ def _cached_session_generation(gh_id: str) -> int | None:
         invalidate_session_generation_cache(key)
         return None
     with _session_gen_cache_lock:
-        _session_gen_cache[key] = (gen, time.monotonic() + _SESSION_GEN_CACHE_TTL_SECONDS)
+        stored_at = time.monotonic()
+        _session_gen_cache.pop(key, None)
+        if len(_session_gen_cache) >= _SESSION_GEN_CACHE_MAX_ENTRIES:
+            for stale in [k for k, (_, exp) in _session_gen_cache.items() if exp <= stored_at]:
+                del _session_gen_cache[stale]
+        while len(_session_gen_cache) >= _SESSION_GEN_CACHE_MAX_ENTRIES:
+            del _session_gen_cache[next(iter(_session_gen_cache))]  # oldest first
+        _session_gen_cache[key] = (gen, stored_at + _SESSION_GEN_CACHE_TTL_SECONDS)
     return gen
 
 
