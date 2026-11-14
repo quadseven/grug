@@ -13,7 +13,7 @@ Asserts that `services/_shared/adapters/pg_user_store.py:UserIdentity`:
      or `blob` — token material lives ONLY on UserWithTokens.
   3. Defines exactly the identity fields documented in CONTEXT.md:
      github_user_id, login, role, tier, allowlisted, created_at,
-     allowlisted_at, allowlisted_by.
+     allowlisted_at, allowlisted_by, session_generation.
 
 The closed-set field list is intentional: adding a new identity field
 should be a deliberate spec change, not an accident. If you want to add
@@ -32,6 +32,7 @@ USER_STORE = REPO_ROOT / "services/_shared/adapters/pg_user_store.py"
 EXPECTED_FIELDS: frozenset[str] = frozenset({
     "github_user_id", "login", "role", "tier",
     "allowlisted", "created_at", "allowlisted_at", "allowlisted_by",
+    "session_generation",
 })
 
 # Substring patterns that indicate token material — must not appear in

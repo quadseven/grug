@@ -57,7 +57,7 @@ def test_every_route_answers_401_without_a_session(client):
 def test_every_route_answers_403_for_a_non_admin(client):
     import admin
 
-    with patch("auth.dependencies._verify_session", return_value="7"), \
+    with patch("auth.dependencies.verify_active_session", return_value="7"), \
             patch("auth.dependencies.get_user", return_value=_user("user")):
         client.cookies.set("grug_session", "s")
         for route in routes_of(admin.router):
