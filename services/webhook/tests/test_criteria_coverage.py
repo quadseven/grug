@@ -280,6 +280,34 @@ def test_test_and_doc_criteria_can_be_met_without_runtime_hunks():
     assert not _by_rule(findings, "intent-mismatch")
 
 
+def test_every_inflection_of_document_is_a_doc_criterion():
+    # #1729: `document` and `documenting` fell through the doc vocabulary
+    # while `documents`, `documented` and `documentation` passed.
+    from personas.code_reviewer.criteria_coverage import _is_runtime_criterion
+
+    for word in ("document", "documenting", "documents", "documented", "documentation"):
+        assert not _is_runtime_criterion(f"Operators {word} the retry window"), word
+    # Near misses stay outside the vocabulary.
+    assert _is_runtime_criterion("The documenter retries the window")
+    assert _is_runtime_criterion("The documental store retries the window")
+
+
+def test_a_bare_document_verb_criterion_is_met_without_runtime_hunks():
+    # #1729: the exact criterion that drew a high intent-mismatch on a
+    # README-only change.
+    from personas.code_reviewer.criteria_coverage import _is_runtime_criterion
+
+    text = ("If no fixed upstream image exists, document the checked image "
+            "version and Node version in the repository.")
+    assert not _is_runtime_criterion(text)
+    hunks, contents = _helper_only_diff()
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=(LinkedCriterion(436, 1, text),),
+        pr_title=_TITLE, pr_body=_BODY,
+    )
+    assert not _by_rule(findings, "intent-mismatch")
+
+
 def test_a_criterion_naming_a_prose_path_is_met_without_runtime_hunks():
     # #1711: the doc exemption fired only on doc VOCABULARY (readme, docs,
     # guide), so a criterion naming a prose file whose path carries none of
