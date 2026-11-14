@@ -308,6 +308,25 @@ def test_a_bare_document_verb_criterion_is_met_without_runtime_hunks():
     assert not _by_rule(findings, "intent-mismatch")
 
 
+def test_doc_word_does_not_exempt_compound_runtime_criterion():
+    # #1735: a doc word in one clause must not exempt a runtime clause
+    # in the same criterion.
+    from personas.code_reviewer.criteria_coverage import _is_runtime_criterion
+
+    assert _is_runtime_criterion(
+        "the handler documents its retries and returns 503 on a store fault"
+    )
+    assert _is_runtime_criterion(
+        "the README documents the flag, and the handler returns 503 when it is unset"
+    )
+    for doc_only in (
+        "README documents the new flag",
+        "the changelog records the retirement",
+        "document the checked image version in the repository",
+    ):
+        assert not _is_runtime_criterion(doc_only), doc_only
+
+
 def test_a_criterion_naming_a_prose_path_is_met_without_runtime_hunks():
     # #1711: the doc exemption fired only on doc VOCABULARY (readme, docs,
     # guide), so a criterion naming a prose file whose path carries none of

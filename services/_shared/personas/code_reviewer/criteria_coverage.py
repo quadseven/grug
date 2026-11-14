@@ -128,13 +128,19 @@ _PRESERVE_ONLY_RE = re.compile(
 )
 # What the subject may not hold: a clause boundary, a conjunction, a relative
 # pronoun, or a verb that names runtime behavior.
-_PRESERVE_SUBJECT_BAR_RE = re.compile(
-    r"[,;:()]"
-    r"|\b(?:and|or|but|nor|so|then|when|whenever|if|unless|after|before|once"
-    r"|while|during|upon|until|since|because|whereas|that|which|who|whom|whose"
-    r"|where"
-    r"|returns?|returning|responds?|responding|rejects?|rejecting|sends?|sending"
-    r"|writes?|writing|fails?|failing|accepts?|accepting|leaves?|leaving)\b",
+# Clause boundaries, conjunctions, and subordinators shared by
+# `_is_preservation_only` and `_is_doc_only` (#1727, #1735).
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[,;:()]|\b(?:and|or|but|nor|so|then|when|whenever|if|unless|after|before"
+    r"|once|while|during|upon|until|since|because|whereas|that|which|who|whom"
+    r"|whose|where)\b",
+    re.IGNORECASE,
+)
+_RUNTIME_TRIGGER_RE = re.compile(
+    r"\b(?:returns?|returning|responds?|responding|rejects?|rejecting"
+    r"|sends?|sending|writes?|writing|fails?|failing|accepts?|accepting"
+    r"|leaves?|leaving|raises?|raising|throws?|throwing|emits?|emitting"
+    r"|executes?|executing)\b",
     re.IGNORECASE,
 )
 # The subject must also be a short plain noun phrase, judged by shape rather
@@ -595,6 +601,22 @@ def _names_doc_path(text: str) -> bool:
 # AI-REVIEW 2026-11-12 [grug-elder, PR #1727, review 5874151160] MEDIUM: a
 # participle subject ("the module serving requests") passed the verb bar.
 # Fixed structurally in _is_plain_noun_phrase, not by adding one more verb.
+def _split_clauses(text: str) -> list[str]:
+    """Split a criterion into trimmed clauses on punctuation and conjunctions."""
+    return [part.strip() for part in _CLAUSE_SPLIT_RE.split(text)]
+
+
+def _is_doc_only(text: str) -> bool:
+    """True when the criterion is about documentation and no non-doc clause
+    contains a runtime trigger (#1735)."""
+    if not _DOC_CRITERION_RE.search(text):
+        return False
+    return not any(
+        _RUNTIME_TRIGGER_RE.search(clause) and not _DOC_CRITERION_RE.search(clause)
+        for clause in _split_clauses(text)
+    )
+
+
 def _is_preservation_only(text: str) -> bool:
     """True when the criterion only says something is left alone (#1726).
 
@@ -610,7 +632,7 @@ def _is_preservation_only(text: str) -> bool:
     if found is None:
         return False
     subject = found.group("subject")
-    if _PRESERVE_SUBJECT_BAR_RE.search(subject):
+    if len(_split_clauses(subject)) > 1 or _RUNTIME_TRIGGER_RE.search(subject):
         return False
     return _is_plain_noun_phrase(subject)
 
@@ -635,7 +657,7 @@ def _is_runtime_criterion(text: str) -> bool:
     return not (
         _LIVE_RE.match(text)
         or _TEST_CRITERION_RE.search(text)
-        or _DOC_CRITERION_RE.search(text)
+        or _is_doc_only(text)
         or _names_doc_path(text)
         or _is_preservation_only(text)
         or _PROCESS_CRITERION_RE.search(text)
