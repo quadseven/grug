@@ -84,7 +84,7 @@ _TEST_CRITERION_RE = re.compile(
     re.IGNORECASE,
 )
 _DOC_CRITERION_RE = re.compile(
-    r"\b(?:readme|docs?|documentation|documented|documents|changelog|adr"
+    r"\b(?:readme|docs?|document(?:s|ed|ation|ing)?|changelog|adr"
     r"|runbooks?|guide|guidance|playbooks?|docstrings?)\b",
     re.IGNORECASE,
 )
