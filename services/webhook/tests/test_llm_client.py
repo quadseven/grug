@@ -1,6 +1,7 @@
 """Tests for the LLM client abstraction."""
 from __future__ import annotations
 
+import errno
 import json
 import logging
 from dataclasses import replace
@@ -775,7 +776,9 @@ def test_call_backend_cancel_event_aborts_in_flight_request() -> None:
 
     try:
         server = _ThreadingServer(("127.0.0.1", 0), _SlowHandler)
-    except PermissionError:
+    except PermissionError as exc:
+        if exc.errno != errno.EPERM:
+            raise
         pytest.skip("sandbox refuses binding a local test server (PermissionError); "
                     "the cancel test cannot run here (grug#1715)")
     port = server.server_address[1]
@@ -799,7 +802,9 @@ def test_call_backend_cancel_event_aborts_in_flight_request() -> None:
         try:
             with pytest.raises((httpx.RequestError, httpx.TimeoutException)):
                 lc._call_backend(config, [{"role": "user", "content": "hi"}], cancel_event=cancel_event)
-        except PermissionError:
+        except PermissionError as exc:
+            if exc.errno != errno.EPERM:
+                raise  # only the sandbox refusal skips; any other PermissionError is a real failure
             pytest.skip("sandbox refuses the socket operation the cancel watcher "
                         "needs (PermissionError); the cancel test cannot run "
                         "here (grug#1715)")

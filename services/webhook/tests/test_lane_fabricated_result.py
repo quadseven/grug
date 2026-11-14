@@ -303,7 +303,9 @@ def test_the_scan_is_linear_on_a_large_diff():
     assert 300 * 40 * 31 * 40 > MAX_RATE_CHECKS
     assert result == ()
     _, calls_half, _ = _scan_counted(150)
-    assert calls < 3 * calls_half + 1000, (calls_half, calls)
+    # The counts here are in the tens of thousands, so the bound needs no slack.
+    assert calls_half > 1000, calls_half
+    assert calls < 3 * calls_half, (calls_half, calls)
 
 
 def test_a_diff_past_the_bound_is_not_evaluated():

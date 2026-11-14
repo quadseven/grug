@@ -239,7 +239,9 @@ def test_the_scan_is_linear_on_a_large_diff():
     found, calls = _scan_counted(400)
     assert len(found) == 1
     _, calls_half = _scan_counted(200)
-    assert calls < 3 * calls_half + 1000, (calls_half, calls)
+    # The counts here are in the tens of thousands, so the bound needs no slack.
+    assert calls_half > 1000, calls_half
+    assert calls < 3 * calls_half, (calls_half, calls)
 
 
 # --- held-out good lane PRs (2026-10-22) -----------------------------------------
