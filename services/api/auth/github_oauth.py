@@ -50,7 +50,12 @@ from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, R
 from fastapi.responses import RedirectResponse
 
 from adapters.pg_rate_limit_store import try_reserve_slot
-from adapters.user_store import get_user, upsert_oauth_user
+from adapters.user_store import (
+    bump_session_generation,
+    get_session_generation,
+    get_user,
+    upsert_oauth_user,
+)
 
 log = logging.getLogger("grug.api.auth")
 
@@ -185,10 +190,54 @@ def _verify_state(state: str) -> bool:
 # any valid session can swap the trailing component to impersonate any
 # user. (Codex P1 review of Slice 7 #28.)
 _SESSION_TTL_SECONDS = 86400 * 7  # 7 days
+_SESSION_GEN_CACHE_TTL_SECONDS = 60.0
+_session_gen_cache: dict[str, tuple[int, float]] = {}
+_session_gen_cache_lock = threading.Lock()
 
 
-def _make_session(gh_id: str) -> str:
-    rand = secrets.token_urlsafe(16)
+def invalidate_session_generation_cache(gh_id: str) -> None:
+    with _session_gen_cache_lock:
+        _session_gen_cache.pop(str(gh_id), None)
+
+
+def _cached_session_generation(gh_id: str) -> int | None:
+    """Return the user's current session generation, cached for at most 60s.
+
+    Store errors are never cached and propagate to fail closed.
+    """
+    key = str(gh_id)
+    now = time.monotonic()
+    with _session_gen_cache_lock:
+        entry = _session_gen_cache.get(key)
+        if entry is not None and now < entry[1]:
+            return entry[0]
+    gen = get_session_generation(key)
+    if gen is None:
+        invalidate_session_generation_cache(key)
+        return None
+    with _session_gen_cache_lock:
+        _session_gen_cache[key] = (gen, time.monotonic() + _SESSION_GEN_CACHE_TTL_SECONDS)
+    return gen
+
+
+def _token_generation(token: str) -> int:
+    """Extract the embedded `g<gen>_` prefix from the random component, or 0."""
+    parts = token.split(".")
+    if len(parts) != 4:
+        return 0
+    rand = parts[0]
+    if not rand.startswith("g") or "_" not in rand:
+        return 0
+    prefix = rand[1:].split("_", 1)[0]
+    try:
+        gen = int(prefix)
+    except ValueError:
+        return 0
+    return gen if gen >= 1 else 0
+
+
+def _make_session(gh_id: str, generation: int = 1) -> str:
+    rand = f"g{int(generation)}_{secrets.token_urlsafe(16)}"
     ts = str(int(time.time()))
     sig = hmac.new(
         _state_secret().encode(),
@@ -219,6 +268,28 @@ def _verify_session(token: str) -> str | None:
     except ValueError:
         return None
     return gh_id
+
+
+def _verify_active_session(token: str) -> str | None:
+    """Verify HMAC, expiry, and server-side session generation (fail-closed)."""
+    gh_id = _verify_session(token)
+    if gh_id is None:
+        return None
+    token_gen = _token_generation(token)
+    try:
+        stored_gen = _cached_session_generation(gh_id)
+    except psycopg.Error:
+        log.error(
+            "session_generation_lookup_failed_refusing",
+            extra={"github_user_id": gh_id},
+        )
+        return None
+    if stored_gen is None or token_gen < stored_gen:
+        return None
+    return gh_id
+
+
+verify_active_session = _verify_active_session
 
 
 def _client_id() -> str:
@@ -434,7 +505,7 @@ def callback(
 
     # Set session cookie. Format: rand.ts.gh_id.sig where sig HMAC-binds
     # gh_id (else the trailing component is swappable; Codex P1 in Slice 7).
-    session_value = _make_session(gh_id)
+    session_value = _make_session(gh_id, generation=user.session_generation)
     target = _DASHBOARD_URL  # Codex post-review #55 — see _DASHBOARD_URL note above.
     resp = RedirectResponse(url=target, status_code=302)
     resp.delete_cookie("grug_oauth_state")
@@ -449,7 +520,7 @@ def callback(
 @router.get("/me")
 def me(grug_session: str = Cookie(default="")) -> dict[str, str | bool]:
     """Current user. Always 200 (auth'd or anon). SPA routes by `allowlisted`."""
-    gh_id = _verify_session(grug_session)
+    gh_id = _verify_active_session(grug_session)
     if gh_id is None:
         return {"authenticated": False}
 
@@ -472,3 +543,25 @@ def logout() -> Response:
     resp = Response(status_code=204)
     resp.delete_cookie("grug_session")
     return resp
+
+
+@router.post("/auth/revoke-sessions")
+def revoke_own_sessions(
+    response: Response,
+    grug_session: str = Cookie(default=""),
+) -> dict[str, int | bool]:
+    """Bump the caller's session generation so all active sessions end."""
+    gh_id = _verify_active_session(grug_session)
+    if gh_id is None or not get_user(gh_id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="not authenticated",
+        )
+    new_gen = bump_session_generation(gh_id)
+    invalidate_session_generation_cache(gh_id)
+    log.info(
+        "sessions_revoked",
+        extra={"github_user_id": gh_id, "session_generation": new_gen},
+    )
+    response.delete_cookie("grug_session")
+    return {"revoked": True, "session_generation": new_gen}

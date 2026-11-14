@@ -53,3 +53,12 @@ export function usePatchUser() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["admin", "users"] }),
   });
 }
+
+export function useRevokeUserSessions() {
+  return useMutation({
+    mutationFn: (user_id: string) =>
+      api(`/api/v1/admin/users/${user_id}/revoke-sessions`, {
+        method: "POST",
+      }),
+  });
+}

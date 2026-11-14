@@ -6,6 +6,7 @@ import {
   useAdminInstallations,
   useAdminUsers,
   usePatchUser,
+  useRevokeUserSessions,
   type AdminUser,
 } from "../lib/admin";
 import "./dashboard-grug.css";
@@ -15,6 +16,7 @@ export function Admin() {
   const users = useAdminUsers();
   const installs = useAdminInstallations();
   const patch = usePatchUser();
+  const revoke = useRevokeUserSessions();
 
   if (me.isLoading) {
     return <div className="grug-dash"><div style={{ padding: 80, textAlign: "center", fontFamily: "'JetBrains Mono',monospace", color: "var(--muted)" }}>loading…</div></div>;
@@ -72,13 +74,15 @@ export function Admin() {
               {users.isError && <div className="err">⚠ failed to load users</div>}
               {userList.length > 0 && (
                 <table className="gtable">
-                  <thead><tr><th>login</th><th>id</th><th>role</th><th>tier</th><th>allowlisted</th><th>last login</th></tr></thead>
+                  <thead><tr><th>login</th><th>id</th><th>role</th><th>tier</th><th>allowlisted</th><th>last login</th><th>sessions</th></tr></thead>
                   <tbody>
                     {userList.map((u) => (
                       <UserRow key={u.github_user_id} user={u}
                         isSelf={u.github_user_id === me.data?.github_user_id}
                         pending={patch.isPending && patch.variables?.user_id === u.github_user_id}
-                        onPatch={(p) => patch.mutate({ user_id: u.github_user_id, patch: p })} />
+                        revoking={revoke.isPending && revoke.variables === u.github_user_id}
+                        onPatch={(p) => patch.mutate({ user_id: u.github_user_id, patch: p })}
+                        onRevoke={() => revoke.mutate(u.github_user_id)} />
                     ))}
                   </tbody>
                 </table>
@@ -135,11 +139,13 @@ function SignOut() {
   );
 }
 
-function UserRow({ user, isSelf, pending, onPatch }: {
+function UserRow({ user, isSelf, pending, revoking, onPatch, onRevoke }: {
   user: AdminUser;
   isSelf: boolean;
   pending: boolean;
+  revoking: boolean;
   onPatch: (p: { allowlisted?: boolean; role?: "admin" | "user" }) => void;
+  onRevoke: () => void;
 }) {
   return (
     <tr className={isSelf ? "self" : undefined}>
@@ -161,6 +167,11 @@ function UserRow({ user, isSelf, pending, onPatch }: {
         </label>
       </td>
       <td style={{ color: "var(--muted)" }}>{user.last_login_at || "—"}</td>
+      <td>
+        <button type="button" className="btn sm ghost" disabled={revoking} onClick={onRevoke}>
+          {revoking ? "Revoking..." : "Revoke"}
+        </button>
+      </td>
     </tr>
   );
 }

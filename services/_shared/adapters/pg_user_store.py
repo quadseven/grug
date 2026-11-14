@@ -37,6 +37,7 @@ class UserIdentity:
     created_at: str
     allowlisted_at: str | None
     allowlisted_by: str | None
+    session_generation: int = 1
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,41 @@ def _identity_from_item(github_user_id: str, item: dict[str, Any]) -> UserIdenti
         created_at=item.get("created_at", ""),
         allowlisted_at=item.get("allowlisted_at"),
         allowlisted_by=item.get("allowlisted_by"),
+        session_generation=int(item.get("session_generation", 1)),
     )
+
+
+def get_session_generation(github_user_id: str) -> int | None:
+    """Read the user's current session generation from Postgres.
+
+    Returns None when the user row does not exist. Raises psycopg.Error on
+    database faults so callers fail closed rather than admitting stale tokens.
+    """
+    item = _fetch_item(github_user_id)
+    if not item:
+        return None
+    return int(item.get("session_generation", 1))
+
+
+def bump_session_generation(github_user_id: str) -> int:
+    """Atomically increment the user's session generation in Postgres."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            UPDATE grug_kv
+            SET data = jsonb_set(
+                data,
+                '{session_generation}',
+                to_jsonb(COALESCE((data->>'session_generation')::int, 1) + 1)
+            )
+            WHERE pk = %(pk)s AND sk = 'META'
+            RETURNING (data->>'session_generation')::int
+            """,
+            {"pk": _user_pk(str(github_user_id))},
+        ).fetchone()
+    if row is None or row[0] is None:
+        raise LookupError(f"user row not found: {github_user_id}")
+    return int(row[0])
 
 
 def get_user(github_user_id: str) -> UserIdentity | None:
@@ -220,6 +255,7 @@ def upsert_oauth_user(
         "tier": "free",
         "allowlisted": False,
         "created_at": now,
+        "session_generation": 1,
     }
 
     with get_pool().connection() as conn:
@@ -248,6 +284,7 @@ def upsert_oauth_user(
         created_at=item["created_at"],
         allowlisted_at=item.get("allowlisted_at"),
         allowlisted_by=item.get("allowlisted_by"),
+        session_generation=int(item.get("session_generation", 1)),
     )
 
 
