@@ -1,6 +1,7 @@
 """Tests for the LLM client abstraction."""
 from __future__ import annotations
 
+import errno
 import json
 import logging
 from dataclasses import replace
@@ -703,31 +704,41 @@ def test_deep_review_consults_both_arms_and_merges_findings(monkeypatch) -> None
 
 
 def test_deep_review_runs_both_arms_concurrently_not_sequentially(monkeypatch) -> None:
-    """Arm parallelization: deep mode's two arms must overlap in wall-clock,
-    not sum. Each mocked backend call sleeps 0.5s; sequential execution would
-    take >=1.0s, concurrent execution should finish close to 0.5s. The upper
-    bound (0.9s) leaves 0.4s for `review_diff`'s own overhead on a loaded
-    machine (a 0.15s margin flaked) while still failing on any regression
-    back to sequential."""
+    """Arm parallelization: deep mode's two arms must overlap, not sum.
+    Each mocked backend call records its start and end stamps and sleeps
+    0.5s; sequential execution produces two disjoint intervals, concurrent
+    execution produces overlapping ones. Asserting on the overlap of the
+    stamps, instead of on a total elapsed bound, keeps the test off the
+    wall clock: a loaded host can stretch either interval, but it cannot
+    make two intervals that ran one after the other overlap, nor stop two
+    intervals that ran together from overlapping."""
+    import threading
     import time
 
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "deep")
+    stamps: list[tuple[float, float]] = []
+    lock = threading.Lock()
 
     def respond(url, **kwargs):
+        start = time.monotonic()
         time.sleep(0.5)
+        end = time.monotonic()
+        with lock:
+            stamps.append((start, end))
         content = '{"findings": []}'
         body = _openai_json_response(content)
         body["model"] = "qwen3.5:122b" if _is_reasoner(kwargs) else "qwen3-coder-next:q8_0"
         return httpx.Response(200, json=body)
 
     with patch.object(httpx, "post", side_effect=respond) as mock_post:
-        start = time.monotonic()
         out = review_diff(assemble_evidence([_hunk()]), installation_id=1)
-        elapsed = time.monotonic() - start
 
     assert mock_post.call_count == 2
     assert out.kind == "reviewed"
-    assert elapsed < 0.9, f"expected concurrent arms (~0.5s), took {elapsed:.3f}s"
+    assert len(stamps) == 2
+    assert max(start for start, _ in stamps) < min(end for _, end in stamps), (
+        f"expected overlapping arms, got intervals {stamps}"
+    )
 
 
 def test_call_backend_cancel_event_aborts_in_flight_request() -> None:
@@ -763,7 +774,13 @@ def test_call_backend_cancel_event_aborts_in_flight_request() -> None:
     class _ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         daemon_threads = True
 
-    server = _ThreadingServer(("127.0.0.1", 0), _SlowHandler)
+    try:
+        server = _ThreadingServer(("127.0.0.1", 0), _SlowHandler)
+    except PermissionError as exc:
+        if exc.errno != errno.EPERM:
+            raise
+        pytest.skip("sandbox refuses binding a local test server (PermissionError); "
+                    "the cancel test cannot run here (grug#1715)")
     port = server.server_address[1]
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -782,8 +799,15 @@ def test_call_backend_cancel_event_aborts_in_flight_request() -> None:
         ).start()
 
         start = time.monotonic()
-        with pytest.raises((httpx.RequestError, httpx.TimeoutException)):
-            lc._call_backend(config, [{"role": "user", "content": "hi"}], cancel_event=cancel_event)
+        try:
+            with pytest.raises((httpx.RequestError, httpx.TimeoutException)):
+                lc._call_backend(config, [{"role": "user", "content": "hi"}], cancel_event=cancel_event)
+        except PermissionError as exc:
+            if exc.errno != errno.EPERM:
+                raise  # only the sandbox refusal skips; any other PermissionError is a real failure
+            pytest.skip("sandbox refuses the socket operation the cancel watcher "
+                        "needs (PermissionError); the cancel test cannot run "
+                        "here (grug#1715)")
         elapsed = time.monotonic() - start
     finally:
         server.shutdown()

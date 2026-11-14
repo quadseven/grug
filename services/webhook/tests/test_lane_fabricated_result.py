@@ -263,20 +263,49 @@ def test_the_rule_shows_under_a_named_category_not_general():
     assert linked_issue.RULE_CATEGORIES[RULE] == "requirements"
 
 
-def test_the_scan_is_linear_on_a_large_diff():
+
+def _counted_calls(fn):
+    """(result, python call count) of fn() under sys.setprofile: a work
+    count, not a wall clock, so a loaded host cannot move it (grug#1715)."""
+    import sys
+    calls = 0
+
+    def _count(frame, event, arg):
+        nonlocal calls
+        if event == "call":
+            calls += 1
+
+    sys.setprofile(_count)
+    try:
+        return fn(), calls
+    finally:
+        sys.setprofile(None)
+
+def _scan_counted(n_files):
     # Every rate is possible, so every line of every file is read in full.
     rates = " ".join(f"{100 * k / 30:.1f}%" for k in range(31))
     lines = [f"Pass rates {rates} on 30 rows, n={j}, {j} of 90, {j}/120." for j in range(40)]
-    diff = "".join(_added_file(f"results/run-{i}.md", lines) for i in range(300))
+    diff = "".join(_added_file(f"results/run-{i}.md", lines) for i in range(n_files))
     # Past the shared check budget the rate check is not evaluated, so an
     # impossible rate at the end draws no finding rather than a slow scan.
     diff += _benchmark_diff("Pass rates were 47.0% energy.")
     changes, hunks = file_changes(diff), parse_diff(diff)
-    assert sum(len(h.body) for h in hunks) > 2_000_000
+    result, calls = _counted_calls(lambda: scan_fabricated_results(changes, hunks))
+    return result, calls, sum(len(h.body) for h in hunks)
+
+
+def test_the_scan_is_linear_on_a_large_diff():
+    # Structural linearity (grug#1715): doubling the diff must less than
+    # triple the scan's counted calls; a quadratic scan grows about four
+    # times. An elapsed-seconds bound flaked on loaded lane hosts.
+    result, calls, size = _scan_counted(300)
+    assert size > 2_000_000
     assert 300 * 40 * 31 * 40 > MAX_RATE_CHECKS
-    start = time.perf_counter()
-    assert scan_fabricated_results(changes, hunks) == ()
-    assert time.perf_counter() - start < 1.0
+    assert result == ()
+    _, calls_half, _ = _scan_counted(150)
+    # The counts here are in the tens of thousands, so the bound needs no slack.
+    assert calls_half > 1000, calls_half
+    assert calls < 3 * calls_half, (calls_half, calls)
 
 
 def test_a_diff_past_the_bound_is_not_evaluated():
