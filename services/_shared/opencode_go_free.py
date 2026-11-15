@@ -16,9 +16,15 @@ failure, and waits out Retry-After after a 429. It never raises.
 ceiling per hour, and a per-model cool-down after a 429 that honours
 Retry-After and otherwise backs off with doubling and jitter. Both classes
 are per process; the ceiling is therefore per pod.
+
+`qualified_models` reads the checked-in eval report and names the free models
+whose measured false-empty rate is low enough for their empty answer to count
+as a confirming second opinion (grug#1601). It works from the counts, never
+from a stored list, and a missing, stale or malformed report qualifies nobody.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -26,6 +32,8 @@ import random
 import threading
 import time
 from collections import deque
+from datetime import date
+from pathlib import Path
 from typing import Any, Callable
 
 import httpx
@@ -295,3 +303,62 @@ class FreeCallGate:
             wait = min(wait * (1 + JITTER_FRACTION * self._rand()), MAX_COOLDOWN_SECONDS * (1 + JITTER_FRACTION))
             self._until[model] = max(self._until.get(model, 0.0), self._clock() + wait)
         log.warning("opencode_go_free_cooldown", extra={"model": model, "seconds": round(wait)})
+
+
+# --- the measured allowlist (grug#1601) ----------------------------------------
+
+EVAL_REPORT_FILE = Path(__file__).with_name("opencode_go_free_eval.json")
+# A model qualifies on at least 20 defect cases with a false-empty rate of at
+# most 5 percent. The rate is compared as integers: false_empty * 20 <= scored.
+MIN_DEFECT_CASES = 20
+MAX_FALSE_EMPTY_RATE_PERCENT = 5
+# A report older than this qualifies nobody: models change under the same name.
+DEFAULT_REPORT_MAX_AGE_DAYS = 60
+
+
+def _today() -> date:
+    return date.today()
+
+
+def _count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def model_qualifies(stats: Any) -> bool:
+    """True when `stats` (`defect_scored`, `false_empty`) clears the bar."""
+    if not isinstance(stats, dict):
+        return False
+    scored, empty = _count(stats.get("defect_scored")), _count(stats.get("false_empty"))
+    if scored is None or empty is None or scored < MIN_DEFECT_CASES or empty > scored:
+        return False
+    return empty * 100 <= scored * MAX_FALSE_EMPTY_RATE_PERCENT
+
+
+def qualified_models(
+    report: Any,
+    *,
+    today: date | None = None,
+    max_age_days: int = DEFAULT_REPORT_MAX_AGE_DAYS,
+) -> frozenset[str]:
+    """The models an eval report shows to clear the bar, or nothing when the
+    report is unreadable or older than `max_age_days`."""
+    if not isinstance(report, dict) or not isinstance(report.get("models"), dict):
+        return frozenset()
+    try:
+        measured = date.fromisoformat(str(report.get("date")))
+    except ValueError:
+        return frozenset()
+    age = ((today or _today()) - measured).days
+    if age < 0 or age > max_age_days:
+        return frozenset()
+    return frozenset(m for m, stats in report["models"].items() if model_qualifies(stats))
+
+
+def load_eval_report(path: Path | str | None = None) -> Any:
+    """The parsed report, or None when it is absent or not JSON."""
+    try:
+        return json.loads(Path(path or EVAL_REPORT_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
