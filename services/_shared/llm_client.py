@@ -1414,7 +1414,7 @@ def _env_number(name: str, default: float, cast: Callable[[str], Any] = float) -
     try:
         return cast(os.getenv(name, "").strip() or default)
     except ValueError:
-        log.warning("grug_opencode_go_free_setting_invalid", extra={"name": name})
+        log.warning("grug_opencode_go_free_setting_invalid", extra={"setting": name})
         return default
 
 
@@ -7254,6 +7254,57 @@ def _free_tier_found_nothing(tier: BackendConfig, outcome: _ArmOutcome) -> bool:
     return not outcome.findings and _empty_confirms_nothing((tier.backend, tier.model))
 
 
+# grug#1601: the narrow relaxation of the rule above. A free Go model answered
+# empty on a 33k-token diff where the paid primary found faults, so the default
+# stands: a free model's empty answer confirms nothing. On a small cohort, after
+# a paid or ranked model already answered empty, a free model that an eval
+# measured at a false-empty rate of 5 percent or less may be the second opinion.
+# Off unless GRUG_OPENCODE_GO_FREE_CONFIRM is set.
+_FREE_CONFIRM_DEFAULT_MAX_TOKENS = 10_000
+_CHARS_PER_TOKEN = 4
+
+
+def _free_confirm_on() -> bool:
+    return os.getenv("GRUG_OPENCODE_GO_FREE_CONFIRM", "").strip().lower() in ("1", "true", "yes")
+
+
+def _free_confirm_cohort_is_small() -> bool:
+    """The cohort under review is at most the configured tokens, from its diff
+    characters at about four to a token. An unknown size is never small."""
+    chars = _REVIEWED_DIFF_CHARS.get()
+    if chars is None:
+        return False
+    limit = _env_number(
+        "GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_TOKENS", _FREE_CONFIRM_DEFAULT_MAX_TOKENS, int,
+    )
+    return limit > 0 and chars <= limit * _CHARS_PER_TOKEN
+
+
+def _free_confirm_allowlist() -> frozenset[str]:
+    max_age = _env_number(
+        "GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_AGE_DAYS", opencode_go_free.DEFAULT_REPORT_MAX_AGE_DAYS, int,
+    )
+    path = os.getenv("GRUG_OPENCODE_GO_FREE_CONFIRM_REPORT", "").strip() or None
+    return opencode_go_free.qualified_models(
+        opencode_go_free.load_eval_report(path), max_age_days=max_age,
+    )
+
+
+def _free_empty_may_confirm(current: "tuple[Backend, str]") -> bool:
+    """May this free model's empty answer count as the second opinion? Only for
+    a Go model that is free now, on a small cohort, when it is on the measured
+    allowlist and the flag is on. The caller has already required that the
+    first empty answer came from a paid or ranked model."""
+    backend, model = current
+    return (
+        _free_confirm_on()
+        and backend == Backend.OPENCODE_GO
+        and _opencode_go_model_is_free(model)
+        and _free_confirm_cohort_is_small()
+        and model in _free_confirm_allowlist()
+    )
+
+
 def _empty_answers_agree(
     first_empty: "tuple[Backend, str] | None",
     current: "tuple[Backend, str]",
@@ -7266,11 +7317,15 @@ def _empty_answers_agree(
     cohorts (2026-10-05). The same model twice is not agreement."""
     if first_empty is None or first_empty == current:
         return False
-    if _empty_confirms_nothing(first_empty) or _empty_confirms_nothing(current):
+    if _empty_confirms_nothing(first_empty):
+        return False
+    relaxed = _empty_confirms_nothing(current)
+    if relaxed and not _free_empty_may_confirm(current):
         return False
     log.info(
         "llm_cloud_empty_consensus",
         extra={
+            "relaxed": relaxed,
             "first_backend": first_empty[0].value,
             "first_model": first_empty[1],
             "second_backend": current[0].value,
