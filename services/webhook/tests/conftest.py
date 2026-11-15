@@ -137,6 +137,10 @@ def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     if lc is not None:
         monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
         monkeypatch.setattr(lc, "_limit_refusals", {}, raising=False)
+        # Free Go model pacing and the price list are module state too.
+        monkeypatch.setattr(lc, "_opencode_go_free_catalog", None, raising=False)
+        monkeypatch.setattr(lc, "_opencode_go_free_gate", None, raising=False)
+        monkeypatch.delenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", raising=False)
         # Fixture replies name these models; the list itself has its own tests.
         monkeypatch.setattr(
             lc, "_TRUSTED_EMPTY_CAVE_MODELS",

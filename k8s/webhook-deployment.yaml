@@ -245,6 +245,10 @@ spec:
             # 40k tokens is about 78% of the plan over 27 days (doc prices, 2026-11-01);
             # the shared key keeps the rest. Identical on all three Elder workloads.
             - {name: GRUG_OPENCODE_GO_DAILY_CAP, value: "200"}
+            # Free-model discovery: Elder reads OpenCode Go's public price list (cached 45 min)
+            # and also tries the models priced exactly zero, at most 2 per walk, paced by an
+            # hourly ceiling, a concurrency bound and a Retry-After cool-down. No new spend.
+            - {name: GRUG_OPENCODE_GO_FREE_DISCOVERY, value: "true"}
             # Poolside stays off while it answers 400 on review calls: 3 of 1112 calls
             # succeeded over 24h on 2026-11-01. The OpenRouter free chain tier is unset: its
             # model left the catalogue, and that tier has no private-code data-terms gate.
