@@ -372,6 +372,30 @@ class TestReviewExclusionSplit:
         ):
             assert not is_review_excluded_path(p), p
 
+    def test_codegen_output_excluded(self):
+        # Patterns adapted from the MIT-licensed PR-Agent
+        # (pr_agent/settings/generated_code_ignore.toml): compiler output
+        # a person never writes, so it carries no review signal.
+        for p in (
+            "proto/user.pb.go", "src/msg.pb.cc", "src/msg.pb.h", "ios/Msg.pb.swift",
+            "lib/msg.pb.rb", "lib/msg.pb.php", "api/user_pb2.py", "api/user_pb2.pyi",
+            "api/user_pb2_grpc.py", "web/src/__generated__/types.ts",
+            "client/openapi_client/api.py", "server/openapi_server/models.py",
+            "web/queries.graphql.ts", "web/queries.graphql.js", "web/types.generated.ts",
+            "svc/UserGrpc.java", "svc/UserGrpc.cs", "web/user_grpc.ts", "web/user_grpc.js",
+            "pkg/user_gen.go", "pkg/zz_generated.go", "pkg/schema.generated.go",
+        ):
+            assert is_review_excluded_path(p), p
+
+    def test_hand_written_lookalikes_kept(self):
+        for p in (
+            "src/grpc_client.py", "src/pb_utils.py", "src/gen_report.py",
+            "src/regenerated.go", "docs/swagger.json", "docs/openapi.yaml",
+            "src/generated_names.py", "src/msg_pb.py", "src/my_grpc.py",
+            "src/openapi_client_config.py",
+        ):
+            assert not is_review_excluded_path(p), p
+
     def test_split_partitions_and_dedupes(self):
         hunks = (
             self._hunk("src/a.py"),
