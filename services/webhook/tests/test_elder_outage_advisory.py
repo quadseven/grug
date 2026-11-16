@@ -309,9 +309,11 @@ def test_publish_fails_closed_then_advisory_then_blocks_again(run):
     assert first.title.startswith("WARN")
     later = run(_DOWN, advance_min=25)
     assert later.conclusion == "neutral"
-    assert later.title == oa.ADVISORY_TITLE
+    assert oa.ADVISORY_TITLE in later.title
+    assert "Neutral because" in later.title
     assert later.summary.split("\n")[0] == f"## {oa.ADVISORY_TITLE}"
     assert "Degraded review (all_failed): not a verdict." in later.summary
+    assert "Neutral because" in later.summary
     assert "poolside (timeout)" in later.summary and "since" in later.summary
     assert "this check fails until" not in later.summary
     clear = run(_UP, advance_min=1)

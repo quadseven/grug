@@ -172,8 +172,8 @@ def _run_tier1(monkeypatch, *, blocking: bool) -> dict[str, str]:
 
 _TIER1_ADVISORY = {
     "check_conclusion": "7e2372f4115c43bac7248772d891df3dbc830a85aa27eeed933688f61c44226c",
-    "check_summary": "22b59a062418c4cadae14e5002ec69e5f2b3504262ffb4dd54e839565882f888",
-    "check_title": "bad94850bce26b970a0876c55916601c869ead8d195cd0c7277ac576cc318157",
+    "check_summary": "42435c557aaf5a74a9b8ccf7179a519d3f0407f9a7b682a97fcf97fba20028c2",
+    "check_title": "7cf6a676e13d159f078db78bff68d4e5f006fcfae772ead6dddafbc718e9eda9",
     "inline_0": "d1aa28ae7d264990e93ad5edcc8801d76409f4cb346662cb1190db05f38902d1",
     "inline_1": "0073265db3a9dccffe42e905144bf6d66ac1741ef3c644ab19be074c87a49126",
     "review_body": "ab9a7ad05178a51a6903e3323e581d1e2f1c3bf26c8590ccb854cea3309e3f78",

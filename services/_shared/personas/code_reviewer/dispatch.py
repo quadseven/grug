@@ -75,8 +75,9 @@ from voice_pack import VoiceSelection, entitled_voice
 from review_evidence import ElderEvidence, assemble_evidence
 from personas.review_publish import (
     DIFF_FETCH_TIMEOUT, PARTIAL_COVERAGE, PUBLISHABLE_DEGRADATIONS, ReviewMode,
-    fetch_file_contents, fetch_pr_diff, fetch_pr_diff_with_scope, is_blackout, fetch_review_comment_body,
-    is_real_degradation, plan_publish, prior_finding_keys,
+    append_neutral_reason, fetch_file_contents, fetch_pr_diff, fetch_pr_diff_with_scope,
+    fetch_review_comment_body, is_blackout, is_real_degradation,
+    neutral_check_title, neutral_reason, plan_publish, prior_finding_keys,
 )
 from personas.code_reviewer.dedup import (
     finding_key, parse_rule,
@@ -3267,6 +3268,17 @@ def dispatch_code_review(
     if outage.advisory:
         title = ADVISORY_TITLE
         summary = advisory_summary(outage, summary)
+    if conclusion == "neutral":
+        # grug#1753: a neutral cannot clear a blocking gate, so say why.
+        # The lock-file rule above changed the conclusion after the gate,
+        # so its cause is passed alongside the ones the gate read.
+        why = neutral_reason(
+            evaluation, mode=mode,
+            outage_advisory=outage.advisory,
+            unreviewed_lock_files=lock_check.unreviewed,
+        )
+        summary = append_neutral_reason(summary, why)
+        title = neutral_check_title(title, why)
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
