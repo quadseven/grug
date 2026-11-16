@@ -285,41 +285,35 @@ def _anchor(function: _Function) -> tuple[str, int] | None:
     return function.path, line
 
 
-def _replacement_for_call(body: str, match: re.Match) -> str:
-    """Extract the replacement string literal from a re.sub/re.subn call.
+_PATTERN_TO_REPLACEMENT_GAP_RE = re.compile(r"[\"']*\s*,\s*[rRuU]?")
+_LEADING_PREFIX_RE = re.compile(r"\s*[rRuU]?")
 
-    Only called for re.sub/re.subn matches. Returns the second string argument
-    if it is a string literal; otherwise returns empty string.
+
+def _replacement_for_call(body: str, match: re.Match) -> str:
+    """The replacement string literal of a re.sub/re.subn call.
+
+    Only the argument directly after the pattern counts. When it is a name
+    or any other expression, no literal is known and the result is "".
     """
     after = body[match.end():]
-    # First string is the pattern
-    first = _first_string_after(after, 0)
-    if first is None:
+    literals = _string_literals(after)
+    if len(literals) < 2:
         return ""
-    # Find the second string argument (the replacement)
-    # Skip past the first string and any whitespace/comma
-    next_start = first[1] + 1 + len(first[0]) + 1
-    # Look for a comma before the second argument
-    comma_pos = after.find(",", first[1] + 1 + len(first[0]))
-    if comma_pos != -1:
-        next_start = comma_pos + 1
-    second = _first_string_after(after, next_start)
-    if second is None:
+    (first_at, first_value), (second_at, second_value) = literals[0], literals[1]
+    gap = after[first_at + 1 + len(first_value):second_at]
+    if _PATTERN_TO_REPLACEMENT_GAP_RE.fullmatch(gap) is None:
         return ""
-    # Verify this is actually the second argument (not a third argument)
-    # by checking there's no other string between pattern and this one
-    # (the _first_string_after already skips non-strings, so this is fine)
-    return second[0]
+    return second_value
 
 
 def _replacement_for_constant_sub(body: str, const_name: str) -> str:
-    """Extract the replacement string literal from a CONST.sub(...) call."""
-    # Look for const_name.sub( or const_name.subn(
+    """The replacement string literal of a CONST.sub(...) call, or "" when
+    the first argument is not a string literal."""
     pattern = rf"(?<!\w){re.escape(const_name)}\.subn?\s*\("
     for match in re.finditer(pattern, body):
         after = body[match.end():]
         first = _first_string_after(after, 0)
-        if first is not None:
+        if first is not None and _LEADING_PREFIX_RE.fullmatch(after[:first[1]]):
             return first[0]
     return ""
 
@@ -442,7 +436,7 @@ def _has_table_driven_passthrough(lines: list[tuple[int, str]]) -> bool:
         test_functions.append((func_start, lines[-1][0], current_func))
     
     # Check each test function for a table-driven passthrough
-    for func_start, func_end, func_lines in test_functions:
+    for _start, _end, func_lines in test_functions:
         full = "\n".join(text for _line, text in func_lines)
         # Look for table-driven test patterns: a loop over cases with (raw, want) pairs
         for pair_match in _TABLE_PAIR_RE.finditer(full):

@@ -147,3 +147,31 @@ def test_sound_sanitizer_with_table_driven_passthrough_draws_nothing():
     """A sound sanitiser with a table-driven passthrough test draws no findings."""
     diff = _diff(_SOUND_SANITIZER, _TABLE_DRIVEN_WITH_PASSTHROUGH)
     assert _scan(diff) == ()
+
+_NAME_REPLACEMENT = [
+    "import re",
+    "",
+    "",
+    "def sanitize_chat(text):",
+    '    return re.sub(r"\\|h", _blank, text)',
+]
+
+_INLINE_ALLOW_LIST = [
+    "import re",
+    "",
+    "",
+    "def sanitize_title(text):",
+    '    return re.sub(r"[^A-Za-z0-9 ,.]", " ", text)',
+]
+
+
+def test_non_literal_replacement_is_not_read_as_a_later_string():
+    """A name in the replacement slot must not borrow a later string literal."""
+    diff = _diff(_NAME_REPLACEMENT, _POSITIVE_TESTS_ONLY)
+    assert RULE_EATS_TEXT in _names(_scan(diff))
+
+
+def test_inline_allow_list_call_yields_no_eats_text_finding():
+    """The allow-list given straight to re.sub is not evaluated either."""
+    diff = _diff(_INLINE_ALLOW_LIST, _POSITIVE_TESTS_ONLY)
+    assert RULE_EATS_TEXT not in _names(_scan(diff))
