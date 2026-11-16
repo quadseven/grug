@@ -1749,7 +1749,10 @@ def _attach_linked_issue_context(
             ),
         )
         if linked:
-            pr_context["linked_issue_context"] = linked
+            # Unpack the tuple (block, live_criteria_count)
+            block, live_criteria_count = linked
+            pr_context["linked_issue_context"] = block
+            pr_context["live_criteria_count"] = live_criteria_count
     except Exception as e:  # noqa: BLE001 - additive; never break the review
         log.info(
             "linked_issue_context_degraded",
@@ -1776,17 +1779,20 @@ def _pinned_issues(
     ))
 
 
-def _linked_issue_summary_note(linked_context: str) -> str:
+def _linked_issue_summary_note(linked_context: str, live_criteria_count: int) -> str:
     """Summarize which linked issue criteria were included in the review."""
     criteria = rendered_criteria(linked_context)
     if not criteria:
         return ""
     issue_numbers = list(dict.fromkeys(issue for issue, _, _ in criteria))
-    return (
+    note = (
         "\n\nLinked issue criteria read: "
         + ", ".join(f"#{number}" for number in issue_numbers)
         + f" ({len(criteria)} criteria)."
     )
+    if live_criteria_count:
+        note += f" {live_criteria_count} live criteria left for after deploy."
+    return note
 
 
 def _pr_labels(pr: dict[str, Any]) -> frozenset[str]:
@@ -3248,6 +3254,7 @@ def dispatch_code_review(
     summary += lock_check.note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
+        pr_context.get("live_criteria_count", 0),
     )
     summary += installation_permission_summary_note(installation_id)
     conclusion, title, summary, listed_threads = _carry_into_check(

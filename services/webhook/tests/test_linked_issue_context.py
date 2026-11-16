@@ -203,16 +203,15 @@ def test_block_sanitizes_mentions_fences_headings_and_control_chars():
 
 def test_build_returns_none_without_links_and_never_fetches():
     calls = []
-    out = build_linked_issue_context(
-        "no links here", fetch_issue=lambda n: calls.append(n) or ISSUE,
+    block, live_count = build_linked_issue_context("no links here", fetch_issue=lambda n: calls.append(n) or ISSUE,
     )
-    assert out is None and calls == []
+    assert block is None and live_count == 0 and live_count == 0 and calls == []
 
 
 def test_build_renders_fetched_criteria():
-    out = build_linked_issue_context("Closes #904", fetch_issue=lambda n: ISSUE)
-    assert out is not None
-    assert "#904 criterion 1 [open]: First criterion about caching" in out
+    block, live_count = build_linked_issue_context("Closes #904", fetch_issue=lambda n: ISSUE)
+    assert block is not None and live_count >= 0
+    assert "#904 criterion 1 [open]: First criterion about caching" in block
 
 
 def test_build_degrades_to_none_on_fetch_failure_and_logs_kind(caplog):
@@ -220,8 +219,8 @@ def test_build_degrades_to_none_on_fetch_failure_and_logs_kind(caplog):
         raise httpx.ConnectTimeout("slow")
 
     with caplog.at_level(logging.INFO):
-        out = build_linked_issue_context("Closes #904", fetch_issue=boom)
-    assert out is None
+        block, live_count = build_linked_issue_context("Closes #904", fetch_issue=boom)
+    assert block is None and live_count == 0 and live_count == 0
     rec = [r for r in caplog.records if r.getMessage() == "linked_issue_fetch_failed"]
     assert rec and rec[0].kind == "ConnectTimeout" and rec[0].issue_number == 904
 
@@ -234,7 +233,7 @@ def test_build_logs_http_status_for_missing_issue(caplog):
         )
 
     with caplog.at_level(logging.INFO):
-        assert build_linked_issue_context("Refs #1", fetch_issue=not_found) is None
+        assert build_linked_issue_context("Refs #1", fetch_issue=not_found)[0] is None and build_linked_issue_context("Refs #1", fetch_issue=not_found)[1] == 0
     rec = [r for r in caplog.records if r.getMessage() == "linked_issue_fetch_failed"]
     assert rec[0].kind == "HTTPStatusError" and rec[0].status == 404
 
@@ -245,14 +244,12 @@ def test_build_one_failure_keeps_the_other_issue():
             raise RuntimeError("down")
         return ISSUE
 
-    out = build_linked_issue_context("Closes #1\nRefs #2", fetch_issue=fetch)
-    assert out is not None and "#2 criterion 1" in out and "#1 criterion" not in out
+    block, live_count = build_linked_issue_context("Closes #1\nRefs #2", fetch_issue=fetch)
+    assert block is not None and live_count >= 0 and "#2 criterion 1" in block and "#1 criterion"not in block
 
 
 def test_build_none_when_issue_has_no_criteria_section():
-    assert build_linked_issue_context(
-        "Closes #1", fetch_issue=lambda n: "## Why\n\nprose only",
-    ) is None
+    assert build_linked_issue_context("Closes #1", fetch_issue=lambda n: "## Why\n\nprose only")[0] is None and build_linked_issue_context("Closes #1", fetch_issue=lambda n: "## Why\n\nprose only")[1] == 0
 
 
 def test_build_bounds_number_of_fetches():
@@ -265,9 +262,7 @@ def test_build_bounds_number_of_fetches():
 
 
 def test_build_non_string_issue_body_is_a_failure_not_a_crash():
-    assert build_linked_issue_context(
-        "Closes #1", fetch_issue=lambda n: None,  # type: ignore[arg-type,return-value]
-    ) is None
+    assert build_linked_issue_context("Closes #1", fetch_issue=lambda n: None)[0] is None and build_linked_issue_context("Closes #1", fetch_issue=lambda n: None)[1] == 0
 
 
 def test_health_ticket_reserve_change_context_requires_symptom_only_review():
@@ -281,10 +276,9 @@ def test_health_ticket_reserve_change_context_requires_symptom_only_review():
             "> The guild bank holds under a gold while 65 members wait on refunds."
         ),
     }
-    block = build_linked_issue_context(
-        "Closes #42", fetch_issue=lambda _number: issue,
+    block, live_count = build_linked_issue_context("Closes #42", fetch_issue=lambda _number: issue,
     )
-    assert block is not None
+    assert block is not None and live_count >= 0
     assert "The guild bank holds under a gold while 65 members wait on refunds" in block
     assert "symptom-only" in block
     assert "reserve held back" in block
@@ -298,10 +292,9 @@ def test_health_ticket_context_distinguishes_improving_the_outcome():
         "title": "Health: store income remains low",
         "body": "> The store receives too little income to serve its customers.",
     }
-    block = build_linked_issue_context(
-        "Closes #43", fetch_issue=lambda _number: issue,
+    block, live_count = build_linked_issue_context("Closes #43", fetch_issue=lambda _number: issue,
     )
-    assert block is not None
+    assert block is not None and live_count >= 0
     assert "health finding evidence" in block.lower()
     assert "improves the outcome" in block
     assert "not symptom-only" in block
@@ -516,8 +509,7 @@ _REFS_BODY = "Meets #2519 criterion 1.\n\nRefs acme/widgets" "#2519\n"  # joined
 
 
 def _weakened(issue_body: str):
-    block = build_linked_issue_context(
-        _REFS_BODY, fetch_issue=lambda n: issue_body, owner="acme", repo="widgets",
+    block, live_count = build_linked_issue_context(_REFS_BODY, fetch_issue=lambda n: issue_body, owner="acme", repo="widgets",
     ) or ""
     found = lane_work_findings(
         diff_text=_REMOVES_TWO, hunks=parse_diff(_REMOVES_TWO),
@@ -545,10 +537,41 @@ def test_weakened_test_still_high_when_the_acceptance_bullet_names_no_test():
 
 
 def test_intent_says_criteria_were_checked_with_only_a_plain_acceptance_heading():
-    linked = build_linked_issue_context(
-        _REFS_BODY, fetch_issue=lambda n: _LOOM_ISSUE, owner="acme", repo="widgets",
+    block, live_count = build_linked_issue_context(_REFS_BODY, fetch_issue=lambda n: _LOOM_ISSUE, owner="acme", repo="widgets",
     )
     paragraph = cr_dispatch._intent_paragraph(
-        {"title": "Tighten the merge gate", "linked_issue_context": linked},
+        {"title": "Tighten the merge gate", "linked_issue_context": block},
     )
     assert "Linked acceptance criteria were checked" in paragraph
+
+
+# --- live criterion filtering --------------------------------------------------
+
+
+def test_live_proof_criterion_is_left_out_of_block():
+    """Live criteria are left out of the rendered block."""
+    issue_with_live = """## Acceptance criteria
+
+- [ ] Live proof (left to the brain): on the next 10 lane PRs
+- [ ] Regular criterion
+"""
+    block, live_count = build_linked_issue_context("Closes #904", fetch_issue=lambda n: issue_with_live)
+    assert block is not None and live_count >= 0
+    assert "#904 criterion 1 [open]: Regular criterion" in block
+    assert "#904 criterion 2" not in block
+    assert "Live proof" not in block
+
+
+def test_is_live_criterion_true_for_valid_patterns():
+    """Test that is_live_criterion correctly identifies live criteria patterns."""
+    assert linked_issue.is_live_criterion("Live: on next lane PR")
+    assert linked_issue.is_live_criterion("Live proof: on next lane PR")
+    assert linked_issue.is_live_criterion("Live proof (left to the brain): on next lane PR")
+    assert linked_issue.is_live_criterion("live (operator): on next lane PR")
+
+
+def test_is_live_criterion_false_for_non_live_patterns():
+    """Test that is_live_criterion correctly rejects non-live criteria."""
+    assert not linked_issue.is_live_criterion("Liveness probe returns 200")
+    assert not linked_issue.is_live_criterion("The live log shows X")
+    assert not linked_issue.is_live_criterion("First criterion")

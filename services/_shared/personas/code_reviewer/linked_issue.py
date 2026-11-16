@@ -181,6 +181,54 @@ _HEADER = (
 )
 
 
+def is_live_criterion(text: str) -> bool:
+    """Return True if the criterion should be left out of the rendered block.
+    
+    Criteria starting with 'Live' (case-insensitive) followed by ':', ' proof' or ' (',
+    after stripping leading whitespace and markdown emphasis, are left out because
+    they are checked after deploy.
+    """
+    if not text:
+        return False
+    
+    # Strip leading whitespace and markdown emphasis
+    stripped = text.lstrip()
+    
+    # Remove markdown emphasis (leading/trailing emphasis characters)
+    while stripped.startswith("*") or stripped.startswith("_"):
+        stripped = stripped[1:]
+    
+    # Check if it starts with Live (case-insensitive) followed by specific patterns
+    lower_stripped = stripped.lower()
+    if not lower_stripped.startswith("live"):
+        return False
+    
+    # After "live", check for one of the allowed patterns
+    # "Live:", "Live proof:", "Live proof (left to the brain):", "live (operator):", etc.
+    # The pattern is: after "live", we expect :, proof:, proof (, or ( followed by something
+    after_live = stripped[4:]  # After "live"
+    
+    # Check for "Live:" or "Live proof:" or "live (operator):" or similar patterns
+    # Pattern 1: "Live:" - starts with :, then optionally more characters or closes
+    if after_live.startswith(":"):
+        return True
+    
+    # Pattern 2: "Live proof:" - starts with " proof:", case-insensitive
+    if len(after_live) >= 6 and after_live.lower().startswith(" proof:"):
+        return True
+    
+    # Pattern 3: "Live proof (left to the brain):" or "live (operator):" 
+    # - starts with " proof ("
+    if len(after_live) >= 7 and after_live.lower().startswith(" proof ("):
+        return True
+    
+    # Pattern 4: "live (operator):" - starts with " (", case-insensitive
+    if len(after_live) >= 2 and after_live.lower().startswith(" ("):
+        return True
+    
+    return False
+
+
 _DELIVERED_NOTE = (
     " A criterion marked 'delivered by merged #N' was met by an earlier pull "
     "request on the same ticket: do not flag it as unmet here."
@@ -299,10 +347,16 @@ def _with_delivered(
 def build_linked_issue_context(
     pr_body: str, *, fetch_issue: IssueDetailsFetcher, owner: str = "", repo: str = "",
     fetch_siblings: SiblingFetcher | None = None,
-) -> str | None:
-    """The block for this PR's linked issues, or None. Never raises."""
+) -> tuple[str | None, int]:
+    """The block for this PR's linked issues, or None. Never raises.
+    
+    Returns a tuple of (block, live_criteria_count) where block is the rendered
+    criteria block with live criteria filtered out, and live_criteria_count is
+    the number of live criteria that were excluded.
+    """
     criteria_by_issue: dict[int, list[Criterion]] = {}
     health_by_issue: dict[int, str] = {}
+    total_live_criteria = 0
     for number in linked_issue_numbers(pr_body, owner=owner, repo=repo):
         try:
             issue = fetch_issue(number)
@@ -326,8 +380,15 @@ def build_linked_issue_context(
             continue
         criteria = extract_criteria(issue_body)
         if criteria:
+            # Filter out live criteria that should be left out of the rendered block
+            filtered_criteria = []
+            for state, text in criteria:
+                if is_live_criterion(text):
+                    total_live_criteria += 1
+                else:
+                    filtered_criteria.append((state, text))
             criteria_by_issue[number] = _with_delivered(
-                number, criteria, issue_body, fetch_siblings,
+                number, filtered_criteria, issue_body, fetch_siblings,
             )
         evidence = _health_evidence(issue_title, issue_body)
         if evidence:
@@ -336,7 +397,8 @@ def build_linked_issue_context(
         render_linked_issue_block(criteria_by_issue),
         _render_health_block(health_by_issue),
     ]
-    return "\n\n".join(block for block in blocks if block) or None
+    block = "\n\n".join(block for block in blocks if block) or None
+    return block, total_live_criteria
 
 
 def rendered_criteria(block: str) -> list[tuple[int, int, str]]:
