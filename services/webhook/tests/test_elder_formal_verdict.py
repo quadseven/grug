@@ -9,6 +9,7 @@ conclusion. A degraded run never approves.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -19,6 +20,7 @@ from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse
 from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer.carry_forward import CarriedFinding
+from personas.code_reviewer.markings import run_marker
 from personas.code_reviewer.persona import CodeReviewEvaluation
 from personas.review_publish import verdict_event
 
@@ -199,6 +201,27 @@ def test_clean_advisory_rereview_withdraws_elders_stale_block(monkeypatch):
     )
     assert [r.event for r in posted] == ["APPROVE"]
     assert dismissed == [1]
+
+
+def test_clean_review_withdraws_a_same_head_block_from_an_earlier_started_run(monkeypatch):
+    """Recency is the run start, not the post time: a block an earlier run
+    posted after this run started is still that earlier run's verdict."""
+    block = _review(1, state="CHANGES_REQUESTED", commit=_HEAD,
+                    submitted_at="2999-01-01T00:00:00Z")
+    block["body"] += "\n" + run_marker(datetime(2000, 1, 1, tzinfo=timezone.utc))
+    _, dismissed = _run(
+        monkeypatch, _clean(), blocking=True, action="synchronize", reviews=[block],
+    )
+    assert dismissed == [1]
+
+
+def test_clean_review_keeps_a_same_head_block_from_a_later_started_run(monkeypatch):
+    block = _review(1, state="CHANGES_REQUESTED", commit=_HEAD, submitted_at=_BEFORE_RUN)
+    block["body"] += "\n" + run_marker(datetime(2999, 1, 1, tzinfo=timezone.utc))
+    _, dismissed = _run(
+        monkeypatch, _clean(), blocking=True, action="synchronize", reviews=[block],
+    )
+    assert dismissed == []
 
 
 def test_degraded_rereview_withdraws_elders_older_approval(monkeypatch):

@@ -68,6 +68,24 @@ never requests changes, so a backend outage cannot block a merge this way.
   `CHANGES_REQUESTED` review on the head as superseding it, since an advisory
   check always concludes `neutral` and cannot show a newer run.
 
+**Recency is the run start, not the post time** (#1764). Two runs
+can review one head at once, and a slow run that started first can post
+after a faster run that started later. Every Elder review carries a run
+marker (`<!-- grug:elder-run started=... -->`) naming when its run started:
+
+- A verdict supersedes this run only if its marker shows a run that started
+  after this one. A review with no marker never counts as later.
+- A blocking deep pass never stands down for an earlier-started run's
+  approval. It posts `REQUEST_CHANGES` and dismisses Elder's approvals from
+  earlier-started runs, on this head and earlier commits. An approval with
+  no marker cannot prove its run, so a block dismisses it too.
+- Right before posting a deferred `APPROVE`, the deep append re-checks the
+  head. If the latest Elder check is not its own and started after this run
+  started, or a later-started run has posted a verdict, or either lookup
+  fails, it does not approve.
+- A later-posted Elder check (#1344) still decides the check surface and
+  refuses approvals, but it no longer silences a block.
+
 GitHub refuses a verdict review from a pull request's own author, so a pull
 request the Grug app opened gets `COMMENT`.
 
