@@ -173,23 +173,41 @@ def test_carried_blocking_finding_requests_changes(monkeypatch, blocking):
     ids=["all_failed", "parse_failed"],
 )
 def test_degraded_review_never_approves(monkeypatch, blocking, llm):
+    """A fully degraded run has nothing to post inline and no verdict, so it
+    posts no review at all (a COMMENT with nothing in it is never sent)."""
     posted, _ = _run(monkeypatch, llm, blocking=blocking)
-    assert all(r.event == "COMMENT" for r in posted)
+    assert [r.event for r in posted] == []
+    assert "APPROVE" not in [r.event for r in posted]
 
 
-def test_unknown_carry_forward_never_approves(monkeypatch):
-    """No thread listing: the clean pass cannot vouch for earlier findings."""
+@pytest.mark.parametrize(
+    ("llm", "expected"),
+    [(_clean(), []), (_with("medium"), ["COMMENT"])],
+    ids=["clean", "medium_finding"],
+)
+def test_unknown_carry_forward_never_approves(monkeypatch, llm, expected):
+    """No thread listing: the clean pass cannot vouch for earlier findings.
+    It posts its inline findings, if any, as exactly one COMMENT review."""
     posted, _ = _run(
-        monkeypatch, _clean(), blocking=False, action="synchronize", threads=None,
+        monkeypatch, llm, blocking=False, action="synchronize", threads=None,
     )
-    assert all(r.event != "APPROVE" for r in posted)
+    assert [r.event for r in posted] == expected
+    assert "APPROVE" not in [r.event for r in posted]
 
 
-def test_own_pull_request_gets_no_verdict_state(monkeypatch):
+@pytest.mark.parametrize(
+    ("llm", "expected"),
+    [(_clean(), []), (_with("medium"), ["COMMENT"]), (_with("high"), ["COMMENT"])],
+    ids=["clean", "medium_finding", "high_finding"],
+)
+def test_own_pull_request_gets_no_verdict_state(monkeypatch, llm, expected):
     """GitHub refuses a verdict review from a pull request's author, so a PR
-    the Grug App opened gets no APPROVE or REQUEST_CHANGES."""
-    posted, _ = _run(monkeypatch, _clean(), blocking=True, author="grug-tribe[bot]")
-    assert all(r.event == "COMMENT" for r in posted)
+    the Grug App opened gets no APPROVE or REQUEST_CHANGES: its findings,
+    if any, ride exactly one COMMENT review."""
+    posted, _ = _run(monkeypatch, llm, blocking=True, author="grug-tribe[bot]")
+    events = [r.event for r in posted]
+    assert events == expected
+    assert "APPROVE" not in events and "REQUEST_CHANGES" not in events
 
 
 def test_clean_advisory_rereview_withdraws_elders_stale_block(monkeypatch):
