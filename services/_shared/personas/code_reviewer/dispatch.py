@@ -178,6 +178,9 @@ from personas.code_reviewer.finding_funnel import (
 from personas.code_reviewer.elder_review import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward, carry_verdict, hunt_link, living_review
 from personas.hunt_recorder import PrRef, now as hunt_now
+from personas.code_reviewer.outage_advisory import (
+    ADVISORY_TITLE, advisory_summary, observe as _observe_outage,
+)
 from personas.code_reviewer.degraded_gate import (
     degraded_conclusion, gate_sentence, lead_with_degraded_line,
 )
@@ -1050,6 +1053,18 @@ def _enrich_claim_check_sources(
 _RE_REVIEW_ACTIONS = {"synchronize", "reopened", "review", "rerun"}
 
 
+def observe_outage(
+    evaluation: CodeReviewEvaluation, *, blocking: bool, record: bool = True,
+):
+    """ADR-0027: is this degraded BLOCK-mode review part of a sustained
+    backend outage? `record` moves the install's outage streak; the deep
+    append only reads it."""
+    return _observe_outage(
+        evaluation.degraded_reason, evaluation.coverage,
+        blocking=blocking, record=record,
+    )
+
+
 def _carry_into_check(
     *, action: str, evaluation: CodeReviewEvaluation, mode: ReviewMode,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
@@ -1868,6 +1883,12 @@ def _delta_is_empty(diff_text: str) -> bool:
     return not parse_diff(diff_text) and not removed_paths(diff_text)
 
 
+def _delta_is_excluded_metadata_only(diff_text: str) -> bool:
+    """A nonempty delta whose hunks the canonical metadata filter excludes (#1730)."""
+    hunks = parse_diff(diff_text)
+    return bool(hunks) and not removed_paths(diff_text) and not split_reviewable_hunks(hunks)[0]
+
+
 def _is_lock_only(diff_text: str) -> bool:
     """Every changed file, both sides of a rename included, is a listed
     lock file (#1649). An empty diff is not lock-only."""
@@ -2387,6 +2408,7 @@ def dispatch_code_review(
     # grug#1644: set to the delta range when that delta held no change and
     # the full PR diff was reviewed instead. Named in the check summary.
     living_delta_empty = ""
+    living_delta_metadata = ""
     try:
         from adapters.install_store import get_elder_last_reviewed
 
@@ -2470,10 +2492,13 @@ def dispatch_code_review(
         labels=labels, author_family=author_family or "",
         config=repr(base_repo_config),
     )
-    full_pr_diff = functools.partial(
+    # AI-REVIEW 2026-11-12 [gpt-6.1-sol/code-review] 1730-R1 (PR #1731; issue #1730):
+    # The carry probe and fallback share this invocation's immutable pinned diff.
+    # Cache successes only; a failed fetch can still retry through normal handling.
+    full_pr_diff = functools.cache(functools.partial(
         _fetch_full_pr_diff, installation_id, owner, repo_name, pull_number,
         base_sha=base_sha, head_sha=head_sha,
-    )
+    ))
     carried = carry_verdict.carry_if_unchanged(carry_request, fetch_pr_diff=full_pr_diff)
     if carried is not None:
         return carried
@@ -2520,10 +2545,7 @@ def dispatch_code_review(
             living_range = ""
         if living_prior_sha and _delta_is_empty(diff_text):
             living_delta_empty, living_prior_sha, living_range = living_range, "", ""
-            diff_text = _fetch_full_pr_diff(
-                installation_id, owner, repo_name, pull_number,
-                base_sha=base_sha, head_sha=head_sha,
-            )
+            diff_text = full_pr_diff()
         elif living_prior_sha and _is_lock_only(diff_text):
             # #1649: a lock-only delta is judged on the whole base..head
             # diff, never on the increment alone.
@@ -2532,10 +2554,10 @@ def dispatch_code_review(
                 extra={"pr": f"{owner}/{repo_name}#{pull_number}", "range": living_range},
             )
             living_prior_sha, living_range = "", ""
-            diff_text = _fetch_full_pr_diff(
-                installation_id, owner, repo_name, pull_number,
-                base_sha=base_sha, head_sha=head_sha,
-            )
+            diff_text = full_pr_diff()
+        elif living_prior_sha and _delta_is_excluded_metadata_only(diff_text):
+            living_delta_metadata, living_prior_sha, living_range = living_range, "", ""
+            diff_text = full_pr_diff()
         pr_context["base_sha"] = living_prior_sha or base_sha
         hunks = parse_diff(diff_text)
         # The lane-work checks (#1179, #1363) judge the WHOLE diff, so they
@@ -2576,6 +2598,12 @@ def dispatch_code_review(
             hunks, pr, installation_id, owner, repo_name,
             config=base_repo_config,
         )
+        if living_delta_metadata:
+            config_note += (
+                "\n\nLiving Hunt: the delta contained only excluded metadata in `"
+                + living_delta_metadata
+                + "`, so Elder reviewed the full PR diff on this head instead."
+            )
         # A hunk bigger than a whole cohort can never be reviewed - the
         # planner will not truncate it (line anchors), so it becomes a solo
         # cohort that is auto-failed, flips the check to `partial_review`,
@@ -3169,8 +3197,10 @@ def dispatch_code_review(
         )
     # Both clients are independent — a 5xx on review post must not
     # skip the check-run post.
+    outage = observe_outage(evaluation, blocking=blocking)
     outcome = plan_publish(
         evaluation, mode=mode, degraded_fails_closed=True,
+        outage_advisory=outage.advisory,
     )
     conclusion, event = outcome.conclusion, outcome.event
     depth_now = os.getenv("GRUG_REVIEW_DEPTH", "tiered").strip().lower()
@@ -3188,7 +3218,7 @@ def dispatch_code_review(
         living_delta_empty=living_delta_empty,
         review_phase=tier1_phase,
         defensive_dropped_count=defensive_dropped_count,
-        blocking=blocking,
+        blocking=blocking and not outage.advisory,
         muted=muted,
     )
     if lock_check.unreviewed and conclusion == "success":
@@ -3234,6 +3264,9 @@ def dispatch_code_review(
         summary, evaluation, head_sha=head_sha, linked_issues=pinned_issues,
     )
     summary = _lead_if_degraded(summary, evaluation)
+    if outage.advisory:
+        title = ADVISORY_TITLE
+        summary = advisory_summary(outage, summary)
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
@@ -4664,6 +4697,9 @@ def _publish_deep_review(
         review_evaluation=deep_eval,
         conclusion=plan_publish(
             combined_eval, mode=mode, degraded_fails_closed=True,
+            outage_advisory=observe_outage(
+                combined_eval, blocking=mode == "blocking", record=False,
+            ).advisory,
         ).conclusion,
         event=event,
         review_phase="deep",
@@ -5061,7 +5097,11 @@ def _async_deep_append_if_needed(
     # ground the deep arm never finished walking.
     combined = with_degradation(combined, deep_eval)
 
-    outcome = plan_publish(combined, mode=mode, degraded_fails_closed=True)
+    outage = observe_outage(combined, blocking=blocking, record=False)
+    outcome = plan_publish(
+        combined, mode=mode, degraded_fails_closed=True,
+        outage_advisory=outage.advisory,
+    )
     conclusion, event = outcome.conclusion, outcome.event
     title, summary = _summary_markdown(
         combined,
@@ -5070,12 +5110,12 @@ def _async_deep_append_if_needed(
         living_baseline_rejected=living_baseline_rejected,
         living_delta_empty=living_delta_empty,
         review_phase="deep",
-        blocking=blocking,
+        blocking=blocking and not outage.advisory,
         muted=_muted_classes_for(f"{owner}/{repo_name}", repo_config),
     )
     summary = _intent_paragraph(pr_context) + summary
     summary += config_note
-    title = f"{title} (deep append)"
+    title = f"{ADVISORY_TITLE if outage.advisory else title} (deep append)"
     # The author-facing distinction #848 asks for: "the reasoner ran and
     # found nothing" and "the reasoner did not run" are different news, and
     # this preamble says which one this is even when `_summary_markdown`'s
@@ -5097,6 +5137,8 @@ def _async_deep_append_if_needed(
         summary, combined, head_sha=head_sha, linked_issues=pinned_issues,
     )
     summary = _lead_if_degraded(summary, combined)
+    if outage.advisory:
+        summary = advisory_summary(outage, summary)
     superseded = _newer_elder_verdict_on_head(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha,

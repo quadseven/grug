@@ -8,8 +8,6 @@ workloads; no changed line of configuration did. Elder passed it.
 
 from __future__ import annotations
 
-import time
-
 from personas.code_reviewer import wrong_target
 from personas.code_reviewer.criteria_coverage import LinkedCriterion
 from personas.code_reviewer.diff_parser import file_changes, parse_diff
@@ -195,7 +193,6 @@ def test_too_many_targets_is_not_evaluated(monkeypatch):
     assert _scan(_recorded_diff(), [_BOXES[0][3]]) == ()
 
 
-
 def _counted_calls(fn):
     """(result, python call count) of fn() under sys.setprofile: a work
     count, not a wall clock, so a loaded host cannot move it (grug#1715)."""
@@ -212,6 +209,7 @@ def _counted_calls(fn):
         return fn(), calls
     finally:
         sys.setprofile(None)
+
 
 def _scan_counted(n_files):
     # n_files files of 120 changed lines, with 40 targets (the cap) the

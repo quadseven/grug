@@ -40,30 +40,30 @@ def _user(*, role="user"):
 
 
 def test_get_current_user_empty_cookie_returns_none():
-    with patch.object(deps, "_verify_session", return_value=None):
+    with patch.object(deps, "verify_active_session", return_value=None):
         assert deps.get_current_user("") is None
 
 
 def test_get_current_user_invalid_cookie_returns_none():
-    with patch.object(deps, "_verify_session", return_value=None):
+    with patch.object(deps, "verify_active_session", return_value=None):
         assert deps.get_current_user("not-a-valid-session") is None
 
 
 def test_get_current_user_missing_user_row_returns_none():
-    with patch.object(deps, "_verify_session", return_value="100"):
+    with patch.object(deps, "verify_active_session", return_value="100"):
         with patch.object(deps, "get_user", return_value=None):
             assert deps.get_current_user("valid-session") is None
 
 
 def test_get_current_user_valid_returns_user():
     u = _user()
-    with patch.object(deps, "_verify_session", return_value="100"):
+    with patch.object(deps, "verify_active_session", return_value="100"):
         with patch.object(deps, "get_user", return_value=u):
             assert deps.get_current_user("valid-session") is u
 
 
 def test_require_authenticated_anonymous_raises_401():
-    with patch.object(deps, "_verify_session", return_value=None):
+    with patch.object(deps, "verify_active_session", return_value=None):
         with pytest.raises(HTTPException) as exc:
             deps.require_authenticated("")
     assert exc.value.status_code == 401
@@ -72,13 +72,13 @@ def test_require_authenticated_anonymous_raises_401():
 
 def test_require_authenticated_passes_user_through():
     u = _user()
-    with patch.object(deps, "_verify_session", return_value="100"):
+    with patch.object(deps, "verify_active_session", return_value="100"):
         with patch.object(deps, "get_user", return_value=u):
             assert deps.require_authenticated("valid") is u
 
 
 def test_require_admin_anonymous_raises_401():
-    with patch.object(deps, "_verify_session", return_value=None):
+    with patch.object(deps, "verify_active_session", return_value=None):
         with pytest.raises(HTTPException) as exc:
             deps.require_admin("")
     # 401 not 403 — anonymous gets the auth gate first
@@ -87,7 +87,7 @@ def test_require_admin_anonymous_raises_401():
 
 def test_require_admin_non_admin_raises_403():
     u = _user(role="user")
-    with patch.object(deps, "_verify_session", return_value="100"):
+    with patch.object(deps, "verify_active_session", return_value="100"):
         with patch.object(deps, "get_user", return_value=u):
             with pytest.raises(HTTPException) as exc:
                 deps.require_admin("valid")
@@ -97,6 +97,6 @@ def test_require_admin_non_admin_raises_403():
 
 def test_require_admin_admin_user_passes_through():
     u = _user(role="admin")
-    with patch.object(deps, "_verify_session", return_value="100"):
+    with patch.object(deps, "verify_active_session", return_value="100"):
         with patch.object(deps, "get_user", return_value=u):
             assert deps.require_admin("valid") is u

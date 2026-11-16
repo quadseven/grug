@@ -1105,7 +1105,6 @@ def test_the_rules_have_board_categories():
 # --- cost (#1367 review: linear, capped) --------------------------------------
 
 
-
 def _counted_calls(fn):
     """(result, python call count) of fn() under sys.setprofile: a work
     count, not a wall clock, so a loaded host cannot move it (grug#1715)."""
@@ -1122,6 +1121,7 @@ def _counted_calls(fn):
         return fn(), calls
     finally:
         sys.setprofile(None)
+
 
 def _scan_counted(n_files):
     # n_files test files of deleted tests and flips, plus a workflow

@@ -727,23 +727,29 @@ def test_a_delta_review_still_reports_a_criterion_no_commit_meets(monkeypatch):
 _ONE_HUNK = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n"
 
 
-def _review_after_push(monkeypatch, *, delta: str, full: str) -> dict:
+def _review_after_push(
+    monkeypatch, *, delta: str, full: str, findings=(), full_failures=(),
+) -> dict:
     """Run a synchronize review with a stored last Elder head and return what
     the model saw, which diffs were fetched, and every published check."""
     from github_checks_client import CheckRunResult
     from llm_client import Backend, LlmReviewResponse
 
     llm = LlmReviewResponse(
-        kind="reviewed", findings=(), backend_used=Backend.CAVE, model_name="coder",
+        kind="reviewed", findings=findings, backend_used=Backend.CAVE, model_name="coder",
     )
-    seen: dict = {"scoped": [], "full": [], "reviewed": [], "checks": []}
+    seen: dict = {"scoped": [], "full": [], "reviewed": [], "checks": [], "review_heads": []}
 
     def _scoped(*_a, **k):
         seen["scoped"].append(k)
         return (delta, True, False)
 
+    failures = list(full_failures)
+
     def _full(*_a, **k):
         seen["full"].append((k.get("base_sha"), k.get("head_sha")))
+        if failures:
+            raise failures.pop(0)
         return full
 
     def _review(evidence, *_a, **_k):
@@ -751,6 +757,7 @@ def _review_after_push(monkeypatch, *, delta: str, full: str) -> dict:
         if not evidence.hunks:
             return LlmReviewResponse(kind="no_diff")
         seen["reviewed"].append({h.path for h in evidence.hunks})
+        seen["review_heads"].append(evidence.pr_context["head_sha"])
         return llm
 
     def _check(*a, **k):
@@ -831,3 +838,117 @@ def test_a_non_empty_delta_still_reviews_only_the_delta(monkeypatch):
     final = seen["checks"][-1]
     assert final.title.startswith("Living Hunt prior000..abcd1234")
     assert "reviewed the full PR diff on this head" not in final.summary
+
+
+# --- #1730: an excluded metadata delta still needs a current-head review ---
+
+def test_a_metadata_only_delta_reviews_full_source_on_the_current_head(monkeypatch):
+    """Excluded ledger hunks must not strand earlier source changes without a verdict."""
+    metadata = _added("logs/review-ledger.jsonl", ["{}"])
+    seen = _review_after_push(monkeypatch, delta=metadata, full=_ONE_HUNK + metadata)
+
+    assert seen["reviewed"] == [{"x.py"}]
+    assert seen["review_heads"] == ["abcd1234efgh"]
+    assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
+    final = seen["checks"][-1]
+    assert final.conclusion == "success"
+    assert "no_diff" not in final.title
+    assert not final.title.startswith("Living Hunt")
+    assert "delta contained only excluded metadata" in final.summary
+    assert "reviewed the full PR diff on this head" in final.summary
+
+
+def test_a_blocking_full_review_after_a_metadata_delta_still_fails(monkeypatch):
+    """Widening scope must not manufacture success or carry an earlier verdict."""
+    from llm_client import Finding as LlmFinding
+
+    metadata = _added("logs/review-ledger.jsonl", ["{}"])
+    finding = LlmFinding(
+        path="x.py", line=1, severity="high", rule="undefined-name",
+        message="The added name is not defined, so executing this line raises NameError.",
+    )
+    seen = _review_after_push(
+        monkeypatch, delta=metadata, full=_ONE_HUNK + metadata, findings=(finding,),
+    )
+
+    assert seen["reviewed"] == [{"x.py"}]
+    assert seen["review_heads"] == ["abcd1234efgh"]
+    assert seen["checks"][-1].conclusion == "failure"
+
+
+def test_a_metadata_only_full_pr_still_concludes_no_diff(monkeypatch):
+    """A bounded fallback does not invent a review for an entirely excluded PR."""
+    metadata = _added("logs/review-ledger.jsonl", ["{}"])
+    seen = _review_after_push(monkeypatch, delta=metadata, full=metadata)
+
+    assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
+    assert seen["reviewed"] == []
+    final = seen["checks"][-1]
+    assert final.conclusion == "neutral"
+    assert "no_diff" in final.title
+
+
+def test_metadata_fallback_keeps_the_existing_full_diff_filters(monkeypatch):
+    """Full scope still honors ignores, size limits, duplicate copies and metadata exclusion."""
+    from personas.code_reviewer.repo_config import RepoConfig
+
+    monkeypatch.setattr(
+        cr_dispatch, "_load_pr_repo_config", lambda *a, **k: RepoConfig(ignore=("ignored.py",)),
+    )
+    monkeypatch.setattr(cr_dispatch, "review_cohort_char_budget", lambda: 1000)
+    metadata = _added("logs/review-ledger.jsonl", ["{}"])
+    copy_lines = [f"value_{i} = {i}" for i in range(30)]
+    full = (
+        _ONE_HUNK + metadata
+        + _added("ignored.py", ["ignored = True"])
+        + _added("oversized.py", ["x = '" + "x" * 2000 + "'"])
+        + _added("first_copy.py", copy_lines)
+        + _added("second_copy.py", copy_lines)
+    )
+    seen = _review_after_push(monkeypatch, delta=metadata, full=full)
+
+    assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
+    assert seen["reviewed"] == [{"x.py", "first_copy.py"}]
+
+
+def _prior_successful_carry_record(monkeypatch):
+    """Keep carry policy real while replacing its record and check-list I/O."""
+    from personas.code_reviewer import carry_verdict
+
+    monkeypatch.setattr(carry_verdict, "_read_record", lambda request: {
+        "head_sha": "prior0001head", "patch_id": carry_verdict.patch_id(_ONE_HUNK),
+        "context_id": request.context,
+    })
+    monkeypatch.setattr(carry_verdict, "get_app_id", lambda: "11")
+    monkeypatch.setattr(carry_verdict, "with_install_token_retry", lambda _id, fn: fn("fixture"))
+    monkeypatch.setattr(carry_verdict, "list_check_runs_for_ref", lambda *a, **k: [{
+        "name": "Grug - Elder", "app": {"id": "11"},
+        "status": "completed", "conclusion": "success",
+    }])
+
+
+def test_metadata_fallback_reuses_the_full_diff_read_by_the_carry_probe(monkeypatch):
+    """A changed patch cannot carry, but its pinned full diff need not be fetched twice."""
+    metadata = _added("logs/review-ledger.jsonl", ["{}"])
+    _prior_successful_carry_record(monkeypatch)
+    seen = _review_after_push(monkeypatch, delta=metadata, full=_ONE_HUNK + metadata)
+
+    assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
+    assert seen["reviewed"] == [{"x.py"}]
+    assert seen["review_heads"] == ["abcd1234efgh"]
+    assert seen["checks"][-1].conclusion == "success"
+
+
+def test_metadata_fallback_retries_a_failed_carry_diff_fetch(monkeypatch):
+    """An exception is not cached as a diff or a verdict."""
+    metadata = _added("logs/review-ledger.jsonl", ["{}"])
+    _prior_successful_carry_record(monkeypatch)
+    seen = _review_after_push(
+        monkeypatch, delta=metadata, full=_ONE_HUNK + metadata,
+        full_failures=(httpx.ConnectError("fixture full-diff fetch unavailable"),),
+    )
+
+    assert seen["full"] == [("base5678ijkl", "abcd1234efgh")] * 2
+    assert seen["reviewed"] == [{"x.py"}]
+    assert seen["review_heads"] == ["abcd1234efgh"]
+    assert seen["checks"][-1].conclusion == "success"

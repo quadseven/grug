@@ -6,6 +6,9 @@ Accepted (2026-10-17). Decided by the owner on grug#1212. Refines the
 advisory-first gate behind `plan_publish` (personas/review_publish.py)
 for Elder only; Guard and Smasher share that gate and are unchanged.
 
+Amended by ADR-0027 (2026-11-13): a sustained backend outage relaxes this to a
+neutral advisory after a bounded time.
+
 ## Context
 
 Since #1205, a repo whose Elder is blocking (`code_reviewer_blocking`) gets

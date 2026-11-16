@@ -582,6 +582,8 @@ function NotificationsPanel({ show, notif, toggle }: { show: boolean; notif: Rec
 }
 
 function AccountPanel({ show, me }: { show: boolean; me: { login: string; role: string } }) {
+  const nav = useNavigate();
+  const [revoking, setRevoking] = useState(false);
   return (
     <section className={`panel${show ? " show" : ""}`}>
       <div className="panel-head">
@@ -607,6 +609,16 @@ function AccountPanel({ show, me }: { show: boolean; me: { login: string; role: 
           <div className="field">
             <div className="lbl"><b>Pause all personas</b><span>Grug stops posting Check Runs everywhere until you flip it back. <span className="mono" style={{ color: "var(--muted)" }}>// not configurable yet - pause a repo from the Repositories panel</span></span></div>
             <div className="sw" role="switch" aria-checked={false} aria-disabled={true} title="Not configurable yet - there is no account-wide pause setting." style={{ opacity: 0.4, cursor: "not-allowed" }}></div>
+          </div>
+          <div className="field">
+            <div className="lbl"><b>Sign out all sessions</b><span>Ends every active session for your account across all browsers and devices.</span></div>
+            <button type="button" className="btn sm danger" disabled={revoking} onClick={async () => {
+              setRevoking(true);
+              try {
+                await fetch(`${API_BASE}/api/v1/auth/revoke-sessions`, { method: "POST", credentials: "include" });
+              } catch { /* ignore */ }
+              nav("/", { replace: true });
+            }}>{revoking ? "Revoking..." : "Revoke all sessions"}</button>
           </div>
           <div className="field">
             <div className="lbl"><b>Uninstall Grug</b><span>Removes the GitHub App and deletes all cave settings. Grug sad.</span></div>

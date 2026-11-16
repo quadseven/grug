@@ -15,8 +15,6 @@ Recorded shapes (anonymized):
 
 from __future__ import annotations
 
-import time
-
 from personas.code_reviewer import linked_issue
 from personas.code_reviewer.diff_parser import file_changes, parse_diff
 from personas.code_reviewer.fabricated_result import (
@@ -263,10 +261,9 @@ def test_the_rule_shows_under_a_named_category_not_general():
     assert linked_issue.RULE_CATEGORIES[RULE] == "requirements"
 
 
-
 def _counted_calls(fn):
-    """(result, python call count) of fn() under sys.setprofile: a work
-    count, not a wall clock, so a loaded host cannot move it (grug#1715)."""
+    """Python call count of fn() under sys.setprofile: a work count, not a
+    wall clock, so a loaded host cannot move it (grug#1715)."""
     import sys
     calls = 0
 
@@ -277,11 +274,13 @@ def _counted_calls(fn):
 
     sys.setprofile(_count)
     try:
-        return fn(), calls
+        fn()
     finally:
         sys.setprofile(None)
+    return calls
 
-def _scan_counted(n_files):
+
+def _large_diff(n_files):
     # Every rate is possible, so every line of every file is read in full.
     rates = " ".join(f"{100 * k / 30:.1f}%" for k in range(31))
     lines = [f"Pass rates {rates} on 30 rows, n={j}, {j} of 90, {j}/120." for j in range(40)]
@@ -289,20 +288,20 @@ def _scan_counted(n_files):
     # Past the shared check budget the rate check is not evaluated, so an
     # impossible rate at the end draws no finding rather than a slow scan.
     diff += _benchmark_diff("Pass rates were 47.0% energy.")
-    changes, hunks = file_changes(diff), parse_diff(diff)
-    result, calls = _counted_calls(lambda: scan_fabricated_results(changes, hunks))
-    return result, calls, sum(len(h.body) for h in hunks)
+    return file_changes(diff), parse_diff(diff)
 
 
 def test_the_scan_is_linear_on_a_large_diff():
+    changes, hunks = _large_diff(300)
+    assert sum(len(h.body) for h in hunks) > 2_000_000
+    assert 300 * 40 * 31 * 40 > MAX_RATE_CHECKS
+    assert scan_fabricated_results(changes, hunks) == ()
     # Structural linearity (grug#1715): doubling the diff must less than
     # triple the scan's counted calls; a quadratic scan grows about four
     # times. An elapsed-seconds bound flaked on loaded lane hosts.
-    result, calls, size = _scan_counted(300)
-    assert size > 2_000_000
-    assert 300 * 40 * 31 * 40 > MAX_RATE_CHECKS
-    assert result == ()
-    _, calls_half, _ = _scan_counted(150)
+    calls = _counted_calls(lambda: scan_fabricated_results(changes, hunks))
+    half_changes, half_hunks = _large_diff(150)
+    calls_half = _counted_calls(lambda: scan_fabricated_results(half_changes, half_hunks))
     # The counts here are in the tens of thousands, so the bound needs no slack.
     assert calls_half > 1000, calls_half
     assert calls < 3 * calls_half, (calls_half, calls)

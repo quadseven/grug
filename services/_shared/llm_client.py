@@ -84,6 +84,7 @@ from review_evidence import Hunk, ElderEvidence, seal
 from model_family import ReviewFamilies, model_family, review_families
 from datadog_switch import datadog_enabled
 import call_report
+import opencode_go_free
 import shared_benches
 import deep_shadow
 from secrets_loader import (
@@ -1392,6 +1393,99 @@ def _opencode_go_fallback_chain_config() -> "BackendConfig | None":
     return _opencode_go_extra_model_config(model, _CLOUD_CHAIN_TIMEOUT_SECONDS)
 
 
+# Free-model discovery. OpenCode Go publishes a price for every model, and the
+# free set changes often, so Elder reads the list (cached, `opencode_go_free`)
+# and tries the models priced exactly zero behind the configured ones. Opt-in:
+# nothing is fetched or added unless `GRUG_OPENCODE_GO_FREE_DISCOVERY` is true.
+# Knobs: `_TTL_SECONDS` (cache, default 2700), `_MAX_TIERS` (discovered tiers
+# per walk, default 2), `_HOURLY_CEILING` (calls per hour per pod to all free
+# Go models, default 240), `_CONCURRENCY` (calls in flight, default 2).
+# Private code still reaches only `_OPENCODE_GO_PRIVATE_SAFE_MODELS`.
+_opencode_go_free_catalog: "opencode_go_free.FreeModelCatalog | None" = None
+_opencode_go_free_gate: "opencode_go_free.FreeCallGate | None" = None
+_opencode_go_free_lock = threading.Lock()
+
+
+def _opencode_go_free_models_fetch() -> httpx.Response:
+    return opencode_go_free._default_fetch()
+
+
+def _env_number(name: str, default: float, cast: Callable[[str], Any] = float) -> Any:
+    try:
+        return cast(os.getenv(name, "").strip() or default)
+    except ValueError:
+        log.warning("grug_opencode_go_free_setting_invalid", extra={"setting": name})
+        return default
+
+
+def _opencode_go_free_discovery_on() -> bool:
+    return os.getenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "").strip().lower() in ("1", "true", "yes")
+
+
+def _opencode_go_free_catalog_get() -> "opencode_go_free.FreeModelCatalog":
+    global _opencode_go_free_catalog
+    with _opencode_go_free_lock:
+        if _opencode_go_free_catalog is None:
+            _opencode_go_free_catalog = opencode_go_free.FreeModelCatalog(
+                lambda: _opencode_go_free_models_fetch(),
+                ttl_seconds=_env_number(
+                    "GRUG_OPENCODE_GO_FREE_TTL_SECONDS", opencode_go_free.DEFAULT_TTL_SECONDS,
+                ),
+            )
+        return _opencode_go_free_catalog
+
+
+def _opencode_go_free_gate_get() -> "opencode_go_free.FreeCallGate":
+    global _opencode_go_free_gate
+    with _opencode_go_free_lock:
+        if _opencode_go_free_gate is None:
+            _opencode_go_free_gate = opencode_go_free.FreeCallGate(
+                hourly_ceiling=_env_number("GRUG_OPENCODE_GO_FREE_HOURLY_CEILING", 240, int),
+                max_concurrent=_env_number("GRUG_OPENCODE_GO_FREE_CONCURRENCY", 2, int),
+            )
+        return _opencode_go_free_gate
+
+
+def _opencode_go_discovered_chain_configs(
+    configured: "list[BackendConfig | None]",
+) -> "list[BackendConfig]":
+    """Chain tiers for the Go models priced zero right now, in list order with
+    the private-safe ones first, skipping any already in the chain, any
+    cooling after a 429, and all of them at the hourly ceiling. Empty when
+    discovery is off, the list is empty or unreachable."""
+    if not _opencode_go_free_discovery_on():
+        return []
+    limit = _env_number("GRUG_OPENCODE_GO_FREE_MAX_TIERS", 2, int)
+    gate = _opencode_go_free_gate_get()
+    if limit <= 0 or gate.ceiling_reached():
+        return []
+    have = {c.model for c in configured if c is not None}
+    found = [
+        m for m in _opencode_go_free_catalog_get().models()
+        if m not in have and m != _OPENCODE_GO_MODEL and not gate.cooling(m)
+    ]
+    found.sort(key=lambda m: m not in _OPENCODE_GO_PRIVATE_SAFE_MODELS)
+    return [_opencode_go_extra_model_config(m, _CLOUD_CHAIN_TIMEOUT_SECONDS) for m in found[:limit]]
+
+
+@contextlib.contextmanager
+def _opencode_go_free_slot(config: BackendConfig):
+    """Pace a call to a free Go model: refuse before the network at the hourly
+    ceiling, a cool-down or full concurrency, and release the slot after."""
+    if config.backend != Backend.OPENCODE_GO or not _opencode_go_model_is_free(config.model):
+        yield
+        return
+    gate = _opencode_go_free_gate_get()
+    if not gate.enter(config.model):
+        raise OpencodeGoCircuitOpenError(
+            f"free Go model {config.model} is paced off (hourly ceiling, cool-down or busy)"
+        )
+    try:
+        yield
+    finally:
+        gate.leave()
+
+
 def _opencode_go_chain_config() -> BackendConfig:
     """opencode Go as the FIRST cloud chain tier (grug#910)."""
     return replace(
@@ -1444,7 +1538,13 @@ _OPENCODE_GO_PRIVATE_SAFE_MODELS = frozenset({"deepseek-v4.1-flash", "beam-free"
 def _opencode_go_model_is_free(model: str) -> bool:
     """OpenCode Go's free models (`*-free`, e.g. `longcat-2.5-preview-free`)
     never count against the paid quota the usage-limit breaker protects, so
-    the breaker must not gate them."""
+    the breaker must not gate them. When the published price list is cached,
+    it overrules the name: a listed price makes the model paid, a listed zero
+    makes it free (a free model need not carry the suffix). With no list the
+    name rule stands."""
+    listed = _opencode_go_free_catalog_get().verdict(model)
+    if listed is not None:
+        return listed
     return model.endswith("-free")
 
 
@@ -2005,10 +2105,14 @@ def _cloud_chain_tiers() -> list[BackendConfig]:
     Models on the per-model bench (`_note_model_response`) or the slow bench
     (`_note_model_timeout`) are skipped, except that the last usable cloud
     tier is never dropped for being slow."""
-    candidates: list["BackendConfig | None"] = [
+    go_tiers: list["BackendConfig | None"] = [
         _opencode_go_chain_config(),
         _opencode_go_second_chain_config(),
         _opencode_go_fallback_chain_config(),
+    ]
+    candidates: list["BackendConfig | None"] = [
+        *go_tiers,
+        *_opencode_go_discovered_chain_configs(go_tiers),
         _free_tier_chain_config(),
         _poolside_chain_config(),
         _free_pool_chain_config(),
@@ -3057,18 +3161,21 @@ def _call_backend(
 
     transport_attempts = _validated_transport_attempts(config)
     deadline = _call_deadline(config.backend)
-    if cancel_event is None:
-        resp = _post_with_retries(
-            config.url, body, headers, config.timeout_seconds,
-            config.retry_attempts, transport_attempts, deadline,
-        )
-    else:
-        resp = _post_with_retries_cancellable(
-            config, body, headers, transport_attempts, cancel_event, deadline,
-        )
+    with _opencode_go_free_slot(config):
+        if cancel_event is None:
+            resp = _post_with_retries(
+                config.url, body, headers, config.timeout_seconds,
+                config.retry_attempts, transport_attempts, deadline,
+            )
+        else:
+            resp = _post_with_retries_cancellable(
+                config, body, headers, transport_attempts, cancel_event, deadline,
+            )
     if config.backend == Backend.OPENCODE_GO:
         _log_opencode_go_usage(config.model, resp)
         _note_opencode_go_response(resp)
+        if _opencode_go_model_is_free(config.model):
+            _opencode_go_free_gate_get().note_response(config.model, resp)
     _note_provider_response(config, resp)
     _note_model_response(config, resp)
     return resp
@@ -7147,6 +7254,57 @@ def _free_tier_found_nothing(tier: BackendConfig, outcome: _ArmOutcome) -> bool:
     return not outcome.findings and _empty_confirms_nothing((tier.backend, tier.model))
 
 
+# grug#1601: the narrow relaxation of the rule above. A free Go model answered
+# empty on a 33k-token diff where the paid primary found faults, so the default
+# stands: a free model's empty answer confirms nothing. On a small cohort, after
+# a paid or ranked model already answered empty, a free model that an eval
+# measured at a false-empty rate of 5 percent or less may be the second opinion.
+# Off unless GRUG_OPENCODE_GO_FREE_CONFIRM is set.
+_FREE_CONFIRM_DEFAULT_MAX_TOKENS = 10_000
+_CHARS_PER_TOKEN = 4
+
+
+def _free_confirm_on() -> bool:
+    return os.getenv("GRUG_OPENCODE_GO_FREE_CONFIRM", "").strip().lower() in ("1", "true", "yes")
+
+
+def _free_confirm_cohort_is_small() -> bool:
+    """The cohort under review is at most the configured tokens, from its diff
+    characters at about four to a token. An unknown size is never small."""
+    chars = _REVIEWED_DIFF_CHARS.get()
+    if chars is None:
+        return False
+    limit = _env_number(
+        "GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_TOKENS", _FREE_CONFIRM_DEFAULT_MAX_TOKENS, int,
+    )
+    return limit > 0 and chars <= limit * _CHARS_PER_TOKEN
+
+
+def _free_confirm_allowlist() -> frozenset[str]:
+    max_age = _env_number(
+        "GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_AGE_DAYS", opencode_go_free.DEFAULT_REPORT_MAX_AGE_DAYS, int,
+    )
+    path = os.getenv("GRUG_OPENCODE_GO_FREE_CONFIRM_REPORT", "").strip() or None
+    return opencode_go_free.qualified_models(
+        opencode_go_free.load_eval_report(path), max_age_days=max_age,
+    )
+
+
+def _free_empty_may_confirm(current: "tuple[Backend, str]") -> bool:
+    """May this free model's empty answer count as the second opinion? Only for
+    a Go model that is free now, on a small cohort, when it is on the measured
+    allowlist and the flag is on. The caller has already required that the
+    first empty answer came from a paid or ranked model."""
+    backend, model = current
+    return (
+        _free_confirm_on()
+        and backend == Backend.OPENCODE_GO
+        and _opencode_go_model_is_free(model)
+        and _free_confirm_cohort_is_small()
+        and model in _free_confirm_allowlist()
+    )
+
+
 def _empty_answers_agree(
     first_empty: "tuple[Backend, str] | None",
     current: "tuple[Backend, str]",
@@ -7159,11 +7317,15 @@ def _empty_answers_agree(
     cohorts (2026-10-05). The same model twice is not agreement."""
     if first_empty is None or first_empty == current:
         return False
-    if _empty_confirms_nothing(first_empty) or _empty_confirms_nothing(current):
+    if _empty_confirms_nothing(first_empty):
+        return False
+    relaxed = _empty_confirms_nothing(current)
+    if relaxed and not _free_empty_may_confirm(current):
         return False
     log.info(
         "llm_cloud_empty_consensus",
         extra={
+            "relaxed": relaxed,
             "first_backend": first_empty[0].value,
             "first_model": first_empty[1],
             "second_backend": current[0].value,

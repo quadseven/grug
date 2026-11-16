@@ -16,7 +16,7 @@ Each part of the review is a persona with its own check run, named
 | Check | What it looks at | When it fails |
 |---|---|---|
 | `Grug - Chief` | The PR body, read as a Hunt Plan (see Contributing). Runs at once, no LLM. | A required section is missing or empty, the PR is `Size: XL`, or a linked ticket has no epic. |
-| `Grug - Elder` | The code. An LLM review with whole-file and cross-file context, posted as inline findings plus a findings table in the check summary. | It finds a real problem. A degraded review (model outage, unreadable answer) ends `neutral`, never a block. |
+| `Grug - Elder` | The code. An LLM review with whole-file and cross-file context, posted as inline findings plus a findings table in the check summary. | It finds a real problem. A degraded review (model outage, unreadable answer) ends `neutral`, never a block, on a repo where Elder only warns. Where Elder blocks, it fails closed, except that a sustained backend outage (20 minutes by default) publishes a neutral `Elder advisory: review backends down` until the backends return (ADR-0027). |
 | `Grug - Guard` | Security: SAST, secrets on added lines, dependency CVEs, and Terraform, Kubernetes and Dockerfile misconfigs. An LLM judge drops the noise first. | Advisory by default: findings post as `neutral` until the repo turns on Guard blocking. |
 
 Also on by default:

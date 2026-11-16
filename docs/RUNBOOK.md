@@ -639,6 +639,37 @@ scoring **0.30 and 0.17** (2026-08-15) at `temperature=0`, and
 single run's overall catch is not separable from sampling noise at this
 corpus size; only differences well outside that band mean anything.
 
+### Free Go model as the confirming second opinion (grug#1601)
+
+By default a short "no findings" answer is a low-confidence review (neutral
+check) unless a second, different, non-free model also answers empty. A free
+model's empty answer confirms nothing, because one answered empty on a
+33k-token diff where the paid primary found faults.
+
+A narrow relaxation exists, off unless `GRUG_OPENCODE_GO_FREE_CONFIRM=1`. A free
+Go model's empty answer then counts as the second opinion only when all of these
+hold: a paid or ranked model already answered empty on the same cohort; the
+cohort is at most `GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_TOKENS` (default 10000,
+about four characters to a token); the model qualifies in
+`services/_shared/opencode_go_free_eval.json` (a false-empty rate of 5 percent
+or less on at least 20 defect cases, computed from the counts, not from the
+stored list); and the report is no more than
+`GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_AGE_DAYS` old (default 60). The log line
+`llm_cloud_empty_consensus` carries `relaxed: true` when the relaxation decided.
+
+To re-measure, from `services/webhook` with `PYTHONPATH=../_shared` and the
+OpenCode Go key in `GRUG_BENCH_OPENCODE_GO_KEY`:
+
+```bash
+python -m elder_eval.free_confirm --state /tmp/free-confirm-state.json   --budget 500 --out ../_shared/opencode_go_free_eval.json
+```
+
+A run takes 30 to 60 minutes and resumes from `--state` until it finishes. It
+asks each free model about 48 small invented diffs (half with one planted
+defect) and honors the provider's pacing; a provider that asks for a pause of
+hours leaves the remaining cases as errors, which are never counted as empty
+answers.
+
 ### Review latency harness (#648)
 
 Short Ollama smokes do not model long-context review prefill. The
@@ -1001,6 +1032,23 @@ First steps:
 4. Run the same fixture against the answering model by hand before changing
    the chain. A single `missed` among `caught` runs is model variance, not an
    outage.
+
+### Elder advisory during an outage (ADR-0027)
+
+In BLOCK mode a degraded Elder review fails closed (ADR-0023). If the review
+backends stay down, the check turns advisory by itself: conclusion `neutral`,
+title `Elder advisory: review backends down`, a summary that names the failed
+backends and since when. It is not an `Elder clear`, and nothing was reviewed.
+
+- Trigger: consecutive backend-outage results across the install for
+  `GRUG_ELDER_OUTAGE_MINUTES` (default 20). The first results still fail closed.
+- It restores itself: the next completed review ends the streak, and the next
+  degraded one blocks again. Push or comment `/grug improve` to re-review.
+- Switch off with `GRUG_ELDER_OUTAGE_ADVISORY=0` (ADR-0023 exactly). The streak
+  is the `outage` kind in `shared_benches` (`grug_kv`, pk `ELDER_BENCH`); a
+  stuck one ends by itself after `GRUG_ELDER_OUTAGE_GAP_MINUTES` (60).
+- Find advisories: check runs titled `Elder advisory: review backends down`.
+  After the outage, re-run any PR that merged on one.
 
 ## LLM backend unusable
 

@@ -113,6 +113,19 @@ def _forget_guideline_files() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _forget_outage_streak() -> Iterator[None]:
+    """ADR-0027: the Elder outage streak is module state; one test's degraded
+    reviews must not age into the next test's advisory."""
+    mod = sys.modules.get("personas.code_reviewer.outage_advisory")
+    if mod is not None:
+        mod._local = None  # noqa: SLF001
+    yield
+    mod = sys.modules.get("personas.code_reviewer.outage_advisory")
+    if mod is not None:
+        mod._local = None  # noqa: SLF001
+
+
+@pytest.fixture(autouse=True)
 def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     """grug#1225: the LLM provider breaker is module state, and a shell's
     GRUG_DISABLED_BACKENDS must not reach a test. Without the reset, one test
@@ -124,6 +137,10 @@ def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     if lc is not None:
         monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
         monkeypatch.setattr(lc, "_limit_refusals", {}, raising=False)
+        # Free Go model pacing and the price list are module state too.
+        monkeypatch.setattr(lc, "_opencode_go_free_catalog", None, raising=False)
+        monkeypatch.setattr(lc, "_opencode_go_free_gate", None, raising=False)
+        monkeypatch.delenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", raising=False)
         # Fixture replies name these models; the list itself has its own tests.
         monkeypatch.setattr(
             lc, "_TRUSTED_EMPTY_CAVE_MODELS",

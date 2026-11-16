@@ -1,6 +1,7 @@
 """Tests for the LLM client abstraction."""
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
@@ -5708,6 +5709,9 @@ def test_outages_limits_and_request_errors_never_bench(monkeypatch, resp) -> Non
     # Spent-limit refusals trip the provider breaker (grug#1225), which would
     # refuse the repeat calls this test needs; the bench is what it checks.
     monkeypatch.setattr(lc, "_note_provider_response", lambda *_: None)
+    # A 429 also cools the model in the free-call gate, which would refuse the
+    # repeats; the gate has its own tests.
+    monkeypatch.setattr(lc, "_opencode_go_free_slot", lambda _c: contextlib.nullcontext())
     cfg = lc.replace(_go_cfg(), retry_attempts=1)
     for _ in range(5):
         _call(cfg, resp)

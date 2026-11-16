@@ -77,13 +77,13 @@ def test_login_state_cookie_value_round_trips_via_verify_state(_oauth_mod):
 
 
 def test_me_anonymous_returns_authenticated_false(_oauth_mod):
-    with patch.object(_oauth_mod, "_verify_session", return_value=None):
+    with patch.object(_oauth_mod, "_verify_active_session", return_value=None):
         out = _oauth_mod.me("")
     assert out == {"authenticated": False}
 
 
 def test_me_invalid_session_returns_authenticated_false(_oauth_mod):
-    with patch.object(_oauth_mod, "_verify_session", return_value=None):
+    with patch.object(_oauth_mod, "_verify_active_session", return_value=None):
         out = _oauth_mod.me("garbage.cookie")
     assert out == {"authenticated": False}
 
@@ -91,7 +91,7 @@ def test_me_invalid_session_returns_authenticated_false(_oauth_mod):
 def test_me_session_valid_but_user_missing_returns_authenticated_false(_oauth_mod):
     """User row deleted from DDB AFTER the session was minted — return
     not-authenticated rather than crash on None.user."""
-    with patch.object(_oauth_mod, "_verify_session", return_value="100"):
+    with patch.object(_oauth_mod, "_verify_active_session", return_value="100"):
         with patch.object(_oauth_mod, "get_user", return_value=None):
             out = _oauth_mod.me("valid-cookie")
     assert out == {"authenticated": False}
@@ -104,7 +104,7 @@ def test_me_returns_user_fields(_oauth_mod):
         allowlisted=True, created_at="",
         allowlisted_at=None, allowlisted_by=None,
     )
-    with patch.object(_oauth_mod, "_verify_session", return_value="100"):
+    with patch.object(_oauth_mod, "_verify_active_session", return_value="100"):
         with patch.object(_oauth_mod, "get_user", return_value=user):
             out = _oauth_mod.me("valid-cookie")
     assert out == {

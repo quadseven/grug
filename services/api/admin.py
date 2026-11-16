@@ -24,8 +24,15 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from adapters.user_store import UserIdentity, get_user_item, scan_meta_items, update_user_fields
+from adapters.user_store import (
+    UserIdentity,
+    bump_session_generation,
+    get_user_item,
+    scan_meta_items,
+    update_user_fields,
+)
 from auth.dependencies import require_admin
+from auth.github_oauth import invalidate_session_generation_cache
 
 log = logging.getLogger("grug.api.admin")
 
@@ -178,3 +185,32 @@ def patch_user(
         "changed": True,
         "user": _user_to_admin_view(new),
     }
+
+
+@router.post("/users/{user_id}/revoke-sessions")
+def revoke_user_sessions(
+    user_id: str,
+    actor: UserIdentity = Depends(require_admin),
+) -> dict[str, Any]:
+    """Bump a user's session generation so all their active sessions end."""
+    if not get_user_item(str(user_id)):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="user not found"
+        )
+    try:
+        new_gen = bump_session_generation(str(user_id))
+    except LookupError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="user not found"
+        ) from None
+    invalidate_session_generation_cache(str(user_id))
+    log.info(
+        "admin_user_sessions_revoked",
+        extra={
+            "actor_login": actor.login,
+            "actor_id": actor.github_user_id,
+            "target_user_id": str(user_id),
+            "session_generation": new_gen,
+        },
+    )
+    return {"github_user_id": str(user_id), "session_generation": new_gen}

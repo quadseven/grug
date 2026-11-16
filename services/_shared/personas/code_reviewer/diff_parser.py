@@ -105,13 +105,29 @@ _HUNK_BOUNDARY_PREFIXES: tuple[str, ...] = (
 # diff was mostly a data file) and slows every review. Conservative,
 # extension/dir-based; excluded paths are NAMED in the check summary so the
 # walkthrough stays honest, and full-file context still covers code files.
+#
+# The codegen group (protobuf, gRPC, GraphQL and OpenAPI generators, Go
+# generators) is adapted from the MIT-licensed PR-Agent's
+# `pr_agent/settings/generated_code_ignore.toml`. It is narrower on purpose:
+# `swagger.json`/`swagger.yaml` are left out (a hand-written API spec is
+# worth reviewing) and the Python gRPC rule is the protoc stub name
+# `_pb2_grpc.py`, not any `*_grpc.py`, so a hand-written `my_grpc.py` stays
+# reviewed. A hand edit inside generated output is still a path named in
+# the check summary, never silently dropped.
 _REVIEW_EXCLUDED_PATH_RE = re.compile(
     r"(?:^|/)("
-    r"node_modules|vendor|__snapshots__|dist"
+    r"node_modules|vendor|__snapshots__|dist|__generated__|"
+    r"openapi_client|openapi_server"
     r")/"
     r"|\.(?:jsonl|csv|tsv|parquet|min\.js|min\.css|svg|map|lock)$"
     r"|(?:^|/)(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|uv\.lock|"
     r"poetry\.lock|Cargo\.lock|go\.sum|Gemfile\.lock|composer\.lock)$"
+    r"|\.pb\.(?:go|cc|h|swift|rb|php)$"
+    r"|_pb2(?:_grpc)?\.pyi?$"
+    r"|\.(?:graphql|generated)\.(?:ts|js)$"
+    r"|Grpc\.(?:java|cs)$"
+    r"|_grpc\.(?:ts|js)$"
+    r"|(?:_gen|[._]generated)\.go$"
 )
 
 

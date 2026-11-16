@@ -27,7 +27,7 @@ from adapters.user_store import (
     UserIdentity,
     get_user,
 )
-from auth.github_oauth import _verify_session  # type: ignore[reportPrivateUsage]
+from auth.github_oauth import verify_active_session
 
 log = logging.getLogger("grug.api.auth.deps")
 
@@ -39,7 +39,7 @@ def get_current_user(grug_session: str = Cookie(default="")) -> UserIdentity | N
     versions left gh_id unsigned and were vulnerable to swap-component
     impersonation.
     """
-    gh_id = _verify_session(grug_session)
+    gh_id = verify_active_session(grug_session)
     if gh_id is None:
         return None
     return get_user(gh_id)

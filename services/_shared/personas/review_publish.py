@@ -537,7 +537,7 @@ class PublishOutcome:
 
 def plan_publish(
     evaluation: CodeReviewEvaluation, *, mode: ReviewMode,
-    degraded_fails_closed: bool = False,
+    degraded_fails_closed: bool = False, outage_advisory: bool = False,
 ) -> PublishOutcome:
     """Single source of truth for the advisory-vs-blocking gate.
 
@@ -553,8 +553,15 @@ def plan_publish(
     `COMMENT`: a degraded review is not a verdict to request changes on.
     `no_diff` is not a degradation (nothing to review) and keeps neutral.
     Guard and Smasher share this gate and do not opt in.
+
+    `outage_advisory` (ADR-0027) is the caller's finding that the degraded
+    review is a sustained backend outage: the fail-closed `failure` becomes
+    `neutral`, and the caller labels the check as an advisory. It changes
+    nothing unless the review is a fail-closed degraded one.
     """
-    conclusion, event = _gate(evaluation, mode, degraded_fails_closed)
+    conclusion, event = _gate(
+        evaluation, mode, degraded_fails_closed, outage_advisory,
+    )
     return PublishOutcome(
         conclusion=conclusion,
         event=event,
@@ -565,12 +572,15 @@ def plan_publish(
 
 def _gate(
     evaluation: CodeReviewEvaluation, mode: ReviewMode, degraded_fails_closed: bool,
+    outage_advisory: bool = False,
 ) -> tuple[CheckConclusion, ReviewEvent]:
     if (
         degraded_fails_closed
         and mode == "blocking"
         and is_real_degradation(evaluation.degraded_reason)
     ):
+        if outage_advisory:
+            return "neutral", "COMMENT"
         return "failure", "COMMENT"
     # Otherwise a degraded evaluation (LLM outage, parse failure, empty
     # diff) forces advisory regardless of mode.
