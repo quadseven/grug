@@ -3266,13 +3266,31 @@ def dispatch_code_review(
     # #1758: the review state is the verdict, whatever the mode. A clean
     # pass vouches for the head only when the carry-forward fold ran (or
     # there was nothing earlier to fold) and every lock file was read.
-    event = _own_pr_event(author_login, verdict_event(
+    verdict = _own_pr_event(author_login, verdict_event(
         evaluation, conclusion=conclusion, carried_blocking=carried_blocking,
         vouched=(
             not lock_check.unreviewed
             and (action not in _RE_REVIEW_ACTIONS or listed_threads is not None)
         ),
     ))
+    # Decided once, before anything is posted (the escalation may sample):
+    # Tier-1 must know whether a deep pass will follow on this head.
+    deep_plan = _async_deep_decision(
+        check_publish_failed=False,
+        llm_hunks=list(evidence.hunks),
+        pr_context=pr_context,
+        evaluation=evaluation,
+        cancel_event=cancel_event,
+        owner=owner,
+        repo_name=repo_name,
+        pull_number=pull_number,
+    )
+    # #1758: an APPROVE posted while the deep pass is still looking would let
+    # a gate merge before that pass reports a blocking finding. So Tier-1
+    # defers its approval to the deep append, which approves only if it
+    # finishes clean; if it fails or degrades the head stays unapproved.
+    deferred_approval = verdict == "APPROVE" and deep_plan is not None
+    event = "COMMENT" if deferred_approval else verdict
     # grug#1429 pin + closure, then grug#1212's degraded lead: a degraded
     # pass still says so before anything else, the pin line right after.
     pinned_issues = _pinned_issues(pr_context, owner, repo_name)
@@ -3405,8 +3423,9 @@ def dispatch_code_review(
             clean_url=check_run_url or str((review_resp or {}).get("html_url") or ""),
         )
     elif event == "COMMENT" and action in _RE_REVIEW_ACTIONS:
-        # #1758, fail closed: this run cannot vouch for the head, so an
-        # approval Elder gave earlier no longer stands.
+        # #1758, fail closed: this run cannot vouch for the head (or has
+        # deferred its verdict to the deep pass), so an approval Elder gave
+        # earlier no longer stands.
         _dismiss_superseded_reviews(
             installation_id, owner, repo_name, pull_number, head_sha,
             run_started_at, state="APPROVED",
@@ -3634,7 +3653,9 @@ def dispatch_code_review(
             config_note=config_note,
             tier1_check_run_id=check_run_id,
             tier1_review_id=review_id if isinstance(review_id, int) else None,
-            tier1_event=event,
+            deep_plan=deep_plan,
+            deferred_approval=deferred_approval,
+            run_started_at=run_started_at,
         )
     except Exception as e:  # noqa: BLE001 - deep append is best-effort
         log.warning(
@@ -4588,19 +4609,22 @@ def _own_pr_event(author_login: str, event: ReviewEvent) -> ReviewEvent:
 def _newer_elder_verdict_review(
     *, installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, tier1_review_id: int | None,
+    run_started_at: datetime | None, on_error: bool = False,
 ) -> bool:
-    """True when Elder posted a verdict review on this head after this run's
-    own Tier-1 review (#1758).
+    """True when another Elder run posted a verdict review on this head
+    after this run started (#1758).
 
     The check-run test (`_newer_elder_verdict_on_head`) counts only success
     or failure, and an advisory-mode check always concludes neutral, so it
-    cannot see a newer advisory run. Review ids rise with creation, so an
-    Elder APPROVED or CHANGES_REQUESTED review on the head above this run's
-    Tier-1 review id is a later verdict. Fails open, as the check-run test
-    does: with no Tier-1 review id or a failed listing nothing proves it.
+    cannot see a newer advisory run. An Elder APPROVED or CHANGES_REQUESTED
+    review on the head, other than this run's own Tier-1 review, submitted
+    at or after `run_started_at` is a later verdict. With no start time,
+    a review id above this run's Tier-1 review id counts instead.
+
+    A failed listing returns `on_error`: the caller passes True when it is
+    about to approve (an approval is never posted unproven) and False when
+    about to block (as the check-run test, it fails open).
     """
-    if not isinstance(tier1_review_id, int):
-        return False
     try:
         reviews = with_install_token_retry(
             installation_id,
@@ -4611,49 +4635,69 @@ def _newer_elder_verdict_review(
             "elder_async_deep_review_supersession_check_failed",
             extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
         )
-        return False
+        return on_error
+
+    def _later(review: dict[str, Any]) -> bool:
+        if review.get("id") == tier1_review_id:
+            return False
+        if run_started_at is not None:
+            return not _submitted_before(review, run_started_at) and (
+                review.get("submitted_at") is not None
+            )
+        return (
+            isinstance(tier1_review_id, int)
+            and isinstance(review.get("id"), int)
+            and review["id"] > tier1_review_id
+        )
+
     return any(
         isinstance(review, dict)
         and review.get("state") in ("APPROVED", "CHANGES_REQUESTED")
         and review.get("commit_id") == head_sha
-        and isinstance(review.get("id"), int)
-        and review["id"] > tier1_review_id
         and _is_elder_review(review)
+        and _later(review)
         for review in reviews or ()
     )
 
 
-def _withdraw_tier1_approval(
+def _post_deferred_approval(
     *, installation_id: int, owner: str, repo_name: str, pull_number: int,
-    head_sha: str, review_id: int,
+    head_sha: str, run_started_at: datetime | None,
 ) -> None:
-    """Dismiss the approval this run's own Tier-1 posted, once the deep
-    append finds the head no longer earns it (#1758). Best-effort."""
+    """Post the APPROVE Tier-1 deferred to the deep pass (#1758), then
+    withdraw Elder's own older blocks, as a clean Tier-1 would.
+
+    Body-only and posted once: a failed post is logged and never queued for
+    retry, so a late approval cannot land over a newer verdict. The head
+    then stays unapproved (fail closed) until the next review.
+    """
+    pr = f"{owner}/{repo_name}#{pull_number}"
+    review, _ = build_review_result(
+        CodeReviewEvaluation(findings=(), conclusion="success"),
+        head_sha=head_sha, event="APPROVE", posts_verdict=True,
+    )
+    if review is None:
+        return
     try:
-        with_install_token_retry(
+        response = with_install_token_retry(
             installation_id,
-            lambda token: dismiss_review(
-                token, owner, repo_name, pull_number=pull_number,
-                review_id=review_id,
-                message=(
-                    f"Withdrawn: Elder's deep review of {head_sha[:7]} "
-                    "no longer supports this approval."
-                ),
+            lambda token: post_review(
+                token, owner, repo_name, pull_number=pull_number, result=review,
             ),
         )
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.warning(
-            "elder_tier1_approval_withdraw_failed",
-            extra={
-                "pr": f"{owner}/{repo_name}#{pull_number}",
-                "kind": type(e).__name__, **_http_error_detail(e),
-            },
+            "elder_deferred_approval_publish_failed",
+            extra={"pr": pr, "kind": type(e).__name__, **_http_error_detail(e)},
         )
         return
-    log.info(
-        "elder_tier1_approval_withdrawn",
-        extra={"pr": f"{owner}/{repo_name}#{pull_number}", "review_id": review_id},
-    )
+    log.info("elder_deferred_approval_posted", extra={"pr": pr})
+    if run_started_at is not None:
+        _dismiss_superseded_reviews(
+            installation_id, owner, repo_name, pull_number, head_sha,
+            run_started_at, state="CHANGES_REQUESTED",
+            clean_url=str((response or {}).get("html_url") or ""),
+        )
 
 
 def _record_hunt_run(
@@ -5082,30 +5126,28 @@ def _async_deep_append_if_needed(
     config_note: str = "",
     tier1_check_run_id: int | None = None,
     tier1_review_id: int | None = None,
-    tier1_event: ReviewEvent = "COMMENT",
+    deep_plan: DeepEscalationDecision | None = None,
+    deferred_approval: bool = False,
+    run_started_at: datetime | None = None,
 ) -> None:
     """Run reasoner after Tier-1 publish when tiered escalation fires (#646).
 
     Posts additional inline comments and a second completed check-run summary
     that includes deep findings. Never raises to the caller.
 
-    Tier-1's review is the head's formal verdict (#1758). The deep append
-    never approves a second time: it escalates to REQUEST_CHANGES when it
-    finds a blocking problem, and when the head no longer earns Tier-1's
-    APPROVE (a blocking finding, or the deep arm degraded the review) it
-    withdraws that approval. A superseded deep append does neither.
+    `deep_plan` is the escalation Tier-1 decided before it published, so
+    Tier-1 knew a deep pass would follow. On such a head the deep append
+    owns the formal verdict (#1758): Tier-1 held back its APPROVE
+    (`deferred_approval`), and this pass posts APPROVE only when it finishes
+    clean, or REQUEST_CHANGES on a blocking finding. If it fails, degrades,
+    is cancelled or is superseded, the head gets no approval (fail closed).
     """
-    decision = _async_deep_decision(
-        check_publish_failed=check_publish_failed,
-        llm_hunks=list(evidence.hunks),
-        pr_context=pr_context,
-        evaluation=evaluation,
-        cancel_event=cancel_event,
-        owner=owner,
-        repo_name=repo_name,
-        pull_number=pull_number,
-    )
-    if decision is None:
+    decision = deep_plan
+    if (
+        decision is None
+        or check_publish_failed
+        or (cancel_event is not None and cancel_event.is_set())
+    ):
         return
 
     log.info(
@@ -5277,31 +5319,28 @@ def _async_deep_append_if_needed(
         tier1_check_run_id=tier1_check_run_id,
     )
     verdict = verdict_event(combined, conclusion=conclusion)
-    withdraws_approval = tier1_event == "APPROVE" and verdict != "APPROVE"
-    if not superseded and (verdict == "REQUEST_CHANGES" or withdraws_approval):
-        # #1758: about to block or withdraw an approval, so make sure no
-        # newer advisory-mode run (whose neutral check the test above
-        # cannot see) has posted its own verdict on this head.
+    # #1758: Tier-1 deferred its APPROVE to this pass; approve only if the
+    # combined review is still clean (not degraded, nothing blocking).
+    approves = deferred_approval and verdict == "APPROVE"
+    if not superseded and (verdict == "REQUEST_CHANGES" or approves):
+        # About to block or approve, so make sure no newer advisory-mode run
+        # (whose neutral check the test above cannot see) has posted its own
+        # verdict on this head.
         superseded = _newer_elder_verdict_review(
             installation_id=installation_id, owner=owner, repo_name=repo_name,
             pull_number=pull_number, head_sha=head_sha,
-            tier1_review_id=tier1_review_id,
+            tier1_review_id=tier1_review_id, run_started_at=run_started_at,
+            on_error=approves,
         )
     # #1344: a superseded run posts its findings as a COMMENT review and
     # leaves the check alone. The inline threads stay open, so the next
     # review carries a still-standing high finding into its own verdict
     # (carry_forward), while a superseded REQUEST_CHANGES never re-blocks a
-    # pull request the newer review cleared. #1758: the deep append never
-    # approves again (Tier-1's review is the verdict); it only escalates.
+    # pull request the newer review cleared, and it never approves.
     event: ReviewEvent = _own_pr_event(
         author_login,
         "REQUEST_CHANGES" if verdict == "REQUEST_CHANGES" and not superseded else "COMMENT",
     )
-    if withdraws_approval and not superseded and isinstance(tier1_review_id, int):
-        _withdraw_tier1_approval(
-            installation_id=installation_id, owner=owner, repo_name=repo_name,
-            pull_number=pull_number, head_sha=head_sha, review_id=tier1_review_id,
-        )
     if not superseded:
         _publish_deep_check(
             installation_id=installation_id,
@@ -5337,6 +5376,12 @@ def _async_deep_append_if_needed(
         linked_issues=pinned_issues,
         diff_text=diff_text,
     )
+    if approves and not superseded:
+        _post_deferred_approval(
+            installation_id=installation_id, owner=owner, repo_name=repo_name,
+            pull_number=pull_number, head_sha=head_sha,
+            run_started_at=run_started_at,
+        )
     _submit_deep_evals(
         deep_graded,
         deep_verdicts,

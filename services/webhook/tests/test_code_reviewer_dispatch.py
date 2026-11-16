@@ -3038,10 +3038,10 @@ def test_deep_review_publishes_and_captures_comment_records(monkeypatch):
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
-    # Tier-1's clean verdict (#1758), then the deep review.
-    assert [r.event for r in posted_reviews][0] == "APPROVE"
-    assert posted_reviews[0].comments == ()
-    assert len(posted_reviews) == 2
+    # The deep review posted. Tier-1 deferred its clean verdict to the deep
+    # pass (#1758), which found a problem, so nothing approves the head.
+    assert len(posted_reviews) == 1
+    assert posted_reviews[0].event != "APPROVE"
     # The deep finding's comment was captured with its ID + span context.
     assert len(captured) == 1
     rec = captured[0]

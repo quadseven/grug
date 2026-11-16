@@ -34,7 +34,9 @@ posted body-only, so the state always lands.
 
 **The blocking flag does not gate the state.** `code_reviewer_blocking` picks
 only the check conclusion (`plan_publish`). The review state is posted in both
-modes, because gates read the state. The consequence is deliberate: a
+modes, because gates read the state. In particular Elder posts `APPROVE` on a
+clean head in advisory mode too: that is intended by the operator decision,
+not a leak of blocking behavior into advisory mode. The consequence is deliberate: a
 `REQUEST_CHANGES` from Grug blocks GitHub's merge button (as it did in
 blocking mode, #1581) on a repository in advisory mode too, until a clean
 re-review (`/grug improve`) approves and withdraws it, or a maintainer
@@ -49,10 +51,18 @@ never requests changes, so a backend outage cannot block a merge this way.
   #1581 did for a `success` check, now in either mode).
 - A re-review that posts `COMMENT` dismisses Elder's own older `APPROVE`, so
   a degraded run cannot leave an approval standing.
-- The deep append never approves a second time. It escalates to
-  `REQUEST_CHANGES` on a blocking finding, and when the head no longer earns
-  Tier-1's approval (a blocking finding, or the deep arm degraded the review)
-  it dismisses that approval.
+- **An escalated head is approved only by the deep pass.** Tier-1 decides
+  before it publishes whether a deep pass will follow on the head. If one
+  will, Tier-1 does not approve: an `APPROVE` standing while the reasoner is
+  still looking would let a gate merge before the deep pass reports a
+  blocking finding. The deep append then posts `APPROVE` only when the
+  combined review finishes clean (and withdraws Elder's own older blocks), or
+  `REQUEST_CHANGES` on a blocking finding. If the deep pass fails, degrades,
+  is cancelled, is superseded, or cannot confirm it is not superseded, the
+  head gets no approval (fail closed). The deferred approval is posted once
+  and never queued for retry, so a late approval cannot land over a newer
+  verdict. Tier-1 still posts `REQUEST_CHANGES` at once when it finds a
+  blocking problem itself.
 - A superseded run never re-blocks and never withdraws. Besides the check-run
   test (#1344), the deep append treats a newer Elder `APPROVED` or
   `CHANGES_REQUESTED` review on the head as superseding it, since an advisory
