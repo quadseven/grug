@@ -306,16 +306,16 @@ def _replacement_for_call(body: str, match: re.Match) -> str:
     return second_value
 
 
-def _replacement_for_constant_sub(body: str, const_name: str) -> str:
-    """The replacement string literal of a CONST.sub(...) call, or "" when
-    the first argument is not a string literal."""
+def _replacement_for_constant_sub(body: str, const_name: str) -> str | None:
+    """The replacement string literal of a CONST.sub(...) call, or None when
+    there is no such call or its first argument is not a string literal."""
     pattern = rf"(?<!\w){re.escape(const_name)}\.subn?\s*\("
     for match in re.finditer(pattern, body):
         after = body[match.end():]
         first = _first_string_after(after, 0)
         if first is not None and _LEADING_PREFIX_RE.fullmatch(after[:first[1]]):
             return first[0]
-    return ""
+    return None
 
 
 def _pattern_for(function: _Function, constants: dict[str, str]) -> tuple[str, int, str, str, str] | None:
@@ -345,7 +345,7 @@ def _pattern_for(function: _Function, constants: dict[str, str]) -> tuple[str, i
         if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", body):
             # Find the replacement used in const_name.sub(...) calls
             replacement = _replacement_for_constant_sub(body, name)
-            if replacement:  # Only add if there's a .sub call with a string replacement
+            if replacement is not None:  # A .sub call with a literal, "" included
                 candidates.append((pattern, start_line, replacement))
     for pattern, line, replacement in candidates:
         change = _plain_text_change(pattern, replacement)

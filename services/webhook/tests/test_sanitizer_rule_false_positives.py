@@ -35,6 +35,26 @@ _ALLOW_LIST = [
     '    return _ALLOWED.sub(" ", text)',
 ]
 
+_MODULE_ALLOW_LIST = [
+    "import re",
+    "",
+    '_ALLOWED = re.compile(r"[^A-Za-z0-9 ,.]")',
+    "",
+    "",
+    "def sanitize_title(text):",
+    '    return _ALLOWED.sub(" ", text)',
+]
+
+_MODULE_LINK_STRIPPER = [
+    "import re",
+    "",
+    '_LINK = re.compile(r"\\|h")',
+    "",
+    "",
+    "def sanitize_chat(text):",
+    '    return _LINK.sub("", text)',
+]
+
 _SOUND_SANITIZER = [
     "import re",
     "",
@@ -175,3 +195,16 @@ def test_inline_allow_list_call_yields_no_eats_text_finding():
     """The allow-list given straight to re.sub is not evaluated either."""
     diff = _diff(_INLINE_ALLOW_LIST, _POSITIVE_TESTS_ONLY)
     assert RULE_EATS_TEXT not in _names(_scan(diff))
+
+
+def test_module_level_allow_list_yields_no_eats_text_finding():
+    """The production shape: a module-level allow-list constant used by name."""
+    diff = _diff(_MODULE_ALLOW_LIST, _POSITIVE_TESTS_ONLY)
+    assert RULE_EATS_TEXT not in _names(_scan(diff))
+
+
+def test_module_level_constant_is_read_by_the_rule():
+    """A module-level raw-string constant that eats `|h` is still flagged,
+    so the allow-list case above is a real skip, not an unread constant."""
+    diff = _diff(_MODULE_LINK_STRIPPER, _POSITIVE_TESTS_ONLY)
+    assert RULE_EATS_TEXT in _names(_scan(diff))
