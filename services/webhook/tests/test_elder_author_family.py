@@ -322,7 +322,7 @@ def test_activity_log_hands_both_families_to_the_store(monkeypatch) -> None:
         ("gpt-5.6-luna", "gpt"),
         ("codex", "gpt"),
         ("qwen3-coder-next:q8_0", "qwen"),
-        ("nvidia/nemotron-3-super-120b-a12b:free", "nemotron"),
+        ("nvidia/nemotron-3-ultra-550b-a55b:free", "nemotron"),
         ("spark:warm-any", None),
         ("openrouter/free", None),
         ("", None),

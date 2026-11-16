@@ -1169,7 +1169,7 @@ def test_openrouter_review_defaults_to_a_free_model_with_reasoning_off() -> None
     403s on every call. The default is a `:free` model, with OpenRouter's
     reasoning toggle off so hidden reasoning cannot eat the budget."""
     config = lc._review_backend_config(Backend.OPENROUTER)
-    assert config.model == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert config.model == "nvidia/nemotron-3-ultra-550b-a55b:free"
     assert config.model.endswith(":free")
     assert config.extra_body["reasoning"] == {"enabled": False}
     assert config.extra_body["max_tokens"] == 8_192

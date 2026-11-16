@@ -345,14 +345,13 @@ _OPENCODE_GO_DEFAULT_WIRE = "chat"
 #
 # The default is a `:free` model: grug's OpenRouter key has a zero spend
 # limit, so a paid model here 403s on every call (read-only key check,
-# 2026-09-26: limit 0, lifetime usage 0). The model was picked on
-# `make elder-eval` evidence, not vendor claims: nvidia/nemotron-3-super-
-# 120b-a12b:free scored 17/17 cases with no errors (catch 0.25, noise 0.00,
-# against the committed bench baseline's 0.17), while qwen3.8-27b:free and
-# gemma-4-31b-it:free answered 429 on every case and north-mini-code:free
-# returned unparseable JSON.
+# 2026-09-26: limit 0, lifetime usage 0). The earlier default,
+# nvidia/nemotron-3-super-120b-a12b:free, scored 17/17 on `make elder-eval`
+# (catch 0.25, noise 0.00) but left the free pool (grug#1544).
+# nvidia/nemotron-3-ultra-550b-a55b:free replaces it as a listed :free model
+# of the same family; its own elder-eval run is not recorded yet.
 _OPENROUTER_REVIEW_MODEL = os.getenv(
-    "GRUG_OPENROUTER_REVIEW_MODEL", "nvidia/nemotron-3-super-120b-a12b:free",
+    "GRUG_OPENROUTER_REVIEW_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free",
 )
 _OPENROUTER_REVIEW_EXTRA_BODY: dict[str, Any] = {
     "max_tokens": 32_768,

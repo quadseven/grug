@@ -11,7 +11,7 @@ import pytest
 from llm_client import Backend, Hunk, review_diff
 from review_evidence import assemble_evidence
 
-_FREE = "nvidia/nemotron-3-super-120b-a12b:free"
+_FREE = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 
 class _FakeClient:

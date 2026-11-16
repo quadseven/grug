@@ -21,7 +21,7 @@ _GO_URL = "opencode.ai"
 _OR_URL = "openrouter.ai"
 _POOLSIDE_URL = "poolside.ai"
 _CAVE_URL = "cave.test"
-_FREE = "nvidia/nemotron-3-super-120b-a12b:free"
+_FREE = "nvidia/nemotron-3-ultra-550b-a55b:free"
 _MESSAGES = [{"role": "user", "content": "hi"}]
 
 
