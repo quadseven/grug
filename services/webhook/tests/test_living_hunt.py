@@ -616,7 +616,9 @@ def test_push_after_first_review_is_a_scoped_delta_review(monkeypatch):
     assert len(scoped_calls) == 1
     assert scoped_calls[0]["base_sha"] == "prior0001head"
     assert scoped_calls[0]["head_sha"] == "abcd1234efgh"
-    assert titles and titles[-1].startswith("Living Hunt prior000..abcd1234")
+    assert titles and "Living Hunt prior000..abcd1234 - Elder clear" in titles[-1]
+    # grug#1753: this is an advisory (neutral) check, so its title says why.
+    assert "Neutral because" in titles[-1]
     assert reviewed_paths == [{"x.py"}]
     assert [(c["base_sha"], c["head_sha"]) for c in full_calls] == [
         ("base5678ijkl", "abcd1234efgh"),
