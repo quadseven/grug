@@ -55,6 +55,10 @@ MAX_CRITERIA_PER_ISSUE = 15
 MAX_CRITERION_CHARS = 300
 MAX_BLOCK_CHARS = 4000
 
+_LIVE_PREFIXES = (
+    "Live:", "Live proof:", "Live proof (left to the brain):", "live (operator):",
+)
+
 # `Refs`/`Part of`/`Relates to #N`: the non-closing links Chief's
 # `_ISSUE_LINK_PAT` also accepts. `Blocked by` is deliberately absent: that
 # issue is a prerequisite, not the spec this PR claims to implement. The
@@ -185,6 +189,21 @@ _DELIVERED_NOTE = (
     " A criterion marked 'delivered by merged #N' was met by an earlier pull "
     "request on the same ticket: do not flag it as unmet here."
 )
+
+
+def is_live_criterion(text: str) -> bool:
+    """Return True when a criterion starts with a live prefix.
+    Live criteria are left out of the rendered block since they're checked
+    after deploy."""
+    if not text:
+        return False
+    cleaned = "".join(text.split())
+    for prefix in _LIVE_PREFIXES:
+        if cleaned.lower().startswith(prefix.lower()):
+            return True
+    return False
+
+
 _OMITTED = "\n... (further criteria omitted)"
 _RENDERED_CRITERION_RE = re.compile(
     r"^#(\d+) criterion (\d+) \[(open|ticked|delivered)(?: by merged #\d+)?\]: (.*)$",
@@ -303,6 +322,7 @@ def build_linked_issue_context(
     """The block for this PR's linked issues, or None. Never raises."""
     criteria_by_issue: dict[int, list[Criterion]] = {}
     health_by_issue: dict[int, str] = {}
+    live_criteria_left_out = 0
     for number in linked_issue_numbers(pr_body, owner=owner, repo=repo):
         try:
             issue = fetch_issue(number)
@@ -326,8 +346,14 @@ def build_linked_issue_context(
             continue
         criteria = extract_criteria(issue_body)
         if criteria:
+            filtered_criteria = []
+            for state, text in criteria:
+                if is_live_criterion(text):
+                    live_criteria_left_out += 1
+                else:
+                    filtered_criteria.append((state, text))
             criteria_by_issue[number] = _with_delivered(
-                number, criteria, issue_body, fetch_siblings,
+                number, filtered_criteria, issue_body, fetch_siblings,
             )
         evidence = _health_evidence(issue_title, issue_body)
         if evidence:
@@ -336,6 +362,12 @@ def build_linked_issue_context(
         render_linked_issue_block(criteria_by_issue),
         _render_health_block(health_by_issue),
     ]
+    if live_criteria_left_out > 0:
+        blocks.append(
+            f"---\nLinked acceptance criteria read: {len(criteria_by_issue)} issue(s) with "
+            f"{sum(len(c) for c in criteria_by_issue.values())} criterion(s) total. "
+            f"{live_criteria_left_out} live criterion(s) left for after deploy."
+        )
     return "\n\n".join(block for block in blocks if block) or None
 
 

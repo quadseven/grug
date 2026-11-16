@@ -27,6 +27,7 @@ from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.linked_issue import (
     build_linked_issue_context,
     extract_criteria,
+    is_live_criterion,
     linked_issue_numbers,
     render_linked_issue_block,
 )
@@ -552,3 +553,48 @@ def test_intent_says_criteria_were_checked_with_only_a_plain_acceptance_heading(
         {"title": "Tighten the merge gate", "linked_issue_context": linked},
     )
     assert "Linked acceptance criteria were checked" in paragraph
+# --- test_is_live_criterion -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "criterion_text,expected",
+    [
+        ("Live:", True),
+        ("Live proof:", True),
+        ("Live proof (left to the brain):", True),
+        ("live (operator):", True),
+        ("Liveness probe returns 200", False),
+        ("The live log shows X", False),
+        ("Live proof (left to the brain): something", True),
+        ("Live proof (left to the brain):", True),
+    ],
+)
+def test_is_live_criterion(criterion_text, expected):
+    assert is_live_criterion(criterion_text) == expected
+
+
+# --- test_live_proof_criterion_is_left_out_of_block ----------------------------
+
+ISSUE_WITH_LIVE_AND_ORDINARY = """## Why
+
+Because.
+
+## Acceptance criteria
+
+- [ ] Live proof (left to the brain): on the next 10 lane PRs that depend on a change
+- [ ] Second ordinary criterion
+"""
+
+
+def test_live_proof_criterion_is_left_out_of_block():
+    def mock_fetch_issue(number):
+        return {"title": "Test Issue", "body": ISSUE_WITH_LIVE_AND_ORDINARY}
+
+    block = build_linked_issue_context(
+        "Closes #1", fetch_issue=mock_fetch_issue, owner="", repo=""
+    )
+    assert block is not None
+    assert "#1 criterion 1 [open]: on the next 10 lane PRs that depend on a change" in block
+    assert "#1 criterion 2 [open]: Second ordinary criterion" in block
+    assert "live (operator):" not in block
+    assert "Live proof (left to the brain):" not in block
