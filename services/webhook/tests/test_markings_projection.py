@@ -177,7 +177,9 @@ _TIER1_ADVISORY = {
     "inline_0": "d1aa28ae7d264990e93ad5edcc8801d76409f4cb346662cb1190db05f38902d1",
     "inline_1": "0073265db3a9dccffe42e905144bf6d66ac1741ef3c644ab19be074c87a49126",
     "review_body": "ab9a7ad05178a51a6903e3323e581d1e2f1c3bf26c8590ccb854cea3309e3f78",
-    "review_event": "71772a68c6d1eeb195691104b12656353e37dc9c3079cd85c555515a78aac90b",
+    # #1758: the review state is the verdict in advisory mode too, so a
+    # standing high finding posts REQUEST_CHANGES here (same as blocking).
+    "review_event": "fded070eb4e135b74ab7cde2e12cfb321cf73c032f0132c03403b9d41982cae5",
     "stack_body": "18442d54d0fff878c2591ad20cd15d2b04943365b185d36ffc4ccdca15ce08f0",
     "stack_create_if_absent": "3cbc87c7681f34db4617feaa2c8801931bc5e42d8d0f560e756dd4cd92885f18",
 }
@@ -342,7 +344,7 @@ def _finished():
         file_contents={"src/x.py": "context\nnew1\nnew2\nnew3\n"},
         diff_text=_DIFF, linked_issues=(42,), precedent_notes={}, muted={},
         prior_keys=frozenset(), held_back=frozenset(), held_note="",
-        repo_config=None,
+        repo_config=None, posts_verdict=True,
     )
 
 

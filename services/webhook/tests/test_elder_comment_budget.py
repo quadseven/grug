@@ -290,7 +290,8 @@ def test_a_late_finding_stays_in_the_check(monkeypatch):
 
     posted, checks = _review_with_eight_blocking(monkeypatch, action="synchronize")
 
-    assert posted == []
+    # No inline comment, but the head's verdict still blocks (#1758).
+    assert [(r.event, r.comments) for r in posted] == [("REQUEST_CHANGES", ())]
     assert checks[-1].conclusion == "failure"
 
 

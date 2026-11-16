@@ -567,3 +567,91 @@ def test_deep_append_publishes_when_the_supersession_lookup_fails(
     posted = _run_escalated_review(monkeypatch, deep=_HIGH_DEEP)
 
     assert _deep_checks(posted)
+
+
+# --- #1758: the deep append and Elder's formal verdict ----------------------
+
+
+def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True):
+    """An escalated review that records every posted review and dismissal."""
+    reviews: list = []
+    dismissed: list[int] = []
+    monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **k: list(reviews_on_pr))
+    monkeypatch.setattr(
+        cr_dispatch, "dismiss_review",
+        lambda *a, **kw: dismissed.append(kw["review_id"]) or {},
+    )
+    posted = _run_escalated_review(
+        monkeypatch, deep=deep, posted_reviews=reviews, blocking=blocking,
+    )
+    return posted, reviews, dismissed
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_deep_arm_failure_withdraws_the_tier1_approval(monkeypatch, blocking):
+    """Tier-1 approved a clean head; the deep arm then never ran, so the head
+    is degraded and the approval Tier-1 just gave (review id 1) is withdrawn."""
+    _, reviews, dismissed = _run_with_verdicts(
+        monkeypatch, blocking=blocking,
+        deep=LlmReviewResponse(
+            kind="all_failed", error="cave-reasoner: ConnectError",
+            backend_used=Backend.CAVE_REASONER,
+        ),
+    )
+    assert [r.event for r in reviews] == ["APPROVE"]
+    assert dismissed == [1]
+
+
+def test_deep_append_that_ran_clean_keeps_the_tier1_approval(monkeypatch):
+    ran_clean = LlmReviewResponse(
+        kind="reviewed", findings=(),
+        backend_used=Backend.CAVE_REASONER, model_name="reasoner",
+        backends_used=(Backend.CAVE_REASONER,), models_used=("reasoner",),
+    )
+    _, reviews, dismissed = _run_with_verdicts(monkeypatch, deep=ran_clean)
+    assert [r.event for r in reviews] == ["APPROVE"]
+    assert dismissed == []
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_deep_blocking_finding_requests_changes_over_the_tier1_approval(
+    monkeypatch, blocking,
+):
+    _, reviews, dismissed = _run_with_verdicts(
+        monkeypatch, deep=_HIGH_DEEP, blocking=blocking,
+    )
+    assert [r.event for r in reviews] == ["APPROVE", "REQUEST_CHANGES"]
+    assert dismissed == [1]
+
+
+def test_deep_append_never_approves_a_second_time(monkeypatch):
+    """A deep pass with only advice keeps Tier-1's approval as the head's
+    verdict and never posts a second APPROVE."""
+    medium_deep = LlmReviewResponse(
+        kind="reviewed",
+        findings=(LlmFinding(
+            path="src/auth.py", line=3, rule="null-deref",
+            severity="medium", message="deep",  # type: ignore[arg-type]
+        ),),
+        backend_used=Backend.CAVE_REASONER, model_name="reasoner",
+        backends_used=(Backend.CAVE_REASONER,), models_used=("reasoner",),
+    )
+    _, reviews, dismissed = _run_with_verdicts(monkeypatch, deep=medium_deep)
+    assert [r.event for r in reviews].count("APPROVE") == 1
+    assert reviews[0].event == "APPROVE"
+    assert dismissed == []
+
+
+def test_newer_verdict_review_supersedes_the_deep_append(monkeypatch):
+    """Advisory checks conclude neutral, so the check list cannot show a
+    newer run. A newer Elder verdict review on the head (id 9, after this
+    run's Tier-1 review id 1) does: the deep append neither re-blocks nor
+    withdraws anything."""
+    newer = {"id": 9, "state": "APPROVED", "commit_id": "abcd1234efgh",
+             "body": "<!-- grug:review persona=elder -->",
+             "user": {"login": "grug-tribe[bot]"}, "submitted_at": None}
+    _, reviews, dismissed = _run_with_verdicts(
+        monkeypatch, deep=_HIGH_DEEP, reviews_on_pr=[newer], blocking=False,
+    )
+    assert [r.event for r in reviews] == ["APPROVE", "COMMENT"]
+    assert dismissed == []
