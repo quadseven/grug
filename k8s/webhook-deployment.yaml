@@ -197,7 +197,12 @@ spec:
             - {name: GRUG_STAGED_REVIEW_BUDGET_S, value: "700"}
             # The key has a zero spend limit: a paid model here 403s on every
             # call. Same :free model as the chain's tier 2.
-            - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
+            - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-ultra-550b-a55b:free"}
+            # grug#1544: the OpenRouter free tier model for the cloud chain
+            # (tier 2 after OpenCode Go). Vetted via `make elder-eval`: 18/18
+            # cases scored, catch 0.29, noise 0.00. Replaces the withdrawn
+            # nvidia/nemotron-3-super-120b-a12b:free.
+            - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-ultra-550b-a55b:free"}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
             - {name: GITHUB_APP_WEBHOOK_SECRET_SSM, value: /grug/github-app-webhook-secret}

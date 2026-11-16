@@ -114,7 +114,12 @@ spec:
                 # Go) to the inference gateway's call ledger, beside the calls it routes.
                 - {name: GRUG_CALL_REPORT, value: "true"}
                 - {name: GRUG_SHARED_BENCHES, value: "true"}
-                - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-super-120b-a12b:free"}
+                - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-ultra-550b-a55b:free"}
+                # grug#1544: the OpenRouter free tier model for the cloud chain
+                # (tier 2 after OpenCode Go). Vetted via `make elder-eval`: 18/18
+                # cases scored, catch 0.29, noise 0.00. Replaces the withdrawn
+                # nvidia/nemotron-3-super-120b-a12b:free.
+                - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-ultra-550b-a55b:free"}
                 - {name: GRUG_REVIEW_DEPTH, value: tiered}
                 # grug#1553: GitHub App logins whose PRs carry an author family, as
                 # `login:family` pairs split by `;` (e.g. `lane-app[bot]:claude`). Exact
