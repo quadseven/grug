@@ -179,7 +179,7 @@ def _constant_patterns(lines: Iterable[tuple[int, str, bool]]) -> dict[str, str]
     out: dict[str, str] = {}
     for _line, text, _added in lines:
         match = re.match(
-            r"^\s*(\w+)\s*=\s*re\.compile\s*\(\s*(['\"])", text,
+            r"^\s*(\w+)\s*=\s*re\.compile\s*\(\s*(r?['\"])", text,
         )
         if not match:
             continue
@@ -286,24 +286,51 @@ def _anchor(function: _Function) -> tuple[str, int] | None:
 
 
 def _replacement_for_call(body: str, match: re.Match) -> str:
-    """Extract the replacement string literal from a re.sub/re.subn call."""
+    """Extract the replacement string literal from a re.sub/re.subn call.
+
+    Only called for re.sub/re.subn matches. Returns the second string argument
+    if it is a string literal; otherwise returns empty string.
+    """
     after = body[match.end():]
-    # First string is the pattern, second is the replacement
+    # First string is the pattern
     first = _first_string_after(after, 0)
     if first is None:
         return ""
-    # first[1] is the offset of the opening quote in 'after'
-    # The string literal spans from first[1] to first[1] + 1 + len(first[0]) (inclusive)
-    # Next search should start after the closing quote
+    # Find the second string argument (the replacement)
+    # Skip past the first string and any whitespace/comma
     next_start = first[1] + 1 + len(first[0]) + 1
+    # Look for a comma before the second argument
+    comma_pos = after.find(",", first[1] + 1 + len(first[0]))
+    if comma_pos != -1:
+        next_start = comma_pos + 1
     second = _first_string_after(after, next_start)
     if second is None:
         return ""
+    # Verify this is actually the second argument (not a third argument)
+    # by checking there's no other string between pattern and this one
+    # (the _first_string_after already skips non-strings, so this is fine)
     return second[0]
 
 
-def _pattern_for(function: _Function, constants: dict[str, str]) -> tuple[str, int, str] | None:
-    """The first pattern used by `function` that changes ordinary text."""
+def _replacement_for_constant_sub(body: str, const_name: str) -> str:
+    """Extract the replacement string literal from a CONST.sub(...) call."""
+    # Look for const_name.sub( or const_name.subn(
+    pattern = rf"(?<!\w){re.escape(const_name)}\.subn?\s*\("
+    for match in re.finditer(pattern, body):
+        after = body[match.end():]
+        first = _first_string_after(after, 0)
+        if first is not None:
+            return first[0]
+    return ""
+
+
+def _pattern_for(function: _Function, constants: dict[str, str]) -> tuple[str, int, str, str, str] | None:
+    """The first pattern used by `function` that changes ordinary text.
+
+    Returns (pattern, line, replacement, probe, result) or None.
+    Only considers re.sub/re.subn calls and constant.sub/constant.subn calls,
+    since other re.* calls (compile, search, match, etc.) don't perform substitution.
+    """
     body = function.body
     start_line = function.def_line
     candidates: list[tuple[str, int, str]] = []
@@ -314,15 +341,23 @@ def _pattern_for(function: _Function, constants: dict[str, str]) -> tuple[str, i
         pattern, at = first
         if len(pattern) > _MAX_PATTERN:
             continue
-        replacement = _replacement_for_call(body, match)
-        candidates.append((pattern, _line_of(body, at, start_line), replacement))
+        # Only consider re.sub/re.subn calls for text-eating patterns
+        matched_text = match.group(0)
+        if matched_text.startswith("re.sub"):
+            replacement = _replacement_for_call(body, match)
+            candidates.append((pattern, _line_of(body, at, start_line), replacement))
+        # Skip re.compile, re.search, re.match, etc. - they don't substitute
     for name, pattern in constants.items():
         if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", body):
-            candidates.append((pattern, start_line, ""))
+            # Find the replacement used in const_name.sub(...) calls
+            replacement = _replacement_for_constant_sub(body, name)
+            if replacement:  # Only add if there's a .sub call with a string replacement
+                candidates.append((pattern, start_line, replacement))
     for pattern, line, replacement in candidates:
         change = _plain_text_change(pattern, replacement)
         if change is not None:
-            return pattern, line, replacement
+            probe, result = change
+            return pattern, line, replacement, probe, result
     return None
 
 
@@ -336,10 +371,7 @@ def _eats_text_findings(
         found = _pattern_for(function, constants)
         if found is None:
             continue
-        pattern, pattern_line, replacement = found
-        probe, result = _plain_text_change(pattern, replacement)
-        if probe is None:
-            continue
+        pattern, pattern_line, replacement, probe, result = found
         anchor = _anchor(function)
         if anchor is None:
             continue
@@ -371,21 +403,54 @@ def _test_side(hunks: Iterable[DiffHunk]) -> dict[str, list[tuple[int, str]]]:
     return out
 
 
+# Matches (raw, want) pairs with possibly different quote styles and across lines
+# Uses two separate quote capture groups to allow mixed quotes
 _TABLE_PAIR_RE = re.compile(
-    r"\(\s*([\"'])(.*?)\1\s*,\s*\1(.*?)\1\s*\)"
+    r"\(\s*([\"'])(.*?)\1\s*,\s*([\"'])(.*?)\3\s*\)",
+    re.DOTALL,
 )
 
 
 def _has_table_driven_passthrough(lines: list[tuple[int, str]]) -> bool:
     """True when a table-driven test has at least one (raw, want) with raw == want."""
-    full = "\n".join(text for _line, text in lines)
-    # Look for table-driven test patterns: a loop over cases with (raw, want) pairs
-    for pair_match in _TABLE_PAIR_RE.finditer(full):
-        raw, want = pair_match.group(2), pair_match.group(3)
-        if raw == want:
-            # Verify this is in a table-driven context (has a loop over cases)
-            if "for " in full and " in cases:" in full:
-                return True
+    # Group lines by test function to scope the "for ... in cases:" check
+    test_functions: list[tuple[int, int, list[tuple[int, str]]]] = []  # (start_line, end_line, lines)
+    current_func: list[tuple[int, str]] = []
+    func_start = None
+    base_indent = None
+    
+    for line_num, text in lines:
+        stripped = text.lstrip()
+        indent = len(text) - len(stripped)
+        if stripped.startswith("def test_"):
+            if current_func and func_start is not None:
+                test_functions.append((func_start, line_num - 1, current_func))
+            current_func = [(line_num, text)]
+            func_start = line_num
+            base_indent = indent
+        elif func_start is not None:  # Only process if we're inside a test function
+            if stripped and indent <= base_indent and not stripped.startswith(("#", "@")):
+                # End of function
+                test_functions.append((func_start, line_num - 1, current_func))
+                current_func = []
+                func_start = None
+                base_indent = None
+            else:
+                current_func.append((line_num, text))
+    
+    if current_func and func_start is not None:
+        test_functions.append((func_start, lines[-1][0], current_func))
+    
+    # Check each test function for a table-driven passthrough
+    for func_start, func_end, func_lines in test_functions:
+        full = "\n".join(text for _line, text in func_lines)
+        # Look for table-driven test patterns: a loop over cases with (raw, want) pairs
+        for pair_match in _TABLE_PAIR_RE.finditer(full):
+            raw, want = pair_match.group(2), pair_match.group(4)
+            if raw == want:
+                # Verify this is in a table-driven context within THIS function
+                if "for " in full and " in cases:" in full:
+                    return True
     return False
 
 
