@@ -144,20 +144,15 @@ def _shipped_env(name: str) -> str:
 
 
 def test_the_shipped_chain_leads_with_go_then_the_free_cloud_tiers(monkeypatch) -> None:
-    """grug#1544: OpenCode Go leads, then the vetted OpenRouter free tier, then
-    the Cave. The free tier model was replaced after the previous one
-    (nvidia/nemotron-3-super-120b-a12b:free) was withdrawn. The free pool
-    tier requires GRUG_CAVE_GATEWAY_URL which is not set in the shipped
-    manifests, so it is not included in the chain."""
-    assert all(
+    """grug#1575: OpenCode Go leads again, then the free cloud tiers, and only
+    then the Cave. OpenRouter's paid pool stays off, Poolside is off while it
+    answers 400, and the OpenRouter free tier is not shipped: its model left
+    the catalogue."""
+    assert not any(
         "GRUG_CLOUD_FREE_TIER_MODEL" in (Path(__file__).resolve().parents[3] / "k8s" / name).read_text()
         for name in ("consumer-deployment.yaml", "webhook-deployment.yaml", "poller-cronjob.yaml")
     )
-    assert all(
-        "nvidia/nemotron-3-ultra-550b-a55b:free" in (Path(__file__).resolve().parents[3] / "k8s" / name).read_text()
-        for name in ("consumer-deployment.yaml", "webhook-deployment.yaml", "poller-cronjob.yaml")
-    )
-    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+    monkeypatch.delenv("GRUG_CLOUD_FREE_TIER_MODEL", raising=False)
     monkeypatch.setenv("GRUG_DISABLED_BACKENDS", _shipped_env("GRUG_DISABLED_BACKENDS"))
     monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", _shipped_env("GRUG_CLOUD_FREE_POOL"))
     monkeypatch.setenv(
@@ -167,10 +162,9 @@ def test_the_shipped_chain_leads_with_go_then_the_free_cloud_tiers(monkeypatch) 
     assert [(t.backend, t.model) for t in lc._cloud_chain_tiers()] == [
         (Backend.OPENCODE_GO, "deepseek-v4.1-flash"),
         (Backend.OPENCODE_GO, "beam-free"),
-        (Backend.OPENROUTER, "nvidia/nemotron-3-ultra-550b-a55b:free"),
     ]
     assert not lc._backend_enabled(Backend.OPENROUTER, "anthropic/claude-opus-4.7")
-    assert lc._backend_enabled(Backend.OPENROUTER, "nvidia/nemotron-3-ultra-550b-a55b:free")
+    assert lc._backend_enabled(Backend.OPENROUTER, _FREE)
 
 
 def test_the_shipped_deep_escalation_is_a_mode_the_client_accepts(monkeypatch, caplog) -> None:
