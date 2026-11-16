@@ -20,6 +20,8 @@ from personas.code_reviewer.diff_parser import file_changes, parse_diff
 from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.linked_issue import RULE_CATEGORIES
 
+from tests._work_count import assert_linear, counted_lines
+
 _TITLE = "Show each raider's item level on the raid card"
 _CRITERIA = (
     LinkedCriterion(7, 1, "The raid card shows a row per raider with average item level."),
@@ -1105,24 +1107,6 @@ def test_the_rules_have_board_categories():
 # --- cost (#1367 review: linear, capped) --------------------------------------
 
 
-def _counted_calls(fn):
-    """(result, python call count) of fn() under sys.setprofile: a work
-    count, not a wall clock, so a loaded host cannot move it (grug#1715)."""
-    import sys
-    calls = 0
-
-    def _count(frame, event, arg):
-        nonlocal calls
-        if event == "call":
-            calls += 1
-
-    sys.setprofile(_count)
-    try:
-        return fn(), calls
-    finally:
-        sys.setprofile(None)
-
-
 def _scan_counted(n_files):
     # n_files test files of deleted tests and flips, plus a workflow
     # rewrite of 50 lines per file: about 135 hunk lines per file.
@@ -1143,20 +1127,18 @@ def _scan_counted(n_files):
                                                      + [f"+      step-{n}: run2" for n in range(steps)])))
     diff = "".join(parts)
     changes, hunks = file_changes(diff), parse_diff(diff)
-    return _counted_calls(lambda: wv.scan_weakened_verification(
+    return counted_lines(lambda: wv.scan_weakened_verification(
         changes, hunks, criteria=_CRITERIA, pr_title=_TITLE))
 
 
 def test_the_scan_is_linear_on_a_large_diff():
     # Structural linearity (grug#1715): doubling the diff must less than
-    # triple the scan's counted calls; a quadratic scan grows about four
-    # times. An elapsed-seconds bound flaked on loaded lane hosts.
-    found, calls = _scan_counted(400)
+    # triple the scan's executed lines; a quadratic scan, even one whose
+    # inner loop makes no call, grows about four times. An elapsed-seconds
+    # bound flaked on loaded lane hosts.
+    found, _ = _scan_counted(400)
     assert len(found) == 400
-    _, calls_half = _scan_counted(200)
-    # The counts here are in the tens of thousands, so the bound needs no slack.
-    assert calls_half > 1000, calls_half
-    assert calls < 3 * calls_half, (calls_half, calls)
+    assert_linear(lambda n: _scan_counted(n)[1], 200)
 
 
 def test_past_the_line_cap_the_scan_is_not_evaluated(monkeypatch):

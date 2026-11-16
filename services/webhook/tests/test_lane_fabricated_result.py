@@ -25,6 +25,8 @@ from personas.code_reviewer.fabricated_result import (
 )
 from personas.code_reviewer.lane_work import lane_work_findings
 
+from tests._work_count import assert_linear, counted_lines
+
 _FOOTER = "\n---\nLoom ticket example.bench-44-r2, lane spark, model m.\nRefs #44\n"
 
 
@@ -261,25 +263,6 @@ def test_the_rule_shows_under_a_named_category_not_general():
     assert linked_issue.RULE_CATEGORIES[RULE] == "requirements"
 
 
-def _counted_calls(fn):
-    """Python call count of fn() under sys.setprofile: a work count, not a
-    wall clock, so a loaded host cannot move it (grug#1715)."""
-    import sys
-    calls = 0
-
-    def _count(frame, event, arg):
-        nonlocal calls
-        if event == "call":
-            calls += 1
-
-    sys.setprofile(_count)
-    try:
-        fn()
-    finally:
-        sys.setprofile(None)
-    return calls
-
-
 def _large_diff(n_files):
     # Every rate is possible, so every line of every file is read in full.
     rates = " ".join(f"{100 * k / 30:.1f}%" for k in range(31))
@@ -297,14 +280,14 @@ def test_the_scan_is_linear_on_a_large_diff():
     assert 300 * 40 * 31 * 40 > MAX_RATE_CHECKS
     assert scan_fabricated_results(changes, hunks) == ()
     # Structural linearity (grug#1715): doubling the diff must less than
-    # triple the scan's counted calls; a quadratic scan grows about four
-    # times. An elapsed-seconds bound flaked on loaded lane hosts.
-    calls = _counted_calls(lambda: scan_fabricated_results(changes, hunks))
-    half_changes, half_hunks = _large_diff(150)
-    calls_half = _counted_calls(lambda: scan_fabricated_results(half_changes, half_hunks))
-    # The counts here are in the tens of thousands, so the bound needs no slack.
-    assert calls_half > 1000, calls_half
-    assert calls < 3 * calls_half, (calls_half, calls)
+    # triple the scan's executed lines; a quadratic scan, even one whose
+    # inner loop makes no call, grows about four times. An elapsed-seconds
+    # bound flaked on loaded lane hosts.
+    def scan_lines(n_files):
+        diff = _large_diff(n_files)
+        return counted_lines(lambda: scan_fabricated_results(*diff))[1]
+
+    assert_linear(scan_lines, 150)
 
 
 def test_a_diff_past_the_bound_is_not_evaluated():

@@ -14,6 +14,8 @@ from personas.code_reviewer.diff_parser import file_changes, parse_diff
 from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.wrong_target import scan_wrong_target, ticket_targets
 
+from tests._work_count import assert_linear, counted_lines
+
 _FOOTER = "\n---\nLoom ticket example.iac-12-r1, lane codex, model gpt-6-luna.\nRefs example/iac#12\n"  # leak-guard-allow: placeholder repo
 _TITLE = "Keep workloads off the memory-pressured node"
 _BOXES = (
@@ -193,24 +195,6 @@ def test_too_many_targets_is_not_evaluated(monkeypatch):
     assert _scan(_recorded_diff(), [_BOXES[0][3]]) == ()
 
 
-def _counted_calls(fn):
-    """(result, python call count) of fn() under sys.setprofile: a work
-    count, not a wall clock, so a loaded host cannot move it (grug#1715)."""
-    import sys
-    calls = 0
-
-    def _count(frame, event, arg):
-        nonlocal calls
-        if event == "call":
-            calls += 1
-
-    sys.setprofile(_count)
-    try:
-        return fn(), calls
-    finally:
-        sys.setprofile(None)
-
-
 def _scan_counted(n_files):
     # n_files files of 120 changed lines, with 40 targets (the cap) the
     # ticket names that no line changes.
@@ -226,20 +210,18 @@ def _scan_counted(n_files):
     texts = [" ".join(f"`names_target_{k}`" for k in range(40)) + " are updated."]
     changes, hunks = file_changes(diff), parse_diff(diff)
     criteria = (LinkedCriterion(12, 1, texts[0]),)
-    return _counted_calls(lambda: scan_wrong_target(
+    return counted_lines(lambda: scan_wrong_target(
         changes, hunks, criteria=criteria, pr_title="Update the targets"))
 
 
 def test_the_scan_is_linear_on_a_large_diff():
     # Structural linearity (grug#1715): doubling the diff must less than
-    # triple the scan's counted calls; a quadratic scan grows about four
-    # times. An elapsed-seconds bound flaked on loaded lane hosts.
-    found, calls = _scan_counted(400)
+    # triple the scan's executed lines; a quadratic scan, even one whose
+    # inner loop makes no call, grows about four times. An elapsed-seconds
+    # bound flaked on loaded lane hosts.
+    found, _ = _scan_counted(400)
     assert len(found) == 1
-    _, calls_half = _scan_counted(200)
-    # The counts here are in the tens of thousands, so the bound needs no slack.
-    assert calls_half > 1000, calls_half
-    assert calls < 3 * calls_half, (calls_half, calls)
+    assert_linear(lambda n: _scan_counted(n)[1], 200)
 
 
 # --- held-out good lane PRs (2026-10-22) -----------------------------------------

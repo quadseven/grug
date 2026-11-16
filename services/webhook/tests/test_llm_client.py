@@ -778,7 +778,7 @@ def test_call_backend_cancel_event_aborts_in_flight_request() -> None:
     try:
         server = _ThreadingServer(("127.0.0.1", 0), _SlowHandler)
     except PermissionError as exc:
-        if exc.errno != errno.EPERM:
+        if exc.errno not in (errno.EPERM, errno.EACCES):
             raise
         pytest.skip("sandbox refuses binding a local test server (PermissionError); "
                     "the cancel test cannot run here (grug#1715)")
@@ -804,7 +804,7 @@ def test_call_backend_cancel_event_aborts_in_flight_request() -> None:
             with pytest.raises((httpx.RequestError, httpx.TimeoutException)):
                 lc._call_backend(config, [{"role": "user", "content": "hi"}], cancel_event=cancel_event)
         except PermissionError as exc:
-            if exc.errno != errno.EPERM:
+            if exc.errno not in (errno.EPERM, errno.EACCES):
                 raise  # only the sandbox refusal skips; any other PermissionError is a real failure
             pytest.skip("sandbox refuses the socket operation the cancel watcher "
                         "needs (PermissionError); the cancel test cannot run "
