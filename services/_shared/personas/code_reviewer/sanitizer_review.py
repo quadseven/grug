@@ -179,7 +179,7 @@ def _constant_patterns(lines: Iterable[tuple[int, str, bool]]) -> dict[str, str]
     out: dict[str, str] = {}
     for _line, text, _added in lines:
         match = re.match(
-            r"^\s*(\w+)\s*=\s*re\.compile\s*\(\s*(['\"])", text,
+            r"^\s*(\w+)\s*=\s*re\.compile\s*\(\s*(r?['\"])", text,
         )
         if not match:
             continue
@@ -241,14 +241,38 @@ def _is_sanitizer(function: _Function, constants: dict[str, str]) -> bool:
     )
 
 
-def _plain_text_change(pattern: str) -> tuple[str, str] | None:
-    """(probe, result) for the first ordinary probe the pattern changes."""
+def _is_whitespace_only(pattern: str) -> bool:
+    """True if the pattern is a simple whitespace matcher like \\s+ or [\\s]+."""
+    # Match patterns that only contain whitespace escapes and quantifiers
+    # e.g., \s+, \s*, [\s]+, [\s]*, \s+|\s+ (alternation of whitespace)
+    if not pattern:
+        return False
+    # Check if pattern consists only of \s, [\s], quantifiers, parentheses, alternation
+    # Simple heuristic: after removing quantifiers +*?{} and grouping ()|, only \s and [\s] remain
+    simplified = re.sub(r"[\+\*\?\{\}\(\)\|]", "", pattern)
+    # Now simplified should only contain \s and [\s] constructs
+    return bool(re.fullmatch(r"(\\\s|\[\s\])+", simplified))
+
+
+def _is_negated_char_class(pattern: str) -> bool:
+    """True if the pattern is a single negated character class like [^...]."""
+    return bool(re.fullmatch(r"\[\^[^\]]+\]", pattern))
+
+
+def _plain_text_change(pattern: str, replacement: str = "") -> tuple[str, str] | None:
+    """(probe, result) for the first ordinary probe the pattern changes.
+
+    Patterns that match only whitespace or are a single negated character
+    class (an allow-list) are never reported.
+    """
+    if _is_whitespace_only(pattern) or _is_negated_char_class(pattern):
+        return None
     try:
         compiled = re.compile(pattern)
     except re.error:
         return None
     for probe in _PROBES:
-        result = compiled.sub("", probe)
+        result = compiled.sub(replacement, probe)
         if result != probe:
             return probe, result
     return None
@@ -261,16 +285,73 @@ def _anchor(function: _Function) -> tuple[str, int] | None:
     return function.path, line
 
 
-def _pattern_for(function: _Function, constants: dict[str, str]) -> tuple[str, int] | None:
-    """The first pattern used by `function` that changes ordinary text."""
-    candidates = _patterns_in(function.body, function.def_line)
+_PATTERN_TO_REPLACEMENT_GAP_RE = re.compile(r"[\"']*\s*,\s*[rRuU]?")
+_LEADING_PREFIX_RE = re.compile(r"\s*[rRuU]?")
+
+
+def _replacement_for_call(body: str, match: re.Match) -> str:
+    """The replacement string literal of a re.sub/re.subn call.
+
+    Only the argument directly after the pattern counts. When it is a name
+    or any other expression, no literal is known and the result is "".
+    """
+    after = body[match.end():]
+    literals = _string_literals(after)
+    if len(literals) < 2:
+        return ""
+    (first_at, first_value), (second_at, second_value) = literals[0], literals[1]
+    gap = after[first_at + 1 + len(first_value):second_at]
+    if _PATTERN_TO_REPLACEMENT_GAP_RE.fullmatch(gap) is None:
+        return ""
+    return second_value
+
+
+def _replacement_for_constant_sub(body: str, const_name: str) -> str | None:
+    """The replacement string literal of a CONST.sub(...) call, or None when
+    there is no such call or its first argument is not a string literal."""
+    pattern = rf"(?<!\w){re.escape(const_name)}\.subn?\s*\("
+    for match in re.finditer(pattern, body):
+        after = body[match.end():]
+        first = _first_string_after(after, 0)
+        if first is not None and _LEADING_PREFIX_RE.fullmatch(after[:first[1]]):
+            return first[0]
+    return None
+
+
+def _pattern_for(function: _Function, constants: dict[str, str]) -> tuple[str, int, str, str, str] | None:
+    """The first pattern used by `function` that changes ordinary text.
+
+    Returns (pattern, line, replacement, probe, result) or None.
+    Only considers re.sub/re.subn calls and constant.sub/constant.subn calls,
+    since other re.* calls (compile, search, match, etc.) don't perform substitution.
+    """
+    body = function.body
+    start_line = function.def_line
+    candidates: list[tuple[str, int, str]] = []
+    for match in _REGEX_CALL_RE.finditer(body):
+        first = _first_string_after(body, match.end())
+        if first is None:
+            continue
+        pattern, at = first
+        if len(pattern) > _MAX_PATTERN:
+            continue
+        # Only consider re.sub/re.subn calls for text-eating patterns
+        matched_text = match.group(0)
+        if matched_text.startswith("re.sub"):
+            replacement = _replacement_for_call(body, match)
+            candidates.append((pattern, _line_of(body, at, start_line), replacement))
+        # Skip re.compile, re.search, re.match, etc. - they don't substitute
     for name, pattern in constants.items():
-        if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", function.body):
-            candidates.append((pattern, function.def_line))
-    for pattern, line in candidates:
-        change = _plain_text_change(pattern)
+        if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", body):
+            # Find the replacement used in const_name.sub(...) calls
+            replacement = _replacement_for_constant_sub(body, name)
+            if replacement is not None:  # A .sub call with a literal, "" included
+                candidates.append((pattern, start_line, replacement))
+    for pattern, line, replacement in candidates:
+        change = _plain_text_change(pattern, replacement)
         if change is not None:
-            return pattern, line
+            probe, result = change
+            return pattern, line, replacement, probe, result
     return None
 
 
@@ -284,8 +365,7 @@ def _eats_text_findings(
         found = _pattern_for(function, constants)
         if found is None:
             continue
-        pattern, pattern_line = found
-        probe, result = _plain_text_change(pattern)
+        pattern, pattern_line, replacement, probe, result = found
         anchor = _anchor(function)
         if anchor is None:
             continue
@@ -317,15 +397,68 @@ def _test_side(hunks: Iterable[DiffHunk]) -> dict[str, list[tuple[int, str]]]:
     return out
 
 
+# Matches (raw, want) pairs with possibly different quote styles and across lines
+# Uses two separate quote capture groups to allow mixed quotes
+_TABLE_PAIR_RE = re.compile(
+    r"\(\s*([\"'])(.*?)\1\s*,\s*([\"'])(.*?)\3\s*\)",
+    re.DOTALL,
+)
+
+
+def _has_table_driven_passthrough(lines: list[tuple[int, str]]) -> bool:
+    """True when a table-driven test has at least one (raw, want) with raw == want."""
+    # Group lines by test function to scope the "for ... in cases:" check
+    test_functions: list[tuple[int, int, list[tuple[int, str]]]] = []  # (start_line, end_line, lines)
+    current_func: list[tuple[int, str]] = []
+    func_start = None
+    base_indent = None
+    
+    for line_num, text in lines:
+        stripped = text.lstrip()
+        indent = len(text) - len(stripped)
+        if stripped.startswith("def test_"):
+            if current_func and func_start is not None:
+                test_functions.append((func_start, line_num - 1, current_func))
+            current_func = [(line_num, text)]
+            func_start = line_num
+            base_indent = indent
+        elif func_start is not None:  # Only process if we're inside a test function
+            if stripped and indent <= base_indent and not stripped.startswith(("#", "@")):
+                # End of function
+                test_functions.append((func_start, line_num - 1, current_func))
+                current_func = []
+                func_start = None
+                base_indent = None
+            else:
+                current_func.append((line_num, text))
+    
+    if current_func and func_start is not None:
+        test_functions.append((func_start, lines[-1][0], current_func))
+    
+    # Check each test function for a table-driven passthrough
+    for _start, _end, func_lines in test_functions:
+        full = "\n".join(text for _line, text in func_lines)
+        # Look for table-driven test patterns: a loop over cases with (raw, want) pairs
+        for pair_match in _TABLE_PAIR_RE.finditer(full):
+            raw, want = pair_match.group(2), pair_match.group(4)
+            if raw == want:
+                # Verify this is in a table-driven context within THIS function
+                if "for " in full and " in cases:" in full:
+                    return True
+    return False
+
+
 def _has_passthrough_test(
     function_name: str, tests: dict[str, list[tuple[int, str]]],
 ) -> bool:
     """True when an added test calls `function_name` with a string and its
-    expected value is the same string."""
+    expected value is the same string, including table-driven tests."""
     call_re = re.compile(rf"(?<!\w){re.escape(function_name)}\s*\(")
     inputs: set[str] = set()
     expected: set[str] = set()
     for lines in tests.values():
+        if _has_table_driven_passthrough(lines):
+            return True
         for _line, text in lines:
             compares = list(_COMPARE_RE.finditer(text))
             if compares:
