@@ -27,7 +27,18 @@ LOOK_ALIKES = (
     "Ensure the parser accepts input `a,,b`; it raises IndexError today.",
     "When `count` is 0 the division crashes. Make sure to guard it.",
     "This uses `<` instead of `<=`, so the final page is never read.",
+    "Ensure the timeout is set; otherwise this request hangs.",
+    "Make sure the key exists, or else the lookup raises KeyError.",
 )
+
+
+def test_a_long_run_of_lead_ins_is_matched_in_linear_time():
+    import time
+
+    message = "Grug say" + ":\tgrug ask" * 20_000 + "!"
+    started = time.monotonic()
+    is_verify_only(message)
+    assert time.monotonic() - started < 0.5
 
 
 @pytest.mark.parametrize("message", VERIFY_ONLY)
