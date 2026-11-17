@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import re
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
-from review_latency.fixtures import default_fixtures
+from llm_client import _build_messages
+from review_evidence import assemble_evidence
+from review_latency import __main__ as cli
+from review_latency.fixtures import default_fixtures, real_fixtures
 from review_latency.scoring import (
     TrialResult,
     percentile,
@@ -348,3 +353,74 @@ def test_run_one_stream_transport_failure_finishes_span_then_retries(monkeypatch
     assert len(finished) == 1, "stream attempt span must be finished exactly once"
     assert finished[0][0].errored is True
     assert "stream transport failed" in finished[0][1]
+
+
+# --- real fixtures built from merged pull requests (#648) -------------------
+
+_FIXTURES_DIR = Path(__file__).resolve().parent.parent / "review_latency" / "fixtures"
+_TOKEN_SHAPES = re.compile(
+    r"ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gh[ousr]_[A-Za-z0-9]{20,}"
+    r"|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}"
+)
+
+
+def _synthetic_diff_chars(fixture) -> int:
+    """Chars of the synthetic fixture's diff section: its hunk bodies, which
+    the prompt carries verbatim."""
+    return sum(
+        len(line) for m in fixture.messages for line in m["content"].splitlines()
+        if line.startswith("+") and "synthetic review bait" in line
+    )
+
+
+def test_real_fixtures_count_and_size_spread():
+    fixtures = real_fixtures()
+    assert 8 <= len(fixtures) <= 12
+    sizes = sorted(f.prompt_chars for f in fixtures)
+    assert sizes[-1] > 1.5 * sizes[0], "real fixtures should span a spread of sizes"
+
+
+def test_real_fixtures_rebuild_through_elder_path_and_beat_synthetic_diff():
+    largest_synthetic_diff = max(_synthetic_diff_chars(f) for f in default_fixtures())
+    assert largest_synthetic_diff > 0
+    for f in real_fixtures():
+        evidence = assemble_evidence(
+            list(f.hunks), pr_context=f.pr_context, file_contents=f.file_contents,
+        )
+        messages = _build_messages(evidence, "v2")
+        rebuilt = sum(len(m["content"]) for m in messages)
+        assert rebuilt == f.prompt_chars, f.name
+        assert f.title and f.title in messages[-1]["content"], f.name
+        assert f.prompt_chars > largest_synthetic_diff, f.name
+
+
+def test_fixture_files_contain_no_token_shaped_strings():
+    paths = sorted(_FIXTURES_DIR.glob("*.json"))
+    assert paths
+    for path in paths:
+        hit = _TOKEN_SHAPES.search(path.read_text(encoding="utf-8"))
+        assert hit is None, f"{path.name} has a token-shaped string"
+
+
+def test_dry_run_real_prints_one_line_per_fixture_without_network(monkeypatch, capsys):
+    def _no_network(*_a, **_k):
+        raise AssertionError("dry run must not reach a backend")
+
+    monkeypatch.setattr(cli, "sweep", _no_network)
+    monkeypatch.setattr(cli, "_backends_from_env", _no_network)
+    monkeypatch.setattr(httpx, "Client", _no_network)
+    monkeypatch.setattr(httpx, "AsyncClient", _no_network)
+
+    assert cli.main(["--fixtures", "real", "--dry-run"]) == 0
+    lines = capsys.readouterr().out.strip().splitlines()
+    expected = real_fixtures()
+    assert len(lines) == len(expected)
+    for line, f in zip(lines, expected, strict=True):
+        assert line.startswith(f"{f.name}: {f.prompt_chars} prompt chars")
+        assert "tokens" in line
+
+
+def test_dry_run_default_lists_only_synthetic(capsys):
+    assert cli.main(["--dry-run"]) == 0
+    names = [ln.split(":")[0] for ln in capsys.readouterr().out.strip().splitlines()]
+    assert names == [f.name for f in default_fixtures()]

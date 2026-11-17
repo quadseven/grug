@@ -1,7 +1,10 @@
-"""Synthetic long-context review fixtures for latency replay (#648).
+"""Review fixtures for latency replay (#648).
 
-These are NOT quality ground truth — they exist to stress prefill + decode
-with Elder-shaped prompts. No secrets, no real hostnames, no customer code.
+Synthetic fixtures (default_fixtures) repeat one added line per hunk; real
+fixtures (real_fixtures) replay merged pull requests of this repo from
+fixtures/*.json (diff, base file contents, PR title and body). Neither is
+quality ground truth - they exist to stress prefill + decode with
+Elder-shaped prompts. No secrets, no customer code.
 
 Uses llm_client._build_messages deliberately (same pattern as elder_eval /
 sast_benchmark runners): the harness must measure Elder's real prompt path,
@@ -168,16 +171,3 @@ def real_fixtures() -> tuple[RealLatencyFixture, ...]:
     """Fixtures built from real merged pull requests in this repo."""
     return tuple(_build_real_fixture(s) for s in _load_real_specs())
 
-
-# Common aliases for callers / hidden tests.
-load_real_fixtures = real_fixtures
-default_real_fixtures = real_fixtures
-real_latency_fixtures = real_fixtures
-all_real_fixtures = real_fixtures
-
-
-def __getattr__(name: str):
-    low = name.lower()
-    if "real" in low and "fixture" in low:
-        return real_fixtures
-    raise AttributeError(name)
