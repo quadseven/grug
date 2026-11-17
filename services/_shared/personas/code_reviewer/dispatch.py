@@ -5442,6 +5442,9 @@ def _async_deep_append_if_needed(
     )
     summary = _intent_paragraph(pr_context) + summary
     summary += config_note
+    summary += _linked_issue_summary_note(
+        str(pr_context.get("linked_issue_context") or ""),
+    )
     title = f"{ADVISORY_TITLE if outage.advisory else title} (deep append)"
     # The author-facing distinction #848 asks for: "the reasoner ran and
     # found nothing" and "the reasoner did not run" are different news, and
