@@ -1985,7 +1985,7 @@ def list_decline_outcomes(repo: str) -> list[dict[str, Any]]:
             SELECT pk, sk, data FROM grug_kv
             WHERE pk = %s AND sk LIKE 'DECLINE#%%' AND {TTL_LIVE}
             ORDER BY sk COLLATE "C" ASC
-            """,
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
             (_decline_outcome_pk(repo),),
         ).fetchall()
     return [dict(decode_item(pk, sk, data)) for pk, sk, data in rows]
