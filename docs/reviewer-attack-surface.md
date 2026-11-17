@@ -17,18 +17,23 @@ data. No repository code runs in a pod that holds a credential.
 
 | Surface | PR-controlled input | Read from | Boundary | State |
 | --- | --- | --- | --- | --- |
-| ruff (`lint.py`) | Changed `.py` file text | Head | Scrubbed environment, read-only copy, `--isolated`, no config on disk | Convention only, #1576 |
-| opengrep analyzer (`analyzers.py`) | Changed JS and TS file text | Head | Scrubbed environment, read-only copy, Grug's rules | Convention only, #1576 |
-| opengrep scan (`sast.py`) | All changed file text | Head | Same as above since #1574; a PR's own ignore files are dropped | Convention only, #1576 |
+| ruff (`lint.py`) | Changed `.py` file text | Head | Landlock and seccomp, read-only copy, `--isolated`, no config on disk | Sandboxed, #1576 |
+| opengrep analyzer (`analyzers.py`) | Changed JS and TS file text | Head | Landlock and seccomp, read-only copy, Grug's rules | Sandboxed, #1576 |
+| opengrep scan (`sast.py`) | All changed file text | Head | Landlock and seccomp, read-only copy, Grug's rules, PR ignore files dropped | Sandboxed, #1576 |
 | Smasher Trial (`smasher/`) | The repo's code and tests | Head | Separate Job, no credential, read-only checkout; deny-all egress needs a policy-enforcing CNI (ADR-0013) | Sandboxed; off by default |
 | Trial dependency install | Requirements files | Head | Wheels only and no build backend. Option lines and direct references are dropped before pip reads the file, and pip runs isolated against the configured index only, so the file cannot choose the host the prep pod connects to, #1580 | Sandboxed; off by default |
 | Trial tarball unpack | Archive member names | Head | Members outside the destination and links are skipped | Handled in code |
 | Grug's own CI | This repo's PRs | Head | No `pull_request_target`; previews run for same-repo PRs only | Handled in config |
 
-"Convention only" means the child process shares the pod's user id, network and
-filesystem view. Scrubbing keeps secrets out of its environment, and no analyzer
-is asked to reach the network, but a flaw in the engine's own parser would not
-meet an operating-system boundary.
+The runtime image launches each analyzer with a scrubbed environment and closes
+inherited descriptors. Landlock allows reads of the copied files, trusted rules,
+and immutable runtime files. Each child gets private writable scratch. The
+pod's credential mounts and other processes' environments are outside that
+boundary. Seccomp denies network socket creation and permits only private
+connection-oriented Unix socket pairs for opengrep's event loop. This works
+with the existing pod security context and is independent of network policy.
+If the kernel cannot install either restriction, the analyzer is skipped.
+Opengrep is unpacked at image build time so scans share immutable engine code.
 
 ## Instructions
 
@@ -88,3 +93,23 @@ second App, which a person registers, and #1500 depends on that decision.
   access is measured by the child's environment. A missing engine fails CI.
 - That run covers the analyzers on a CI runner. The run through a live
   installation on a test repository, against a deployed build, is #1587.
+
+### Kernel boundary proof for #1576
+
+On 2026-11-17, `test_analyzer_child_cannot_access_parent_resources` failed on
+the old launch path and passed with the launcher in an arm64 K3s
+v1.37.2+k3s1 pod with Calico v3.33.1 and Linux 6.8. The pod used UID 10001,
+`RuntimeDefault` seccomp, all capabilities dropped, and a read-only root
+filesystem. A second pod's Calico deny-egress policy blocked an ordinary
+TCP connection to the test Service. The reviewer parent could reach that
+Service and a loopback listener and could read the synthetic credential mount
+and its own environment. The analyzer was denied each operation by the
+kernel. Real-engine checks in the same pod still reported the planted ruff,
+SAST, and Elder findings.
+
+In the same cluster, a 40-file fixture (20 Python, 20 JavaScript) ran Elder's
+ruff and opengrep passes plus the standalone SAST pass. The warm median over
+12 runs fell from 2.52 s on `dc55243e` to 1.99 s with the launcher and bundled
+runtime, a 0.53 s reduction. The first run took 2.62 s before and 1.94 s after.
+The timings cover the analyzer portion of a review and exclude GitHub and
+model calls. Both runs used pinned opengrep 1.27.1 and the same ruff binary.
