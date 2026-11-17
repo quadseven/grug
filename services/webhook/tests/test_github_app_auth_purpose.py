@@ -9,6 +9,7 @@ installation grants, so an install without `administration` still mints.
 from __future__ import annotations
 
 import ast
+import logging
 import pathlib
 from unittest.mock import MagicMock, patch
 
@@ -79,6 +80,55 @@ def test_review_token_requests_no_administration_and_read_only_contents():
     assert perms["statuses"] == "write"
     assert perms["metadata"] == "read"
     assert get_mock.call_args.args[0].endswith("/app/installations/7")
+
+
+def test_review_token_logs_response_permissions_without_credentials(caplog):
+    import github_app_auth as gh
+
+    token = "tok-example"
+    permissions = {"contents": "read", "pull_requests": "write"}
+    get_mock, _ = _github(FULL_GRANT)
+    response = MagicMock()
+    response.json.return_value = {"token": token, "permissions": permissions}
+    caplog.set_level(logging.DEBUG)
+    with patch("httpx.get", get_mock), patch("httpx.post", return_value=response):
+        assert gh.get_install_token(7) == token
+
+    assert all(token not in record.getMessage() and token not in repr(vars(record))
+               for record in caplog.records)
+    (event,) = [r for r in caplog.records if r.getMessage() == "install_token_minted"]
+    assert (event.levelno, event.installation_id, event.purpose, event.permissions) == (
+        logging.INFO, 7, "review", permissions,
+    )
+
+
+def test_cached_review_token_does_not_log_another_mint(caplog):
+    import github_app_auth as gh
+
+    get_mock, post_mock = _github(FULL_GRANT)
+    caplog.set_level(logging.INFO)
+    with patch("httpx.get", get_mock), patch("httpx.post", post_mock):
+        token = gh.get_install_token(7)
+        assert gh.get_install_token(7) == token
+
+    assert [r.getMessage() for r in caplog.records].count("install_token_minted") == 1
+
+
+@pytest.mark.parametrize("fields", [{}, {"permissions": []},
+                                    {"permissions": {"contents": 1}},
+                                    {"permissions": {1: "read"}}])
+def test_token_with_missing_or_invalid_permissions_logs_none(caplog, fields):
+    import github_app_auth as gh
+
+    get_mock, _ = _github(FULL_GRANT)
+    response = MagicMock()
+    response.json.return_value = {"token": "tok-example", **fields}
+    caplog.set_level(logging.INFO)
+    with patch("httpx.get", get_mock), patch("httpx.post", return_value=response):
+        assert gh.get_install_token(7) == "tok-example"
+
+    (event,) = [r for r in caplog.records if r.getMessage() == "install_token_minted"]
+    assert event.permissions is None
 
 
 def test_ruleset_token_adds_administration_write_but_cannot_push():
