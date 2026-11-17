@@ -269,3 +269,35 @@ def test_funnel_filters_run_before_the_judge():
     assert graded == [()]
     assert result.defensive_dropped == 1
     assert result.evaluation.findings == ()
+
+
+def test_funnel_ranks_defects_before_style_kinds():
+    """grug#1767: published findings rank by expected defect value. Defect
+    kinds come first, by severity; style kinds (complexity, dead code,
+    broad-except) trail them, so a budget or a reader reaches the defects
+    first. Ties keep their order."""
+    from personas.code_reviewer.finding_funnel import publish_funnel
+
+    def finding(line, rule, severity):
+        return Finding(
+            file=_PY_PATH, line=line, rule_name=rule, severity=severity,
+            message=f"{rule} named by caller `main`", suggestion=None,
+        )
+
+    findings = (
+        finding(2, "high-complexity", "medium"),
+        finding(2, "broad-except-masks-bug", "medium"),
+        finding(3, "race-condition", "medium"),
+        finding(3, "null-deref", "high"),
+        finding(2, "missing-test-coverage", "medium"),
+    )
+    result = publish_funnel(
+        CodeReviewEvaluation(findings=findings, conclusion="failure"),
+        _CONTENTS, {}, grade=lambda e: (), verify=lambda e: e,
+        falsify=lambda found, *_: found,
+    )
+
+    assert [f.rule_name for f in result.evaluation.findings] == [
+        "null-deref", "race-condition", "missing-test-coverage",
+        "high-complexity", "broad-except-masks-bug",
+    ]
