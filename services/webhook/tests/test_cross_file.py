@@ -676,3 +676,157 @@ def test_stale_assertion_in_untouched_test_reaches_the_model():
         )
     assert any("Welcome back, friend" in q for q in queried)
     assert 'assert greeting() == "Welcome back, friend"' in out["tests/test_messages.py"]
+
+
+# ── ranking and test-file detection (T1756) ────────────────────────────
+
+
+def test_rank_candidates_orders_caller_then_test_then_definition():
+    """Ranking: caller files first, then test files, then definition files,
+    then by number of matched symbols descending."""
+    from personas.code_reviewer.cross_file import (
+        CrossFileCandidate,
+        FileTag,
+        rank_cross_file_candidates,
+    )
+
+    candidates = [
+        CrossFileCandidate(
+            path="src/definition.py",
+            content="def fetch_user():\n    pass\n",
+            matched_symbols=("fetch_user",),
+            tag=FileTag.DEFINITION,
+        ),
+        CrossFileCandidate(
+            path="tests/test_fetch.py",
+            content="def test_fetch():\n    fetch_user()\n",
+            matched_symbols=("fetch_user",),
+            tag=FileTag.TEST,
+        ),
+        CrossFileCandidate(
+            path="src/caller.py",
+            content="def call_it():\n    fetch_user()\n",
+            matched_symbols=("fetch_user",),
+            tag=FileTag.CALLER,
+        ),
+    ]
+
+    ranked = rank_cross_file_candidates(candidates, char_budget=10000)
+    assert [c.path for c in ranked] == [
+        "src/caller.py",
+        "tests/test_fetch.py",
+        "src/definition.py",
+    ]
+
+
+def test_rank_candidates_trims_to_char_budget_drops_lowest_ranked_first():
+    """Character budget trims by dropping the lowest-ranked whole file first,
+    never cutting a snippet mid-file."""
+    from personas.code_reviewer.cross_file import (
+        CrossFileCandidate,
+        FileTag,
+        rank_cross_file_candidates,
+    )
+
+    # Each snippet ~300 chars. Budget 600 -> fits 2 files (caller + test), drops definition.
+    caller = CrossFileCandidate(
+        path="src/caller.py",
+        content="1: def call_it():\n2:     fetch_user()\n" + "x" * 250,
+        matched_symbols=("fetch_user",),
+        tag=FileTag.CALLER,
+    )
+    test_file = CrossFileCandidate(
+        path="tests/test_fetch.py",
+        content="1: def test_fetch():\n2:     fetch_user()\n" + "y" * 250,
+        matched_symbols=("fetch_user",),
+        tag=FileTag.TEST,
+    )
+    definition = CrossFileCandidate(
+        path="src/definition.py",
+        content="1: def fetch_user():\n2:     pass\n" + "z" * 250,
+        matched_symbols=("fetch_user",),
+        tag=FileTag.DEFINITION,
+    )
+
+    ranked = rank_cross_file_candidates(
+        [caller, test_file, definition], char_budget=600
+    )
+    assert [c.path for c in ranked] == ["src/caller.py", "tests/test_fetch.py"]
+    # Total chars of kept files should be within budget
+    total = sum(len(c.content) for c in ranked)
+    assert total <= 600
+
+
+def test_rank_candidates_prefers_more_matched_symbols_within_same_tag():
+    """Within the same tag, more matched symbols ranks higher."""
+    from personas.code_reviewer.cross_file import (
+        CrossFileCandidate,
+        FileTag,
+        rank_cross_file_candidates,
+    )
+
+    caller_one = CrossFileCandidate(
+        path="src/caller_one.py",
+        content="fetch_user()\n",
+        matched_symbols=("fetch_user",),
+        tag=FileTag.CALLER,
+    )
+    caller_two = CrossFileCandidate(
+        path="src/caller_two.py",
+        content="fetch_user()\nvalidate_tenant()\n",
+        matched_symbols=("fetch_user", "validate_tenant"),
+        tag=FileTag.CALLER,
+    )
+
+    ranked = rank_cross_file_candidates([caller_one, caller_two], char_budget=10000)
+    assert [c.path for c in ranked] == ["src/caller_two.py", "src/caller_one.py"]
+
+
+def test_is_test_file_detects_test_paths():
+    """Test file detection: paths under tests/, test_*.py, *_test.py."""
+    from personas.code_reviewer.cross_file import is_test_file
+
+    assert is_test_file("tests/test_fetch.py") is True
+    assert is_test_file("src/tests/helper.py") is True
+    assert is_test_file("test_fetch.py") is True
+    assert is_test_file("fetch_test.py") is True
+    assert is_test_file("src/fetch.py") is False
+    assert is_test_file("src/testing_utils.py") is False
+    assert is_test_file("conftest.py") is False
+
+
+def test_tag_candidate_classifies_caller_test_definition():
+    """Tagging logic: test paths -> TEST; content with 'def sym(' -> DEFINITION;
+    otherwise -> CALLER."""
+    from personas.code_reviewer.cross_file import (
+        CrossFileCandidate,
+        FileTag,
+        tag_candidate,
+    )
+
+    # Test file -> TEST tag
+    test_cand = CrossFileCandidate(
+        path="tests/test_fetch.py",
+        content="def test_it():\n    fetch_user()\n",
+        matched_symbols=("fetch_user",),
+        tag=FileTag.CALLER,
+    )
+    assert tag_candidate(test_cand).tag == FileTag.TEST
+
+    # Definition content -> DEFINITION tag
+    def_cand = CrossFileCandidate(
+        path="src/api.py",
+        content="def fetch_user():\n    pass\n",
+        matched_symbols=("fetch_user",),
+        tag=FileTag.CALLER,
+    )
+    assert tag_candidate(def_cand).tag == FileTag.DEFINITION
+
+    # Caller content (calls but doesn't define) -> CALLER tag
+    caller_cand = CrossFileCandidate(
+        path="src/caller.py",
+        content="fetch_user()\n",
+        matched_symbols=("fetch_user",),
+        tag=FileTag.CALLER,
+    )
+    assert tag_candidate(caller_cand).tag == FileTag.CALLER
