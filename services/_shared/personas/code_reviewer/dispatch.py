@@ -4723,6 +4723,22 @@ def _from_later_run(review: dict[str, Any], run_started_at: datetime) -> bool:
     return started is not None and started > run_started_at
 
 
+def _is_superseded(
+    review: dict[str, Any], *, state: str, head_sha: str,
+    run_started_at: datetime, other_commits_only: bool,
+) -> bool:
+    """Whether `_dismiss_superseded_reviews` withdraws `review`: Elder's own,
+    in `state`, and on another commit (approvals only, #1781) or on this
+    head from an earlier-started run (unless `other_commits_only`)."""
+    if review.get("state") != state or not _is_elder_review(review):
+        return False
+    if review.get("commit_id") != head_sha:
+        return state == "APPROVED"
+    return not other_commits_only and _from_earlier_run(
+        review, run_started_at, unmarked_is_earlier=state == "APPROVED",
+    )
+
+
 _DISMISS_LOGS: dict[str, tuple[str, str]] = {
     "CHANGES_REQUESTED": ("elder_stale_block_dismiss_failed", "elder_stale_blocks_dismissed"),
     "APPROVED": ("elder_stale_approval_dismiss_failed", "elder_stale_approvals_dismissed"),
@@ -4823,19 +4839,9 @@ def _dismiss_superseded_reviews(
             ),
         )
         for review in reviews:
-            same_head = review.get("commit_id") == head_sha
-            if (
-                review.get("state") != state
-                or not _is_elder_review(review)
-                or (state == "CHANGES_REQUESTED" and not same_head)
-                or (same_head and other_commits_only)
-                or (
-                    same_head
-                    and not _from_earlier_run(
-                        review, run_started_at,
-                        unmarked_is_earlier=state == "APPROVED",
-                    )
-                )
+            if not _is_superseded(
+                review, state=state, head_sha=head_sha,
+                run_started_at=run_started_at, other_commits_only=other_commits_only,
             ):
                 continue
             review_id = review["id"]
@@ -5645,12 +5651,11 @@ def _async_deep_append_if_needed(
         pull_number=pull_number, head_sha=head_sha,
         tier1_check_run_id=tier1_check_run_id,
     )
-    # A run whose sensitive-path security pass did not finish never
-    # approves (ADR-0028); a blocking finding still requests changes.
-    verdict = verdict_event(
-        combined, conclusion=conclusion,
-        vouched=security_pass_complete and not unreviewed_paths,
-    )
+    # A run whose sensitive-path security pass did not finish, or that left
+    # a changed path unreviewed, never approves (ADR-0028); a blocking
+    # finding still requests changes.
+    vouched = security_pass_complete and not unreviewed_paths
+    verdict = verdict_event(combined, conclusion=conclusion, vouched=vouched)
     # #1758: Tier-1 deferred its APPROVE to this pass; approve only if the
     # combined review is still clean (not degraded, nothing blocking) and
     # no later check exists (fail closed).
@@ -5727,7 +5732,7 @@ def _async_deep_append_if_needed(
             own_check_ids=frozenset(
                 i for i in (tier1_check_run_id, deep_check_id) if isinstance(i, int)
             ),
-            vouched=security_pass_complete and not unreviewed_paths,
+            vouched=vouched,
         )
     _submit_deep_evals(
         deep_graded,
