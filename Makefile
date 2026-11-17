@@ -196,3 +196,11 @@ elder-eval-column:
 	cd services/webhook && PYTHONPATH=../_shared uv run --python 3.13 --with httpx --with pyjwt --with cryptography \
 		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
 		--with 'datadog-lambda>=6.107,<7' python -m elder_eval.column_type_mismatch $(ARGS)
+
+# Elder repo-guideline effect fixture (#1481). Uses the bench backend twice,
+# once without the guideline and once with it. Live results are recorded only
+# by --record; --check requires a changed outcome matching the baseline.
+elder-eval-guideline:
+	cd services/webhook && PYTHONPATH=../_shared uv run --python 3.13 --with httpx --with pyjwt --with cryptography \
+		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
+		--with 'datadog-lambda>=6.107,<7' python -m elder_eval.guideline_effect $(ARGS)

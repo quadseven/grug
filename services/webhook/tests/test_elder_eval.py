@@ -88,6 +88,32 @@ def test_expected_elder_classes_out_of_taxonomy_is_empty():
     assert expected_elder_classes("iac-hygiene") == frozenset()
 
 
+def test_guideline_effect_eval_pairs_prompts_and_requires_recorded_change():
+    from elder_eval.guideline_effect import (
+        DIFF,
+        GUIDELINE,
+        PATH,
+        _check,
+    )
+    from elder_eval.guideline_effect import _build_messages, assemble_evidence, Hunk
+
+    assert "except:" in DIFF
+    assert PATH == "sample.py"
+    assert "Never use a bare except clause" in GUIDELINE
+    evidence = assemble_evidence([Hunk(path=PATH, body=DIFF)])
+    plain = _build_messages(evidence, "v2")
+    guided = _build_messages(evidence, "v2", guidelines=GUIDELINE)
+    assert GUIDELINE not in plain[0]["content"]
+    assert GUIDELINE in guided[0]["content"]
+    result = {"without_guideline": True, "with_guideline": False}
+    assert _check("bench", result, {"measurements": {"bench": result}})
+    assert not _check(
+        "bench", {"without_guideline": True, "with_guideline": True},
+        {"measurements": {"bench": result}},
+    )
+    assert not _check("bench", result, {"measurements": {}})
+
+
 # --- corpus construction ----------------------------------------------------
 
 
