@@ -371,6 +371,48 @@ def test_secret_scan_still_flags_key_shaped_literal_in_test_file():
     assert _scan_with(path, "S105") == ()
 
 
+def _scan_s105(source: str, row: int = 1):
+    path = "src/query.py"
+    result = _s_result(path, "S105")
+    result["location"]["row"] = row
+    lines = source.splitlines()
+    body = f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(f"+{line}\n" for line in lines)
+    with patch("subprocess.run", return_value=_proc(1, json.dumps([result]))), \
+         patch("tempfile.TemporaryDirectory") as td:
+        td.return_value.__enter__.return_value = _FAKE_DIR
+        return scan_ruff((_hunk(path, body),), {path: source})
+
+
+def test_s105_sql_constant_named_pass_is_medium():
+    found = _scan_s105("LAST_PASS_SQL = 'SELECT finished_at FROM pass_log ORDER BY id DESC LIMIT 1'\n")
+    assert len(found) == 1
+    assert found[0].severity == "medium"
+
+
+def test_s105_real_password_constant_stays_high():
+    found = _scan_s105("DB_PASSWORD = 'example-password'\n")
+    assert len(found) == 1
+    assert found[0].severity == "high"
+
+
+def test_s105_passphrase_opening_with_sql_word_stays_high():
+    found = _scan_s105("DB_PASSWORD = 'with great power comes responsibility'\n")
+    assert len(found) == 1
+    assert found[0].severity == "high"
+
+
+def test_s105_multiline_sql_constant_is_medium():
+    source = ('RECORD_PASS_SQL = (\n'
+              '    """\n'
+              '    insert into pass_log (finished_at)\n'
+              '    values (CURRENT_TIMESTAMP)\n'
+              '    """\n'
+              ')\n')
+    found = _scan_s105(source, row=2)
+    assert len(found) == 1
+    assert found[0].severity == "medium"
+
+
 def _scan_s608(source: str, policy=None):
     path = "src/query.py"
     row = next((i for i, line in enumerate(source.splitlines(), 1)
