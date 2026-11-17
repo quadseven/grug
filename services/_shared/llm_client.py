@@ -7884,11 +7884,30 @@ def _run_subscription_fallback(
                 error=f"{Backend.SUBSCRIPTION.value}: {resolved_model} is the author's family",
                 tier_served="subscription",
             )
-        if _is_degenerate_empty_review(findings, attempt.usage_metrics):
-            return _untrusted_empty_review(
-                Backend.SUBSCRIPTION, resolved_model, _served_models(model), span_context,
-                "subscription",
+        # grug#1601: the lane's empty answer gets the trust rule every other
+        # rung gets. A short empty (`_is_degenerate_empty_review`) is held at
+        # low confidence until a second, different model confirms it. The
+        # `elder_subscription_lane_empty` line is the measurement this rule is
+        # re-checked against.
+        if not findings:
+            usage = attempt.usage_metrics
+            degenerate = _is_degenerate_empty_review(findings, usage)
+            log.info(
+                "elder_subscription_lane_empty",
+                extra={
+                    "model": resolved_model,
+                    "input_tokens": usage.get("input_tokens"),
+                    "output_tokens": usage.get("output_tokens"),
+                    "diff_chars": _REVIEWED_DIFF_CHARS.get(),
+                    "trusted": not degenerate,
+                },
             )
+            if degenerate:
+                _record_degenerate_review(Backend.SUBSCRIPTION, resolved_model, usage)
+                return _untrusted_empty_review(
+                    Backend.SUBSCRIPTION, resolved_model, _served_models(model), span_context,
+                    "subscription",
+                )
         log.info(
             "elder_last_resort_tier_served",
             extra={

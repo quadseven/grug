@@ -14,6 +14,7 @@ Acceptance criteria verified:
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -874,6 +875,38 @@ def test_a_lane_empty_of_real_length_is_a_clean_review(monkeypatch) -> None:
     assert resp.backend_used == Backend.SUBSCRIPTION
     assert not resp.error
     assert len(recorder.called_urls) == 1
+
+
+def test_a_short_lane_empty_logs_low_confidence(monkeypatch, caplog) -> None:
+    caplog.set_level(logging.INFO, logger=lc.log.name)
+    _lane_first(monkeypatch, {"subscription": _lane_answer(_NO_FINDINGS, completion_tokens=9)})
+
+    [event] = [r for r in caplog.records if r.message == "elder_subscription_lane_empty"]
+    assert event.levelno == logging.INFO
+    assert (event.model, event.input_tokens, event.output_tokens) == ("gpt-6-luna", 30_000, 9)
+    assert event.diff_chars is None
+    assert event.trusted is False
+    [warning] = [r for r in caplog.records if r.message == "llm_review_degenerate_empty"]
+    assert warning.backend == Backend.SUBSCRIPTION.value
+
+
+def test_a_lane_empty_of_real_length_logs_trust(monkeypatch, caplog) -> None:
+    caplog.set_level(logging.INFO, logger=lc.log.name)
+    _lane_first(monkeypatch, {"subscription": _lane_answer(_NO_FINDINGS)})
+
+    [event] = [r for r in caplog.records if r.message == "elder_subscription_lane_empty"]
+    assert event.trusted is True
+    assert "llm_review_degenerate_empty" not in caplog.messages
+
+
+def test_a_lane_answer_with_findings_does_not_log_an_empty(monkeypatch, caplog) -> None:
+    caplog.set_level(logging.INFO, logger=lc.log.name)
+    content = json.loads(_finding_body())["choices"][0]["message"]["content"]
+    resp, _ = _lane_first(monkeypatch, {"subscription": _lane_answer(content, completion_tokens=9)})
+
+    assert resp.backend_used == Backend.SUBSCRIPTION
+    assert resp.findings
+    assert "elder_subscription_lane_empty" not in caplog.messages
 
 
 def test_a_private_repo_is_not_reviewed_lane_first(monkeypatch) -> None:
