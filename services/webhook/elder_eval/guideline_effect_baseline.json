@@ -1,0 +1,10 @@
+{
+  "case": {
+    "path": "sample.py",
+    "finding": "bare-except",
+    "guideline": "Never use a bare except clause.",
+    "requires_different_outcomes": true
+  },
+  "measurements": {},
+  "models": {}
+}
