@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -1294,6 +1294,34 @@ def test_ledger_exemplars_cache_and_corpus_scan_exclusion(pg):
     assert exemplars == [{"class": "correctness", "severity": "HIGH",
                           "finding": "real row", "pr": 1}]
     assert store.get_repo_exemplars("o/none") == []
+
+
+def test_second_lineage_finding_keeps_first_observation_across_pushes(pg):
+    from adapters import pg_install_store as store
+
+    finding = {
+        "repo": "o/ledger", "pr": 1, "reviewer": "elder-second-lineage",
+        "severity": "high", "class": "security", "finding": "finding",
+        "verdict": "second-only", "evidence": "second-lineage:a.py:1:security",
+        "ts": "2026-05-04T12:00:00+00:00", "head_sha": "first",
+    }
+    store.put_ledger_row(finding)
+    store.put_ledger_row({**finding, "ts": "2026-05-11T12:00:00+00:00", "head_sha": "later"})
+
+    rows = store.list_ledger_rows("o/ledger")
+    assert [(r["ts"], r["head_sha"]) for r in rows] == [(finding["ts"], "first")]
+
+    store.put_ledger_row({**finding, "pr": 2, "ts": ""})
+    store.put_ledger_row({**finding, "pr": 2})
+    store.put_ledger_row({**finding, "pr": 3, "ts": "2026-05-11T00:00:00+00:00"})
+    store.put_ledger_row({**finding, "pr": 4, "reviewer": "elder"})
+    start, end = date(2026, 5, 4), date(2026, 5, 11)
+    assert [r["pr"] for r in store.list_second_lineage_rows(start, end)] == [1]
+
+    assert store.get_second_lineage_report(start) is None
+    assert store.put_second_lineage_report(start, {"findings": 1})
+    assert not store.put_second_lineage_report(start, {"findings": 2})
+    assert store.get_second_lineage_report(start)["findings"] == 1
 
 
 def test_ledger_verdict_filter_applies_before_limit(pg):

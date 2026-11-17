@@ -70,6 +70,10 @@ When `GRUG_QUARANTINED_SECURITY_PASS` is set on the deployment, a pull request t
 
 When `GRUG_SECOND_LINEAGE_REVIEW` is set on the deployment, a pull request touching a path in the same sensitive list, or a migration path while the default list applies, gets a second review of those paths from a different model family, on the subscription lane, with code-only evidence. Findings merge into the one review, and a finding only this pass raised reads `[Second lineage]`. If no provably different family answered, its findings are dropped and the summary says `Single-lineage review`.
 
+Set the same flag on `grug-poller` to report yield from the live review ledger. The `elder_second_lineage_weekly` log event covers the previous completed UTC week and the trailing four completed weeks. The poller also stores each report under `SECOND_LINEAGE_REPORT` in `grug_kv`, keyed by the Monday that started the reported week. Each report counts second-pass-only blocking findings and reports cost in model calls per incremental blocking finding. The ratio is unset when the count is zero. Findings recorded before timestamps were added are excluded from dated totals.
+
+After four full weeks of collection, use the trailing totals to revisit the path list or the feature if incremental yield is near zero.
+
 ## Comment budget
 
 The budget applies only when `GRUG_COMMENT_BUDGET` is set on the deployment. Deterministic scanner findings are never capped or dropped. A held finding has no inline comment, is listed on the board by severity and judge confidence, and still counts toward the check. A non-blocking finding the judge called not real, or graded below 0.7, is held too. When a blocking finding is held for the cap, the next push reviews that ground again.
