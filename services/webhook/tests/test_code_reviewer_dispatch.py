@@ -4279,7 +4279,7 @@ def test_clean_rereview_dismisses_only_elders_own_stale_block(monkeypatch):
         _review(6, state="COMMENTED"),                               # not a block
     ]
     listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
-    assert listed == [7, 7]  # #1781: approval withdrawal at the start, then the block
+    assert listed == [7, 7, 7]  # #1781: approvals at start and end, plus the block
     assert dismissed == [1]
 
 
@@ -4336,7 +4336,7 @@ def test_carried_open_finding_keeps_the_block(monkeypatch):
     listed, dismissed = _run_dismiss(
         monkeypatch, llm, reviews=[_review(1)], carried_conclusion="failure",
     )
-    assert listed == [7]  # #1781: only the start-of-run approval withdrawal
+    assert listed == [7, 7]  # #1781: only the approval withdrawals, start and end
     assert dismissed == []
 
 
@@ -4359,7 +4359,7 @@ def test_failing_review_keeps_the_block(monkeypatch):
         backend_used=Backend.POOLSIDE,
     )
     listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)])
-    assert listed == [7]  # #1781: only the start-of-run approval withdrawal
+    assert listed == [7, 7]  # #1781: only the approval withdrawals, start and end
     assert dismissed == []
 
 
@@ -4430,7 +4430,7 @@ def test_failing_improve_rerun_keeps_the_block(monkeypatch):
     listed, dismissed = _run_dismiss(
         monkeypatch, llm, reviews=reviews, action="rerun",
     )
-    assert listed == [7]  # #1781: only the start-of-run approval withdrawal
+    assert listed == [7, 7]  # #1781: only the approval withdrawals, start and end
     assert dismissed == []
 
 
@@ -4443,7 +4443,7 @@ def test_advisory_clean_review_approves_and_withdraws_the_block(monkeypatch):
     listed, dismissed = _run_dismiss(
         monkeypatch, llm, reviews=reviews, action="synchronize", blocking=False,
     )
-    assert listed == [7, 7]  # #1781: approval withdrawal at the start, then the block
+    assert listed == [7, 7, 7]  # #1781: approvals at start and end, plus the block
     assert dismissed == [1]
 
 
@@ -4471,7 +4471,7 @@ def test_clean_improve_rerun_never_touches_a_human_block(monkeypatch):
     listed, dismissed = _run_dismiss(
         monkeypatch, llm, reviews=reviews, action="rerun",
     )
-    assert listed == [7, 7]  # #1781: approval withdrawal at the start, then the block
+    assert listed == [7, 7, 7]  # #1781: approvals at start and end, plus the block
     assert dismissed == []
 
 

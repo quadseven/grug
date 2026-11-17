@@ -875,15 +875,15 @@ def _publish_config_skip(
 def _apply_repo_config(
     hunks: tuple[DiffHunk, ...], pr: dict[str, Any], installation_id: int,
     owner: str, repo_name: str, config: RepoConfig | None = None,
-) -> tuple[tuple[DiffHunk, ...], RepoConfig, str]:
+) -> tuple[tuple[DiffHunk, ...], RepoConfig, str, tuple[str, ...]]:
     """Load `.grug.yaml` from the PR base and drop `ignore`d hunks.
 
-    Returns (kept hunks, config, summary note). `config`, when given, is
+    Returns (kept hunks, config, summary note, ignored paths). `config`, when given, is
     the one already loaded for this pass, so the file is fetched once."""
     if config is None:
         config = _load_pr_repo_config(pr, installation_id, owner, repo_name)
     kept, ignored = split_ignored_hunks(hunks, config)
-    return kept, config, _repo_config_note(config, ignored)
+    return kept, config, _repo_config_note(config, ignored), ignored
 
 
 def _list_dir_contents(
@@ -1982,6 +1982,37 @@ def _keep_unchecked_locks(
     return hunks, tuple(p for p in excluded_paths if not is_unchecked_lock_path(p))
 
 
+_UNREVIEWED_NAMED = 20
+
+
+def _unreviewed_paths(
+    *, excluded: tuple[str, ...], oversized: tuple[str, ...], ignored: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Changed paths no model read on this head (#1781): data, generated or
+    vendored files, hunks too big for any cohort, and `.grug.yaml` ignores.
+    Lock files are left to the lock check (`lock_check.unreviewed`). Proven
+    copies and moves are not here: their content is byte-identical to code
+    already at head. Deduped, in order."""
+    return tuple(dict.fromkeys(
+        p for p in (*excluded, *oversized, *ignored) if not is_lock_file_path(p)
+    ))
+
+
+def _unreviewed_note(paths: tuple[str, ...]) -> str:
+    """The summary paragraph that names the unreviewed paths, or ""."""
+    if not paths:
+        return ""
+    named = ", ".join(f"`{p}`" for p in paths[:_UNREVIEWED_NAMED])
+    more = (
+        f", and {len(paths) - _UNREVIEWED_NAMED} more"
+        if len(paths) > _UNREVIEWED_NAMED else ""
+    )
+    return (
+        f"\n\nElder does not approve this head: {len(paths)} changed path(s) "
+        f"were not reviewed: {named}{more}."
+    )
+
+
 def _lock_findings(
     parsed_hunks: tuple[DiffHunk, ...], *, installation_id: int, owner: str,
     repo_name: str, head_sha: str, base_sha: str,
@@ -2400,6 +2431,41 @@ def dispatch_code_review(
     cancel_event: threading.Event | None = None,
     rerun_pending: bool = False,
 ) -> dict[str, str]:
+    """Entry point: one Elder review pass (`_review_pass`), then, however it
+    ended (approved, skipped, carried, stale, degraded, or raised), withdraw
+    Elder's approvals on commits other than the reviewed head (#1781). An
+    approval on another commit never vouches for this head; one on a newer
+    head is safe, since the withdrawal stands down when the head has moved.
+    """
+    try:
+        return _review_pass(
+            payload, blocking=blocking, cancel_event=cancel_event,
+            rerun_pending=rerun_pending,
+        )
+    finally:
+        _withdraw_other_commit_approvals(payload)
+
+
+def _withdraw_other_commit_approvals(payload: dict[str, Any]) -> None:
+    """Best-effort and silent on failure: it must never mask the pass's own
+    result or exception."""
+    try:
+        pr = payload["pull_request"]
+        repo = payload["repository"]
+        _dismiss_superseded_reviews(
+            int(payload["installation"]["id"]), repo["owner"]["login"],
+            repo["name"], int(pr["number"]), pr["head"]["sha"], _run_clock(),
+            state="APPROVED", other_commits_only=True,
+        )
+    except Exception as e:  # noqa: BLE001 - never mask the review's outcome
+        log.warning("elder_final_approval_withdrawal_failed", extra={"kind": type(e).__name__})
+
+
+def _review_pass(
+    payload: dict[str, Any], *, blocking: bool,
+    cancel_event: threading.Event | None = None,
+    rerun_pending: bool = False,
+) -> dict[str, str]:
     """Entry point — orchestrate one Elder review pass.
 
     `blocking` comes from RepoConfig.code_reviewer_blocking. False ⇒
@@ -2677,7 +2743,7 @@ def dispatch_code_review(
             )
         # `.grug.yaml` from the BASE ref: `ignore` globs are dropped here,
         # before anything below (full-file fetch, prompt, judge) can see them.
-        hunks, repo_config, config_note = _apply_repo_config(
+        hunks, repo_config, config_note, ignored_paths = _apply_repo_config(
             hunks, pr, installation_id, owner, repo_name,
             config=base_repo_config,
         )
@@ -3058,6 +3124,11 @@ def dispatch_code_review(
     )
     if quarantine_gap:
         config_note = f"{config_note}\n\n{quarantine_gap}".strip()
+    # #1781: a changed path no model read leaves the head unvouched.
+    unreviewed_paths = _unreviewed_paths(
+        excluded=excluded_paths, oversized=oversized_paths, ignored=ignored_paths,
+    )
+    config_note += _unreviewed_note(unreviewed_paths)
     evaluation, lineage_gap = _run_second_lineage_pass(
         evaluation, hunks, evidence, installation_id,
         primary_models=llm_response.models_used,
@@ -3349,6 +3420,7 @@ def dispatch_code_review(
         vouched=(
             not lock_check.unreviewed
             and not quarantine_gap
+            and not unreviewed_paths
             and (action not in _RE_REVIEW_ACTIONS or listed_threads is not None)
         ),
     ))
@@ -3752,6 +3824,7 @@ def dispatch_code_review(
             deep_plan=deep_plan,
             deferred_approval=deferred_approval,
             security_pass_complete=not quarantine_gap,
+            unreviewed_paths=unreviewed_paths,
             run_started_at=run_started_at,
         )
     except Exception as e:  # noqa: BLE001 - deep append is best-effort
@@ -3762,15 +3835,6 @@ def dispatch_code_review(
                 "kind": type(e).__name__,
             },
         )
-    if deep_plan is not None:
-        # #1781: however the deep append ended (clean, failed, cancelled,
-        # degraded), an older run's approval on an earlier commit may have
-        # landed while it ran. Withdraw it so it cannot outlive this run.
-        _dismiss_superseded_reviews(
-            installation_id, owner, repo_name, pull_number, head_sha,
-            run_started_at, state="APPROVED", other_commits_only=True,
-        )
-
     # Close Elder's own threads the push fixed and this review does not
     # re-raise (#1102). After the deep append so a deep-only re-raise has
     # already posted its fresh thread.
@@ -4884,7 +4948,7 @@ def _newer_run_started(
 def _post_deferred_approval(
     *, installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, run_started_at: datetime, own_check_ids: frozenset[int],
-    security_pass_complete: bool,
+    vouched: bool,
 ) -> None:
     """Post the APPROVE Tier-1 deferred to the deep pass (#1758), then
     withdraw Elder's own older blocks, as a clean Tier-1 would.
@@ -4899,8 +4963,8 @@ def _post_deferred_approval(
     then stays unapproved (fail closed) until the next review.
     """
     pr = f"{owner}/{repo_name}#{pull_number}"
-    if not security_pass_complete:
-        log.info("elder_deferred_approval_security_pass_incomplete", extra={"pr": pr})
+    if not vouched:
+        log.info("elder_deferred_approval_not_vouched", extra={"pr": pr})
         return
     if _pr_head_state(
         installation_id, owner, repo_name, pull_number, head_sha,
@@ -5373,6 +5437,7 @@ def _async_deep_append_if_needed(
     deep_plan: DeepEscalationDecision | None = None,
     deferred_approval: bool = False,
     security_pass_complete: bool,
+    unreviewed_paths: tuple[str, ...],
     run_started_at: datetime,
 ) -> None:
     """Run reasoner after Tier-1 publish when tiered escalation fires (#646).
@@ -5580,7 +5645,8 @@ def _async_deep_append_if_needed(
     # A run whose sensitive-path security pass did not finish never
     # approves (ADR-0028); a blocking finding still requests changes.
     verdict = verdict_event(
-        combined, conclusion=conclusion, vouched=security_pass_complete,
+        combined, conclusion=conclusion,
+        vouched=security_pass_complete and not unreviewed_paths,
     )
     # #1758: Tier-1 deferred its APPROVE to this pass; approve only if the
     # combined review is still clean (not degraded, nothing blocking) and
@@ -5658,7 +5724,7 @@ def _async_deep_append_if_needed(
             own_check_ids=frozenset(
                 i for i in (tier1_check_run_id, deep_check_id) if isinstance(i, int)
             ),
-            security_pass_complete=security_pass_complete,
+            vouched=security_pass_complete and not unreviewed_paths,
         )
     _submit_deep_evals(
         deep_graded,

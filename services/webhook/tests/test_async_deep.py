@@ -304,6 +304,7 @@ def _run_escalated_review(
     posted_reviews: list | None = None,
     on_reasoner=None,
     tier1=None,
+    diff: str = _DIFF,
 ) -> list[dict]:
     """Drive one escalated tiered review (clean Tier-1, `deep` from the
     reasoner) in blocking mode (unless told otherwise) and return every
@@ -351,7 +352,7 @@ def _run_escalated_review(
         )
     with patch("adapters.install_store.put_elder_last_reviewed", lambda **k: None), \
          patch("adapters.install_store.get_elder_last_reviewed", return_value=None), \
-         patch("httpx.get", return_value=_diff_response()):
+         patch("httpx.get", return_value=_diff_response(diff)):
         cr_dispatch.dispatch_code_review(_payload(), blocking=blocking)
     return posted_checks
 
@@ -626,7 +627,8 @@ def _elder_review(rid, *, state, commit="abcd1234efgh", submitted_at=None):
 
 
 def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True,
-                       checks_on_head=None, posted=None, tier1=None):
+                       checks_on_head=None, posted=None, tier1=None,
+                       diff=_DIFF):
     """An escalated review that records every posted review, every
     dismissal, and the reviews already posted when the reasoner started.
 
@@ -645,6 +647,7 @@ def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True,
         monkeypatch, deep=deep, posted_reviews=reviews, blocking=blocking,
         on_reasoner=lambda: before_deep.extend(r.event for r in reviews),
         tier1=tier1,
+        diff=diff,
         checks_on_head=(
             [_elder_run(1, started_at="2999-01-01T00:00:00Z")]
             if checks_on_head is None else checks_on_head
@@ -832,7 +835,7 @@ def test_deferred_approval_refuses_an_unfinished_security_pass(monkeypatch):
         installation_id=11, owner="myorg", repo_name="myrepo", pull_number=7,
         head_sha="abcd1234efgh",
         run_started_at=datetime.fromisoformat("2000-01-01T00:00:00+00:00"),
-        own_check_ids=frozenset(), security_pass_complete=False,
+        own_check_ids=frozenset(), vouched=False,
     )
     assert posted == []
 
@@ -872,5 +875,37 @@ def test_deep_append_end_withdraws_a_late_approval_on_an_earlier_commit(
     )
     assert dismissed == [7]
     assert ("APPROVE" in events) == (deep is _RAN_CLEAN)
+
+
+_DIFF_WITH_IGNORED = _DIFF + """diff --git a/docs/guide.md b/docs/guide.md
+--- a/docs/guide.md
++++ b/docs/guide.md
+@@ -1,1 +1,2 @@
+ context
++words
+"""
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_deep_append_never_approves_over_an_unreviewed_path(monkeypatch, blocking):
+    """#1781: `.grug.yaml` ignores a changed path, so neither pass read it.
+    The clean deep pass posts no approval and its summary names the path."""
+    from personas.code_reviewer.repo_config import parse_repo_config
+
+    config = parse_repo_config("ignore:\n  - 'docs/**'\n")
+    monkeypatch.setattr(cr_dispatch, "_load_pr_repo_config", lambda *a, **k: config)
+    checks: list = []
+    monkeypatch.setattr(cr_dispatch, "get_app_id", lambda: _APP_ID)
+    monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **k: [])
+    monkeypatch.setattr(cr_dispatch, "dismiss_review", lambda *a, **kw: {})
+    reviews: list = []
+    checks = _run_escalated_review(
+        monkeypatch, deep=_RAN_CLEAN, blocking=blocking, posted_reviews=reviews,
+        diff=_DIFF_WITH_IGNORED,
+        checks_on_head=[_elder_run(1, started_at="2999-01-01T00:00:00Z")],
+    )
+    assert "APPROVE" not in [r.event for r in reviews]
+    deep = _deep_checks(checks)
+    assert deep and "`docs/guide.md`" in deep[-1]["summary"]
 
 

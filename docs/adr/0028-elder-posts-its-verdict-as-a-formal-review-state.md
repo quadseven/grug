@@ -31,6 +31,18 @@ state is the verdict (`personas.review_publish.verdict_event`):
   or superseded. A degraded run never approves: fail closed. A degraded run
   with a blocking finding still posts `COMMENT`, as ADR-0023 decided.
 
+**No approval over unreviewed code** (#1781). A changed path no model read
+leaves the head unvouched: data, generated or vendored files
+(`split_reviewable_hunks`), hunks too big for any cohort, and paths
+`.grug.yaml` `ignore`s. The run posts `COMMENT`, or `REQUEST_CHANGES` when a
+blocking finding stands, and the summary names the paths. The rule holds on
+Tier-1, on the deep append, and at the deferred `APPROVE`. Lock files are
+left to the lock check, which already refuses to vouch for one it did not
+read. Proven byte-identical copies and 100% moves (#813, #772) count as
+reviewed, since their content is already at head. A repository that
+`ignore`s paths, or a pull request that changes a CSV or a vendored file,
+therefore gets no `APPROVE`; the check conclusion is unchanged.
+
 **An unfinished security pass never approves** (#1780). When the diff touches
 a sensitive path and the code-only security pass (grug#1569) failed, timed
 out, or was skipped by a cancel, the run cannot vouch for the head: it posts
@@ -75,9 +87,11 @@ never requests changes, so a backend outage cannot block a merge this way.
   commit, or the lookup fails, the run posts no approval. Withdrawing
   approvals stands down when the head has moved: an approval on the new head
   belongs to a newer run.
-- At the end of every deep append, clean or failed, cancelled or degraded,
-  Elder withdraws its approvals on commits other than the reviewed head, so
-  a late approval from an older run cannot survive (#1781).
+- However a review run ends (approved, skipped by `skip_prs`, carried,
+  stale, degraded, re-run pending, a deep append that failed or was
+  cancelled, or an exception), Elder withdraws its approvals on commits
+  other than the reviewed head, so a late approval from an older run cannot
+  survive (#1781). This runs in a `finally` around the whole pass.
 - **An escalated head is approved only by the deep pass.** Tier-1 decides
   before it publishes whether a deep pass will follow on the head. If one
   will, Tier-1 does not approve: an `APPROVE` standing while the reasoner is
