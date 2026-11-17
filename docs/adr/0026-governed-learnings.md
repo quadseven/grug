@@ -75,3 +75,21 @@ Two paths could silence a finding before this ADR:
   re-review on that PR. That sits in the review pipeline, tracked separately.
 - The main review prompt's protection for a free-text rule rests on the filter
   and the prompt sentence. The hard guarantees are the SAST and judge paths.
+
+## Addendum - outcome-proposed rules (#1757)
+
+Grug can now also propose a rule from its own review outcomes, not just from a
+person's reply. `cave_drawings.propose_rules` reads one repo's finding outcomes
+and proposes a rule when findings of one class were declined with a written
+reason of at least four words on at least two distinct pull requests, by
+someone who is neither the PR author nor a commit author nor an App. The
+proposal names the pattern in plain words and cites every pull request it came
+from. Protected classes are out at proposal time: any SAST class, the security
+category, or protected vocabulary in the class or the reason.
+
+The store writes each proposal as a Cave Drawings row with status `pending`,
+keyed by `learning_id` so a rerun over the same outcomes adds nothing new and
+never overwrites an operator's decision. Pending rows reach the operator views
+but not `select_for_prompt`, which reads active rows only. No pattern of
+outcomes can quiet Elder on its own: a person must approve the rule first,
+under the same governance as an imported learning.

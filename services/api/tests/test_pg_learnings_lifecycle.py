@@ -269,3 +269,16 @@ def test_each_review_records_which_rules_fired(store):
     assert store.get_review_fired_learnings("o/r", "9@abc") == sorted([a, b])
     assert store.get_review_fired_learnings("o/r", "10@def") == [b]
     assert store.get_review_fired_learnings("o/r", "11@none") == []
+
+
+def test_the_decline_outcome_query_is_one_literal_that_filters_expired_rows():
+    """The decline listing reads one string constant, so no SQL is built
+    from parts at call time, and that constant still carries the shared
+    live-row predicate (#1757)."""
+    from adapters import pg_install_store
+    from adapters.pg_base import TTL_LIVE
+
+    query = pg_install_store._DECLINE_OUTCOMES_SQL
+    assert isinstance(query, str)
+    assert TTL_LIVE in query
+    assert "DECLINE#%%" in query

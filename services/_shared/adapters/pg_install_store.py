@@ -1369,6 +1369,8 @@ class Learning(TypedDict):
     repo: str
     scope_path: NotRequired[str]
     source_pr: NotRequired[int]
+    # #1757: every PR an outcome-proposed rule cites as its evidence.
+    source_prs: NotRequired[list[int]]
     source_comment_id: NotRequired[int]
     author: NotRequired[str]
     created_at: NotRequired[str]
@@ -1913,6 +1915,86 @@ def import_learnings(
     except psycopg.errors.UniqueViolation as e:
         raise LearningImportConflict(str(e).splitlines()[0]) from e
     return ids
+
+
+def put_rule_proposals(proposals: list[Any], *, actor: str = "outcome-proposer") -> list[str]:
+    """Persist outcome-proposed rules (#1757) as pending Cave Drawings rows.
+
+    Each row is keyed by `learning_id` of its rule text and written with
+    `ON CONFLICT DO NOTHING`, so a rerun over the same outcomes adds no second
+    row and never overwrites a decision an operator already made. A pending
+    row never reaches a review prompt (`select_for_prompt` selects active
+    rows only), so an outcome alone cannot quiet Elder.
+
+    Returns the ids written or already present, in input order.
+    """
+    from cave_drawings import STATUS_PENDING, learning_id as _lid
+
+    now = _now_iso()
+    ids: list[str] = []
+    for proposal in proposals:
+        data: dict[str, Any] = dict(proposal.as_learning(now=now))
+        text = str(data.get("text") or "").strip()
+        repo = str(data.get("repo") or "").strip()
+        if not (text and repo):
+            continue
+        lid = _lid(text)
+        data.update({
+            "text": text,
+            "repo": repo,
+            "status": STATUS_PENDING,
+            "active": False,
+            "history": [_history_entry("proposed", actor)],
+        })
+        with get_pool().connection() as conn, conn.transaction():
+            conn.execute(
+                "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (pk, sk) DO NOTHING",
+                (_learning_pk(repo), _learning_sk(lid), encode_attrs(data), _learning_ttl()),
+            )
+        ids.append(lid)
+    return ids
+
+
+def _decline_outcome_pk(repo: str) -> str:
+    return f"OUTCOME#{repo}"
+
+
+def put_decline_outcome(repo: str, comment_id: int, outcome: Mapping[str, Any]) -> None:
+    """Keep one reasoned-decline outcome (#1757), keyed by the reply comment.
+
+    `ON CONFLICT DO NOTHING`, so a redelivered reply stores nothing twice."""
+    if not (repo and comment_id):
+        return
+    with get_pool().connection() as conn, conn.transaction():
+        conn.execute(
+            "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (pk, sk) DO NOTHING",
+            (
+                _decline_outcome_pk(repo), f"DECLINE#{int(comment_id)}",
+                encode_attrs(dict(outcome)), _learning_ttl(),
+            ),
+        )
+
+
+# One literal, nothing interpolated: the live-row predicate is spelled out
+# as pg_base.TTL_LIVE has it, and a test holds the two equal (#1757).
+_DECLINE_OUTCOMES_SQL = """
+    SELECT pk, sk, data FROM grug_kv
+    WHERE pk = %s AND sk LIKE 'DECLINE#%%'
+      AND (ttl IS NULL OR ttl > EXTRACT(EPOCH FROM now()))
+    ORDER BY sk COLLATE "C" ASC
+"""
+
+
+def list_decline_outcomes(repo: str) -> list[dict[str, Any]]:
+    """Every live decline outcome kept for a repo, oldest key first."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            _DECLINE_OUTCOMES_SQL,
+            (_decline_outcome_pk(repo),),
+        ).fetchall()
+    return [dict(decode_item(pk, sk, data)) for pk, sk, data in rows]
 
 
 def _learning_fired_pk(repo: str) -> str:

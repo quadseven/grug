@@ -908,6 +908,40 @@ def test_review_reply_write_collaborator_enqueues():
     mock_enq.assert_called_once()
 
 
+def _decline_run(record, outcomes):
+    payload = _review_reply_payload(sender={"login": "teammate", "type": "User"})
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", return_value=True), \
+         patch("dispatcher._pr_commit_logins", return_value=frozenset({"coder"})), \
+         patch("github_app_auth.with_install_token_retry", side_effect=lambda iid, fn, **_: "write"), \
+         patch("adapters.install_store.get_comment_record", return_value=record), \
+         patch("adapters.install_store.put_decline_outcome") as put_out, \
+         patch("adapters.install_store.list_decline_outcomes", return_value=outcomes), \
+         patch("adapters.install_store.put_rule_proposals") as put_props, \
+         patch("rerun.enqueue_learn"):
+        out = dispatch("pull_request_review_comment", payload)
+    return out, put_out, put_props
+
+
+def test_review_reply_keeps_a_decline_outcome_and_proposes_rules():
+    record = {"finding_tags": {"rule_name": "magic-number", "category": "style"}}
+    out, put_out, put_props = _decline_run(record, [])
+    assert out == {"status": "enqueued", "kind": "learn"}
+    repo, comment_id, outcome = put_out.call_args.args
+    assert (repo, comment_id) == ("quadseven/infra", 5001)
+    assert outcome["finding_class"] == "magic-number"
+    assert outcome["declined_by"] == "teammate"
+    assert outcome["pr_author"] == "dev" and outcome["commit_authors"] == ["coder"]
+    put_props.assert_called_once_with([])
+
+
+def test_review_reply_without_a_finding_record_keeps_no_outcome():
+    out, put_out, put_props = _decline_run(None, [])
+    assert out == {"status": "enqueued", "kind": "learn"}
+    put_out.assert_not_called()
+    put_props.assert_not_called()
+
+
 def test_review_reply_enqueue_sqs_failure_is_skip_not_500():
     # A botocore/SQS send failure must return skip, never bubble to a 500.
     class _Boom(Exception):

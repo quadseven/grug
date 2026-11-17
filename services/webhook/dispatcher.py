@@ -1831,6 +1831,42 @@ def _handle_check_suite(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "dispatched", "trigger": "check_suite_rerequested", "results": results}
 
 
+def _propose_rules_from_decline(
+    installation_id: int, repo_full: str, pr_number: int, comment_id: int,
+    parent_comment_id: int, body: str, sender: dict[str, Any],
+    pr_author: str, commit_logins: frozenset[str],
+) -> None:
+    """Keep a trusted, reasoned reply to a finding as a decline outcome, then
+    write the pending rule proposals the repo's outcomes now support (#1757).
+
+    Called only after the reply passed every gate above, so the sender is a
+    write-access person who wrote none of the PR. A proposal lands pending, so
+    it never reaches a review prompt without a person's approval (ADR-0026).
+    Best effort: a store failure is logged and never fails the webhook."""
+    from adapters.install_store import (  # type: ignore
+        get_comment_record, list_decline_outcomes, put_decline_outcome,
+        put_rule_proposals,
+    )
+    from cave_drawings import propose_rules  # type: ignore
+    try:
+        record = get_comment_record(installation_id, parent_comment_id)
+        if record is None:
+            return
+        tags = dict(record.get("finding_tags") or {})
+        put_decline_outcome(repo_full, comment_id, {
+            "verdict": "declined", "repo": repo_full, "pr": pr_number,
+            "finding_class": str(tags.get("rule_name") or ""),
+            "category": str(tags.get("category") or ""),
+            "reason": body, "declined_by": str(sender.get("login") or ""),
+            "actor_type": str(sender.get("type") or ""),
+            "pr_author": pr_author, "commit_authors": sorted(commit_logins),
+        })
+        put_rule_proposals(propose_rules(list_decline_outcomes(repo_full)))
+    except Exception as e:  # noqa: BLE001 - proposing is best effort
+        log.warning("rule_proposal_failed", extra={
+            "repo": repo_full, "pr": pr_number, "kind": type(e).__name__})
+
+
 def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
     """A maintainer replied to an inline review-comment thread. If the reply
     answers one of grug's OWN findings, enqueue a learnings-classification job
@@ -1974,6 +2010,12 @@ def _handle_review_comment_reply(payload: dict[str, Any]) -> dict[str, str]:
         return {"status": "skip", "reason": "pr_commits_unreadable"}
     if sender_login.lower() in pr_writers | commit_logins:
         return {"status": "no_op", "reason": "reply author wrote this PR"}
+
+    _propose_rules_from_decline(
+        int(installation_id), f"{owner}/{repo_name}", int(pr_number),
+        int(comment_id), int(in_reply_to), body, sender,
+        str((pr.get("user") or {}).get("login") or ""), commit_logins,
+    )
 
     from rerun import enqueue_learn  # type: ignore
     try:
