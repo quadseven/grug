@@ -424,3 +424,12 @@ def test_dry_run_default_lists_only_synthetic(capsys):
     assert cli.main(["--dry-run"]) == 0
     names = [ln.split(":")[0] for ln in capsys.readouterr().out.strip().splitlines()]
     assert names == [f.name for f in default_fixtures()]
+
+
+def test_unreadable_real_fixture_fails_loudly_with_its_name(monkeypatch, tmp_path):
+    from review_latency import fixtures as fx
+
+    (tmp_path / "pr_broken.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(fx, "_REAL_FIXTURES_DIR", tmp_path)
+    with pytest.raises(ValueError, match="pr_broken.json"):
+        fx.real_fixtures()

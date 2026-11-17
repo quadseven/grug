@@ -162,8 +162,8 @@ def _load_real_specs() -> tuple[dict, ...]:
         try:
             with path.open(encoding="utf-8") as fh:
                 out.append(json.load(fh))
-        except (OSError, ValueError):
-            continue
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"unreadable real fixture {path.name}: {exc}") from exc
     return tuple(out)
 
 
