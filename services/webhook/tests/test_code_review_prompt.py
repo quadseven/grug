@@ -471,6 +471,38 @@ def test_stale_reverse_check_intermediary_rule_contract():
         assert rule.description in prompt, f"variant {variant} lost the rule text"
 
 
+def test_elder_states_the_change_intent_before_looking_for_code_faults():
+    """grug#1766: before code faults, Elder states what the change is for
+    from the linked ticket and the PR intent block, then checks the diff
+    against it: unsupported claims, ignored ticket holds or preconditions,
+    and tests whose expected values have no independent source."""
+    for variant in ("v1", "v2"):
+        prompt = crp.build_system_prompt(variant)
+        assert "BEFORE looking for code faults" in prompt
+        assert "hold or precondition" in prompt
+        assert "independent source" in prompt
+        assert prompt.index("BEFORE looking for code faults") < prompt.index("RULES:")
+
+
+@pytest.mark.parametrize(
+    ("name", "must_say"),
+    [
+        ("unsupported-claim", "QUOTE the claim"),
+        ("unsourced-test-oracle", "independent source"),
+    ],
+)
+def test_intent_check_rules_quote_their_evidence_and_never_block(name, must_say):
+    """grug#1766: each intent-check rule asks for the quoted claim or
+    expected value, and stays advisory (medium): a missed precondition
+    must not block merges fleet-wide the way the first intent check did."""
+    rule = next((r for r in crp.RULES if r.name == name), None)
+    assert rule is not None, f"{name} missing from RULES"
+    assert must_say in rule.description
+    assert rule.severity == "medium"
+    for variant in ("v1", "v2"):
+        assert rule.description in crp.build_system_prompt(variant)
+
+
 def test_stale_reverse_check_intermediary_rule_requires_concrete_stale_entry():
     """#1421 AC: the rule description in the prompt mandates that every
     finding emitted under this rule MUST name the concrete stale entry that

@@ -2,6 +2,8 @@
   "backends": {
     "openrouter": {
       "anchored_cases": [
+        "quadseven/grug#1727",
+        "quadseven/grug#1728",
         "quadseven/grug#366",
         "quadseven/grug#477",
         "quadseven/grug#480",
@@ -20,24 +22,24 @@
         "quadseven/grug#762"
       ],
       "backend_attribution": {},
-      "cases_scored": 18,
+      "cases_scored": 20,
       "errored_cases": [],
-      "measured_prompt_sha": "aed36784141d0366adb40ac4a763ec168182f2e4c2cd8a9cf292dcf22f33cb01",
+      "measured_prompt_sha": "198a383c8e1523e42252dca54733082e779158d1323227faeda41bb2b111dd64",
       "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
       "noise_rate": 0.0,
       "output_truncated_cases": [],
-      "overall_catch": 0.2857142857142857,
+      "overall_catch": 0.27692307692307694,
       "per_class_catch": {
-        "correctness": 0.2727272727272727,
+        "correctness": 0.16666666666666666,
         "security-scope": 0.1111111111111111,
-        "silent-failure": 0.5714285714285714,
+        "silent-failure": 0.6,
         "simplification": 0.0,
         "test-gap": 0.25,
         "type-design": 0.0,
         "upstream-semantics": 0.42857142857142855
       },
       "served_models": {
-        "nvidia/nemotron-3-ultra-550b-a55b:free": 18
+        "nvidia/nemotron-3-ultra-550b-a55b:free": 20
       },
       "staged_cases": [
         "quadseven/grug#366",
@@ -60,5 +62,5 @@
       "truncated_cases": []
     }
   },
-  "prompt_sha": "aed36784141d0366adb40ac4a763ec168182f2e4c2cd8a9cf292dcf22f33cb01"
+  "prompt_sha": "198a383c8e1523e42252dca54733082e779158d1323227faeda41bb2b111dd64"
 }
