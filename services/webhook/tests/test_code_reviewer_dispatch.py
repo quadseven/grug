@@ -83,10 +83,12 @@ def _diff_response(diff: str = _DIFF):
     return r
 
 
-def test_dispatch_advisory_mode_posts_neutral_check_and_comment_review(monkeypatch):
+def test_dispatch_advisory_mode_posts_neutral_check_and_approve_review(monkeypatch):
     """Default mode (`code_reviewer_blocking=False`): check-run
-    conclusion=neutral, review event=COMMENT. Both clients called with
-    the right payload."""
+    conclusion=neutral. The review state is the verdict in either mode
+    (#1758): a medium finding blocks nothing, so the review approves and
+    carries the finding inline. Both clients called with the right
+    payload."""
     llm = LlmReviewResponse(
         kind="reviewed",
         findings=(LlmFinding(
@@ -123,7 +125,7 @@ def test_dispatch_advisory_mode_posts_neutral_check_and_comment_review(monkeypat
     assert len(posted_check) == 1
     assert posted_check[0]["result"].conclusion == "neutral"  # advisory
     assert len(posted_review) == 1
-    assert posted_review[0]["result"].event == "COMMENT"  # advisory
+    assert posted_review[0]["result"].event == "APPROVE"  # verdict, any mode
     # Inline comments include the finding.
     inline = posted_review[0]["result"].comments
     assert len(inline) == 1
@@ -632,9 +634,8 @@ def test_dispatch_blocking_mode_uses_failure_conclusion_and_request_changes(monk
 
 def test_dispatch_no_findings_posts_clean_pass(monkeypatch):
     """LLM returned reviewed + empty findings → check conclusion=success
-    (or neutral in advisory mode), review event=COMMENT, zero inline
-    comments. Don't post a noisy "looks good!" inline comment when
-    there's nothing to flag."""
+    (or neutral in advisory mode) and one body-only APPROVE review, the
+    head's formal verdict (#1758), with zero inline comments."""
     llm = LlmReviewResponse(
         kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
     )
@@ -654,8 +655,9 @@ def test_dispatch_no_findings_posts_clean_pass(monkeypatch):
 
     # Clean pass — check posts but with no findings table.
     assert posted_check[0].conclusion == "neutral"  # advisory always neutral
-    # No inline review when there's nothing to comment on.
-    assert posted_review == []
+    # The verdict review, with no inline comment.
+    assert [r.event for r in posted_review] == ["APPROVE"]
+    assert posted_review[0].comments == ()
 
 
 def test_dispatch_llm_outage_fails_closed_in_block_mode(monkeypatch):
@@ -1098,8 +1100,10 @@ def test_dispatch_suppresses_confident_medium_false_positive(monkeypatch):
     with patch("httpx.get", return_value=_diff_response()):
         out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
-    # The suppressed finding produced no inline review (nothing to post).
-    assert posted_reviews == []
+    # The suppressed finding produced no inline comment; only the clean
+    # verdict review posts (#1758).
+    assert [kw["result"].event for kw in posted_reviews] == ["APPROVE"]
+    assert posted_reviews[0]["result"].comments == ()
     # But it was still submitted to DD evals (denominator preserved).
     assert len(submitted[0]) == 1
     # Suppressed-all -> clean pass verdict.
@@ -2166,7 +2170,8 @@ def test_elder_no_longer_carries_security_findings(monkeypatch):
 
     assert out["result"] == "pass"
     assert posted_check[0].conclusion == "success"  # blocking mode, no findings
-    assert posted_review == []  # no inline security comments from Elder
+    # No inline security comments from Elder: only the verdict review.
+    assert [kw["result"].comments for kw in posted_review] == [()]
 
 
 def test_inline_comment_body_renders_committable_suggestion_block():
@@ -2779,7 +2784,8 @@ def test_dispatch_verification_kills_contradicted_finding(monkeypatch, caplog):
          caplog.at_level(logging.INFO):
         out = cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
-    assert posted_reviews == []  # killed finding produced no inline review
+    # The killed finding produced no inline comment; only the verdict review.
+    assert [kw["result"].comments for kw in posted_reviews] == [()]
     assert out["result"] == "pass"
     row = next(
         r for r in caplog.records
@@ -3032,8 +3038,10 @@ def test_deep_review_publishes_and_captures_comment_records(monkeypatch):
     with patch("httpx.get", return_value=_diff_response()):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
 
-    # The deep review posted.
+    # The deep review posted. Tier-1 deferred its clean verdict to the deep
+    # pass (#1758), which found a problem, so nothing approves the head.
     assert len(posted_reviews) == 1
+    assert posted_reviews[0].event != "APPROVE"
     # The deep finding's comment was captured with its ID + span context.
     assert len(captured) == 1
     rec = captured[0]
@@ -4331,8 +4339,8 @@ def test_unknown_carry_forward_keeps_the_block(monkeypatch):
     """No thread listing means the carry-forward check could not run, so a
     clean review cannot vouch for earlier commits."""
     llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
-    listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)], threads=None)
-    assert listed == []
+    _, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)], threads=None)
+    # #1758: the run lists reviews only to withdraw Elder's approvals.
     assert dismissed == []
 
 
@@ -4353,8 +4361,8 @@ def test_failing_review_keeps_the_block(monkeypatch):
 def test_degraded_review_never_unblocks(monkeypatch):
     """An LLM outage read nothing, so it must not withdraw a block."""
     llm = LlmReviewResponse(kind="all_failed", error="poolside: timeout")
-    listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)])
-    assert listed == []
+    _, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)])
+    # #1758: the run lists reviews only to withdraw Elder's approvals.
     assert dismissed == []
 
 
@@ -4421,15 +4429,31 @@ def test_failing_improve_rerun_keeps_the_block(monkeypatch):
     assert dismissed == []
 
 
-def test_neutral_check_keeps_the_block(monkeypatch):
-    """Only a `success` check withdraws a block: an advisory-mode `neutral`
-    check is not a clear verdict."""
+def test_advisory_clean_review_approves_and_withdraws_the_block(monkeypatch):
+    """#1758: the dismissal follows the verdict, not the check. An
+    advisory-mode clean review concludes the check `neutral` but approves
+    the head, so Elder's own older block is withdrawn."""
     llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
     reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)]
     listed, dismissed = _run_dismiss(
         monkeypatch, llm, reviews=reviews, action="synchronize", blocking=False,
     )
-    assert listed == []
+    assert listed == [7]
+    assert dismissed == [1]
+
+
+def test_advisory_neutral_from_a_lock_file_keeps_the_block(monkeypatch):
+    """A clean pass that did not read a lock file cannot vouch for the head,
+    so it neither approves nor withdraws the block."""
+    llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
+    monkeypatch.setattr(
+        cr_dispatch, "_lock_findings",
+        lambda *a, **kw: cr_dispatch.LockCheck(unreviewed=("uv.lock",)),
+    )
+    reviews = [_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)]
+    _, dismissed = _run_dismiss(
+        monkeypatch, llm, reviews=reviews, action="synchronize", blocking=False,
+    )
     assert dismissed == []
 
 
@@ -4455,10 +4479,9 @@ def test_dismissal_message_links_the_clean_check_run(monkeypatch):
         check_run=lambda *a, **kw: {"id": 424242, "html_url": _CLEAN_CHECK_URL},
     )
     assert dismissed == [1]
-    assert messages == [(
-        "Superseded: the Elder check on abcd123 concluded success with "
-        f"nothing blocking: {_CLEAN_CHECK_URL}"
-    )]
+    assert messages == [
+        f"Superseded: Elder approved abcd123 with nothing blocking: {_CLEAN_CHECK_URL}"
+    ]
 
 
 def test_dismiss_failure_does_not_change_the_result(monkeypatch):

@@ -50,6 +50,7 @@ __all__ = [
     "is_real_degradation",
     "plan_publish",
     "prior_finding_keys",
+    "verdict_event",
 ]
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
@@ -533,6 +534,47 @@ class PublishOutcome:
         return self.eval_degraded_reason or (
             "check_publish_failed" if self.check_publish_failed else None
         )
+
+
+def verdict_event(
+    evaluation: CodeReviewEvaluation, *, conclusion: CheckConclusion,
+    carried_blocking: bool = False, vouched: bool = True,
+    superseded: bool = False,
+) -> ReviewEvent:
+    """Elder's formal review state for one head (#1758).
+
+    Merge gates read GitHub review state, so Elder's review carries the
+    verdict: `APPROVE` for a clean head, `REQUEST_CHANGES` while a blocking
+    finding stands, `COMMENT` when the run cannot speak for the head.
+
+    The mode (`code_reviewer_blocking`) is deliberately NOT an input. The
+    flag picks the check-run conclusion (`plan_publish`); the review state
+    is the verdict in both modes, which is what a gate counts.
+
+    - `superseded`: a newer review owns the head, so this run never blocks
+      or approves.
+    - Any `degraded_reason`, `no_diff` included, is `COMMENT`: a run that
+      did not read the whole head never approves (fail closed), and a
+      degraded review is not a verdict to request changes on (ADR-0023).
+    - `conclusion` is the check conclusion after every fold, so a
+      carried-forward block in blocking mode reads as `failure` here;
+      `carried_blocking` says the same in advisory mode, where the check
+      stays `neutral`.
+    - `vouched=False` means the run could not confirm that nothing earlier
+      still stands (the carry-forward listing failed, or a lock file went
+      unread), so a clean pass is `COMMENT`, not `APPROVE`.
+    """
+    if superseded or evaluation.degraded_reason:
+        return "COMMENT"
+    if (
+        evaluation.conclusion == "failure"
+        or conclusion == "failure"
+        or carried_blocking
+    ):
+        return "REQUEST_CHANGES"
+    if evaluation.conclusion == "success" and vouched:
+        return "APPROVE"
+    return "COMMENT"
 
 
 def plan_publish(

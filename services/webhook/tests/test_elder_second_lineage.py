@@ -170,7 +170,8 @@ def test_a_same_family_reply_posts_no_second_lineage_finding(monkeypatch):
 
     run.review()
 
-    assert run.posted == []
+    # At most a verdict review (#1758), never an inline finding.
+    assert all(r.comments == () for r in run.posted)
     assert [r["verdict"] for r in run.rows] == ["single-lineage"]
 
 

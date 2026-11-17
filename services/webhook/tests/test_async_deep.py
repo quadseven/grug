@@ -300,6 +300,7 @@ def _run_escalated_review(
     monkeypatch, *, deep: LlmReviewResponse, blocking: bool = True,
     checks_on_head: list[dict] | None = None,
     posted_reviews: list | None = None,
+    on_reasoner=None,
 ) -> list[dict]:
     """Drive one escalated tiered review (clean Tier-1, `deep` from the
     reasoner) in blocking mode (unless told otherwise) and return every
@@ -319,7 +320,12 @@ def _run_escalated_review(
         return {"id": len(posted_checks)}
 
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _clean_tier1())
-    monkeypatch.setattr(cr_dispatch, "review_reasoner_diff", lambda *a, **kw: deep)
+    def _fake_reasoner(*a, **kw):
+        if on_reasoner is not None:
+            on_reasoner()
+        return deep
+
+    monkeypatch.setattr(cr_dispatch, "review_reasoner_diff", _fake_reasoner)
     monkeypatch.setattr(cr_dispatch, "post_check_run", _fake_post_check)
 
     def _fake_post_review(*a, result, **k):
@@ -567,3 +573,93 @@ def test_deep_append_publishes_when_the_supersession_lookup_fails(
     posted = _run_escalated_review(monkeypatch, deep=_HIGH_DEEP)
 
     assert _deep_checks(posted)
+
+
+# --- #1758: the deep append owns the verdict on an escalated head -----------
+
+_RAN_CLEAN = LlmReviewResponse(
+    kind="reviewed", findings=(),
+    backend_used=Backend.CAVE_REASONER, model_name="reasoner",
+    backends_used=(Backend.CAVE_REASONER,), models_used=("reasoner",),
+)
+_DEEP_DOWN = LlmReviewResponse(
+    kind="all_failed", error="cave-reasoner: ConnectError",
+    backend_used=Backend.CAVE_REASONER,
+)
+
+
+def _elder_review(rid, *, state, commit="abcd1234efgh", submitted_at=None):
+    return {"id": rid, "state": state, "commit_id": commit,
+            "body": "<!-- grug:review persona=elder -->",
+            "user": {"login": "grug-tribe[bot]"}, "submitted_at": submitted_at}
+
+
+def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True):
+    """An escalated review that records every posted review, every
+    dismissal, and the reviews already posted when the reasoner started."""
+    reviews: list = []
+    dismissed: list[int] = []
+    before_deep: list = []
+    monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **k: list(reviews_on_pr))
+    monkeypatch.setattr(
+        cr_dispatch, "dismiss_review",
+        lambda *a, **kw: dismissed.append(kw["review_id"]) or {},
+    )
+    _run_escalated_review(
+        monkeypatch, deep=deep, posted_reviews=reviews, blocking=blocking,
+        on_reasoner=lambda: before_deep.extend(r.event for r in reviews),
+    )
+    return [r.event for r in reviews], dismissed, before_deep
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_escalated_head_is_approved_only_after_the_deep_pass(monkeypatch, blocking):
+    """Tier-1 is clean but a deep pass is scheduled: no APPROVE may stand
+    while the reasoner is still looking, or a gate could merge in between.
+    The deep append posts the approval once it finishes clean."""
+    events, _, before_deep = _run_with_verdicts(
+        monkeypatch, deep=_RAN_CLEAN, blocking=blocking,
+    )
+    assert "APPROVE" not in before_deep
+    assert events.count("APPROVE") == 1
+    assert events[-1] == "APPROVE"
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_deep_arm_failure_leaves_the_head_unapproved(monkeypatch, blocking):
+    """Fail closed: the reasoner never ran, so nobody approves the head."""
+    events, _, _ = _run_with_verdicts(monkeypatch, deep=_DEEP_DOWN, blocking=blocking)
+    assert "APPROVE" not in events
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_deep_blocking_finding_requests_changes_with_no_approval(monkeypatch, blocking):
+    events, _, _ = _run_with_verdicts(monkeypatch, deep=_HIGH_DEEP, blocking=blocking)
+    assert "APPROVE" not in events
+    assert events[-1] == "REQUEST_CHANGES"
+
+
+def test_deferred_approval_withdraws_elders_older_block(monkeypatch):
+    """The clean deep pass is the approving run, so it withdraws Elder's own
+    block on an earlier commit, as a clean Tier-1 would."""
+    block = _elder_review(5, state="CHANGES_REQUESTED", commit="old0000")
+    events, dismissed, _ = _run_with_verdicts(
+        monkeypatch, deep=_RAN_CLEAN, reviews_on_pr=[block],
+    )
+    assert events[-1] == "APPROVE"
+    assert dismissed == [5]
+
+
+@pytest.mark.parametrize("deep", [_RAN_CLEAN, _HIGH_DEEP], ids=["clean", "high"])
+def test_newer_verdict_review_supersedes_the_deep_append(monkeypatch, deep):
+    """Advisory checks conclude neutral, so the check list cannot show a
+    newer run. A newer Elder verdict review on the head, submitted after
+    this run started, does: the deep append neither approves nor blocks."""
+    newer = _elder_review(9, state="APPROVED", submitted_at="2999-01-01T00:00:00Z")
+    events, dismissed, _ = _run_with_verdicts(
+        monkeypatch, deep=deep, reviews_on_pr=[newer], blocking=False,
+    )
+    assert "APPROVE" not in events and "REQUEST_CHANGES" not in events
+    assert dismissed == []
+
+

@@ -1,19 +1,22 @@
 """GitHub PR Reviews API client — post reviews + inline comments.
 
 Wraps `POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews` for the
-Elder (code-reviewer) persona. Supports two events:
+review personas. Supports three events:
 
-  - COMMENT: advisory mode — reports findings but does not block merge.
-  - REQUEST_CHANGES: blocking mode — blocks merge until the same
-    reviewer approves or the review is dismissed. A new push does NOT
-    clear it; see `dismiss_review`.
+  - APPROVE: Elder's verdict on a clean head (#1758), so a merge gate
+    that reads review state can count it.
+  - REQUEST_CHANGES: a blocking finding stands. It stays the reviewer's
+    standing verdict until the same reviewer approves or the review is
+    dismissed. A new push does NOT clear it; see `dismiss_review`.
+  - COMMENT: findings with no verdict (a degraded or superseded run, or
+    a persona that never approves).
 
-`APPROVE` is intentionally not modeled. Grug does not automatically
-approve PRs (it would short-circuit human review and is not what an
-LLM-backed reviewer should claim). `PENDING` is also out — that creates
-a draft review that never publishes, which the persona has no use for.
-Reject both shapes at construction so the bad payload never leaves the
-process (GH 422s on submit either way, but failing locally is faster).
+Only Elder chooses APPROVE (`personas.review_publish.verdict_event`);
+Guard and Smasher keep COMMENT/REQUEST_CHANGES. `PENDING` is not
+modeled: it creates a draft review that never publishes, which no
+persona has use for. Reject it at construction so the bad payload never
+leaves the process (GH 422s on submit either way, but failing locally is
+faster).
 
 Mirrors `github_checks_client.py` transport shape per ADR-0001;
 retry/401-handling lives in the `with_install_token_retry` caller,
@@ -35,9 +38,9 @@ _log = logging.getLogger(__name__)
 # 10 × 100 = 1000 comments in one review is implausible; a cap-hit is logged.
 _MAX_REVIEW_COMMENT_PAGES = 10
 
-# Subset of GitHub's `event` enum the Elder persona uses. APPROVE +
-# PENDING omitted on purpose — see module docstring.
-ReviewEvent = Literal["COMMENT", "REQUEST_CHANGES"]
+# Subset of GitHub's `event` enum the review personas use. PENDING is
+# omitted on purpose - see module docstring.
+ReviewEvent = Literal["APPROVE", "COMMENT", "REQUEST_CHANGES"]
 # Derived from the Literal so adding a future event (e.g. "DISMISS")
 # updates runtime validation automatically. Without `get_args`, the
 # allowlist and the Literal silently drift.
@@ -90,7 +93,7 @@ class ReviewResult:
     commit.
 
     `event` is the cross-field invariant the constructor enforces (see
-    module docstring for why APPROVE/PENDING are omitted).
+    module docstring for why PENDING is omitted).
     """
 
     commit_id: str
@@ -102,8 +105,7 @@ class ReviewResult:
         if self.event not in _VALID_EVENTS:
             raise ValueError(
                 f"ReviewResult.event must be one of {sorted(_VALID_EVENTS)} "
-                f"(got {self.event!r}). APPROVE/PENDING are not supported "
-                "for the Elder persona."
+                f"(got {self.event!r}). PENDING is not supported."
             )
         if not self.commit_id:
             raise ValueError("ReviewResult.commit_id must be non-empty")
@@ -209,9 +211,10 @@ def dismiss_review(
 
     A REQUEST_CHANGES review stays the reviewer's standing verdict until
     the same reviewer approves or the review is dismissed; a later COMMENT
-    review does not replace it. Grug never approves, so dismissal is the
-    only way it can withdraw its own block. Needs `pull_requests: write`,
-    which the app already holds.
+    review does not replace it. Elder dismisses its own block once a clean
+    run approves (#1758), and its own approval once a later run cannot
+    vouch for the head. Needs `pull_requests: write`, which the app already
+    holds.
     """
     resp = httpx.put(
         f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}/reviews/{review_id}/dismissals",
