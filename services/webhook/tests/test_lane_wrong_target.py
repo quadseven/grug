@@ -8,13 +8,13 @@ workloads; no changed line of configuration did. Elder passed it.
 
 from __future__ import annotations
 
-import time
-
 from personas.code_reviewer import wrong_target
 from personas.code_reviewer.criteria_coverage import LinkedCriterion
 from personas.code_reviewer.diff_parser import file_changes, parse_diff
 from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.wrong_target import scan_wrong_target, ticket_targets
+
+from tests._work_count import assert_linear, counted_lines
 
 _FOOTER = "\n---\nLoom ticket example.iac-12-r1, lane codex, model gpt-6-luna.\nRefs example/iac#12\n"  # leak-guard-allow: placeholder repo
 _TITLE = "Keep workloads off the memory-pressured node"
@@ -195,26 +195,33 @@ def test_too_many_targets_is_not_evaluated(monkeypatch):
     assert _scan(_recorded_diff(), [_BOXES[0][3]]) == ()
 
 
-def test_the_scan_is_linear_on_a_large_diff():
-    # 400 files of 120 changed lines: 48,000 lines, with 40 targets (the cap) the
+def _scan_counted(n_files):
+    # n_files files of 120 changed lines, with 40 targets (the cap) the
     # ticket names that no line changes.
     parts = [
         _appended(
             f"svc/mod_{i:03d}.py", ["def run():"],
             [f"    step_{n} = compute({n})  # pass {i}" for n in range(120)],
         )
-        for i in range(400)
+        for i in range(n_files)
     ]
     parts.append(_added_file("tests/test_mods.py", [f"# names_target_{k}" for k in range(40)]))
     diff = "".join(parts)
     texts = [" ".join(f"`names_target_{k}`" for k in range(40)) + " are updated."]
     changes, hunks = file_changes(diff), parse_diff(diff)
     criteria = (LinkedCriterion(12, 1, texts[0]),)
-    start = time.perf_counter()
-    found = scan_wrong_target(changes, hunks, criteria=criteria, pr_title="Update the targets")
-    elapsed = time.perf_counter() - start
+    return counted_lines(lambda: scan_wrong_target(
+        changes, hunks, criteria=criteria, pr_title="Update the targets"))
+
+
+def test_the_scan_is_linear_on_a_large_diff():
+    # Structural linearity (grug#1715): doubling the diff must less than
+    # triple the scan's executed lines; a quadratic scan, even one whose
+    # inner loop makes no call, grows about four times. An elapsed-seconds
+    # bound flaked on loaded lane hosts.
+    found, _ = _scan_counted(400)
     assert len(found) == 1
-    assert elapsed < 1.0, elapsed
+    assert_linear(lambda n: _scan_counted(n)[1], 200)
 
 
 # --- held-out good lane PRs (2026-10-22) -----------------------------------------
