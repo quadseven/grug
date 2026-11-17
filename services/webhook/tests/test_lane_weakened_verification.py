@@ -20,6 +20,8 @@ from personas.code_reviewer.diff_parser import file_changes, parse_diff
 from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.linked_issue import RULE_CATEGORIES
 
+from tests._work_count import assert_linear, counted_lines
+
 _TITLE = "Show each raider's item level on the raid card"
 _CRITERIA = (
     LinkedCriterion(7, 1, "The raid card shows a row per raider with average item level."),
@@ -1105,11 +1107,11 @@ def test_the_rules_have_board_categories():
 # --- cost (#1367 review: linear, capped) --------------------------------------
 
 
-def test_the_scan_is_linear_on_a_large_diff():
-    # 2,000 deleted tests and 2,000 flips in 400 test files, plus a 20,000
-    # line workflow rewrite: about 54,000 hunk lines.
+def _scan_counted(n_files):
+    # n_files test files of deleted tests and flips, plus a workflow
+    # rewrite of 50 lines per file: about 135 hunk lines per file.
     parts = []
-    for i in range(400):
+    for i in range(n_files):
         body = []
         for j in range(5):
             body += [
@@ -1120,15 +1122,23 @@ def test_the_scan_is_linear_on_a_large_diff():
                 "         pass",
             ]
         parts.append(_diff(f"tests/test_mod_{i}.py", ("", body)))
-    parts.append(_diff(".github/workflows/big.yml", ("", [f"-      step-{n}: run" for n in range(10_000)]
-                                                     + [f"+      step-{n}: run2" for n in range(10_000)])))
+    steps = 25 * n_files
+    parts.append(_diff(".github/workflows/big.yml", ("", [f"-      step-{n}: run" for n in range(steps)]
+                                                     + [f"+      step-{n}: run2" for n in range(steps)])))
     diff = "".join(parts)
     changes, hunks = file_changes(diff), parse_diff(diff)
-    start = time.perf_counter()
-    found = wv.scan_weakened_verification(changes, hunks, criteria=_CRITERIA, pr_title=_TITLE)
-    elapsed = time.perf_counter() - start
+    return counted_lines(lambda: wv.scan_weakened_verification(
+        changes, hunks, criteria=_CRITERIA, pr_title=_TITLE))
+
+
+def test_the_scan_is_linear_on_a_large_diff():
+    # Structural linearity (grug#1715): doubling the diff must less than
+    # triple the scan's executed lines; a quadratic scan, even one whose
+    # inner loop makes no call, grows about four times. An elapsed-seconds
+    # bound flaked on loaded lane hosts.
+    found, _ = _scan_counted(400)
     assert len(found) == 400
-    assert elapsed < 1.0, elapsed
+    assert_linear(lambda n: _scan_counted(n)[1], 200)
 
 
 def test_past_the_line_cap_the_scan_is_not_evaluated(monkeypatch):
