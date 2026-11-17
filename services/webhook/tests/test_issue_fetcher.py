@@ -70,13 +70,15 @@ def test_details_fetcher_reads_title_and_body():
             pass
 
         def json(self):
-            return {"title": "Health: low income", "body": "quoted evidence"}
+            return {"title": "Health: low income", "body": "quoted evidence", "state": "open"}
 
     with patch(
         "github_app_auth.with_install_token_retry",
         side_effect=lambda _i, fn: fn("t"),
     ), patch("httpx.get", return_value=_R()):
-        assert fetcher(1) == {"title": "Health: low income", "body": "quoted evidence"}
+        assert fetcher(1) == {
+            "title": "Health: low income", "body": "quoted evidence", "state": "open",
+        }
 
 
 def test_fetcher_raises_on_http_error_so_check_can_fail_open(mock_transport_client):

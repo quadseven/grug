@@ -54,6 +54,7 @@ from personas.code_reviewer.linked_issue import (
 )
 from personas.code_reviewer.pinned_review import pin_line, pin_review
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
+from personas.code_reviewer.verify_only import is_summary_only
 from personas.code_reviewer.degraded_gate import (
     gate_sentence, lead_with_degraded_line,
 )
@@ -1567,6 +1568,10 @@ def build_review_result(
         if not _is_complexity_finding(f)
         or (f.suggestion and f.effort != "heavy-lift" and f.severity in ("low", "medium"))
     )
+    # grug#1749: a low or medium finding that only asks the author to verify,
+    # ensure or confirm, with no failing input or wrong line, stays in the
+    # check summary with no inline comment.
+    new_findings = tuple(f for f in new_findings if not is_summary_only(f))
     if repo_config is not None:
         # `.grug.yaml` min_inline_severity: lower findings stay in the check
         # summary (built from the full evaluation) but get no inline comment.
