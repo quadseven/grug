@@ -15,8 +15,6 @@ Recorded shapes (anonymized):
 
 from __future__ import annotations
 
-import time
-
 from personas.code_reviewer import linked_issue
 from personas.code_reviewer.diff_parser import file_changes, parse_diff
 from personas.code_reviewer.fabricated_result import (
@@ -26,6 +24,8 @@ from personas.code_reviewer.fabricated_result import (
     scan_fabricated_results,
 )
 from personas.code_reviewer.lane_work import lane_work_findings
+
+from tests._work_count import assert_linear, counted_lines
 
 _FOOTER = "\n---\nLoom ticket example.bench-44-r2, lane spark, model m.\nRefs #44\n"
 
@@ -263,20 +263,31 @@ def test_the_rule_shows_under_a_named_category_not_general():
     assert linked_issue.RULE_CATEGORIES[RULE] == "requirements"
 
 
-def test_the_scan_is_linear_on_a_large_diff():
+def _large_diff(n_files):
     # Every rate is possible, so every line of every file is read in full.
     rates = " ".join(f"{100 * k / 30:.1f}%" for k in range(31))
     lines = [f"Pass rates {rates} on 30 rows, n={j}, {j} of 90, {j}/120." for j in range(40)]
-    diff = "".join(_added_file(f"results/run-{i}.md", lines) for i in range(300))
+    diff = "".join(_added_file(f"results/run-{i}.md", lines) for i in range(n_files))
     # Past the shared check budget the rate check is not evaluated, so an
     # impossible rate at the end draws no finding rather than a slow scan.
     diff += _benchmark_diff("Pass rates were 47.0% energy.")
-    changes, hunks = file_changes(diff), parse_diff(diff)
+    return file_changes(diff), parse_diff(diff)
+
+
+def test_the_scan_is_linear_on_a_large_diff():
+    changes, hunks = _large_diff(300)
     assert sum(len(h.body) for h in hunks) > 2_000_000
     assert 300 * 40 * 31 * 40 > MAX_RATE_CHECKS
-    start = time.perf_counter()
     assert scan_fabricated_results(changes, hunks) == ()
-    assert time.perf_counter() - start < 1.0
+    # Structural linearity (grug#1715): doubling the diff must less than
+    # triple the scan's executed lines; a quadratic scan, even one whose
+    # inner loop makes no call, grows about four times. An elapsed-seconds
+    # bound flaked on loaded lane hosts.
+    def scan_lines(n_files):
+        diff = _large_diff(n_files)
+        return counted_lines(lambda: scan_fabricated_results(*diff))[1]
+
+    assert_linear(scan_lines, 150)
 
 
 def test_a_diff_past_the_bound_is_not_evaluated():
