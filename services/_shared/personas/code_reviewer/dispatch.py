@@ -3331,11 +3331,13 @@ def dispatch_code_review(
     )
     # #1758: the review state is the verdict, whatever the mode. A clean
     # pass vouches for the head only when the carry-forward fold ran (or
-    # there was nothing earlier to fold) and every lock file was read.
+    # there was nothing earlier to fold), every lock file was read, and the
+    # sensitive-path security pass finished.
     verdict = _own_pr_event(author_login, verdict_event(
         evaluation, conclusion=conclusion, carried_blocking=carried_blocking,
         vouched=(
             not lock_check.unreviewed
+            and not quarantine_gap
             and (action not in _RE_REVIEW_ACTIONS or listed_threads is not None)
         ),
     ))
@@ -3721,6 +3723,7 @@ def dispatch_code_review(
             tier1_check_run_id=check_run_id,
             deep_plan=deep_plan,
             deferred_approval=deferred_approval,
+            security_pass_complete=not quarantine_gap,
             run_started_at=run_started_at,
         )
     except Exception as e:  # noqa: BLE001 - deep append is best-effort
@@ -3800,17 +3803,21 @@ def _run_quarantined_pass(
     """The code-only security pass (grug#1569): reviews the sensitive paths
     without author text, adjudicates with the same quarantined evidence, and
     merges one way into `evaluation`. Returns the evaluation and a summary
-    note, empty unless the pass failed. The pass is additive, so a failure
+    note, empty unless the pass did not finish (failed, or skipped on a
+    sensitive path). A non-empty note means the run never approves. The pass is additive, so a failure
     leaves the normal review standing and names the gap in the summary. It
     shares the review's wall-clock budget, so it cannot run past the job
     timeout. One `elder_quarantined_pass` row per run reports calls per PR."""
-    if skip or not quarantined_pass_enabled():
+    if not quarantined_pass_enabled():
         return evaluation, ""
     paths = sensitive_paths(
         dict.fromkeys(h.path for h in evidence.hunks), repo_config,
     )
     if not paths:
         return evaluation, ""
+    if skip:
+        # Sensitive paths with no security pass: not finished (fail closed).
+        return evaluation, QUARANTINE_UNAVAILABLE_NOTE
     quarantined = quarantined_evidence(evidence, paths)
     pr = f"{owner}/{repo_name}#{pull_number}"
     outcome = "unavailable"
@@ -4800,6 +4807,7 @@ def _newer_run_started(
 def _post_deferred_approval(
     *, installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, run_started_at: datetime, own_check_ids: frozenset[int],
+    security_pass_complete: bool,
 ) -> None:
     """Post the APPROVE Tier-1 deferred to the deep pass (#1758), then
     withdraw Elder's own older blocks, as a clean Tier-1 would.
@@ -4813,6 +4821,9 @@ def _post_deferred_approval(
     then stays unapproved (fail closed) until the next review.
     """
     pr = f"{owner}/{repo_name}#{pull_number}"
+    if not security_pass_complete:
+        log.info("elder_deferred_approval_security_pass_incomplete", extra={"pr": pr})
+        return
     if _newer_run_started(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         head_sha=head_sha, run_started_at=run_started_at,
@@ -5281,6 +5292,7 @@ def _async_deep_append_if_needed(
     tier1_check_run_id: int | None = None,
     deep_plan: DeepEscalationDecision | None = None,
     deferred_approval: bool = False,
+    security_pass_complete: bool,
     run_started_at: datetime,
 ) -> None:
     """Run reasoner after Tier-1 publish when tiered escalation fires (#646).
@@ -5477,7 +5489,11 @@ def _async_deep_append_if_needed(
         pull_number=pull_number, head_sha=head_sha,
         tier1_check_run_id=tier1_check_run_id,
     )
-    verdict = verdict_event(combined, conclusion=conclusion)
+    # A run whose sensitive-path security pass did not finish never
+    # approves (ADR-0028); a blocking finding still requests changes.
+    verdict = verdict_event(
+        combined, conclusion=conclusion, vouched=security_pass_complete,
+    )
     # #1758: Tier-1 deferred its APPROVE to this pass; approve only if the
     # combined review is still clean (not degraded, nothing blocking) and
     # no later check exists (fail closed).
@@ -5554,6 +5570,7 @@ def _async_deep_append_if_needed(
             own_check_ids=frozenset(
                 i for i in (tier1_check_run_id, deep_check_id) if isinstance(i, int)
             ),
+            security_pass_complete=security_pass_complete,
         )
     _submit_deep_evals(
         deep_graded,

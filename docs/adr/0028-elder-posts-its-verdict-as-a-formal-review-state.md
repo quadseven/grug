@@ -22,12 +22,22 @@ state is the verdict (`personas.review_publish.verdict_event`):
 
 - `APPROVE`: the review is clean. No blocking finding stands, carried-forward
   findings included; the carry-forward fold ran (or there was nothing earlier
-  to fold); every lock file was read; and the run was not degraded.
+  to fold); every lock file was read; the code-only security pass on the
+  sensitive paths finished, where one applies (#1780); and the run was not
+  degraded.
 - `REQUEST_CHANGES`: a blocking (high or critical) finding stands, new or
   carried forward.
 - `COMMENT`: the run is degraded (any `degraded_reason`, `no_diff` included)
   or superseded. A degraded run never approves: fail closed. A degraded run
   with a blocking finding still posts `COMMENT`, as ADR-0023 decided.
+
+**An unfinished security pass never approves** (#1780). When the diff touches
+a sensitive path and the code-only security pass (grug#1569) failed, timed
+out, or was skipped by a cancel, the run cannot vouch for the head: it posts
+`COMMENT`, or `REQUEST_CHANGES` when a blocking finding stands, and its
+summary says the security pass did not finish. The rule holds on the Tier-1
+verdict, on the deep append's verdict, and at the deferred `APPROVE` itself.
+The pass switched off by configuration is not an unfinished pass.
 
 With nothing new to say inline, the `APPROVE` or `REQUEST_CHANGES` review is
 posted body-only, so the state always lands.

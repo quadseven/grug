@@ -34,7 +34,8 @@ SINGLE_LINEAGE_NOTE = (
 SECOND_LINEAGE_MARK = "[Second lineage] "
 UNAVAILABLE_NOTE = (
     "The code-only security pass did not finish on this head, so only the "
-    "normal review covered the sensitive paths."
+    "normal review covered the sensitive paths. Elder does not approve a head "
+    "whose security pass did not finish."
 )
 
 # Whole words, so `authors.md` and `tokenizer.py` stay ordinary paths.

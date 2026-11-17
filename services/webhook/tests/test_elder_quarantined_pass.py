@@ -478,3 +478,84 @@ def test_the_quarantined_pass_is_switched_on_in_production(manifest):
 
     text = (Path(__file__).resolve().parents[3] / "k8s" / manifest).read_text()
     assert '- {name: GRUG_QUARANTINED_SECURITY_PASS, value: "1"}' in text
+
+
+def _security_pass_fails(harness, monkeypatch) -> list:
+    """The primary review answers; the code-only security pass does not.
+    Returns the list every posted check-run lands in."""
+    monkeypatch.setenv("GRUG_DEEP_ASYNC", "0")  # Tier-1 owns the verdict
+    primary = harness._review
+
+    def _second_call_fails(evidence, installation_id, voice="caveman", cancel_event=None):
+        if harness.calls:
+            harness.calls.append(evidence)
+            return LlmReviewResponse(kind="all_failed", error="down")
+        return primary(evidence, installation_id, voice, cancel_event)
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", _second_call_fails)
+    checks: list = []
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run",
+        lambda token, owner, repo, result, external_id=None: checks.append(result) or {},
+    )
+    return checks
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_unfinished_security_pass_never_approves_a_clean_head(monkeypatch, blocking):
+    """Fail closed: the sensitive paths were not security-reviewed, so the
+    clean primary review cannot vouch for the head (ADR-0028)."""
+    monkeypatch.setenv("GRUG_QUARANTINED_SECURITY_PASS", "1")
+    harness = _Harness(monkeypatch)
+    checks = _security_pass_fails(harness, monkeypatch)
+
+    _run(harness, blocking=blocking)
+
+    events = [result.event for result in harness.posted]
+    assert "APPROVE" not in events
+    assert "Elder does not approve" in checks[-1].summary
+
+
+def test_unfinished_security_pass_still_requests_changes_on_a_block(monkeypatch):
+    monkeypatch.setenv("GRUG_QUARANTINED_SECURITY_PASS", "1")
+    harness = _Harness(monkeypatch)
+    _security_pass_fails(harness, monkeypatch)
+
+    _run(harness, body="")
+
+    assert [result.event for result in harness.posted][-1] == "REQUEST_CHANGES"
+
+
+def test_cancelled_security_pass_never_approves(monkeypatch):
+    """A pass skipped by a cancel did not finish either."""
+    monkeypatch.setenv("GRUG_QUARANTINED_SECURITY_PASS", "1")
+    harness = _Harness(monkeypatch)
+    evaluation = cr_dispatch.CodeReviewEvaluation(findings=(), conclusion="success")
+    evidence = assemble_evidence(
+        [Hunk("src/auth/session.py", "+a")], pr_context={"repo": "o/r"},
+    )
+
+    _, gap = cr_dispatch._run_quarantined_pass(
+        evaluation, (), evidence, 11, repo_config=RepoConfig(), started=0.0,
+        voice="caveman", cancel_event=None, owner="o", repo_name="r",
+        pull_number=1, head_sha="h", skip=True,
+    )
+
+    assert "did not finish" in gap
+    assert harness.calls == []
+
+
+def test_finished_security_pass_still_approves_a_clean_head(monkeypatch):
+    monkeypatch.setenv("GRUG_QUARANTINED_SECURITY_PASS", "1")
+    monkeypatch.setenv("GRUG_DEEP_ASYNC", "0")
+    harness = _Harness(monkeypatch)
+    monkeypatch.setattr(
+        cr_dispatch, "review_diff",
+        lambda *a, **kw: LlmReviewResponse(
+            kind="reviewed", findings=(), backend_used=Backend.POOLSIDE,
+        ),
+    )
+
+    _run(harness)
+
+    assert [result.event for result in harness.posted][-1] == "APPROVE"
