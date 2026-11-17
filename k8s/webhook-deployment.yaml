@@ -198,6 +198,7 @@ spec:
             # The key has a zero spend limit: a paid model here 403s on every
             # call. Same :free model as the chain's tier 2.
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-ultra-550b-a55b:free"}
+            - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-ultra-550b-a55b:free"}
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
             - {name: GITHUB_APP_WEBHOOK_SECRET_SSM, value: /grug/github-app-webhook-secret}

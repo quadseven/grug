@@ -244,6 +244,7 @@ spec:
             # The key has a zero spend limit: a paid model here 403s on every
             # call. Same :free model as the chain's tier 2.
             - {name: GRUG_OPENROUTER_REVIEW_MODEL, value: "nvidia/nemotron-3-ultra-550b-a55b:free"}
+            - {name: GRUG_CLOUD_FREE_TIER_MODEL, value: "nvidia/nemotron-3-ultra-550b-a55b:free"}
             # Apex: more concurrent durable reviews so a busy multi-repo
             # night does not serialize Elder behind unrelated large PRs.
             # 3 per pod x 2 replicas (#701) = the same total 6 the single
