@@ -39,7 +39,10 @@ blocking finding stands, and the summary names the paths. The rule holds on
 Tier-1, on the deep append, and at the deferred `APPROVE`. Lock files are
 left to the lock check, which already refuses to vouch for one it did not
 read. Proven byte-identical copies and 100% moves (#813, #772) count as
-reviewed, since their content is already at head. A repository that
+reviewed, since their content is already at head. Such a run also keeps
+the Living Hunt baseline where it was and stores no patch-id, so the next
+push reviews the skipped path again instead of a delta that omits it, and
+no carried verdict can vouch for it. A repository that
 `ignore`s paths, or a pull request that changes a CSV or a vendored file,
 therefore gets no `APPROVE`; the check conclusion is unchanged.
 

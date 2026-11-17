@@ -94,7 +94,7 @@ def _review(rid, *, state, commit="old0000", submitted_at=None):
 
 def _run(monkeypatch, llm, *, blocking, action="opened", threads=(),
          carried=(), reviews=(), author="alice", head_state="current",
-         rerun_pending=False, diff=_DIFF, checks=None):
+         rerun_pending=False, diff=_DIFF, checks=None, head=_HEAD):
     """Drive one Tier-1 review; return (posted reviews, dismissed ids).
     `checks`, when given, collects every posted check-run.
 
@@ -132,6 +132,7 @@ def _run(monkeypatch, llm, *, blocking, action="opened", threads=(),
     )
     payload = _payload(action)
     payload["pull_request"]["user"]["login"] = author
+    payload["pull_request"]["head"]["sha"] = head
     with patch("httpx.get", return_value=_diff_response(diff)):
         cr_dispatch.dispatch_code_review(
             payload, blocking=blocking, rerun_pending=rerun_pending,
@@ -456,6 +457,56 @@ def test_unreviewed_path_still_requests_changes_on_a_block(monkeypatch):
         diff=_with_file("docs/guide.md", "+words\n"),
     )
     assert [r.event for r in posted][-1] == "REQUEST_CHANGES"
+
+
+_HEAD2 = "feed5678beef"
+_HUGE = "".join(f"+v{i} = {i}\n" for i in range(400))
+_OTHER = """diff --git a/src/y.py b/src/y.py
+--- a/src/y.py
++++ b/src/y.py
+@@ -1,1 +1,2 @@
+ context
++y = 2
+"""
+
+
+def test_unreviewed_path_is_not_skipped_by_the_next_delta_review(monkeypatch):
+    """#1781: push 1 carries a file too big to review, so it gets no
+    approval. Push 2 touches only another file. The Living Hunt baseline
+    must not have moved past push 1, or push 2's delta would skip the big
+    file and approve code nobody read."""
+    import adapters.install_store as store
+
+    baseline: dict = {}
+    monkeypatch.setattr(store, "get_elder_last_reviewed", lambda **k: baseline.get("head"))
+    monkeypatch.setattr(
+        store, "put_elder_last_reviewed", lambda **k: baseline.update(head=k["head_sha"]),
+    )
+    monkeypatch.setattr(cr_dispatch, "review_cohort_char_budget", lambda: 2000)
+    full_pr = _with_file("src/huge.py", _HUGE) + _OTHER
+    heads = iter((_HEAD, _HEAD2))
+    current = {}
+
+    def _snapshot(*a, **k):
+        return ("id", current["head"], "open", False)
+
+    monkeypatch.setattr(cr_dispatch, "_fetch_current_review_snapshot", _snapshot)
+    monkeypatch.setattr(
+        cr_dispatch, "fetch_pr_diff_with_scope", lambda *a, **k: (_OTHER, True, False),
+    )
+
+    current["head"] = next(heads)
+    first, _ = _run(
+        monkeypatch, _clean(), blocking=True, diff=_with_file("src/huge.py", _HUGE),
+    )
+    current["head"] = next(heads)
+    second, _ = _run(
+        monkeypatch, _clean(), blocking=True, action="synchronize", diff=full_pr,
+        head=_HEAD2,
+    )
+
+    assert "APPROVE" not in [r.event for r in first]
+    assert "APPROVE" not in [r.event for r in second]
 
 
 def test_lock_files_are_left_to_the_lock_check():

@@ -3751,6 +3751,9 @@ def _review_pass(
         # judges the lock change again rather than only what follows it.
         and not ((lock_only_review or lock_findings) and result != "pass")
         and not lock_check.unreviewed
+        # #1781: a path no model read keeps the baseline (and stores no
+        # patch-id to carry), so the next push reviews it again.
+        and not unreviewed_paths
     ):
         try:
             _, current_head_sha, _, _ = with_install_token_retry(
