@@ -174,7 +174,7 @@ def _published_findings(
         return tuple(f for f in findings if id(f) not in refuted_ids)
 
     return publish_funnel(
-        evaluate_diff(tuple(hunks), response),
+        evaluate_diff(tuple(hunks), response, cross_file_contents=evidence.cross_file_contents),
         contents,
         evidence.pr_context or {},
         grade=lambda evaluation: grade(evaluation, evidence, 0),
@@ -320,6 +320,8 @@ def diff_for_case(
     `fetch_final` (the PR's current merged diff) and reports unanchored -
     resolution trouble must never turn a replayable case into an errored
     one, it only widens the KNOWN METHODOLOGY BIAS slice honestly."""
+    if case.fixture is not None:
+        return case.fixture.diff, False
     if case.anchored:
         try:
             anchor_sha = resolve_anchor(case, token)
@@ -442,7 +444,8 @@ def run_case(
         for cohort in plan.cohorts:
             cohort_hunks = [hunks[index] for index in cohort.hunk_indexes]
             messages = _build_messages(
-                assemble_evidence(cohort_hunks), _PROMPT_VARIANT,
+                assemble_evidence(cohort_hunks, cross_file_contents=case.cross_file_contents),
+                _PROMPT_VARIANT,
                 team_practices=team_practices,
                 few_shot_examples=few_shot,
                 review_map=review_map,
@@ -564,11 +567,15 @@ def run_production_case(
         hunks = [Hunk(path=hunk.file_path, body=hunk.body) for hunk in diff_hunks]
         if not diff_hunks:
             return CaseReplay(case_id=case.case_id, emitted={}, errored=True)
-        evidence = assemble_evidence(hunks, pr_context={
-            "repo": case.repo,
-            "pr_number": case.pr,
-            "review_phase": "eval-production",
-        })
+        evidence = assemble_evidence(
+            hunks,
+            cross_file_contents=case.cross_file_contents,
+            pr_context={
+                "repo": case.repo,
+                "pr_number": case.pr,
+                "review_phase": "eval-production",
+            },
+        )
         response = review(evidence, installation_id=0)
     except Exception as e:  # noqa: BLE001 - one case must not abort the sweep
         log.warning(

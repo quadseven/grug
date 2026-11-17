@@ -1,0 +1,4 @@
+from src.render import render
+
+def main():
+    return render("daily")

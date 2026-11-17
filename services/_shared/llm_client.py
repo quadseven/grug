@@ -62,7 +62,7 @@ from openrouter_free_limiter import (
 from repo_file_cache import RepoFileCache
 from voice_pack import VoiceSelection, apply_voice
 from review_types import (
-    CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, Severity,
+    CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, EvidenceReference, Severity,
     category_or_default,
 )
 from review_pipeline import (
@@ -805,6 +805,7 @@ class Finding:
     # A duplicate candidate can be independently produced by both models. Keep
     # every source so judge and human feedback train both originating spans.
     origins: tuple[FindingOrigin, ...] = field(default_factory=tuple, compare=False)
+    evidence_ref: EvidenceReference | None = None
 
 
 # grug#1397 backstop for a model that ignores `is_finding`: the candidate's
@@ -2485,6 +2486,15 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                             "outside_diff_reason": {
                                 "type": "string", "maxLength": MAX_FINDING_MESSAGE_CHARS,
                             },
+                            "evidence_ref": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string", "maxLength": CAVE_MAX_PATH_CHARS},
+                                    "line": {"type": "integer", "minimum": 1},
+                                },
+                                "required": ["path", "line"],
+                                "additionalProperties": False,
+                            },
                             "is_finding": {"type": "boolean"},
                         },
                         "required": ["path", "line", "rule", "severity", "message"],
@@ -3005,6 +3015,15 @@ def _build_messages(
         learnings=learnings,
         guidelines=guidelines,
     )
+    if evidence.cross_file_contents:
+        system += (
+            "\n\nWhen unchanged cross-file context proves a finding, anchor the "
+            "finding's path and line on the changed diff line. Add one optional "
+            '`"evidence_ref": {"path": "src/caller.py", "line": 42}` field '
+            "using the exact path and original line number from the snippet. "
+            "For caller-not-updated, put the caller or test location in this field. "
+            "Describe the breakage in the message without repeating the citation."
+        )
     # The review prompt is redacted on EVERY backend, Cave included (#438):
     # a PR diff can carry a committed credential, and the Elder reviews code
     # structure, not the literal secret value, so masking does not cost
@@ -3393,6 +3412,18 @@ _MAX_FINDING_MESSAGE_CHARS = MAX_FINDING_MESSAGE_CHARS
 _MAX_SUGGESTION_CHARS = CAVE_MAX_SUGGESTION_CHARS
 
 
+def _coerce_evidence_ref(raw: object) -> EvidenceReference | None:
+    if not isinstance(raw, dict):
+        return None
+    path, line = raw.get("path"), raw.get("line")
+    if (
+        isinstance(path, str) and path and _redact_secrets(path) == path
+        and type(line) is int and line > 0
+    ):
+        return EvidenceReference(path, line)
+    return None
+
+
 def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
     """Validate one raw dict from the LLM into a `Finding`. Returns
     `(finding, "")` on success or `(None, reason)` on rejection so
@@ -3470,6 +3501,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
         suggestion=suggestion, effort=effort, category=category,
         outside_diff_reason=outside_diff_reason, withdrawn=withdrawn,
+        evidence_ref=_coerce_evidence_ref(raw.get("evidence_ref")),
     ), ""
 
 
@@ -4807,6 +4839,12 @@ def _merge_review_findings(
             severity = finding.severity if incoming_rank > current_rank else current.severity
             preferred = finding if incoming_rank > current_rank else current
             other = current if preferred is finding else finding
+            explanation = (
+                finding
+                if incoming_rank == current_rank
+                and len(finding.message) > len(current.message)
+                else preferred
+            )
             merged[key] = replace(
                 current,
                 # Both sides are out here. A preferred message need not carry
@@ -4816,12 +4854,8 @@ def _merge_review_findings(
                 # Prefer the explanation from the model that assigned the
                 # stronger severity; use length only as a same-severity
                 # tiebreaker so the merged finding keeps the most evidence.
-                message=(
-                    finding.message
-                    if incoming_rank == current_rank
-                    and len(finding.message) > len(current.message)
-                    else preferred.message
-                ),
+                message=explanation.message,
+                evidence_ref=explanation.evidence_ref,
                 suggestion=preferred.suggestion or other.suggestion,
                 effort=preferred.effort or other.effort,
                 category=(

@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 
+import pytest
 from elder_eval.corpus import (
     build_cases,
     expected_elder_classes,
@@ -716,6 +718,72 @@ def _finding(path: str) -> dict:
         "path": path, "line": 1, "rule": "correctness",
         "severity": "high", "message": "m",
     }
+
+
+@pytest.mark.parametrize("production", [False, True])
+def test_cross_file_fixtures_replay_and_score_without_network(monkeypatch, production):
+    from elder_eval import __main__ as cli
+    from elder_eval import runner
+    from llm_client import _build_messages, _coerce_finding
+    from sast_benchmark.backends import BenchBackend
+
+    _, args = cli._parse_args([])
+    _, _, cases = cli._load_corpus(args)
+    fixtures = [case for case in cases if case.case_id.startswith("fixture:")]
+    assert {case.case_id for case in fixtures} == {
+        "fixture:stale-arguments", "fixture:stale-return-test",
+        "fixture:missed-second-caller", "fixture:correct-arguments",
+        "fixture:correct-return-test",
+    }
+
+    def findings_for(messages):
+        assert '"evidence_ref"' in messages[0]["content"]
+        prompt = messages[1]["content"]
+        for path, witness, changed_path in (
+            ("src/job.py", "4:     return fetch(7)", "src/api.py"),
+            ("tests/test_api.py", "4:     assert status() is True", "src/status.py"),
+            ("src/cli.py", '4:     return render("daily")', "src/render.py"),
+        ):
+            if f"### {path} (UNCHANGED" in prompt and witness in prompt:
+                return [{
+                    **_finding(changed_path), "rule": "caller-not-updated",
+                    "evidence_ref": {"path": path, "line": 4},
+                }]
+        assert "4:     return fetch(7, tenant=" in prompt or (
+            '4:     assert status() == "ready"' in prompt
+        )
+        return []
+
+    def no_fetch(*args):
+        pytest.fail("committed fixtures must replay without fetching a PR")
+
+    if production:
+        def fake_review(evidence, **kwargs):
+            findings = tuple(
+                _coerce_finding(raw)[0]
+                for raw in findings_for(_build_messages(evidence, "v2"))
+            )
+            assert all(finding is not None for finding in findings)
+            return LlmReviewResponse(kind="reviewed", findings=findings)
+
+        replays = runner.run_production_eval(fixtures, fetch=no_fetch, review=fake_review)
+    else:
+        def fake_post(backend, messages):
+            return _bench_response(findings_for(messages))
+
+        monkeypatch.setattr(runner, "_post", fake_post)
+        backend = BenchBackend(name="fake", url="http://invalid", model="m", api_key="")
+        replays = runner.run_eval(backend, fixtures, fetch=no_fetch)
+
+    report = score(fixtures, replays)
+    assert report.cases_scored == 5
+    assert report.errored_cases == ()
+    assert report.overall_catch == 1.0
+    assert report.noise_rate == 0.0
+
+    clean = "fixture:correct-arguments"
+    replays[clean] = replace(replays[clean], emitted={"unknown-class": 1})
+    assert score(fixtures, replays).noise_rate == 0.25
 
 
 def test_run_case_sends_one_call_for_a_diff_that_fits_one_cohort(monkeypatch):
