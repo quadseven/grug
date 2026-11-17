@@ -1369,6 +1369,8 @@ class Learning(TypedDict):
     repo: str
     scope_path: NotRequired[str]
     source_pr: NotRequired[int]
+    # #1757: every PR an outcome-proposed rule cites as its evidence.
+    source_prs: NotRequired[list[int]]
     source_comment_id: NotRequired[int]
     author: NotRequired[str]
     created_at: NotRequired[str]
@@ -1912,6 +1914,45 @@ def import_learnings(
                 ids.append(lid)
     except psycopg.errors.UniqueViolation as e:
         raise LearningImportConflict(str(e).splitlines()[0]) from e
+    return ids
+
+
+def put_rule_proposals(proposals: list[Any], *, actor: str = "outcome-proposer") -> list[str]:
+    """Persist outcome-proposed rules (#1757) as pending Cave Drawings rows.
+
+    Each row is keyed by `learning_id` of its rule text and written with
+    `ON CONFLICT DO NOTHING`, so a rerun over the same outcomes adds no second
+    row and never overwrites a decision an operator already made. A pending
+    row never reaches a review prompt (`select_for_prompt` selects active
+    rows only), so an outcome alone cannot quiet Elder.
+
+    Returns the ids written or already present, in input order.
+    """
+    from cave_drawings import STATUS_PENDING, learning_id as _lid
+
+    now = _now_iso()
+    ids: list[str] = []
+    for proposal in proposals:
+        data: dict[str, Any] = dict(proposal.as_learning(now=now))
+        text = str(data.get("text") or "").strip()
+        repo = str(data.get("repo") or "").strip()
+        if not (text and repo):
+            continue
+        lid = _lid(text)
+        data.update({
+            "text": text,
+            "repo": repo,
+            "status": STATUS_PENDING,
+            "active": False,
+            "history": [_history_entry("proposed", actor)],
+        })
+        with get_pool().connection() as conn, conn.transaction():
+            conn.execute(
+                "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (pk, sk) DO NOTHING",
+                (_learning_pk(repo), _learning_sk(lid), encode_attrs(data), _learning_ttl()),
+            )
+        ids.append(lid)
     return ids
 
 

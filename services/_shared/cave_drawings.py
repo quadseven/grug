@@ -22,6 +22,9 @@ unit-testable without a store or a network:
 - portable export and an import PLAN (dry run): validation, deduplication
   and repository resolution happen here; the store applies a clean plan in
   one transaction, and imported rows land `pending` until approved.
+- outcome-proposed rules (#1757): `propose_rules` turns a repo's repeated
+  reasoned declines into pending rule proposals. A person still approves;
+  no outcome alone reaches a prompt.
 """
 
 from __future__ import annotations
@@ -180,6 +183,149 @@ def touches_protected(row: dict[str, Any]) -> bool:
     return is_protected_finding(
         str(row.get("finding_class") or ""), str(row.get("finding_category") or ""),
     ) or names_protected_class(str(row.get("text") or ""))
+
+
+# --- outcome-proposed rules (#1757) ---------------------------------------
+# A finding outcome joins the ledger's written fields (repo, pr, class,
+# category, verdict) with the reply's written reason and the ADR-0026 trust
+# fields (declined_by, pr_author, commit_authors). The proposer is pure: the
+# store reads the rows, this module makes every decision.
+
+_MIN_DECLINING_PRS = 2
+
+
+@dataclass(frozen=True)
+class RuleProposal:
+    """One pending rule proposed from repeated reasoned declines on one repo."""
+
+    text: str
+    repo: str
+    finding_class: str
+    source_prs: tuple[int, ...]
+
+    @property
+    def id(self) -> str:
+        """The Cave Drawings key the store writes, from the rule text alone."""
+        return learning_id(self.text)
+
+    def as_learning(self, now: str = "") -> dict[str, Any]:
+        """The pending Cave Drawings row this proposal becomes."""
+        stamp = now or datetime.now(timezone.utc).isoformat()
+        return {
+            "text": self.text,
+            "repo": self.repo,
+            "finding_class": self.finding_class,
+            "source_prs": list(self.source_prs),
+            "source_pr": self.source_prs[0] if self.source_prs else 0,
+            "reason": f"declined with a reason on {len(self.source_prs)} pull requests",
+            "status": STATUS_PENDING,
+            "active": False,
+            "created_at": stamp,
+            "reinforced_at": stamp,
+            "version": 1,
+        }
+
+
+def _outcome_pr(outcome: dict[str, Any]) -> int | None:
+    try:
+        return int(outcome.get("pr"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _pr_writers(outcome: dict[str, Any]) -> set[str] | None:
+    """The PR's author and commit identities, lower-case, or None when either
+    is unknown, which trusts nobody (the ADR-0026 reply gate's rule)."""
+    author = str(outcome.get("pr_author") or "").strip().lower()
+    commits = outcome.get("commit_authors")
+    if not author or commits is None or isinstance(commits, (str, bytes)):
+        return None
+    try:
+        return {author} | {str(c).strip().lower() for c in commits}
+    except TypeError:
+        return None
+
+
+def _countable_decline(outcome: Any) -> bool:
+    """Whether one outcome is a reasoned decline by a trusted non-writer."""
+    if not isinstance(outcome, dict):
+        return False
+    if str(outcome.get("verdict") or "").strip().lower() != "declined":
+        return False
+    if not is_reasoned_dismissal(str(outcome.get("reason") or "")):
+        return False
+    decliner = str(outcome.get("declined_by") or "").strip().lower()
+    if not decliner or is_app_actor(decliner, str(outcome.get("actor_type") or "")):
+        return False
+    writers = _pr_writers(outcome)
+    return writers is not None and decliner not in writers
+
+
+def _plain_pattern(finding_class: str) -> str:
+    """The class name as plain words, for a rule a person can read."""
+    spaced = _CAMEL_BOUNDARY.sub(" ", finding_class)
+    return re.sub(r"[-_]+", " ", spaced).strip().lower()
+
+
+def _outcome_is_protected(outcome: dict[str, Any], finding_class: str) -> bool:
+    category = str(outcome.get("category") or outcome.get("finding_category") or "")
+    return (
+        is_protected_finding(finding_class, category)
+        or names_protected_class(_plain_pattern(finding_class))
+        or names_protected_class(str(outcome.get("reason") or ""))
+    )
+
+
+def _proposal_text(finding_class: str, repo: str, prs: tuple[int, ...]) -> str:
+    cites = ", ".join(f"#{pr}" for pr in prs)
+    return (
+        f"Do not re-raise {_plain_pattern(finding_class)} findings in {repo}; "
+        f"maintainers declined this pattern with a reason on PRs {cites}."
+    )
+
+
+def propose_rules(outcomes: list[dict[str, Any]]) -> list[RuleProposal]:
+    """Pending rule proposals from one repo's finding outcomes.
+
+    One proposal per (repo, finding class) when outcomes from at least two
+    DISTINCT pull requests are reasoned declines (`declined` + a reason of at
+    least four words) by someone who is neither the PR author nor a commit
+    author, nor an App. The text names the pattern in plain words and cites
+    every PR it came from. A protected class (SAST, security category, or
+    protected vocabulary in the class or reason) is never proposed.
+
+    The result is deterministic for the same outcomes, so a store writing
+    rows keyed by `RuleProposal.id` adds nothing on a rerun. Callers write
+    these as pending; `select_for_prompt` reads active rows only, so no
+    outcome can quiet Elder without a person's approval.
+    """
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for outcome in outcomes:
+        if not _countable_decline(outcome):
+            continue
+        repo = str(outcome.get("repo") or "").strip()
+        finding_class = str(outcome.get("finding_class") or "").strip()
+        if not (repo and finding_class):
+            continue
+        group = groups.setdefault((repo, finding_class), {"prs": set(), "protected": False})
+        pr = _outcome_pr(outcome)
+        if pr is not None:
+            group["prs"].add(pr)
+        if _outcome_is_protected(outcome, finding_class):
+            group["protected"] = True
+
+    proposals: list[RuleProposal] = []
+    for (repo, finding_class), group in groups.items():
+        if group["protected"] or len(group["prs"]) < _MIN_DECLINING_PRS:
+            continue
+        prs = tuple(sorted(group["prs"]))
+        proposals.append(RuleProposal(
+            text=_proposal_text(finding_class, repo, prs),
+            repo=repo,
+            finding_class=finding_class,
+            source_prs=prs,
+        ))
+    return proposals
 
 
 def fired_review_key(pr: int | str, head_sha: str) -> str:
