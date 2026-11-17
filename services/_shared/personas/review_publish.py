@@ -659,11 +659,14 @@ def neutral_reason(
         return f"lock files {names} were kept from review and have no machine check"
     if outage_advisory:
         return "the Elder review backends are in a sustained outage, so the check is advisory"
+    if evaluation.degraded_reason == "no_diff":
+        # Not a degradation: there was nothing to review (degraded_gate.py).
+        return "there was no reviewable diff on this head (`no_diff`)"
     if evaluation.degraded_reason:
         return f"the review was degraded (`{evaluation.degraded_reason}`)"
     if mode == "advisory":
         return "the Elder check is in advisory mode"
-    return "the Elder check is advisory"
+    return "the review itself concluded neutral"
 
 
 def append_neutral_reason(summary: str, reason: str) -> str:

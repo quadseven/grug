@@ -5493,6 +5493,14 @@ def _async_deep_append_if_needed(
     summary = _lead_if_degraded(summary, combined)
     if outage.advisory:
         summary = advisory_summary(outage, summary)
+    if conclusion == "neutral":
+        # grug#1753: the deep append is an Elder check too, so a neutral
+        # one names its cause the same way Tier-1 does.
+        why = neutral_reason(
+            combined, mode=mode, outage_advisory=outage.advisory,
+        )
+        summary = append_neutral_reason(summary, why)
+        title = neutral_check_title(title, why)
     # #1344: a later-POSTED Elder check owns the check surface. Post order is
     # not run order, so this only decides the check and refuses approvals;
     # it never silences a block (below).

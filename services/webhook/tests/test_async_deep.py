@@ -461,6 +461,29 @@ def test_async_deep_arm_ran_clean_still_publishes_success(monkeypatch):
     assert "appended after Tier-1 completed" in deep[-1]["summary"]
 
 
+def test_async_deep_clean_advisory_pass_says_why_it_is_neutral(monkeypatch):
+    """grug#1753: the deep append publishes its own Elder check, so a clean
+    advisory deep pass must name advisory mode just as Tier-1 does, or the
+    latest check reads "Elder clear" with a bare neutral."""
+    ran_clean = LlmReviewResponse(
+        kind="reviewed", findings=(),
+        backend_used=Backend.CAVE_REASONER, model_name="reasoner",
+        backends_used=(Backend.CAVE_REASONER,), models_used=("reasoner",),
+    )
+
+    posted = _run_escalated_review(monkeypatch, deep=ran_clean, blocking=False)
+
+    deep = _deep_checks(posted)
+    assert deep, "deep check-run was never posted"
+    assert deep[-1]["conclusion"] == "neutral"
+    assert "Neutral because" in deep[-1]["title"]
+    assert "advisory mode" in deep[-1]["title"]
+    neutral_lines = [line for line in deep[-1]["summary"].splitlines()
+                     if line.startswith("Neutral because ")]
+    assert len(neutral_lines) == 1
+    assert "advisory mode" in neutral_lines[0]
+
+
 def test_async_deep_arm_no_diff_is_not_a_failure(monkeypatch, caplog):
     """`no_diff` from the reasoner means there was nothing for it to look at
     (BENIGN_DEGRADATIONS) - not a failure to look. It must not manufacture a
