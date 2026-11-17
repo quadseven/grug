@@ -13,6 +13,9 @@ an underscore-private name from another persona's module:
     string and the Activity-feed degraded reason all read off one value, so
     the check run, the log and the feed cannot tell different stories ("no
     lies", ADR-0003).
+  * the neutral-reason helpers (`neutral_reason` and friends): a check that
+    concludes `neutral` names its cause in its title and summary, so a
+    clean-looking pass cannot hide behind a neutral conclusion (#1753).
 
 Rendering of the Elder-voiced review body lives in `code_reviewer.markings` (#1591).
 """
@@ -41,6 +44,7 @@ __all__ = [
     "PersonaResultStr",
     "PublishOutcome",
     "ReviewMode",
+    "append_neutral_reason",
     "fetch_file_contents",
     "fetch_pr_diff",
     "fetch_pr_diff_with_scope",
@@ -48,6 +52,8 @@ __all__ = [
     "is_low_confidence",
     "is_partial_coverage",
     "is_real_degradation",
+    "neutral_check_title",
+    "neutral_reason",
     "plan_publish",
     "prior_finding_keys",
     "verdict_event",
@@ -631,3 +637,49 @@ def _gate(
     if evaluation.conclusion == "failure":
         return "failure", "REQUEST_CHANGES"
     return evaluation.conclusion, "COMMENT"
+
+
+def neutral_reason(
+    evaluation: CodeReviewEvaluation, *, mode: ReviewMode,
+    outage_advisory: bool = False,
+    unreviewed_lock_files: tuple[str, ...] = (),
+) -> str:
+    """Why a check concluded `neutral` instead of a pass (grug#1753).
+
+    A neutral Elder check cannot clear a blocking merge gate, so the check
+    output must name the cause: a lock file with no machine check, a
+    sustained backend outage, the exact `degraded_reason` value, or
+    advisory mode. Call only when the published conclusion is `neutral`;
+    the arguments are the same ones the gate and the later lock-file rule
+    read, so the words here cannot drift from the decision they explain
+    ("no lies", ADR-0003).
+    """
+    if unreviewed_lock_files:
+        names = ", ".join(f"`{name}`" for name in unreviewed_lock_files)
+        return f"lock files {names} were kept from review and have no machine check"
+    if outage_advisory:
+        return "the Elder review backends are in a sustained outage, so the check is advisory"
+    if evaluation.degraded_reason == "no_diff":
+        # Not a degradation: there was nothing to review (degraded_gate.py).
+        return "there was no reviewable diff on this head (`no_diff`)"
+    if evaluation.degraded_reason:
+        return f"the review was degraded (`{evaluation.degraded_reason}`)"
+    if mode == "advisory":
+        return "the Elder check is in advisory mode"
+    return "the review itself concluded neutral"
+
+
+def append_neutral_reason(summary: str, reason: str) -> str:
+    """Add the standalone 'Neutral because ...' line to a check summary.
+
+    Appended after the pinned closure so a reader sees the review's own
+    verdict first, then why it did not become a pass. The dedicated line
+    lets a scan of the Checks tab find every neutral Elder check without
+    parsing the prose above it.
+    """
+    return f"{summary.rstrip()}\n\nNeutral because {reason}."
+
+
+def neutral_check_title(title: str, reason: str) -> str:
+    """Make a neutral check's title say so, instead of reading like a pass."""
+    return f"Neutral because {reason} - {title}"

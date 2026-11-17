@@ -199,7 +199,9 @@ def test_published_check_summary_is_pinned_and_closed(posted_checks):
     ))
     final = posted[-1].summary
     assert final.splitlines()[0] == f"Reviewed head `{SHA}` for #1429."
-    assert final.rstrip().splitlines()[-1] == pr.CLOSURE_NOTHING
+    lines = [line for line in final.splitlines() if line.strip()]
+    assert lines[-2] == pr.CLOSURE_NOTHING
+    assert lines[-1].startswith("Neutral because ")
 
 
 def test_degraded_check_summary_leads_with_degraded_line_then_pin(posted_checks):
@@ -207,4 +209,5 @@ def test_degraded_check_summary_leads_with_degraded_line_then_pin(posted_checks)
     lines = _visible(posted[-1].summary)
     assert lines[0].startswith("Degraded review (all_failed):")
     assert lines[1] == f"Reviewed head `{SHA}` for #1429."
-    assert lines[-1] == pr.CLOSURE_DEGRADED
+    assert lines[-2] == pr.CLOSURE_DEGRADED
+    assert lines[-1].startswith("Neutral because ")
