@@ -198,6 +198,30 @@ model leaving a weaker one in the chain: search `llm_model_benched`); failures
 across every model right after a deploy point at a prompt or parser
 regression.
 
+### Elder: "Grug cannot read this pull request: 403 from GitHub"
+
+Elder's own read of `GET repos/<owner>/<repo>/pulls/<n>` was denied. The job
+posts one failing check-run with that title on the queued head and ends with
+status `pr_read_forbidden`, with no redrive. The structured log event is
+`elder_pr_read_forbidden` (fields: `install_id`, `repo`, `pr`, `head_sha`).
+This is a GitHub access problem, not a model outage: model failures carry
+`eyes clouded` titles instead.
+
+Because other calls on the same repo can still succeed (models reached,
+other passes ran), the denial is specific to this read. Check in order:
+
+1. App installation coverage: in the installation's settings on GitHub,
+   confirm the repository is selected (or "All repositories" is on). A
+   private repo added after install is not covered by a "selected
+   repositories" installation.
+2. App permissions: `pull_requests` must be granted (see
+   `docs/app-permissions.md`). A permission change waits for the owner to
+   accept the new permissions on the installation; until then reads fail 403.
+3. Repository rules or an organization SAML/IP allow list that blocks the
+   App's installation token.
+
+Operator step once fixed: re-run Elder on the pull request (`/grug improve`).
+
 ## Missed-delivery replay (#407)
 
 The DoR/TPM check runs inline on the webhook. GitHub does not automatically
