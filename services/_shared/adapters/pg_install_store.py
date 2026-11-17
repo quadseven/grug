@@ -1956,6 +1956,41 @@ def put_rule_proposals(proposals: list[Any], *, actor: str = "outcome-proposer")
     return ids
 
 
+def _decline_outcome_pk(repo: str) -> str:
+    return f"OUTCOME#{repo}"
+
+
+def put_decline_outcome(repo: str, comment_id: int, outcome: Mapping[str, Any]) -> None:
+    """Keep one reasoned-decline outcome (#1757), keyed by the reply comment.
+
+    `ON CONFLICT DO NOTHING`, so a redelivered reply stores nothing twice."""
+    if not (repo and comment_id):
+        return
+    with get_pool().connection() as conn, conn.transaction():
+        conn.execute(
+            "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (pk, sk) DO NOTHING",
+            (
+                _decline_outcome_pk(repo), f"DECLINE#{int(comment_id)}",
+                encode_attrs(dict(outcome)), _learning_ttl(),
+            ),
+        )
+
+
+def list_decline_outcomes(repo: str) -> list[dict[str, Any]]:
+    """Every live decline outcome kept for a repo, oldest key first."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT pk, sk, data FROM grug_kv
+            WHERE pk = %s AND sk LIKE 'DECLINE#%%' AND {TTL_LIVE}
+            ORDER BY sk COLLATE "C" ASC
+            """,
+            (_decline_outcome_pk(repo),),
+        ).fetchall()
+    return [dict(decode_item(pk, sk, data)) for pk, sk, data in rows]
+
+
 def _learning_fired_pk(repo: str) -> str:
     return f"LEARNFIRED#{repo}"
 
