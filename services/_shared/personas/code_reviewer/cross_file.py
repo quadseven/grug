@@ -102,6 +102,118 @@ _SNIPPET_RADIUS = 10
 _MAX_SNIPPET_WINDOWS = 3
 _MAX_SNIPPET_LINES = 80
 
+# Cross-file context character budget (T1756): total characters across all
+# cross-file snippets. Replaces the fixed _MAX_FILES count with a budget
+# that fits the prompt window. A file that does not fit is dropped whole.
+_MAX_CROSS_FILE_TOTAL_CHARS = 40_000
+
+# File classification for ranking (T1756).
+from enum import Enum
+from dataclasses import dataclass, replace
+
+
+class FileTag(Enum):
+    """Priority order for cross-file context: callers matter most (they
+    may break), then tests (they pin contracts), then definitions (for
+    understanding the callee)."""
+    CALLER = 0
+    TEST = 1
+    DEFINITION = 2
+
+
+@dataclass(frozen=True, slots=True)
+class CrossFileCandidate:
+    """A candidate cross-file context file with its classification and
+    matched symbols. Used for pure ranking before budget trimming."""
+    path: str
+    content: str
+    matched_symbols: tuple[str, ...]
+    tag: FileTag
+
+
+def is_test_file(path: str) -> bool:
+    """Return True if `path` looks like a test file: under a tests/
+    directory, or named test_*.py or *_test.py. Pure."""
+    name = path.split("/")[-1]
+    if name.startswith("test_") and name.endswith(".py"):
+        return True
+    if name.endswith("_test.py"):
+        return True
+    parts = path.split("/")
+    return any(p == "tests" for p in parts)
+
+
+def _defines_symbol(content: str, symbol: str) -> bool:
+    """Check if `content` defines `symbol` as a function or class. Pure."""
+    # Content may have line numbers prefixed (e.g., "1: def foo():")
+    # Match optional line number prefix: ^\d+:\s*
+    line_prefix = r"(?:\d+:\s*)?"
+    # Function definition: def symbol( or async def symbol(
+    if re.search(
+        rf"^{line_prefix}\s*(?:async\s+)?def\s+{re.escape(symbol)}\s*\(",
+        content,
+        re.MULTILINE,
+    ):
+        return True
+    # Class definition: class symbol( or class symbol:
+    if re.search(
+        rf"^{line_prefix}\s*class\s+{re.escape(symbol)}\s*[\(:]",
+        content,
+        re.MULTILINE,
+    ):
+        return True
+    return False
+
+
+def tag_candidate(candidate: CrossFileCandidate) -> CrossFileCandidate:
+    """Classify a candidate as CALLER, TEST, or DEFINITION based on path
+    and content. Pure; returns a new candidate with the tag set."""
+    # Test files always tag as TEST (highest priority after caller)
+    if is_test_file(candidate.path):
+        return replace(candidate, tag=FileTag.TEST)
+
+    # If the content defines any of the matched symbols, it's a DEFINITION
+    for sym in candidate.matched_symbols:
+        if _defines_symbol(candidate.content, sym):
+            return replace(candidate, tag=FileTag.DEFINITION)
+
+    # Otherwise it's a CALLER (references the symbol without defining it)
+    return replace(candidate, tag=FileTag.CALLER)
+
+
+def rank_cross_file_candidates(
+    candidates: list[CrossFileCandidate],
+    char_budget: int = _MAX_CROSS_FILE_TOTAL_CHARS,
+) -> list[CrossFileCandidate]:
+    """Rank candidates by tag priority (CALLER > TEST > DEFINITION), then
+    by number of matched symbols descending, then trim to `char_budget`
+    by dropping the lowest-ranked whole file first. Pure; no I/O."""
+    if not candidates:
+        return []
+
+    # Tag each candidate first
+    tagged = [tag_candidate(c) for c in candidates]
+
+    # Sort by: tag priority (lower enum value = higher priority), then
+    # by matched symbol count descending, then by path for determinism.
+    tagged.sort(
+        key=lambda c: (c.tag.value, -len(c.matched_symbols), c.path)
+    )
+
+    # Trim to character budget by keeping highest-ranked files that fit.
+    # A file that doesn't fit is dropped entirely (never cut mid-snippet).
+    kept: list[CrossFileCandidate] = []
+    total = 0
+    for c in tagged:
+        c_len = len(c.content)
+        if total + c_len <= char_budget:
+            kept.append(c)
+            total += c_len
+        else:
+            # Drop this file and all lower-ranked ones (they're larger or equal)
+            break
+    return kept
+
 
 def _symbol_snippet(content: str, symbols: tuple[str, ...]) -> str | None:
     """Bounded, original-line-numbered windows of `content` around lines
@@ -256,7 +368,9 @@ def fetch_cross_file_context(
     on the default-branch index) and fetch each file's content AT
     `head_sha` (contents API - SHA-accurate). Returns {path: content};
     `exclude_paths` (the diff's own files, already in #336 context) are
-    skipped. FAIL-SAFE: any error degrades to partial-or-empty, logged.
+    skipped. Results are ranked (CALLER > TEST > DEFINITION, then by
+    matched symbol count) and trimmed to a character budget. FAIL-SAFE:
+    any error degrades to partial-or-empty, logged.
     """
     if not symbols:
         return {}
@@ -266,11 +380,11 @@ def fetch_cross_file_context(
     # must finish inside _TOTAL_BUDGET_SECONDS.
     deadline = time.monotonic() + _TOTAL_BUDGET_SECONDS
 
-    paths: list[str] = []
+    # Collect candidate paths from search (per symbol, up to _MAX_FILES each).
+    # We gather more than the old _MAX_FILES limit because ranking will
+    # trim to the character budget.
+    candidate_paths: list[str] = []
     for sym in symbols[:_MAX_SYMBOLS]:
-        # Clamp the per-call timeout to the REMAINING budget (codex round
-        # 2): a call started at deadline-epsilon must not block the full
-        # _SEARCH_TIMEOUT past the global cap.
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             log.info(
@@ -295,9 +409,6 @@ def fetch_cross_file_context(
             resp.raise_for_status()
             items = (resp.json() or {}).get("items", [])
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
-            # 403 = rate-limited (code-search is the tightest GitHub
-            # bucket); transport = blip. Either way: degrade, log, and
-            # STOP searching - further calls would burn the same budget.
             log.info(
                 "cross_file_context_degraded",
                 extra={"stage": "search", "symbol": sym, "error": str(e)},
@@ -305,26 +416,24 @@ def fetch_cross_file_context(
             break
         for item in items:
             p = item.get("path")
-            # Tracer scope: Python callers only. Also cuts injection/noise
-            # surface — a README or docs file mentioning the symbol is
-            # attacker-influenceable prose, not a caller (codex round 5).
             if (
                 p
                 and p.endswith(".py")
                 and p not in exclude_paths
-                and p not in paths
+                and p not in candidate_paths
             ):
-                paths.append(p)
-        if len(paths) >= _MAX_FILES:
-            break
+                candidate_paths.append(p)
+        # Continue searching for more symbols even if we have many paths;
+        # ranking will select the best ones.
 
-    contents: dict[str, str] = {}
-    for path in paths[:_MAX_FILES]:
+    # Fetch content for candidate paths and build CrossFileCandidate objects.
+    candidates: list[CrossFileCandidate] = []
+    for path in candidate_paths:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             log.info(
                 "cross_file_context_degraded",
-                extra={"stage": "budget", "phase": "content", "collected": len(contents)},
+                extra={"stage": "budget", "phase": "content", "collected": len(candidates)},
             )
             break
         try:
@@ -340,19 +449,12 @@ def fetch_cross_file_context(
             )
             resp.raise_for_status()
             if len(resp.content) > _MAX_FILE_BYTES:
-                # Prompt-budget guard: an oversized context file costs
-                # more than its 1-hop value. Skip it, keep the rest.
                 log.info(
                     "cross_file_context_degraded",
                     extra={"stage": "size", "path": path, "bytes": len(resp.content)},
                 )
                 continue
-            # Ship SNIPPETS around the symbol matches, not the whole file
-            # (codex round 7): bounds what leaves the boundary + the
-            # prompt cost. Original line numbers preserved so the
-            # caller-not-updated rule can cite caller path:line. A file
-            # where no symbol actually appears (search false-hit) is
-            # dropped entirely.
+            # Extract snippet around symbol matches.
             snippet = _symbol_snippet(resp.text, symbols)
             if snippet is None:
                 log.info(
@@ -360,12 +462,28 @@ def fetch_cross_file_context(
                     extra={"stage": "no_symbol_match", "path": path},
                 )
                 continue
-            contents[path] = snippet
+            # Determine which symbols actually appear in this file's snippet.
+            matched = tuple(s for s in symbols if s in snippet)
+            if not matched:
+                log.info(
+                    "cross_file_context_degraded",
+                    extra={"stage": "no_symbol_match", "path": path},
+                )
+                continue
+            candidates.append(
+                CrossFileCandidate(
+                    path=path,
+                    content=snippet,
+                    matched_symbols=matched,
+                    tag=FileTag.CALLER,  # placeholder; will be retagged
+                )
+            )
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
-            # Same per-file degrade contract as #336's fetch_file_contents:
-            # skip this file, keep the rest.
             log.info(
                 "cross_file_context_degraded",
                 extra={"stage": "content", "path": path, "error": str(e)},
             )
-    return contents
+
+    # Rank and trim to character budget.
+    ranked = rank_cross_file_candidates(candidates)
+    return {c.path: c.content for c in ranked}
