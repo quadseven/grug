@@ -185,7 +185,7 @@ def test_preview_rejects_invalid_paths_and_missing_sources(api):
 
 def test_export_import_round_trip_is_dry_run_first_then_pending(api, store):
     _teach(store, "rule one", repo="o/src", scope_path="src/*.py", source_pr=3)
-    store.put_rule_proposals([cd.RuleProposal("rule two", "o/src", "nested-if", (12, 34))])
+    _teach(store, "rule two", repo="o/src")
     doc = api.export_learnings(repo="o/src", user=_admin())
     assert doc["format"] == cd.EXPORT_FORMAT and len(doc["learnings"]) == 2
 
@@ -202,13 +202,6 @@ def test_export_import_round_trip_is_dry_run_first_then_pending(api, store):
     rows = store.list_learnings("o/dst", include_inactive=True)
     assert {r["status"] for r in rows} == {cd.STATUS_PENDING}
     assert {r["text"] for r in rows} == {"rule one", "rule two"}
-    [proposal] = api.list_learnings(repo="o/dst", q="rule two", user=_admin())["learnings"]
-    assert proposal["source"]["origin"] == "import"
-    assert proposal["source"]["signal"] == "import"
-    exported = api.export_learnings(repo="o/dst", user=_admin())["learnings"]
-    [reexported] = [row for row in exported if row["text"] == "rule two"]
-    assert reexported["origin"] == "import"
-    assert reexported["source_prs"] == [12, 34]
 
     # Re-importing is a no-op: every row is now a duplicate.
     again = api.import_learnings(
@@ -216,6 +209,20 @@ def test_export_import_round_trip_is_dry_run_first_then_pending(api, store):
     )
     assert again["created"] == []
     assert [i["action"] for i in again["items"]] == ["duplicate", "duplicate"]
+
+
+def test_an_imported_outcome_proposal_keeps_its_cited_prs(api, store):
+    store.put_rule_proposals([cd.RuleProposal("rule two", "o/src", "nested-if", (12, 34))])
+    doc = api.export_learnings(repo="o/src", user=_admin())
+    api.import_learnings(
+        api.ImportRequest(document=doc, target_repo="o/dst", dry_run=False), user=_admin(),
+    )
+    [view] = api.list_learnings(repo="o/dst", user=_admin())["learnings"]
+    assert view["source"]["origin"] == "import"
+    assert view["source"]["cited_prs"] == [12, 34]
+    [reexported] = api.export_learnings(repo="o/dst", user=_admin())["learnings"]
+    assert reexported["origin"] == "import"
+    assert reexported["source_prs"] == [12, 34]
 
 
 def test_import_refuses_to_apply_an_ambiguous_or_invalid_plan(api, store):
