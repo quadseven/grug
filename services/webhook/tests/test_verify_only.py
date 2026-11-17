@@ -32,6 +32,15 @@ LOOK_ALIKES = (
 )
 
 
+def test_a_grug_note_asking_to_confirm_does_not_make_a_finding_verify_only():
+    """The refute-outage advisory note ends "confirm by hand"; it is Grug's
+    own annotation, not the reviewer's ask."""
+    from personas.code_reviewer.judge import _ADVISORY_NOTE
+
+    message = "value may be None here" + _ADVISORY_NOTE.format(confidence=0.92)
+    assert not is_verify_only(message)
+
+
 def test_a_long_run_of_lead_ins_is_matched_in_linear_time():
     import time
 

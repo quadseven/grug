@@ -50,8 +50,14 @@ _SENTENCE_RE = re.compile(
 _DEMOTABLE = frozenset({"low", "medium"})
 
 
+# Grug's own bracketed notes on a finding ("[Downgraded to advisory: ...
+# confirm by hand.]") are not the reviewer's ask and are not read.
+_GRUG_NOTE_RE = re.compile(r"\[[^\[\]]{0,600}\]")
+
+
 def _sentences(message: str) -> list[str]:
-    return [s.strip(" -*>") for s in _SENTENCE_RE.split(message or "") if s.strip(" -*>")]
+    text = _GRUG_NOTE_RE.sub(" ", message or "")
+    return [s.strip(" -*>") for s in _SENTENCE_RE.split(text) if s.strip(" -*>")]
 
 
 def is_verify_only(message: str) -> bool:
