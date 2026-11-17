@@ -43,7 +43,7 @@ from pathlib import Path
 
 from sast_benchmark.backends import BenchBackend
 
-from .fixtures import default_fixtures
+from .fixtures import default_fixtures, real_fixtures
 from .llmobs_export import _DEFAULT_ML_APP, flush, maybe_enable
 from .runner import sweep
 from .scoring import summarize_trials
@@ -89,10 +89,38 @@ def main(argv: list[str] | None = None) -> int:
         default="all",
         choices=("small", "medium", "large", "all"),
     )
+    p.add_argument(
+        "--fixtures",
+        default=None,
+        choices=("synthetic", "real", "all"),
+        help="Which fixture set to run (default: synthetic)",
+    )
+    p.add_argument("--dry-run", action="store_true", help="Print prompt sizes; no backend call")
     p.add_argument("--no-stream", action="store_true")
     p.add_argument("--timeout-s", type=float, default=330.0)
     p.add_argument("--json", dest="json_path", default="", help="Write trials JSON")
     args = p.parse_args(argv)
+
+    fixtures_choice = args.fixtures or "synthetic"
+    if fixtures_choice == "synthetic":
+        fixtures = default_fixtures()
+        if args.fixture != "all":
+            fixtures = tuple(f for f in fixtures if f.name == args.fixture)
+    elif fixtures_choice == "real":
+        fixtures = real_fixtures()
+    else:
+        fixtures = default_fixtures() + real_fixtures()
+        if args.fixture != "all":
+            fixtures = tuple(f for f in fixtures if f.name == args.fixture)
+    if not fixtures:
+        print("No fixtures selected", file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        for f in fixtures:
+            est_tokens = f.prompt_chars // 4
+            print(f"{f.name}: {f.prompt_chars} prompt chars (~{est_tokens} tokens)")
+        return 0
 
     backends = _backends_from_env()
     if not backends:
@@ -104,13 +132,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     levels = tuple(int(x.strip()) for x in args.levels.split(",") if x.strip())
-    fixtures = default_fixtures()
-    if args.fixture != "all":
-        fixtures = tuple(f for f in fixtures if f.name == args.fixture)
-    if not fixtures:
-        print("No fixtures selected", file=sys.stderr)
-        return 2
-
     llmobs_on = maybe_enable()
     print("Fixtures:")
     for f in fixtures:
