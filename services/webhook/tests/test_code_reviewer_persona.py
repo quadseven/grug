@@ -747,8 +747,10 @@ def test_evaluate_diff_carries_suggestion_and_effort():
 
 def test_complexity_severity_clamp_keys_on_the_marker_the_prompt_asks_for() -> None:
     """The prompt tells the model which prefix keeps a complexity finding
-    above medium; the clamp must key on that same prefix, or the rule and
-    the code disagree about when `high` survives."""
+    at medium; the clamp must key on that same prefix, or the rule and the
+    code disagree about when the finding counts. Complexity is never
+    blocking (grug#1767): even a marked one stops at medium, and an
+    unmarked one is a low summary note."""
     from code_review_prompt import COMPLEXITY_CORRECTNESS_MARKER, build_system_prompt
 
     assert COMPLEXITY_CORRECTNESS_MARKER in build_system_prompt()
@@ -767,4 +769,46 @@ def test_complexity_severity_clamp_keys_on_the_marker_the_prompt_asks_for() -> N
         backend_used=Backend.POOLSIDE,
     )
     out = evaluate_diff(hunks, llm)
-    assert [f.severity for f in out.findings] == ["medium", "high", "high"]
+    assert [f.severity for f in out.findings] == ["low", "medium", "high"]
+
+
+def test_model_complexity_findings_are_never_blocking() -> None:
+    """grug#1767: a model `high-complexity` finding keeps no blocking
+    severity, marked or not, and an unmarked one drops to a low note."""
+    from code_review_prompt import COMPLEXITY_CORRECTNESS_MARKER
+
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            _llm_finding(line=2, severity="critical", rule="high-complexity",
+                         message=f"{COMPLEXITY_CORRECTNESS_MARKER} the new "
+                         "branch skips the lock release."),
+            _llm_finding(line=3, severity="medium", rule="high-complexity",
+                         message="This function is long."),
+        ),
+        backend_used=Backend.POOLSIDE,
+    )
+    out = evaluate_diff(hunks, llm)
+    assert [f.severity for f in out.findings] == ["medium", "low"]
+
+
+def test_broad_except_keeps_severity_only_when_a_caller_relies_on_the_result() -> None:
+    """grug#1767: `broad-except-masks-bug` posts at its severity only when
+    its message names a caller-visible result the swallowed error can
+    change; otherwise it is a low note."""
+    hunks = parse_diff(_DIFF)
+    llm = LlmReviewResponse(
+        kind="reviewed",
+        findings=(
+            _llm_finding(line=2, severity="medium", rule="broad-except-masks-bug",
+                         message="`except Exception` catches every fish, even "
+                         "the bugs you not mean."),
+            _llm_finding(line=3, severity="medium", rule="broad-except-masks-bug",
+                         message="On a KeyError this returns None, and the "
+                         "caller `charge` reads None as a paid order."),
+        ),
+        backend_used=Backend.POOLSIDE,
+    )
+    out = evaluate_diff(hunks, llm)
+    assert [f.severity for f in out.findings] == ["low", "medium"]

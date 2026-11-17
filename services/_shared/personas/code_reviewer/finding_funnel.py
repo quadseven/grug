@@ -36,10 +36,12 @@ from personas.code_reviewer.intent_filter import (
 from personas.code_reviewer.judge import partition_findings
 from personas.code_reviewer.linked_issue import rendered_criteria_with_state
 from personas.code_reviewer.persona import (
+    BROAD_EXCEPT_RULE,
     CodeReviewEvaluation,
     Finding,
     with_findings,
 )
+from personas.code_reviewer.repo_config import _SEVERITY_RANK
 from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
 from personas.tpm.ticket_compliance import closes_refs
 
@@ -52,6 +54,10 @@ CORRECTNESS_ONLY_SCOPE = "correctness findings only (documentation/tests change)
 NON_CORRECTNESS_RULES = frozenset({
     "dead-code", "complexity-hotspot", "high-complexity", "type-safety-gap",
 })
+
+# Kinds the review benchmark found mostly matching no defect (grug#1767):
+# they rank after every defect kind.
+LOW_VALUE_STYLE_RULES = NON_CORRECTNESS_RULES | {BROAD_EXCEPT_RULE}
 
 # Defensive model rules eligible for the reachable-caller post-filter. Security
 # rules and deterministic linter rule IDs are intentionally absent.
@@ -73,6 +79,18 @@ Falsify = Callable[
     [tuple[Finding, ...], tuple[Finding, ...], tuple[FindingJudgement, ...]],
     tuple[Finding, ...],
 ]
+
+
+def rank_by_defect_value(findings: tuple[Finding, ...]) -> tuple[Finding, ...]:
+    """Order findings by expected defect value (grug#1767): defect kinds
+    first, then low-value style kinds, each by severity. The sort is stable,
+    so ties keep the order the passes produced."""
+    return tuple(sorted(
+        findings,
+        key=lambda f: (
+            f.rule_name in LOW_VALUE_STYLE_RULES, -_SEVERITY_RANK[f.severity],
+        ),
+    ))
 
 
 def drop_non_correctness_findings(
@@ -212,8 +230,9 @@ def publish_funnel(
         evaluation = with_findings(evaluation, kept)
     evaluation = verify(evaluation)
     surviving = falsify(evaluation.findings, graded, verdicts)
-    if surviving != evaluation.findings:
-        evaluation = with_findings(evaluation, surviving)
+    ranked = rank_by_defect_value(surviving)
+    if ranked != evaluation.findings:
+        evaluation = with_findings(evaluation, ranked)
     return FunnelResult(
         evaluation, graded, verdicts, tuple(suppressed), filtered.defensive_dropped,
     )
