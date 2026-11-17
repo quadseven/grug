@@ -55,6 +55,27 @@ def test_list_shows_scope_matcher_provenance_status_and_usage(api, store):
     assert view["created_at"] and view["updated_at"]
 
 
+def test_list_shows_pending_outcome_proposal_with_cited_prs(bare_api, monkeypatch):
+    proposal = cd.RuleProposal("prefer early returns", "o/r", "nested-if", (12, 34))
+    row = {**proposal.as_learning(), "history": [{"action": "proposed"}]}
+    monkeypatch.setattr(bare_api.install_store, "list_learnings", lambda *a, **kw: [row])
+
+    [view] = bare_api.list_learnings(repo="o/r", status="pending", user=_admin())["learnings"]
+    assert view["status"] == "pending"
+    assert view["source"]["origin"] == "outcome"
+    assert view["source"]["cited_prs"] == [12, 34]
+    assert view["source"]["signal"] == "maintainer-reply"
+
+
+def test_list_shows_reply_taught_origin(bare_api, monkeypatch):
+    row = {"text": "prefer early returns", "repo": "o/r", "source_pr": 4, "source_comment_id": 55}
+    monkeypatch.setattr(bare_api.install_store, "list_learnings", lambda *a, **kw: [row])
+
+    [view] = bare_api.list_learnings(repo="o/r", user=_admin())["learnings"]
+    assert view["source"]["origin"] == "reply"
+    assert view["source"]["signal"] == "maintainer-reply"
+
+
 def test_list_across_repos_with_search_and_status_filter(api, store):
     _teach(store, "prefer early returns", repo="o/a")
     b = _teach(store, "name the caller", repo="o/b")
@@ -164,7 +185,7 @@ def test_preview_rejects_invalid_paths_and_missing_sources(api):
 
 def test_export_import_round_trip_is_dry_run_first_then_pending(api, store):
     _teach(store, "rule one", repo="o/src", scope_path="src/*.py", source_pr=3)
-    _teach(store, "rule two", repo="o/src")
+    store.put_rule_proposals([cd.RuleProposal("rule two", "o/src", "nested-if", (12, 34))])
     doc = api.export_learnings(repo="o/src", user=_admin())
     assert doc["format"] == cd.EXPORT_FORMAT and len(doc["learnings"]) == 2
 
@@ -181,6 +202,13 @@ def test_export_import_round_trip_is_dry_run_first_then_pending(api, store):
     rows = store.list_learnings("o/dst", include_inactive=True)
     assert {r["status"] for r in rows} == {cd.STATUS_PENDING}
     assert {r["text"] for r in rows} == {"rule one", "rule two"}
+    [proposal] = api.list_learnings(repo="o/dst", q="rule two", user=_admin())["learnings"]
+    assert proposal["source"]["origin"] == "import"
+    assert proposal["source"]["signal"] == "import"
+    exported = api.export_learnings(repo="o/dst", user=_admin())["learnings"]
+    [reexported] = [row for row in exported if row["text"] == "rule two"]
+    assert reexported["origin"] == "import"
+    assert reexported["source_prs"] == [12, 34]
 
     # Re-importing is a no-op: every row is now a duplicate.
     again = api.import_learnings(
@@ -287,8 +315,7 @@ def _status_error(code: int) -> httpx.HTTPStatusError:
 
 @pytest.fixture()
 def bare_api():
-    """The preview route never touches the store when GitHub fails, so
-    these run without the Postgres fixture."""
+    """Load the router for tests that run without the Postgres fixture."""
     import learnings
 
     return learnings

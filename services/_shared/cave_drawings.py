@@ -79,8 +79,11 @@ EXPORT_VERSION = 1
 
 # Fields that travel in an export. Usage counters and TTLs are local to one
 # instance and are deliberately left behind.
+# `source_prs` carries the pull request numbers cited as evidence. The export
+# also describes the row's `origin` (reply, import or outcome). An imported
+# row gets its own `import` origin and keeps the cited numbers.
 _PORTABLE_FIELDS = (
-    "text", "repo", "scope_path", "source_pr", "source_comment_id", "author",
+    "text", "repo", "scope_path", "source_pr", "source_prs", "source_comment_id", "author",
     "created_at", "supersedes", "conflicts_with",
     "reason", "finding_class", "finding_category",
 )
@@ -94,6 +97,17 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 def learning_id(text: str) -> str:
     """Stable 12-hex identity of a learning from its rule text."""
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:12]
+
+
+def learning_origin(row: dict[str, Any]) -> str:
+    """Identify how the learning first entered the store."""
+    history = row.get("history") or []
+    action = history[0].get("action") if history else None
+    if action == "imported":
+        return "import"
+    if action == "proposed":
+        return "outcome"
+    return "reply"
 
 
 def effective_status(row: dict[str, Any], now: datetime | None = None) -> str:
@@ -482,6 +496,7 @@ def export_document(rows: list[dict[str, Any]]) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     for row in rows:
         item = {k: row[k] for k in _PORTABLE_FIELDS if row.get(k) not in (None, "", [])}
+        item["origin"] = learning_origin(row)
         item["status"] = effective_status(row)
         item["expires_at"] = expires_at(row)
         items.append(item)
@@ -587,11 +602,14 @@ def _invalid_reason(raw: Any) -> str | None:
 def _portable_learning(raw: dict[str, Any], repo: str) -> dict[str, Any]:
     """The fields of one valid exported learning that an import writes."""
     conflicts = raw.get("conflicts_with")
+    source_prs = raw.get("source_prs")
     return {
         "text": str(raw.get("text", "")).strip(),
         "repo": repo,
         "scope_path": str(raw.get("scope_path", "") or ""),
         "source_pr": _int_or_zero(raw.get("source_pr")),
+        "source_prs": [pr for pr in source_prs if type(pr) is int and pr > 0]
+        if isinstance(source_prs, list) else [],
         "source_comment_id": _int_or_zero(raw.get("source_comment_id")),
         "author": str(raw.get("author", "") or ""),
         "created_at": str(raw.get("created_at", "") or ""),
