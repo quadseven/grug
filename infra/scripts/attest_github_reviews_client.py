@@ -3,7 +3,7 @@
 
 Proves NECESSARY conditions for these bools (via AST static analysis):
 
-  - `event_is_comment_or_request_changes_per_elder_persona`
+  - `event_is_approve_comment_or_request_changes_per_elder_persona` (#1758)
   - `post_init_raises_on_invalid_event_per_elder_persona`
   - `payload_shape_matches_github_pulls_reviews_api_per_elder_persona`
   - `request_uses_install_token_bearer_auth_per_elder_persona`
@@ -30,7 +30,7 @@ CLIENT_PATHS: tuple[Path, ...] = (
     REPO_ROOT / "services/_shared/github_reviews_client.py",
 )
 
-EXPECTED_EVENTS: frozenset[str] = frozenset(("COMMENT", "REQUEST_CHANGES"))
+EXPECTED_EVENTS: frozenset[str] = frozenset(("APPROVE", "COMMENT", "REQUEST_CHANGES"))
 
 
 def _find_frozen_dataclass(tree: ast.Module, name: str) -> ast.ClassDef | None:
@@ -244,7 +244,7 @@ def _check(path: Path) -> list[str]:
     failures: list[str] = []
     tree = ast.parse(path.read_text(), filename=str(path))
 
-    # event allowlist must exactly equal {COMMENT, REQUEST_CHANGES}
+    # event allowlist must exactly equal {APPROVE, COMMENT, REQUEST_CHANGES}
     valid_events_node = _find_assignment(tree, "_VALID_EVENTS")
     events = _str_set_from_node(valid_events_node, tree)
     if events != EXPECTED_EVENTS:

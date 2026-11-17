@@ -1,7 +1,10 @@
-"""Synthetic long-context review fixtures for latency replay (#648).
+"""Review fixtures for latency replay (#648).
 
-These are NOT quality ground truth — they exist to stress prefill + decode
-with Elder-shaped prompts. No secrets, no real hostnames, no customer code.
+Synthetic fixtures (default_fixtures) repeat one added line per hunk; real
+fixtures (real_fixtures) replay merged pull requests of this repo from
+fixtures/*.json (diff, base file contents, PR title and body). Neither is
+quality ground truth - they exist to stress prefill + decode with
+Elder-shaped prompts. No secrets, no customer code.
 
 Uses llm_client._build_messages deliberately (same pattern as elder_eval /
 sast_benchmark runners): the harness must measure Elder's real prompt path,
@@ -10,10 +13,14 @@ not a reimplementation that can drift.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from llm_client import Hunk, _build_messages  # noqa: PLC2701 - Elder path on purpose
 from review_evidence import assemble_evidence
+
+_REAL_FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +33,24 @@ class LatencyFixture:
     messages: tuple[dict[str, str], ...]
     prompt_chars: int
 
+
+@dataclass(frozen=True, slots=True)
+class RealLatencyFixture(LatencyFixture):
+    """A LatencyFixture built from a real merged pull request.
+
+    Carries the raw inputs (hunks, pr_context, file_contents) so callers can
+    rebuild the prompt through assemble_evidence + _build_messages exactly as
+    production does, in addition to the already-materialized messages."""
+
+    title: str = ""
+    body: str = ""
+    pr_number: int | None = None
+    repo: str = ""
+    commit: str = ""
+    hunks: tuple[Hunk, ...] = ()
+    pr_context: dict = field(default_factory=dict)
+    file_contents: dict[str, str] = field(default_factory=dict)
+    diff: str = ""
 
 _PROMPT_VARIANT = "v2"
 
@@ -83,3 +108,66 @@ def default_fixtures() -> tuple[LatencyFixture, ...]:
             ],
         ),
     )
+
+
+def _added_lines_for_hunks(hunks: list[Hunk]) -> int:
+    n = 0
+    for h in hunks:
+        for line in h.body.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                n += 1
+    return n
+
+
+def _build_real_fixture(spec: dict) -> RealLatencyFixture:
+    hunks = [Hunk(path=h["path"], body=h["body"]) for h in spec.get("hunks", [])]
+    pr_context = {
+        "title": spec.get("title", ""),
+        "body": spec.get("body", ""),
+        "repo": spec.get("repo", "quadseven/grug"),
+        "pr_number": spec.get("pr_number") or 0,
+        "head_sha": (spec.get("commit") or "abc1234")[:7],
+        "base_sha": "base",
+    }
+    file_contents = spec.get("file_contents") or {}
+    evidence = assemble_evidence(
+        hunks, pr_context=pr_context, file_contents=file_contents,
+    )
+    messages = _build_messages(evidence, _PROMPT_VARIANT)
+    frozen = tuple({"role": m["role"], "content": m["content"]} for m in messages)
+    chars = sum(len(m["content"]) for m in frozen)
+    diff_text = "\n".join(h["body"] for h in spec.get("hunks", []))
+    return RealLatencyFixture(
+        name=spec.get("name", "real"),
+        added_lines=_added_lines_for_hunks(hunks),
+        messages=frozen,
+        prompt_chars=chars,
+        title=spec.get("title", ""),
+        body=spec.get("body", ""),
+        pr_number=spec.get("pr_number"),
+        repo=spec.get("repo", "quadseven/grug"),
+        commit=spec.get("commit", ""),
+        hunks=tuple(hunks),
+        pr_context=pr_context,
+        file_contents=dict(file_contents),
+        diff=diff_text,
+    )
+
+
+def _load_real_specs() -> tuple[dict, ...]:
+    out: list[dict] = []
+    if not _REAL_FIXTURES_DIR.exists():
+        return ()
+    for path in sorted(_REAL_FIXTURES_DIR.glob("*.json")):
+        try:
+            with path.open(encoding="utf-8") as fh:
+                out.append(json.load(fh))
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"unreadable real fixture {path.name}: {exc}") from exc
+    return tuple(out)
+
+
+def real_fixtures() -> tuple[RealLatencyFixture, ...]:
+    """Fixtures built from real merged pull requests in this repo."""
+    return tuple(_build_real_fixture(s) for s in _load_real_specs())
+

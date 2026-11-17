@@ -355,16 +355,33 @@ def with_degradation(
     )
 
 
+COMPLEXITY_RULES = frozenset({"high-complexity", "complexity-hotspot"})
+BROAD_EXCEPT_RULE = "broad-except-masks-bug"
+# What a broad-except finding must name to keep its severity: a caller or
+# consumer whose result the swallowed error can change (grug#1767).
+_CALLER_RESULT_RE = re.compile(
+    r"\b(?:callers?|consumers?|downstream|relies on|rely on|depends on)\b",
+    re.IGNORECASE,
+)
+
+
 def _capped_severity(rule: str, severity: Severity, message: str) -> Severity:
-    """A complexity finding is advice, so it stays at medium unless its
-    message opens with the correctness-risk marker and names a real bug
-    risk (grug#1144). Every other kind keeps the severity it came with.
+    """Quiet the low-value style kinds a model emits (grug#1767).
+
+    A complexity finding is advice and never blocks: with the
+    correctness-risk marker (grug#1144) it stays at most medium, without it
+    it is a low summary note. A broad-except finding keeps its severity only
+    when it names a caller or consumer whose result the swallowed error can
+    change; otherwise it is a low note. Every other kind keeps the severity
+    it came with.
     """
-    if rule not in {"high-complexity", "complexity-hotspot"}:
-        return severity
-    if message.lstrip().lower().startswith(COMPLEXITY_CORRECTNESS_MARKER.lower()):
-        return severity
-    return "medium"
+    if rule in COMPLEXITY_RULES:
+        if message.lstrip().lower().startswith(COMPLEXITY_CORRECTNESS_MARKER.lower()):
+            return "medium" if severity in _BLOCKING_SEVERITIES else severity
+        return "low"
+    if rule == BROAD_EXCEPT_RULE and not _CALLER_RESULT_RE.search(message):
+        return "low"
+    return severity
 
 
 def _hunk_line_index(hunks: tuple[DiffHunk, ...]) -> dict[str, set[int]]:

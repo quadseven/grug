@@ -98,17 +98,21 @@ def test_post_review_body_request_changes_with_inline_comments():
 
 
 def test_review_result_rejects_invalid_event():
-    """type-design: only COMMENT and REQUEST_CHANGES are permitted.
-    APPROVE would be wrong shape for an automated reviewer that does
-    not actually approve PRs; PENDING leaves the review unsubmitted
-    (a draft) which the persona does not use. Reject at construction."""
+    """type-design: only APPROVE, COMMENT and REQUEST_CHANGES are
+    permitted. An unknown event never leaves the process."""
     with pytest.raises((TypeError, ValueError)):
         ReviewResult(  # type: ignore[arg-type]
             commit_id="abc",
-            event="APPROVE",
+            event="DISMISS",
             body="ok",
             comments=(),
         )
+
+
+def test_review_result_accepts_approve():
+    """#1758: Elder posts its clean verdict as a formal APPROVE review."""
+    r = ReviewResult(commit_id="abc", event="APPROVE", body="ok", comments=())
+    assert r.event == "APPROVE"
 
 
 def test_review_result_rejects_zero_line_in_inline_comment():
@@ -156,8 +160,7 @@ def test_inline_comment_rejects_negative_line():
 def test_review_result_rejects_pending_event():
     """PENDING is explicitly called out in the module docstring as
     rejected (creates a draft review that never publishes — the persona
-    has no use for it). Only APPROVE was previously tested; this covers
-    the second documented rejection."""
+    has no use for it)."""
     with pytest.raises(ValueError, match="event must be one of"):
         ReviewResult(  # type: ignore[arg-type]
             commit_id="abc", event="PENDING", body="x", comments=(),

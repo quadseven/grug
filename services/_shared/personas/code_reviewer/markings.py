@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from model_family import ReviewFamilies
@@ -1448,6 +1449,68 @@ def _checked_comment_body(f: Finding, file_text: str, precedent_note: str) -> st
     return _inline_comment_body(replace(f, suggestion=checked), precedent_note)
 
 
+_RUN_MARKER = "<!-- grug:elder-run started={} -->"
+_RUN_MARKER_RE = re.compile(r"<!-- grug:elder-run started=(\S+) -->")
+
+
+def run_marker(started: datetime) -> str:
+    """The run identity an Elder review carries: when its run started.
+
+    Later runs on the same head order verdicts by run start, not by when a
+    review was posted (#1764), since a slow run can post after a
+    faster run that started later.
+    """
+    return _RUN_MARKER.format(started.astimezone(timezone.utc).isoformat())
+
+
+def review_run_started(body: str | None) -> datetime | None:
+    """The run start a review body's marker names, or None when it carries
+    no parseable marker (a review posted before markers existed)."""
+    match = _RUN_MARKER_RE.search(body or "")
+    if match is None:
+        return None
+    try:
+        started = datetime.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+    return started if started.tzinfo is not None else None
+
+
+_VERDICT_LINES: dict[str, str] = {
+    "APPROVE": "Nothing blocking stands on this head.",
+    "REQUEST_CHANGES": (
+        "A blocking finding still stands on this head; the Grug - Elder "
+        "check lists it."
+    ),
+}
+
+
+def _tags(persona: str, run_started_at: datetime | None) -> str:
+    """The machine-read markers closing every review body: the persona tag
+    (dismissal and replay detection) and, when known, the run marker."""
+    tag = f"\n\n{_REVIEW_PERSONA_TAG.format(persona)}"
+    return tag + (f"\n{run_marker(run_started_at)}" if run_started_at else "")
+
+
+def _verdict_only_review(
+    head_sha: str, event: ReviewEvent, persona: str, run_started_at: datetime | None,
+) -> ReviewResult:
+    """A verdict review with no inline comment (#1758): the head's formal
+    state when every finding is already posted, or there is none. Carries
+    the persona tag, so dismissal and replay detection find it."""
+    return ReviewResult(
+        commit_id=head_sha,
+        event=event,
+        body=(
+            f'<img src="{_PERSONA_PORTRAIT}" width="46" align="left" alt="Grug {_PERSONA}" />'
+            f"\n\n**Grug {_PERSONA}** gaze upon your PR - {_VERDICT_LINES[event]}"
+            + (f"\n\n{pin_line(head_sha)}" if head_sha else "")
+            + _tags(persona, run_started_at)
+        ),
+        comments=(),
+    )
+
+
 def build_review_result(
     evaluation: CodeReviewEvaluation, *, head_sha: str, event: ReviewEvent,
     prior_keys: frozenset[str] = frozenset(),
@@ -1457,8 +1520,18 @@ def build_review_result(
     persona: str = "elder",
     muted: dict[str, ClassPrecision] | None = None,
     held_back: frozenset[str] = frozenset(),
+    posts_verdict: bool = False,
+    run_started_at: datetime | None = None,
 ) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
     """Build the ReviewResult, or (None, ()) if nothing NEW to post.
+
+    `run_started_at` (Elder) is written into the body as the run marker, so
+    later runs order verdicts by run start (`review_run_started`).
+
+    `posts_verdict` (#1758, Elder's Tier-1 pass): an `APPROVE` or
+    `REQUEST_CHANGES` event is the head's formal verdict, so it is posted
+    even with no new inline comment, as a body-only review. A `COMMENT`
+    with nothing new still posts nothing.
 
     Skips entirely on fully degraded responses. A partial staged review still
     publishes its validated findings, but stays advisory. `prior_keys`
@@ -1516,6 +1589,8 @@ def build_review_result(
             if finding_key(f.file, f.line, f.rule_name) not in held_back
         )
     if not new_findings:
+        if posts_verdict and event != "COMMENT":
+            return _verdict_only_review(head_sha, event, persona, run_started_at), ()
         return None, ()
     notes = precedent_notes or {}
     texts = file_contents or {}
@@ -1536,7 +1611,7 @@ def build_review_result(
             f'<img src="{_PERSONA_PORTRAIT}" width="46" align="left" alt="Grug {_PERSONA}" />'
             f"\n\n**Grug {_PERSONA}** gaze upon your PR · {len(comments)} finding(s)"
             + (f"\n\n{pin_line(head_sha)}" if head_sha else "")
-            + f"\n\n{_REVIEW_PERSONA_TAG.format(persona)}"
+            + _tags(persona, run_started_at)
         ),
         comments=comments,
     ), new_findings
@@ -1576,6 +1651,11 @@ class FinishedPass:
     held_back: frozenset[str]
     held_note: str
     repo_config: RepoConfig | None
+    # #1758: True on the pass whose review is the head's formal verdict
+    # (Tier-1); the deep append only adds findings, so it is False there.
+    posts_verdict: bool
+    # When this Elder run started: the run marker later runs order by.
+    run_started_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -1611,6 +1691,8 @@ def project(finished: FinishedPass) -> Markings:
         file_contents=finished.file_contents,
         muted=finished.muted,
         held_back=finished.held_back,
+        posts_verdict=finished.posts_verdict,
+        run_started_at=finished.run_started_at,
     )
     stack_body: str | None = None
     stack_error = ""
