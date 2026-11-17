@@ -875,18 +875,70 @@ def _names_changed_doc(hunks: tuple[DiffHunk, ...], pr_title: str) -> bool:
     )
 
 
+_CONDITIONAL_RE = re.compile(r"^\s*if\s+(?P<antecedent>[^,]+),", re.IGNORECASE)
+_NEGATORS = frozenset({"no", "not", "never", "none"})
+_FILLER_WORDS = frozenset({"a", "an", "the", "any", "some"})
+_ANTECEDENT_WORD_RE = re.compile(r"[a-z0-9_.>=<-]+")
+
+
+def _antecedent(text: str) -> tuple[frozenset[str], bool] | None:
+    """`If P, ...` as (P's words less negation and articles, negated?).
+    "n't" counts as a negation ("doesn't exist" pairs with "exists")."""
+    found = _CONDITIONAL_RE.match(text)
+    if found is None:
+        return None
+    raw = found.group("antecedent").lower().replace("n't", " not")
+    words = _ANTECEDENT_WORD_RE.findall(raw)
+    negations = sum(w in _NEGATORS for w in words)
+    core = frozenset(
+        w for w in words if w not in _NEGATORS and w not in _FILLER_WORDS
+        and w not in {"does", "do", "is", "are"}
+    )
+    return (core, negations % 2 == 1) if core else None
+
+
+def _exempt_by_sibling(
+    criteria: tuple[LinkedCriterion, ...], state: list[LinkedCriterion],
+) -> set[tuple[int, int]]:
+    """Criteria whose `if P` / `if not P` sibling in the same issue can be
+    met without runtime change (grug#1752). Exactly one branch of the pair
+    can ever be delivered; when the diff delivers the sibling, this
+    branch's antecedent is false and no diff can satisfy it. A pair whose
+    branches both need runtime change exempts neither, and an unpaired
+    conditional is still a runtime criterion."""
+    in_state = {(c.issue, c.number) for c in state}
+    exempt: set[tuple[int, int]] = set()
+    for c in state:
+        mine = _antecedent(c.text)
+        if mine is None:
+            continue
+        for other in criteria:
+            theirs = _antecedent(other.text)
+            if (
+                other.issue == c.issue and other.number != c.number
+                and theirs is not None and theirs[0] == mine[0]
+                and theirs[1] != mine[1]
+                and (other.issue, other.number) not in in_state
+            ):
+                exempt.add((c.issue, c.number))
+    return exempt
+
+
 def _state_criteria(
     criteria: tuple[LinkedCriterion, ...], renamed: tuple[tuple[str, str], ...],
 ) -> list[LinkedCriterion]:
     """The runtime and `Live:` criteria a change must make true, less those
-    a production rename in the diff meets (#1379), and less a CI run that
-    happens only after the merge (#1509)."""
-    return [
+    a production rename in the diff meets (#1379), less a CI run that
+    happens only after the merge (#1509), and less the untaken branch of an
+    if/else pair whose other branch needs no runtime change (#1752)."""
+    state = [
         c for c in criteria
         if (_is_runtime_criterion(c.text) or _is_live_criterion(c.text))
         and not _met_by_rename(c.text, renamed)
         and not is_future_post_merge_observation(c.text)
     ]
+    exempt = _exempt_by_sibling(criteria, state)
+    return [c for c in state if (c.issue, c.number) not in exempt]
 
 
 def _unmet_criteria_finding(

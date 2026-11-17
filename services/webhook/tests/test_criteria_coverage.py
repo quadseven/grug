@@ -735,3 +735,58 @@ def test_criteria_about_the_pull_request_itself_need_no_hunk():
         hunks, {}, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
     )
     assert not _by_rule(findings, "intent-mismatch")
+
+
+# grug#1752: an if/else pair over one fact, verbatim from the recorded
+# ticket. Exactly one branch can be delivered; the other's antecedent is
+# false, so no diff can satisfy it.
+_IF_ELSE_PAIR = (
+    "Check the current upstream Scrypted image for Node >= 22.23.4.",
+    "If a fixed upstream image exists, update Scrypted to use it.",
+    "If no fixed upstream image exists, document the checked image version "
+    "and Node version in the repository.",
+)
+
+
+def _pair_mismatches(texts: Sequence[str]) -> int:
+    hunks, contents = _docs_only_diff()
+    criteria = tuple(LinkedCriterion(6149, n, t) for n, t in enumerate(texts, 1))
+    findings = scan_criteria_coverage(
+        hunks, contents, criteria=criteria, pr_title=_TITLE, pr_body=_BODY,
+    )
+    return len(_by_rule(findings, "intent-mismatch"))
+
+
+def test_a_docs_diff_delivering_the_else_branch_exempts_the_if_branch():
+    assert _pair_mismatches(_IF_ELSE_PAIR[1:]) == 0
+    # The unconditional check criterion stays as it was on its own.
+    assert _pair_mismatches(_IF_ELSE_PAIR) == _intent_mismatches(_IF_ELSE_PAIR[0])
+
+
+def test_the_pair_is_matched_whichever_branch_is_negated():
+    swapped = (
+        "If no fixed upstream image exists, update Scrypted to pin the patched base.",
+        "If a fixed upstream image exists, document the image version in the repository.",
+    )
+    assert _pair_mismatches(swapped) == 0
+    assert _pair_mismatches(tuple(reversed(swapped))) == 0
+    assert _pair_mismatches(tuple(reversed(_IF_ELSE_PAIR[1:]))) == 0
+
+
+def test_an_unpaired_conditional_is_still_a_runtime_criterion():
+    alone = "If the cache is enabled, the handler returns 304 on a repeat read."
+    assert _pair_mismatches((alone,)) == 1
+    unrelated = (
+        alone,
+        "If no fixed upstream image exists, document the checked image version "
+        "in the repository.",
+    )
+    assert _pair_mismatches(unrelated) == 1
+
+
+def test_a_pair_whose_branches_both_need_runtime_is_still_unmet():
+    both_runtime = (
+        "If the cache is enabled, the handler returns 304 on a repeat read.",
+        "If the cache is not enabled, the handler returns 200 on a repeat read.",
+    )
+    assert _pair_mismatches(both_runtime) == 1
