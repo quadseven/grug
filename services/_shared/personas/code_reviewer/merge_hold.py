@@ -27,6 +27,11 @@ MAX_HOLDS = 8
 MAX_QUOTE_CHARS = 240
 # Only this much of a line is read for a hold and its references.
 MAX_LINE_CHARS = 1000
+# A hold keeps at most this many cited issues, and one review reads at most
+# this many cited issues' states, so a long hold list cannot drain the App's
+# GitHub rate limit. Past the read cap the check fails closed.
+MAX_REFS_PER_HOLD = 8
+MAX_ISSUE_READS = 16
 
 # Owner and repository names are bounded as GitHub bounds them, so a long
 # run of name characters cannot make each start position rescan the run.
@@ -62,13 +67,16 @@ class Hold:
 
 
 def _refs(text: str, owner: str, repo: str) -> tuple[int, ...]:
-    """Same-repository issue numbers cited in `text`, in order."""
+    """Same-repository issue numbers cited in `text`, in order, at most
+    MAX_REFS_PER_HOLD."""
     found: dict[int, None] = {}
     for m in _REF_RE.finditer(text[:MAX_LINE_CHARS]):
         if m.group(4):
             found.setdefault(int(m.group(4)), None)
         elif m.group(1).casefold() == owner.casefold() and m.group(2).casefold() == repo.casefold():
             found.setdefault(int(m.group(3)), None)
+        if len(found) >= MAX_REFS_PER_HOLD:
+            break
     return tuple(found)
 
 
@@ -122,17 +130,37 @@ def _first_added_line(hunks: tuple[DiffHunk, ...]) -> tuple[str, int] | None:
     return None
 
 
+def _unchecked_finding(anchor: tuple[str, int], unchecked: int) -> Finding:
+    return Finding(
+        file=anchor[0],
+        line=anchor[1],
+        severity="high",
+        rule_name=RULE,
+        message=(
+            f"Merge holds cite more issues than one review reads: {unchecked} "
+            f"cited issues past the first {MAX_ISSUE_READS} were not checked, "
+            "so the holds cannot be shown met. Trim the hold list to the "
+            "issues the merge really waits on."
+        ),
+        suggestion=None,
+        category="correctness",
+    )
+
+
 def hold_findings(
     holds: tuple[Hold, ...], open_refs: frozenset[int],
-    hunks: tuple[DiffHunk, ...],
+    hunks: tuple[DiffHunk, ...], *, unchecked: int = 0,
 ) -> tuple[Finding, ...]:
-    """One high finding per hold that waits on a still-open issue. Holds
-    whose every cited issue is closed, or a diff with no added line, give
-    none. Duplicate quotes count once."""
+    """One high finding per hold that waits on a still-open issue, plus one
+    when `unchecked` cited issues went past the read cap (fail closed).
+    Holds whose every cited issue is closed, or a diff with no added line,
+    give none. Duplicate quotes count once."""
     anchor = _first_added_line(hunks)
     if anchor is None:
         return ()
-    findings: list[Finding] = []
+    findings: list[Finding] = (
+        [_unchecked_finding(anchor, unchecked)] if unchecked else []
+    )
     seen: set[str] = set()
     for hold in holds[:MAX_HOLDS]:
         waiting = [n for n in hold.refs if n in open_refs]

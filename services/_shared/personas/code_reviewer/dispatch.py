@@ -133,7 +133,9 @@ from personas.code_reviewer.deferred_ruff import (
 )
 from personas.code_reviewer.lint import ruff_hits
 from personas.code_reviewer.lane_work import is_lane_pr, lane_work_findings
-from personas.code_reviewer.merge_hold import MAX_HOLDS, find_holds, hold_findings
+from personas.code_reviewer.merge_hold import (
+    MAX_HOLDS, MAX_ISSUE_READS, find_holds, hold_findings,
+)
 from personas.code_reviewer.linked_issue import (
     IssueDetailsFetcher, build_linked_issue_context, linked_issue_numbers,
     rendered_criteria, rendered_criteria_with_state, rendered_health_issues,
@@ -1749,19 +1751,21 @@ def _note_open_merge_holds(
                 str(issue.get("body") or ""), source=f"ticket #{number}",
                 owner=owner, repo=repo_name,
             ))
-        cited = dict.fromkeys(
+        cited = list(dict.fromkeys(
             n for hold in holds[:MAX_HOLDS] for n in hold.refs if n not in linked
-        )
+        ))
         open_refs = frozenset(
-            n for n in cited
+            n for n in cited[:MAX_ISSUE_READS]
             if (_read_issue_or_none(fetch_issue, n) or {}).get("state") == "open"
         )
+        unchecked = max(0, len(cited) - MAX_ISSUE_READS)
     except Exception as e:  # noqa: BLE001 - additive; never break the review
         log.info("code_review_merge_hold_failed", extra={"kind": type(e).__name__})
         return
-    if open_refs:
+    if open_refs or unchecked:
         pr_context["merge_holds"] = tuple(holds[:MAX_HOLDS])
         pr_context["merge_hold_open_refs"] = open_refs
+        pr_context["merge_hold_unchecked"] = unchecked
 
 
 def _merge_open_merge_holds(
@@ -1774,6 +1778,7 @@ def _merge_open_merge_holds(
         tuple(pr_context.get("merge_holds") or ()),
         frozenset(pr_context.get("merge_hold_open_refs") or ()),
         hunks,
+        unchecked=int(pr_context.get("merge_hold_unchecked") or 0),
     )
     return with_extra_findings(evaluation, found)
 

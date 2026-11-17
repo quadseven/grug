@@ -154,6 +154,33 @@ def test_dispatch_passes_when_every_held_issue_is_closed_or_unreadable():
     assert merged.conclusion == "success"
 
 
+def test_a_hold_keeps_at_most_the_per_hold_cap_of_references():
+    from personas.code_reviewer.merge_hold import MAX_REFS_PER_HOLD
+
+    refs = " ".join(f"#{n}" for n in range(1, 50))
+    (hold,) = _holds(f"Blocked by {refs}.")
+    assert hold.refs == tuple(range(1, MAX_REFS_PER_HOLD + 1))
+
+
+def test_dispatch_reads_at_most_the_cap_and_says_the_rest_went_unchecked():
+    """200 cited issues across many holds: Elder reads at most
+    MAX_ISSUE_READS of them, and a finding says the cap was hit."""
+    from personas.code_reviewer.merge_hold import MAX_ISSUE_READS
+
+    lines = "\n".join(
+        "- " + " ".join(f"#{n}" for n in range(start, start + 10))
+        for start in range(1000, 1200, 10)
+    )
+    body = f"Refs #160\n\n## Blocked by\n{lines}\n"
+    reads = []
+    merged = _review(body, {160: ("open", "")}, reads)
+    cited_reads = [n for n in reads if n != 160]
+    assert len(cited_reads) <= MAX_ISSUE_READS
+    capped = [f for f in merged.findings if "were not checked" in f.message]
+    assert len(capped) == 1 and capped[0].severity == "high"
+    assert merged.conclusion == "failure"
+
+
 def test_dispatch_skips_the_tickets_the_pr_links():
     """The linked ticket is the work itself, open until this PR lands."""
     body = "Refs #22\n\nDo not merge until #22 is fixed."

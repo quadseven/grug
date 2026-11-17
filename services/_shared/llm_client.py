@@ -255,6 +255,8 @@ class PrContext(TypedDict, total=False):
     # issues still open at review time (grug#1766).
     merge_holds: tuple[Any, ...]
     merge_hold_open_refs: frozenset[int]
+    # Cited issues past the per-review read cap; any fails the check closed.
+    merge_hold_unchecked: int
     review_scope: str
     sensitive_review: bool
     # A quarantined pass reads no text the PR's author could write (grug#1569).
