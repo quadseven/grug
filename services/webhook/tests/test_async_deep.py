@@ -303,6 +303,7 @@ def _run_escalated_review(
     checks_on_head: list[dict] | None = None,
     posted_reviews: list | None = None,
     on_reasoner=None,
+    tier1=None,
 ) -> list[dict]:
     """Drive one escalated tiered review (clean Tier-1, `deep` from the
     reasoner) in blocking mode (unless told otherwise) and return every
@@ -321,7 +322,9 @@ def _run_escalated_review(
         })
         return {"id": len(posted_checks)}
 
-    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: _clean_tier1())
+    monkeypatch.setattr(
+        cr_dispatch, "review_diff", tier1 or (lambda *a, **kw: _clean_tier1()),
+    )
     def _fake_reasoner(*a, **kw):
         if on_reasoner is not None:
             on_reasoner()
@@ -600,7 +603,7 @@ def _elder_review(rid, *, state, commit="abcd1234efgh", submitted_at=None):
 
 
 def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True,
-                       checks_on_head=None, posted=None):
+                       checks_on_head=None, posted=None, tier1=None):
     """An escalated review that records every posted review, every
     dismissal, and the reviews already posted when the reasoner started.
 
@@ -618,6 +621,7 @@ def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True,
     _run_escalated_review(
         monkeypatch, deep=deep, posted_reviews=reviews, blocking=blocking,
         on_reasoner=lambda: before_deep.extend(r.event for r in reviews),
+        tier1=tier1,
         checks_on_head=(
             [_elder_run(1, started_at="2999-01-01T00:00:00Z")]
             if checks_on_head is None else checks_on_head
@@ -750,5 +754,61 @@ def test_every_verdict_review_carries_its_run_start(monkeypatch):
     posted: list = []
     _run_with_verdicts(monkeypatch, deep=_RAN_CLEAN, posted=posted)
     assert posted and all(review_run_started(r.body) is not None for r in posted)
+
+
+def _security_pass_down():
+    """Tier-1 answers clean; the code-only security pass on the sensitive
+    path (`src/auth.py`) does not finish."""
+    calls: list = []
+
+    def _review(*a, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            return _clean_tier1()
+        return LlmReviewResponse(kind="all_failed", error="down")
+
+    return _review
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_unfinished_security_pass_leaves_an_escalated_head_unapproved(
+    monkeypatch, blocking,
+):
+    """The deep pass finishes clean, but the security pass on the sensitive
+    path did not: no approval, before or after the deep append."""
+    monkeypatch.setenv("GRUG_QUARANTINED_SECURITY_PASS", "1")
+    events, _, _ = _run_with_verdicts(
+        monkeypatch, deep=_RAN_CLEAN, blocking=blocking, tier1=_security_pass_down(),
+    )
+    assert "APPROVE" not in events
+
+
+def test_unfinished_security_pass_still_requests_changes_from_the_deep_pass(
+    monkeypatch,
+):
+    monkeypatch.setenv("GRUG_QUARANTINED_SECURITY_PASS", "1")
+    events, _, _ = _run_with_verdicts(
+        monkeypatch, deep=_HIGH_DEEP, tier1=_security_pass_down(),
+    )
+    assert events[-1] == "REQUEST_CHANGES"
+
+
+def test_deferred_approval_refuses_an_unfinished_security_pass(monkeypatch):
+    """Defense in depth at the last seam: the deferred APPROVE is never
+    posted for a run whose security pass did not finish."""
+    posted: list = []
+    monkeypatch.setattr(cr_dispatch, "get_app_id", lambda: _APP_ID)
+    monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **k: [])
+    monkeypatch.setattr(cr_dispatch, "list_check_runs_for_ref", lambda *a, **k: [])
+    monkeypatch.setattr(
+        cr_dispatch, "post_review", lambda *a, result, **k: posted.append(result) or {},
+    )
+    cr_dispatch._post_deferred_approval(
+        installation_id=11, owner="myorg", repo_name="myrepo", pull_number=7,
+        head_sha="abcd1234efgh",
+        run_started_at=datetime.fromisoformat("2000-01-01T00:00:00+00:00"),
+        own_check_ids=frozenset(), security_pass_complete=False,
+    )
+    assert posted == []
 
 
