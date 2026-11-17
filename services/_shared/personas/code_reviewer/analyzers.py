@@ -62,7 +62,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 
 from personas.code_reviewer.analyzer_sandbox import (
-    AnalyzerSkip, read_only_tree, sandbox_env,
+    AnalyzerSkip, read_only_tree, run_analyzer, sandbox_env,
 )
 from personas.code_reviewer.complexity import _changed_by_file
 from personas.code_reviewer.diff_parser import DiffHunk
@@ -172,13 +172,12 @@ def _run_opengrep(ctx: _Context) -> tuple[Finding, ...]:
         home = _opengrep_home_env(os.path.join(tmp, "home"))
         os.makedirs(home["HOME"], exist_ok=True)
         with read_only_tree(scan_root):
-            proc = subprocess.run(
+            proc = run_analyzer(
                 ["opengrep", "scan", "--config", _ELDER_RULES_DIR, "--json",
                  "--quiet", "--disable-version-check", "--no-rewrite-rule-ids",
-                 "--disable-nosem", "."],
-                cwd=scan_root, env=sandbox_env(home["HOME"], home),
-                capture_output=True, text=True, timeout=ctx.timeout_s,
-                check=False,
+                 "--disable-nosem", "--no-git-ignore", "."],
+                scan_root=scan_root, rules_dir=_ELDER_RULES_DIR, cwd=scan_root,
+                env=sandbox_env(home["HOME"], home), timeout=ctx.timeout_s,
             )
     if proc.returncode != 0:
         log.warning("elder_analyzer_engine_failed", extra={

@@ -29,7 +29,7 @@ from typing import Optional
 from llm_client import _cave_judge_config, FindingJudgement, Hunk, JudgeFindingRepr, PrContext, judge_findings
 from review_evidence import assemble_evidence, without_author_text
 
-from .analyzer_sandbox import read_only_tree, sandbox_env, without_engine_config
+from .analyzer_sandbox import read_only_tree, run_analyzer, sandbox_env, without_engine_config
 from .complexity import _changed_by_file
 from .diff_parser import added_lines, DiffHunk
 from .persona import Finding
@@ -193,17 +193,11 @@ def _write_scan_files(tmp: str, kept_files: dict[str, str]) -> None:
 
 
 def _opengrep_home_env(scan_tmp: str) -> dict[str, str]:
-    """HOME/XDG_CACHE_HOME for the opengrep subprocess (#865).
+    """Writable home for source runs using the upstream opengrep bundle.
 
-    Prefers `GRUG_SAST_CACHE_DIR` - a stable, writable, per-pod path on its
-    own volume - so opengrep's 242M runtime extraction happens ONCE per pod
-    instead of once per scan, outside both the scanned tree and the
-    size-capped `tmp` volume.
-
-    Returns `scan_tmp` instead when that path is unset or not writable, which
-    the caller keeps beside the scanned tree: wasteful, but it keeps a
-    self-hosted deploy that has not added the volume working rather than
-    crashing on an unwritable HOME (the 2026-07-13 zero-findings regression).
+    `GRUG_SAST_CACHE_DIR` avoids repeating the runtime extraction (#865).
+    The container image ships the extracted runtime and the launcher gives
+    each scan its own private home (#1576).
     """
     cache = os.getenv("GRUG_SAST_CACHE_DIR", "").strip()
     if cache:
@@ -257,49 +251,20 @@ def scan_opengrep(
             scan_root = os.path.join(tmp, "scan")
             os.makedirs(scan_root)
             _write_scan_files(scan_root, kept_files)
-            # Opengrep initializes settings/cache under $HOME at
-            # startup. The pods run as uid 10001 created with --no-create-home
-            # on a readOnlyRootFilesystem, so that mkdir crashed semgrep with
-            # exit 1 before it scanned anything - every production scan
-            # silently degraded to zero findings (found live 2026-07-13
-            # during an infrastructure sweep). HOME must therefore point
-            # somewhere WRITABLE.
-            #
-            # It must also point somewhere STABLE and OUTSIDE `tmp` (#865).
-            # Pointing it at the scan dir cost three things at once:
-            #   1. opengrep scanned its own cache (the original #865 report);
-            #   2. a cold HOME makes opengrep extract 242M of runtime EVERY
-            #      scan, because a fresh temp dir is never a warm cache;
-            #   3. that 242M landed in the `tmp` emptyDir, whose sizeLimit is
-            #      64Mi - measured evicting a live webhook pod on 2026-08-15
-            #      ("Usage of EmptyDir volume tmp exceeds the limit 64Mi").
-            # A dedicated cache volume fixes all three: extract once per pod,
-            # never inside the scanned tree, never against the tmp cap.
-            #
-            # Falls back to a per-run home when the cache dir is unset or not
-            # writable, so a self-hosted deploy without the extra
-            # volume still scans (degraded to re-extracting, never broken).
-            #
-            # The sandbox rules every analyzer follows (#1254) apply here too
-            # (#1574): the pod's environment holds the App key and the
-            # database URL, so the child gets the allowlist and a read-only
-            # tree. The home sits beside the scanned tree, never in it.
-            #
+            # Keep the writable home outside the scan tree. The deployed
+            # launcher gives it private scratch and an immutable runtime.
             # --disable-nosem: a `nosemgrep` in the scanned files is
             # PR-controlled, so the engine must not honor it on its own;
             # suppression_scope keeps only the ones on the base (#1579).
             home = _opengrep_home_env(os.path.join(tmp, "home"))
             os.makedirs(home["HOME"], exist_ok=True)
             with read_only_tree(scan_root):
-                proc = subprocess.run(
+                proc = run_analyzer(
                     ["opengrep", "scan", "--config", _RULES_DIR, "--json", "--quiet",
                      "--disable-version-check", "--no-rewrite-rule-ids",
-                     "--disable-nosem", scan_root],
-                    capture_output=True, text=True, timeout=_OPENGREP_TIMEOUT_S,
+                     "--disable-nosem", "--no-git-ignore", scan_root],
+                    scan_root=scan_root, rules_dir=_RULES_DIR, timeout=_OPENGREP_TIMEOUT_S,
                     env=sandbox_env(home["HOME"], home),
-                    # We inspect returncode ourselves below (a non-zero exit with
-                    # parseable JSON is a real degrade path, #77), so never raise.
-                    check=False,
                 )
             if proc.returncode != 0:
                 # Version-dependent, opengrep can exit non-zero AND emit

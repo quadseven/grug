@@ -87,7 +87,7 @@ from personas.code_reviewer.suppression_scope import (
     PR_ADDED_NOTE, record, ruff_scope,
 )
 from personas.code_reviewer.analyzer_sandbox import (
-    AnalyzerSkip, read_only_tree, sandbox_env,
+    AnalyzerSkip, read_only_tree, run_analyzer, sandbox_env,
 )
 
 log = logging.getLogger("grug.code_reviewer.lint")
@@ -355,12 +355,11 @@ def _run_ruff(
             # PR wrote from hiding its own finding; suppression_scope puts
             # back the ones already on the base (#1579).
             with read_only_tree(tmp):
-                proc = subprocess.run(
+                proc = run_analyzer(
                     ["ruff", "check", "--isolated", "--select", _SELECT,
                      "--ignore", _IGNORE, "--ignore-noqa", "--output-format",
                      "json", "--no-cache", tmp],
-                    capture_output=True, text=True, timeout=timeout,
-                    check=False, env=sandbox_env(tmp),
+                    scan_root=tmp, timeout=timeout, env=sandbox_env(tmp),
                 )
             # ONLY >= 2 is an error. Exit 1 means violations were found and
             # stdout carries them - see the module docstring.
