@@ -187,6 +187,21 @@ def test_export_then_plan_import_round_trips_into_an_empty_instance():
     assert plan.items[0]["learning"]["source_pr"] == 3
 
 
+def test_outcome_citations_survive_export_and_plan_import():
+    row = _row("prefer early returns", status="pending", source_prs=[12, 34],
+               history=[{"action": "proposed"}])
+    doc = cd.export_document([row])
+    assert doc["version"] == 1
+
+    plan = cd.plan_import(doc, target_repo=None, existing_ids=set())
+    assert plan.ok
+    [learning] = plan.to_create
+    assert learning["source_prs"] == [12, 34]
+    [exported] = doc["learnings"]
+    assert exported["origin"] == "outcome"
+    assert exported["source_prs"] == [12, 34]
+
+
 def test_plan_import_rejects_an_unknown_format_or_version():
     assert cd.plan_import({"format": "other", "version": 1, "learnings": []},
                           target_repo="o/r", existing_ids=set()).errors
@@ -342,6 +357,7 @@ def test_a_dismissal_that_explains_itself_is_a_reason():
 def test_export_carries_origin_reason_and_expiry():
     row = _taught(1, reason="the caller validates", finding_class="null-deref", author="dev")
     item = cd.export_document([row])["learnings"][0]
+    assert item["origin"] == "reply"
     assert item["reason"] == "the caller validates"
     assert item["finding_class"] == "null-deref"
     assert item["expires_at"] == cd.expires_at(row)

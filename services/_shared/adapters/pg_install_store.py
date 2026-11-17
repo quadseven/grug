@@ -1904,9 +1904,9 @@ def import_learnings(
                     "version": 1,
                     "history": [_history_entry("imported", actor)],
                 }
-                for link in ("supersedes", "conflicts_with"):
-                    if item.get(link):
-                        data[link] = item[link]
+                for field in ("supersedes", "conflicts_with", "source_prs"):
+                    if item.get(field):
+                        data[field] = item[field]
                 conn.execute(
                     "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s)",
                     (pk, sk, encode_attrs(data), _learning_ttl()),
