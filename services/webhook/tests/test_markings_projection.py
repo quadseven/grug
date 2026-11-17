@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -68,6 +69,11 @@ def _review_surfaces(result) -> dict[str, str]:
 @pytest.fixture(autouse=True)
 def _fixed_environment(monkeypatch):
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "tiered")
+    # The run marker in each review body names the run start; pin it.
+    monkeypatch.setattr(
+        cr_dispatch, "_run_clock",
+        lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
     monkeypatch.setattr(
         cr_dispatch, "with_install_token_retry", lambda inst, fn: fn("tok"),
     )
@@ -176,7 +182,7 @@ _TIER1_ADVISORY = {
     "check_title": "bad94850bce26b970a0876c55916601c869ead8d195cd0c7277ac576cc318157",
     "inline_0": "d1aa28ae7d264990e93ad5edcc8801d76409f4cb346662cb1190db05f38902d1",
     "inline_1": "0073265db3a9dccffe42e905144bf6d66ac1741ef3c644ab19be074c87a49126",
-    "review_body": "ab9a7ad05178a51a6903e3323e581d1e2f1c3bf26c8590ccb854cea3309e3f78",
+    "review_body": "b8e451594c5c87911b0a1dec765b48c90e66355e82c83bfd2118dec0e94fc5fa",
     # #1758: the review state is the verdict in advisory mode too, so a
     # standing high finding posts REQUEST_CHANGES here (same as blocking).
     "review_event": "fded070eb4e135b74ab7cde2e12cfb321cf73c032f0132c03403b9d41982cae5",
@@ -190,7 +196,7 @@ _TIER1_BLOCKING = {
     "check_title": "bad94850bce26b970a0876c55916601c869ead8d195cd0c7277ac576cc318157",
     "inline_0": "d1aa28ae7d264990e93ad5edcc8801d76409f4cb346662cb1190db05f38902d1",
     "inline_1": "0073265db3a9dccffe42e905144bf6d66ac1741ef3c644ab19be074c87a49126",
-    "review_body": "ab9a7ad05178a51a6903e3323e581d1e2f1c3bf26c8590ccb854cea3309e3f78",
+    "review_body": "b8e451594c5c87911b0a1dec765b48c90e66355e82c83bfd2118dec0e94fc5fa",
     "review_event": "fded070eb4e135b74ab7cde2e12cfb321cf73c032f0132c03403b9d41982cae5",
     "stack_body": "c17d54f7be4cae427ae108f28488f546b91f2225a362d6920022984514582f33",
     "stack_create_if_absent": "3cbc87c7681f34db4617feaa2c8801931bc5e42d8d0f560e756dd4cd92885f18",
@@ -345,6 +351,7 @@ def _finished():
         diff_text=_DIFF, linked_issues=(42,), precedent_notes={}, muted={},
         prior_keys=frozenset(), held_back=frozenset(), held_note="",
         repo_config=None, posts_verdict=True,
+        run_started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
 
 

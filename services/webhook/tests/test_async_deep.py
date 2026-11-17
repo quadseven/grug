@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -9,6 +10,7 @@ import pytest
 
 from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse
 from personas.code_reviewer import dispatch as cr_dispatch
+from personas.code_reviewer.markings import review_run_started, run_marker
 from review_pipeline import ReviewCoverage
 
 
@@ -484,9 +486,9 @@ _APP_ID = "4242"
 
 
 def _elder_run(run_id: int, *, app_id: str = _APP_ID, status: str = "completed",
-               conclusion: str | None = "success") -> dict:
+               conclusion: str | None = "success", started_at: str | None = None) -> dict:
     return {"id": run_id, "name": "Grug - Elder", "app": {"id": int(app_id)},
-            "status": status, "conclusion": conclusion}
+            "status": status, "conclusion": conclusion, "started_at": started_at}
 
 
 @pytest.fixture
@@ -498,11 +500,14 @@ def test_superseded_review_deep_append_never_replaces_a_newer_verdict(
     monkeypatch, _own_app,
 ):
     """#1344: a newer review of the same head already posted the newest
-    `Grug - Elder` verdict (id 99, after this run's Tier-1 id 1). This run's
-    late deep append must not land on top of it: no deep check run and no
+    `Grug - Elder` verdict (check id 99, after this run's Tier-1 id 1, and
+    an approval from a run that started after this one). This run's late
+    deep append must not land on top of it: no deep check run and no
     REQUEST_CHANGES. Its high finding still posts as a COMMENT review, so
     the open thread carries into the next review's verdict."""
     reviews: list = []
+    newer = _marked(98, state="APPROVED", started="2999-01-01T00:00:00+00:00")
+    monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **k: [newer])
     posted = _run_escalated_review(
         monkeypatch, deep=_HIGH_DEEP,
         checks_on_head=[_elder_run(99)],
@@ -594,12 +599,17 @@ def _elder_review(rid, *, state, commit="abcd1234efgh", submitted_at=None):
             "user": {"login": "grug-tribe[bot]"}, "submitted_at": submitted_at}
 
 
-def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True):
+def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True,
+                       checks_on_head=None, posted=None):
     """An escalated review that records every posted review, every
-    dismissal, and the reviews already posted when the reasoner started."""
-    reviews: list = []
+    dismissal, and the reviews already posted when the reasoner started.
+
+    By default the latest Elder check on the head is this run's own Tier-1
+    check (id 1), so no newer run has started."""
+    reviews: list = [] if posted is None else posted
     dismissed: list[int] = []
     before_deep: list = []
+    monkeypatch.setattr(cr_dispatch, "get_app_id", lambda: _APP_ID)
     monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **k: list(reviews_on_pr))
     monkeypatch.setattr(
         cr_dispatch, "dismiss_review",
@@ -608,8 +618,20 @@ def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True):
     _run_escalated_review(
         monkeypatch, deep=deep, posted_reviews=reviews, blocking=blocking,
         on_reasoner=lambda: before_deep.extend(r.event for r in reviews),
+        checks_on_head=(
+            [_elder_run(1, started_at="2999-01-01T00:00:00Z")]
+            if checks_on_head is None else checks_on_head
+        ),
     )
     return [r.event for r in reviews], dismissed, before_deep
+
+
+def _marked(rid, *, state, started, submitted_at=None, commit="abcd1234efgh"):
+    """An Elder review carrying the run marker of a run that started at
+    `started` (#1764: recency is the run start, not post time)."""
+    review = _elder_review(rid, state=state, commit=commit, submitted_at=submitted_at)
+    review["body"] += "\n" + run_marker(datetime.fromisoformat(started))
+    return review
 
 
 @pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
@@ -653,13 +675,80 @@ def test_deferred_approval_withdraws_elders_older_block(monkeypatch):
 @pytest.mark.parametrize("deep", [_RAN_CLEAN, _HIGH_DEEP], ids=["clean", "high"])
 def test_newer_verdict_review_supersedes_the_deep_append(monkeypatch, deep):
     """Advisory checks conclude neutral, so the check list cannot show a
-    newer run. A newer Elder verdict review on the head, submitted after
-    this run started, does: the deep append neither approves nor blocks."""
-    newer = _elder_review(9, state="APPROVED", submitted_at="2999-01-01T00:00:00Z")
+    newer run. An Elder verdict review from a run that STARTED after this
+    one does: the deep append neither approves nor blocks."""
+    newer = _marked(9, state="APPROVED", started="2999-01-01T00:00:00+00:00",
+                    submitted_at="2999-01-01T00:00:05Z")
     events, dismissed, _ = _run_with_verdicts(
         monkeypatch, deep=deep, reviews_on_pr=[newer], blocking=False,
     )
     assert "APPROVE" not in events and "REQUEST_CHANGES" not in events
     assert dismissed == []
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_earlier_run_approval_posted_late_never_silences_a_block(monkeypatch, blocking):
+    """Runs A and B on one head; A started first. A's deferred APPROVE lands
+    after B started, so by post time it looks newer. B's deep pass finds a
+    blocking problem: B must request changes and dismiss A's stale approval,
+    not stand down and leave the approval standing."""
+    stale = _marked(7, state="APPROVED", started="2000-01-01T00:00:00+00:00",
+                    submitted_at="2999-01-01T00:00:00Z")
+    # A's own deep check also landed after B's Tier-1 check (higher id).
+    a_check = _elder_run(99, started_at="2999-01-01T00:00:00Z")
+    events, dismissed, _ = _run_with_verdicts(
+        monkeypatch, deep=_HIGH_DEEP, reviews_on_pr=[stale], blocking=blocking,
+        checks_on_head=[a_check],
+    )
+    assert events[-1] == "REQUEST_CHANGES"
+    assert 7 in dismissed
+
+
+def test_unmarked_approval_posted_after_the_run_started_is_dismissed_by_a_block(
+    monkeypatch,
+):
+    """A same-head Elder approval with no run marker cannot prove it came
+    from a newer run, so a blocking deep pass dismisses it."""
+    legacy = _elder_review(7, state="APPROVED", submitted_at="2999-01-01T00:00:00Z")
+    events, dismissed, _ = _run_with_verdicts(
+        monkeypatch, deep=_HIGH_DEEP, reviews_on_pr=[legacy],
+    )
+    assert events[-1] == "REQUEST_CHANGES"
+    assert dismissed == [7]
+
+
+def test_deferred_approval_stands_down_when_a_newer_run_has_started(monkeypatch):
+    """Right before the deferred APPROVE, the latest Elder check on the head
+    belongs to another run that started after this one (still in progress,
+    so it decided nothing yet): no approval."""
+    newer_check = _elder_run(
+        50, status="in_progress", conclusion=None, started_at="2999-01-01T00:00:00Z",
+    )
+    events, _, _ = _run_with_verdicts(
+        monkeypatch, deep=_RAN_CLEAN, checks_on_head=[newer_check],
+    )
+    assert "APPROVE" not in events
+
+
+def test_deferred_approval_stands_down_when_the_check_list_fails(monkeypatch):
+    """Fail closed: no proof that no newer run started, no approval."""
+    def _boom(*a, **k):
+        raise httpx.ConnectError("down")
+
+    reviews: list = []
+    monkeypatch.setattr(cr_dispatch, "get_app_id", lambda: _APP_ID)
+    monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **k: [])
+    monkeypatch.setattr(cr_dispatch, "dismiss_review", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "list_check_runs_for_ref", _boom)
+    _run_escalated_review(monkeypatch, deep=_RAN_CLEAN, posted_reviews=reviews)
+    assert "APPROVE" not in [r.event for r in reviews]
+
+
+def test_every_verdict_review_carries_its_run_start(monkeypatch):
+    """The run marker is what later runs order by, so each posted review
+    carries one, and it parses back."""
+    posted: list = []
+    _run_with_verdicts(monkeypatch, deep=_RAN_CLEAN, posted=posted)
+    assert posted and all(review_run_started(r.body) is not None for r in posted)
 
 
