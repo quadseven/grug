@@ -251,6 +251,10 @@ class PrContext(TypedDict, total=False):
     deferred_lint: tuple[Any, ...]
     # Why that list is incomplete; any entry degrades the review.
     deferred_lint_unfinished: tuple[str, ...]
+    # `merge_hold.Hold` rows of the PR body and its tickets, and the cited
+    # issues still open at review time (grug#1766).
+    merge_holds: tuple[Any, ...]
+    merge_hold_open_refs: frozenset[int]
     review_scope: str
     sensitive_review: bool
     # A quarantined pass reads no text the PR's author could write (grug#1569).

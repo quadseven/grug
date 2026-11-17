@@ -103,7 +103,8 @@ def build_changed_files_fetcher(
 def build_issue_details_fetcher(
     *, installation_id: int, owner: str, repo: str,
 ) -> Callable[[int], dict[str, str]]:
-    """Return a `number -> {title, body}` callable for review enrichment."""
+    """Return a `number -> {title, body, state}` callable for review
+    enrichment. `state` is GitHub's `open` or `closed` (grug#1766)."""
 
     def _fetch_issue_details(number: int) -> dict[str, str]:
         from urllib.parse import quote
@@ -121,7 +122,11 @@ def build_issue_details_fetcher(
             )
             response.raise_for_status()
             issue = response.json() or {}
-            return {"title": issue.get("title") or "", "body": issue.get("body") or ""}
+            return {
+                "title": issue.get("title") or "",
+                "body": issue.get("body") or "",
+                "state": issue.get("state") or "",
+            }
 
         from github_app_auth import with_install_token_retry  # type: ignore
         return with_install_token_retry(installation_id, _get)

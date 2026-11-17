@@ -133,6 +133,7 @@ from personas.code_reviewer.deferred_ruff import (
 )
 from personas.code_reviewer.lint import ruff_hits
 from personas.code_reviewer.lane_work import is_lane_pr, lane_work_findings
+from personas.code_reviewer.merge_hold import MAX_HOLDS, find_holds, hold_findings
 from personas.code_reviewer.linked_issue import (
     IssueDetailsFetcher, build_linked_issue_context, linked_issue_numbers,
     rendered_criteria, rendered_criteria_with_state, rendered_health_issues,
@@ -1720,6 +1721,63 @@ def _note_deferred_lint(
         pr_context["deferred_lint_unfinished"] = tuple(dict.fromkeys(unfinished))
 
 
+def _read_issue_or_none(fetch_issue: IssueDetailsFetcher, number: int) -> dict | None:
+    """One issue read for the merge-hold check; a failed read is None, so
+    an unreadable issue holds nothing rather than blocking on a guess."""
+    try:
+        issue = fetch_issue(number)
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        return None
+    return issue if isinstance(issue, dict) else None
+
+
+def _note_open_merge_holds(
+    pr_context: PrContext, fetch_issue: IssueDetailsFetcher, *,
+    owner: str, repo_name: str,
+) -> None:
+    """Put the merge holds still waiting on an open issue on `pr_context`
+    (grug#1766): the PR body's and its linked tickets'. The linked tickets
+    are the work itself, open until this PR lands, so they never count as a
+    hold. Additive: any failure leaves the check off for this pass."""
+    body = str(pr_context.get("body") or "")
+    try:
+        linked = linked_issue_numbers(body, owner=owner, repo=repo_name)
+        holds = list(find_holds(body, source="the PR body", owner=owner, repo=repo_name))
+        for number in linked:
+            issue = _read_issue_or_none(fetch_issue, number) or {}
+            holds.extend(find_holds(
+                str(issue.get("body") or ""), source=f"ticket #{number}",
+                owner=owner, repo=repo_name,
+            ))
+        cited = dict.fromkeys(
+            n for hold in holds[:MAX_HOLDS] for n in hold.refs if n not in linked
+        )
+        open_refs = frozenset(
+            n for n in cited
+            if (_read_issue_or_none(fetch_issue, n) or {}).get("state") == "open"
+        )
+    except Exception as e:  # noqa: BLE001 - additive; never break the review
+        log.info("code_review_merge_hold_failed", extra={"kind": type(e).__name__})
+        return
+    if open_refs:
+        pr_context["merge_holds"] = tuple(holds[:MAX_HOLDS])
+        pr_context["merge_hold_open_refs"] = open_refs
+
+
+def _merge_open_merge_holds(
+    evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
+    pr_context: PrContext,
+) -> CodeReviewEvaluation:
+    """Add a blocking finding per merge hold still waiting on an open issue
+    (grug#1766). Pure over what `_note_open_merge_holds` recorded."""
+    found = hold_findings(
+        tuple(pr_context.get("merge_holds") or ()),
+        frozenset(pr_context.get("merge_hold_open_refs") or ()),
+        hunks,
+    )
+    return with_extra_findings(evaluation, found)
+
+
 def _log_omit_markings(
     evaluation: CodeReviewEvaluation, *, pr: str, head_sha: str,
 ) -> None:
@@ -1744,6 +1802,7 @@ def _attach_linked_issue_context(
             installation_id=installation_id, owner=owner, repo=repo_name,
         ))
         _note_deferred_lint(pr_context, fetch_issue, owner=owner, repo_name=repo_name)
+        _note_open_merge_holds(pr_context, fetch_issue, owner=owner, repo_name=repo_name)
         linked = build_linked_issue_context(
             str(pr_context.get("body") or ""),
             fetch_issue=fetch_issue,
@@ -2290,6 +2349,7 @@ def _merge_lane_work_for_pass(
             "code_review_criteria_coverage_failed",
             extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
         )
+    evaluation = _merge_open_merge_holds(evaluation, hunks, pr_context)
     return _merge_deferred_ruff(evaluation, hunks, contents, pr_context)
 
 
