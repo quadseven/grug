@@ -1728,7 +1728,11 @@ def _read_issue_or_none(fetch_issue: IssueDetailsFetcher, number: int) -> dict |
     an unreadable issue holds nothing rather than blocking on a guess."""
     try:
         issue = fetch_issue(number)
-    except (httpx.HTTPStatusError, httpx.RequestError):
+    except Exception as e:  # noqa: BLE001 - the IO boundary only: a read that fails holds nothing
+        log.info(
+            "code_review_merge_hold_read_failed",
+            extra={"issue": number, "kind": type(e).__name__},
+        )
         return None
     return issue if isinstance(issue, dict) else None
 
@@ -1740,28 +1744,25 @@ def _note_open_merge_holds(
     """Put the merge holds still waiting on an open issue on `pr_context`
     (grug#1766): the PR body's and its linked tickets'. The linked tickets
     are the work itself, open until this PR lands, so they never count as a
-    hold. Additive: any failure leaves the check off for this pass."""
+    hold. A failed GitHub read holds nothing (`_read_issue_or_none`); the
+    parsing is pure, so any other error is a bug and is left to raise."""
     body = str(pr_context.get("body") or "")
-    try:
-        linked = linked_issue_numbers(body, owner=owner, repo=repo_name)
-        holds = list(find_holds(body, source="the PR body", owner=owner, repo=repo_name))
-        for number in linked:
-            issue = _read_issue_or_none(fetch_issue, number) or {}
-            holds.extend(find_holds(
-                str(issue.get("body") or ""), source=f"ticket #{number}",
-                owner=owner, repo=repo_name,
-            ))
-        cited = list(dict.fromkeys(
-            n for hold in holds[:MAX_HOLDS] for n in hold.refs if n not in linked
+    linked = linked_issue_numbers(body, owner=owner, repo=repo_name)
+    holds = list(find_holds(body, source="the PR body", owner=owner, repo=repo_name))
+    for number in linked:
+        issue = _read_issue_or_none(fetch_issue, number) or {}
+        holds.extend(find_holds(
+            str(issue.get("body") or ""), source=f"ticket #{number}",
+            owner=owner, repo=repo_name,
         ))
-        open_refs = frozenset(
-            n for n in cited[:MAX_ISSUE_READS]
-            if (_read_issue_or_none(fetch_issue, n) or {}).get("state") == "open"
-        )
-        unchecked = max(0, len(cited) - MAX_ISSUE_READS)
-    except Exception as e:  # noqa: BLE001 - additive; never break the review
-        log.info("code_review_merge_hold_failed", extra={"kind": type(e).__name__})
-        return
+    cited = list(dict.fromkeys(
+        n for hold in holds[:MAX_HOLDS] for n in hold.refs if n not in linked
+    ))
+    open_refs = frozenset(
+        n for n in cited[:MAX_ISSUE_READS]
+        if (_read_issue_or_none(fetch_issue, n) or {}).get("state") == "open"
+    )
+    unchecked = max(0, len(cited) - MAX_ISSUE_READS)
     if open_refs or unchecked:
         pr_context["merge_holds"] = tuple(holds[:MAX_HOLDS])
         pr_context["merge_hold_open_refs"] = open_refs
