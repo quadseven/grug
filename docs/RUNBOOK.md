@@ -205,7 +205,11 @@ posts one failing check-run with that title on the queued head and ends with
 status `pr_read_forbidden`, with no redrive. The structured log event is
 `elder_pr_read_forbidden` (fields: `install_id`, `repo`, `pr`, `head_sha`).
 This is a GitHub access problem, not a model outage: model failures carry
-`eyes clouded` titles instead.
+`eyes clouded` titles instead. The handling lives in
+`services/webhook/rerun.py::_run_hot_review` (the 403 branch around the
+`_fetch_current_pr` call) and is pinned by
+`test_hot_review_pr_read_403_completes_check_without_redrive` in
+`services/webhook/tests/test_rerun.py`.
 
 Because other calls on the same repo can still succeed (models reached,
 other passes ran), the denial is specific to this read. Check in order:
