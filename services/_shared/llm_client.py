@@ -1813,21 +1813,28 @@ _SPENT_LIMIT_MARKERS = (
 # A 429 trips it only when the body names a daily or monthly allowance.
 # Poolside answers short-lived throttling with `429 usage limit exceeded` and
 # no Retry-After; reading that as spent blocked the one working cloud tier
-# for an hour (live, 2026-10-17). OpenCode Go's monthly 429 carries the
+# for an hour (live, 2026-10-17). It can also last: on 2026-10-31 it ran 75
+# minutes, 1,473 `llm_backend_rate_limited` across both consumer pods and
+# still firing, and over seven days 7,203 of 13,199 Poolside calls were
+# refused. So that body is held by the short escalating limit hold below, not
+# by this one-hour trip. OpenCode Go's monthly 429 carries the
 # `GoUsageLimitError` type, and its own breaker above honours Retry-After.
 _SPENT_RATE_MARKERS = ("per-day", "per day", "daily", "monthly", "gousagelimiterror")
 _provider_breaker_lock = threading.Lock()
 _provider_blocked_until: dict[tuple[str, str], float] = {}
-# A limit that outlasts a throttle reads the same on one response, so the count
-# decides: a second limit refusal within five minutes skips the provider for
-# five minutes, then it is asked again. On 2026-10-31 Poolside answered 1,892 of
-# these in nine hours and the free pool 57, each costing a chunk its retry and
-# its wait before the subscription tier could run.
-_LIMIT_REFUSAL_THRESHOLD = 2
-_LIMIT_REFUSAL_WINDOW_SECONDS = 300.0
-_LIMIT_HOLD_SECONDS = 300.0
+# A limit that outlasts a throttle reads the same on one response, so the hold
+# escalates instead: the first limit refusal holds the provider for two
+# minutes, and each refusal that follows a hold doubles it, up to thirty. The
+# first success clears it, so Poolside is back the moment its limit resets.
+# While held the provider is not called at all, so no call retries the body,
+# and a review that ran during the hold ends degraded. On 2026-10-31 Poolside
+# answered 1,892 of these in nine hours and the free pool 57, each costing a
+# chunk its retry and its wait before the subscription tier could run. The
+# open hold is shared with every pod; the escalation step stays per process.
+_LIMIT_HOLD_BASE_SECONDS = 120.0
+_LIMIT_HOLD_MAX_SECONDS = 1800.0
 _LIMIT_REFUSAL_MARKERS = ("usage limit", "capacity is reserved")
-_limit_refusals: dict[tuple[str, str], list[float]] = {}
+_limit_hold_level: dict[tuple[str, str], int] = {}
 _warned_disabled_entries: set[str] = set()
 
 
@@ -1900,29 +1907,75 @@ def _is_spent_quota_refusal(resp: httpx.Response) -> bool:
     return any(m in text for m in markers)
 
 
-def _limit_refusals_repeated(config: BackendConfig, resp: httpx.Response) -> bool:
-    """Count one usage-limit 429; True when the count reaches the hold. Any
-    other answer from the provider starts the count over."""
-    key = (config.backend.value, _backend_pool(config.backend, config.model))
+def _is_limit_refusal(resp: httpx.Response) -> bool:
+    """A 429 whose body says a usage limit or reserved capacity, the kind the
+    limit hold escalates on."""
     text = (resp.text or "").lower()
-    limited = resp.status_code == 429 and any(m in text for m in _LIMIT_REFUSAL_MARKERS)
+    return resp.status_code == 429 and any(m in text for m in _LIMIT_REFUSAL_MARKERS)
+
+
+def _next_limit_hold(config: BackendConfig, resp: httpx.Response) -> float | None:
+    """Seconds to hold the provider after this answer, or None for no new hold.
+
+    A limit refusal from a provider that is not already held steps the hold up
+    (2, 4, ... 30 minutes); one from a call that was in flight when another
+    opened the hold adds nothing. A success clears the escalation and the
+    hold, locally and in the shared store."""
+    pool = _backend_pool(config.backend, config.model)
+    key = (config.backend.value, pool)
     now = time.time()
+    if resp.is_success:
+        with _provider_breaker_lock:
+            was_held = _limit_hold_level.pop(key, None) is not None
+            if was_held:
+                _provider_blocked_until.pop(key, None)
+        if was_held:
+            shared_benches.clear("provider", *key)
+            shared_benches.clear("limit", *key)
+        return None
+    if not _is_limit_refusal(resp):
+        return None
+    held_until = shared_benches.blocked_until("provider", *key)
     with _provider_breaker_lock:
-        if not limited:
-            _limit_refusals.pop(key, None)
-            return False
-        recent = [t for t in _limit_refusals.get(key, []) if now - t < _LIMIT_REFUSAL_WINDOW_SECONDS]
-        recent.append(now)
-        if len(recent) < _LIMIT_REFUSAL_THRESHOLD:
-            _limit_refusals[key] = recent
-            return False
-        _limit_refusals.pop(key, None)
-        return True
+        if now < max(_provider_blocked_until.get(key, 0.0), held_until):
+            return None
+        level = _limit_hold_level.get(key, 0)
+        _limit_hold_level[key] = level + 1
+    return min(_LIMIT_HOLD_BASE_SECONDS * 2 ** level, _LIMIT_HOLD_MAX_SECONDS)
+
+
+def _limit_hold_error() -> str:
+    """A `partial review:` error naming a provider held by the limit hold, so
+    a review made during one ends degraded; empty when none is held."""
+    now = time.time()
+    held = sorted(
+        f"{backend.value}:{pool}"
+        for backend in _LIMIT_HOLD_BACKENDS
+        for pool in _PROVIDER_POOLS
+        if shared_benches.blocked_until("limit", backend.value, pool) > now
+        or _limit_hold_active((backend.value, pool), now)
+    )
+    if not held:
+        return ""
+    return f"partial review: provider held after repeated usage limit refusals ({', '.join(held)})"
+
+
+def _with_limit_hold_error(result: LlmReviewResponse) -> LlmReviewResponse:
+    """A clean reviewed result made while a limit hold is open, marked
+    degraded with `_limit_hold_error`; any other result as it came."""
+    if result.kind != "reviewed" or result.error:
+        return result
+    return replace(result, error=_limit_hold_error())
+
+
+def _limit_hold_active(key: tuple[str, str], now: float) -> bool:
+    with _provider_breaker_lock:
+        return key in _limit_hold_level and _provider_blocked_until.get(key, 0.0) > now
 
 
 def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None:
-    """Open the provider breaker on a 401, a 402, a spent-limit refusal, or
-    repeated limit refusals."""
+    """Open the provider breaker on a 401, a 402, a spent-limit refusal, or a
+    limit refusal (the escalating hold), and clear that hold on a success."""
     pool = _backend_pool(config.backend, config.model)
     if config.backend in _BENCH_CLOUD_BACKENDS:
         # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
@@ -1932,8 +1985,13 @@ def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None
         if _is_spent_quota_refusal(resp):
             _open_provider_breaker(config, resp, (pool,), time.time() + _retry_after_seconds(resp))
             return
-    if config.backend in _LIMIT_HOLD_BACKENDS and _limit_refusals_repeated(config, resp):
-        _open_provider_breaker(config, resp, (pool,), time.time() + _LIMIT_HOLD_SECONDS)
+    if config.backend not in _LIMIT_HOLD_BACKENDS:
+        return
+    seconds = _next_limit_hold(config, resp)
+    if seconds is not None:
+        until = time.time() + seconds
+        _open_provider_breaker(config, resp, (pool,), until)
+        shared_benches.publish("limit", config.backend.value, pool, until)
 
 
 def _open_provider_breaker(
@@ -2994,8 +3052,10 @@ def _post_with_retries(
         if (
             resp.status_code in _RETRYABLE_STATUSES
             and attempt < retry_attempts - 1
-            # A spent daily or monthly allowance does not clear in a backoff.
+            # A spent daily or monthly allowance does not clear in a backoff,
+            # and a limit refusal opens a hold, so asking again only repeats it.
             and not _is_spent_quota_refusal(resp)
+            and not _is_limit_refusal(resp)
         ):
             _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
             continue
@@ -6075,7 +6135,7 @@ def review_diff(
         result = review.run_staged(plan)
     note = _render_reviewability_note(assessment)
     return replace(
-        result,
+        _with_limit_hold_error(result),
         reviewability_note=note,
         reviewability_blocking=assessment.decision == "block",
         families=(

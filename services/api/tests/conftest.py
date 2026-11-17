@@ -88,3 +88,4 @@ def _reset_llm_provider_switches(monkeypatch: pytest.MonkeyPatch) -> None:
     lc = sys.modules.get("llm_client")
     if lc is not None:
         monkeypatch.setattr(lc, "_provider_blocked_until", {}, raising=False)
+        monkeypatch.setattr(lc, "_limit_hold_level", {}, raising=False)
