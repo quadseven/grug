@@ -295,6 +295,36 @@ RULES: tuple[ReviewRule, ...] = (
         severity="low",
     ),
     ReviewRule(
+        name="unsupported-claim",
+        bug_class="correctness",
+        description="The PR body, a docstring, a comment or a test name "
+        "claims a behavior, a measured number or a result that nothing in "
+        "the diff or the supplied context produces or supports. QUOTE the "
+        "claim, anchor on the changed line it describes, and say what is "
+        "missing. Do not flag a claim the diff plainly delivers, or a plan "
+        "for later work the body marks as out of scope.",
+        bad_example="PR body: 'catch rate rises to 40% on the benchmark' with "
+        "no run, results file or test in the diff that produces 40%",
+        good_example="PR body cites the results file the diff adds, and its "
+        "summary line shows 40%",
+        severity="medium",
+    ),
+    ReviewRule(
+        name="unsourced-test-oracle",
+        bug_class="test fidelity",
+        description="A new or changed test asserts an expected value that "
+        "comes from the code under test (copied from its output, or computed "
+        "by calling it) rather than from an independent source: the ticket, "
+        "a spec, a documented constant or a hand-worked example. Such a test "
+        "passes on wrong behavior. QUOTE the expected value and say where it "
+        "should come from. Do not flag a value the ticket or a named spec "
+        "states.",
+        bad_example="assert price(cart) == price(cart)  # or a literal pasted "
+        "from a run of the code it tests, which the ticket contradicts",
+        good_example="assert price(cart) == 42  # 2 x 21, the ticket's worked example",
+        severity="medium",
+    ),
+    ReviewRule(
         name="stale-test-assertion",
         bug_class="test fidelity",
         description="The diff changes a value (a user-facing string, "
@@ -781,6 +811,26 @@ assert set(_CONFIDENCE_CLAUSES) == set(get_args(PromptVariant)), (
     "_CONFIDENCE_CLAUSES keys drifted from PromptVariant members"
 )
 
+# INTENT FIRST (grug#1766). On the review benchmark most reverted changes
+# drew no finding: a test asserting a rule the system does not have, a
+# change made despite its own ticket's hold, a benchmark row no run
+# produced. Each is visible only against what the ticket, the docs or the
+# PR itself says, so Elder states the intent before hunting code faults.
+_INTENT_FIRST = (
+    "BEFORE looking for code faults, state to yourself in one sentence what "
+    "this change is for, from the linked issue and the PULL REQUEST INTENT "
+    "block. Then check the diff against that intent: (1) a claim in the PR "
+    "body, a docstring, a comment or a test name that nothing in the diff or "
+    "the supplied context supports (unsupported-claim); (2) a hold or "
+    "precondition the linked issue states (\"only once X is proven\", "
+    "\"blocked on\", \"do not merge until\") that the change goes ahead "
+    "without (intent-mismatch, quoting the issue line); (3) a new or changed "
+    "test whose expected value comes from the code under test rather than "
+    "from an independent source such as the ticket, a spec, a documented "
+    "constant or a hand-worked example (unsourced-test-oracle). Quote the "
+    "claim, the issue line or the expected value in each such finding. "
+)
+
 _PREAMBLE_TAIL = (
     "Start by assessing the PR's intended behavior against the linked issue's "
     "acceptance criteria. For a documentation-only or test-only scope, report "
@@ -915,6 +965,7 @@ def build_system_prompt(variant: PromptVariant = "v1", extra_rules: str = "") ->
         + _CONFIDENCE_CLAUSES[variant]
         + _MITIGATION_SCAN
         + _NEGATED_CRITERION
+        + _INTENT_FIRST
         + _PREAMBLE_TAIL
     )
     rules_block = "\n".join(_render_rule(r) for r in RULES)
