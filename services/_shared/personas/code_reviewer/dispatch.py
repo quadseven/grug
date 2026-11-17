@@ -2527,6 +2527,16 @@ def dispatch_code_review(
             },
         )
 
+    # #1781, fail closed: a re-review may still exit early (stale, skipped,
+    # carried, degraded, re-run pending) without vouching for this head, so
+    # Elder's earlier approvals are withdrawn before any exit. A clean
+    # finish approves again.
+    if action in _RE_REVIEW_ACTIONS:
+        _dismiss_superseded_reviews(
+            installation_id, owner, repo_name, pull_number, head_sha,
+            run_started_at, state="APPROVED",
+        )
+
     # A queued message can already be stale when the consumer starts it. Check
     # the complete review input before spending model tokens: unchanged head
     # does not imply unchanged diff or intent when base/title/body moved.
@@ -3360,6 +3370,12 @@ def dispatch_code_review(
     # finishes clean; if it fails or degrades the head stays unapproved.
     deferred_approval = verdict == "APPROVE" and deep_plan is not None
     event = "COMMENT" if deferred_approval else verdict
+    if event == "APPROVE" and _pr_head_state(
+        installation_id, owner, repo_name, pull_number, head_sha,
+    ) != "current":
+        # #1781: a push landed after this run read the head (or the head
+        # could not be confirmed). Never approve a head that is not current.
+        event = "COMMENT"
     # grug#1429 pin + closure, then grug#1212's degraded lead: a degraded
     # pass still says so before anything else, the pin line right after.
     pinned_issues = _pinned_issues(pr_context, owner, repo_name)
@@ -3485,9 +3501,9 @@ def dispatch_code_review(
             else:
                 review_publish_failed = True
 
-    # A blocking review from an earlier commit stays GitHub's standing verdict
-    # until it is dismissed; a clean re-review alone does not clear it.
-    # Withdraw it when this run APPROVES the head (grug#1581, #1758): the
+    # A block Elder posted on this head from an earlier-started run stays
+    # GitHub's standing verdict until it is dismissed (blocks on other commits
+    # stay, #1781). Withdraw it when this run APPROVES the head (grug#1581, #1758): the
     # dismissal follows the verdict, so advisory findings never keep a block
     # alive, in either mode. `verdict_event` already refuses to approve a
     # degraded run, a head with an earlier finding still open
@@ -3745,6 +3761,14 @@ def dispatch_code_review(
                 "pr": f"{owner}/{repo_name}#{pull_number}",
                 "kind": type(e).__name__,
             },
+        )
+    if deep_plan is not None:
+        # #1781: however the deep append ended (clean, failed, cancelled,
+        # degraded), an older run's approval on an earlier commit may have
+        # landed while it ran. Withdraw it so it cannot outlive this run.
+        _dismiss_superseded_reviews(
+            installation_id, owner, repo_name, pull_number, head_sha,
+            run_started_at, state="APPROVED", other_commits_only=True,
         )
 
     # Close Elder's own threads the push fixed and this review does not
@@ -4647,24 +4671,57 @@ def _is_elder_review(review: dict[str, Any]) -> bool:
     )
 
 
+def _pr_head_state(
+    installation_id: int, owner: str, repo_name: str, pull_number: int,
+    head_sha: str,
+) -> Literal["current", "moved", "unknown"]:
+    """Whether `head_sha` is still the pull request's head on GitHub (#1781).
+
+    `moved` means a push landed after this run read the head: a newer run
+    owns the verdict. `unknown` (the lookup failed) proves nothing, so a
+    caller about to approve treats it as not current (fail closed)."""
+    try:
+        _, current, _, _ = with_install_token_retry(
+            installation_id,
+            lambda token: _fetch_current_review_snapshot(
+                token, owner, repo_name, pull_number,
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 - no proof; the caller fails closed
+        log.warning(
+            "elder_head_check_failed",
+            extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+        )
+        return "unknown"
+    return "current" if current == head_sha else "moved"
+
+
 def _dismiss_superseded_reviews(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, run_started_at: datetime, *,
     state: Literal["CHANGES_REQUESTED", "APPROVED"], clean_url: str = "",
+    other_commits_only: bool = False,
 ) -> int:
     """Dismiss Elder's own reviews in `state` that this run supersedes.
 
-    `CHANGES_REQUESTED`: this run approved the head, so Elder's older blocks
-    are withdrawn. `APPROVED` (#1758): this run cannot vouch for the head,
-    so Elder's older approvals are withdrawn (fail closed).
+    `CHANGES_REQUESTED`: this run approved the head, so Elder's blocks on
+    that head from runs that started earlier are withdrawn. A block on any
+    other commit is never dismissed (#1781): it may come from a newer push,
+    and Elder's newer review already replaces an older one as its standing
+    state on GitHub.
 
-    That is every such review on an earlier commit, plus one on the current
-    head from a run that started before this one (`_from_earlier_run`): its
-    run marker decides, so an earlier run's review that landed mid-flight is
-    still superseded, while a later-started run's review stays. A same-head
-    block with no marker counts as earlier only when submitted before
-    `run_started_at` (#1350); a same-head approval with no marker is always
-    withdrawn (fail closed).
+    `APPROVED` (#1758): this run cannot vouch for the head, so Elder's older
+    approvals are withdrawn (fail closed): every one on another commit, plus
+    one on this head from an earlier-started run unless `other_commits_only`.
+    When a push has moved the head past `head_sha`, nothing is dismissed: a
+    newer run owns the verdict, and an approval on the new head is not this
+    run's to withdraw (#1781).
+
+    Same-head recency is the run marker (`_from_earlier_run`), so an earlier
+    run's review that landed mid-flight is still superseded, while a
+    later-started run's review stays. A same-head block with no marker
+    counts as earlier only when submitted before `run_started_at` (#1350); a
+    same-head approval with no marker is always withdrawn (fail closed).
 
     A block's dismissal message links `clean_url`, the clean check run (or
     the approving review), so the PR timeline names what superseded it.
@@ -4686,6 +4743,11 @@ def _dismiss_superseded_reviews(
             f"Withdrawn: Elder's newest review of {head_sha[:7]} could not "
             "vouch for it, so this approval no longer stands."
         )
+    if state == "APPROVED" and _pr_head_state(
+        installation_id, owner, repo_name, pull_number, head_sha,
+    ) == "moved":
+        log.info("elder_approval_withdrawal_head_moved", extra={"pr": pr})
+        return 0
     try:
         reviews = with_install_token_retry(
             installation_id,
@@ -4694,11 +4756,14 @@ def _dismiss_superseded_reviews(
             ),
         )
         for review in reviews:
+            same_head = review.get("commit_id") == head_sha
             if (
                 review.get("state") != state
                 or not _is_elder_review(review)
+                or (state == "CHANGES_REQUESTED" and not same_head)
+                or (same_head and other_commits_only)
                 or (
-                    review.get("commit_id") == head_sha
+                    same_head
                     and not _from_earlier_run(
                         review, run_started_at,
                         unmarked_is_earlier=state == "APPROVED",
@@ -4715,7 +4780,7 @@ def _dismiss_superseded_reviews(
                 ),
             )
             dismissed += 1
-    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+    except Exception as e:  # noqa: BLE001 - best-effort; never changes the outcome
         log.warning(
             failed_log,
             extra={"pr": pr, "kind": type(e).__name__, **_http_error_detail(e)},
@@ -4824,9 +4889,10 @@ def _post_deferred_approval(
     """Post the APPROVE Tier-1 deferred to the deep pass (#1758), then
     withdraw Elder's own older blocks, as a clean Tier-1 would.
 
-    Right before posting, re-checks that no other run has started on the
-    head (`_newer_run_started`) and that no later-started run has posted a
-    verdict; either stands this approval down.
+    Right before posting, re-checks that the PR head is still `head_sha`
+    (#1781), that no other run has started on the head
+    (`_newer_run_started`), and that no later-started run has posted a
+    verdict; any of them stands this approval down.
 
     Body-only and posted once: a failed post is logged and never queued for
     retry, so a late approval cannot land over a newer verdict. The head
@@ -4836,7 +4902,9 @@ def _post_deferred_approval(
     if not security_pass_complete:
         log.info("elder_deferred_approval_security_pass_incomplete", extra={"pr": pr})
         return
-    if _newer_run_started(
+    if _pr_head_state(
+        installation_id, owner, repo_name, pull_number, head_sha,
+    ) != "current" or _newer_run_started(
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         head_sha=head_sha, run_started_at=run_started_at,
         own_check_ids=own_check_ids,

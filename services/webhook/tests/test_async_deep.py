@@ -690,10 +690,12 @@ def test_deep_blocking_finding_requests_changes_with_no_approval(monkeypatch, bl
 
 def test_deferred_approval_withdraws_elders_older_block(monkeypatch):
     """The clean deep pass is the approving run, so it withdraws Elder's own
-    block on an earlier commit, as a clean Tier-1 would."""
-    block = _elder_review(5, state="CHANGES_REQUESTED", commit="old0000")
+    block on this head from an earlier-started run, as a clean Tier-1 would.
+    A block on another commit stays (#1781): it may come from a newer push."""
+    block = _marked(5, state="CHANGES_REQUESTED", started="2000-01-01T00:00:00+00:00")
+    other = _elder_review(6, state="CHANGES_REQUESTED", commit="old0000")
     events, dismissed, _ = _run_with_verdicts(
-        monkeypatch, deep=_RAN_CLEAN, reviews_on_pr=[block],
+        monkeypatch, deep=_RAN_CLEAN, reviews_on_pr=[block, other],
     )
     assert events[-1] == "APPROVE"
     assert dismissed == [5]
@@ -833,5 +835,42 @@ def test_deferred_approval_refuses_an_unfinished_security_pass(monkeypatch):
         own_check_ids=frozenset(), security_pass_complete=False,
     )
     assert posted == []
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_deferred_approval_stands_down_after_a_push(monkeypatch, blocking):
+    """#1781: a push lands while the deep pass runs and a newer run blocks
+    the new head. The older run's clean deep pass posts no approval on the
+    old head and dismisses neither the newer block nor anything else."""
+    monkeypatch.setattr(cr_dispatch, "_pr_head_state", lambda *a, **k: "moved")
+    newer_block = _marked(8, state="CHANGES_REQUESTED", commit="new9999",
+                          started="2999-01-01T00:00:00+00:00")
+    events, dismissed, _ = _run_with_verdicts(
+        monkeypatch, deep=_RAN_CLEAN, reviews_on_pr=[newer_block], blocking=blocking,
+    )
+    assert "APPROVE" not in events
+    assert dismissed == []
+
+
+def test_unconfirmed_head_never_gets_the_deferred_approval(monkeypatch):
+    monkeypatch.setattr(cr_dispatch, "_pr_head_state", lambda *a, **k: "unknown")
+    events, _, _ = _run_with_verdicts(monkeypatch, deep=_RAN_CLEAN)
+    assert "APPROVE" not in events
+
+
+@pytest.mark.parametrize("deep", [_DEEP_DOWN, _RAN_CLEAN], ids=["failed", "clean"])
+def test_deep_append_end_withdraws_a_late_approval_on_an_earlier_commit(
+    monkeypatch, deep,
+):
+    """#1781: an older run's approval on an earlier commit landed while this
+    run's deep pass ran. However the deep append ends, it is withdrawn, and
+    this run's own approval on its head (clean case) stays."""
+    late = _marked(7, state="APPROVED", commit="old0000",
+                   started="2000-01-01T00:00:00+00:00")
+    events, dismissed, _ = _run_with_verdicts(
+        monkeypatch, deep=deep, reviews_on_pr=[late],
+    )
+    assert dismissed == [7]
+    assert ("APPROVE" in events) == (deep is _RAN_CLEAN)
 
 

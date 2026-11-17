@@ -93,10 +93,15 @@ def _review(rid, *, state, commit="old0000", submitted_at=None):
 
 
 def _run(monkeypatch, llm, *, blocking, action="opened", threads=(),
-         carried=(), reviews=(), author="alice"):
-    """Drive one Tier-1 review; return (posted reviews, dismissed ids)."""
+         carried=(), reviews=(), author="alice", head_state="current",
+         rerun_pending=False):
+    """Drive one Tier-1 review; return (posted reviews, dismissed ids).
+
+    `head_state` is what GitHub says about the head when Elder checks it
+    (#1781): "moved" models a push that landed after the run started."""
     posted: list[ReviewResult] = []
     dismissed: list[int] = []
+    monkeypatch.setattr(cr_dispatch, "_pr_head_state", lambda *a, **k: head_state)
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
     monkeypatch.setattr(
@@ -104,10 +109,16 @@ def _run(monkeypatch, llm, *, blocking, action="opened", threads=(),
         lambda *a, result, **kw: posted.append(result) or {"id": 500 + len(posted)},
     )
     monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **kw: list(reviews))
-    monkeypatch.setattr(
-        cr_dispatch, "dismiss_review",
-        lambda *a, **kw: dismissed.append(kw["review_id"]) or {},
-    )
+
+    def _dismiss(*a, review_id, **kw):
+        # As on GitHub: a dismissed review lists as DISMISSED afterward.
+        dismissed.append(review_id)
+        for review in reviews:
+            if review["id"] == review_id:
+                review["state"] = "DISMISSED"
+        return {}
+
+    monkeypatch.setattr(cr_dispatch, "dismiss_review", _dismiss)
     monkeypatch.setattr(
         cr_dispatch.carry_forward, "list_threads",
         lambda *a, **kw: None if threads is None else list(threads),
@@ -118,7 +129,9 @@ def _run(monkeypatch, llm, *, blocking, action="opened", threads=(),
     payload = _payload(action)
     payload["pull_request"]["user"]["login"] = author
     with patch("httpx.get", return_value=_diff_response()):
-        cr_dispatch.dispatch_code_review(payload, blocking=blocking)
+        cr_dispatch.dispatch_code_review(
+            payload, blocking=blocking, rerun_pending=rerun_pending,
+        )
     return posted, dismissed
 
 
@@ -256,11 +269,77 @@ def test_degraded_rereview_withdraws_elders_older_approval(monkeypatch):
     assert dismissed == [1]
 
 
-def test_clean_rereview_keeps_elders_older_approval(monkeypatch):
+def test_rereview_withdraws_elders_approval_on_an_earlier_commit(monkeypatch):
+    """#1781: the approval vouched for an older commit. A clean finish
+    approves the new head again."""
     reviews = [_review(1, state="APPROVED", commit="old0000")]
-    _, dismissed = _run(
+    posted, dismissed = _run(
         monkeypatch, _clean(), blocking=True, action="synchronize", reviews=reviews,
     )
+    assert dismissed == [1]
+    assert [r.event for r in posted] == ["APPROVE"]
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_degraded_rerun_pending_withdraws_elders_older_approval(monkeypatch, blocking):
+    """#1781: a run that exits early to wait for its re-run cannot vouch
+    for the head either, so the earlier approval is withdrawn first."""
+    reviews = [_review(1, state="APPROVED", commit="old0000")]
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    _, dismissed = _run(
+        monkeypatch, LlmReviewResponse(kind="all_failed", error="poolside: timeout"),
+        blocking=blocking, action="synchronize", reviews=reviews, rerun_pending=True,
+    )
+    assert dismissed == [1]
+
+
+def test_stale_rereview_withdraws_elders_older_approval(monkeypatch):
+    """A queued re-review whose input went stale exits before any model
+    call, after withdrawing the approval it can no longer stand behind."""
+    reviews = [_review(1, state="APPROVED", commit="old0000")]
+    monkeypatch.setattr(
+        cr_dispatch, "_review_snapshot_freshness_failure",
+        lambda **kw: {"persona": "code_reviewer", "result": "stale"},
+    )
+    posted, dismissed = _run(
+        monkeypatch, _clean(), blocking=True, action="review", reviews=reviews,
+    )
+    assert posted == []
+    assert dismissed == [1]
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_push_after_the_run_started_leaves_the_newer_block_and_no_approval(
+    monkeypatch, blocking,
+):
+    """#1781: run A reviews the old head; a push lands and run B blocks the
+    new head. A finishes clean: it must not approve the old head, and must
+    not dismiss B's block or any approval on the new head."""
+    newer_block = _review(1, state="CHANGES_REQUESTED", commit="new9999")
+    newer_block["body"] += "\n" + run_marker(datetime(2999, 1, 1, tzinfo=timezone.utc))
+    posted, dismissed = _run(
+        monkeypatch, _clean(), blocking=blocking, action="synchronize",
+        reviews=[newer_block, _review(2, state="APPROVED", commit="new9999")],
+        head_state="moved",
+    )
+    assert "APPROVE" not in [r.event for r in posted]
+    assert dismissed == []
+
+
+def test_unconfirmed_head_never_approves(monkeypatch):
+    """Fail closed: the head lookup failed, so the approval is not posted."""
+    posted, _ = _run(monkeypatch, _clean(), blocking=True, head_state="unknown")
+    assert "APPROVE" not in [r.event for r in posted]
+
+
+def test_approving_run_never_dismisses_a_block_on_another_commit(monkeypatch):
+    """Only a same-head block from an earlier-started run is withdrawn; a
+    block on another commit may belong to a newer push (#1781)."""
+    reviews = [_review(1, state="CHANGES_REQUESTED", commit="other00")]
+    posted, dismissed = _run(
+        monkeypatch, _clean(), blocking=True, action="synchronize", reviews=reviews,
+    )
+    assert [r.event for r in posted] == ["APPROVE"]
     assert dismissed == []
 
 

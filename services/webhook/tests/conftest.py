@@ -200,6 +200,20 @@ def _mock_learn_living_review_sync(monkeypatch):
     monkeypatch.setattr(learn_job, "_sync_living_review", MagicMock(return_value=0))
 
 
+@pytest.fixture(autouse=True)
+def _pr_head_has_not_moved(monkeypatch):
+    """Elder confirms the PR head right before it approves (#1781).
+
+    Most Elder tests patch `httpx.get` to return a diff for every URL, so the
+    real head lookup would fail and every approval would fail closed. By
+    default the head has not moved; tests of a push mid-run patch
+    `dispatch._pr_head_state` themselves (innermost patch wins).
+    """
+    from personas.code_reviewer import dispatch
+
+    monkeypatch.setattr(dispatch, "_pr_head_state", lambda *a, **k: "current")
+
+
 class _LabelHttpResponse:
     """Minimal httpx.Response stand-in for the label calls."""
 
