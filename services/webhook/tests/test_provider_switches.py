@@ -498,9 +498,10 @@ def test_a_review_skips_a_provider_after_its_first_auth_refusal(monkeypatch) -> 
     assert fake.hosts() == {_POOLSIDE_URL}
 
 
-def test_a_poolside_usage_limit_429_holds_poolside_without_a_retry() -> None:
-    """One `429 usage limit exceeded` holds Poolside for two minutes and the
-    call is not retried: asking again inside a spell only repeats the body."""
+def test_a_poolside_usage_limit_429_takes_poolside_out_of_the_chain_without_a_retry() -> None:
+    """The live regression was a one-hour trip on one `429 usage limit
+    exceeded` (2026-10-17). Now that body holds Poolside for two minutes only,
+    and the call is not retried: asking again inside a spell only repeats it."""
     cfg = lc.replace(lc._BACKEND_CONFIGS[Backend.POOLSIDE], retry_attempts=2)
     with patch.object(
         httpx, "post", side_effect=[_err(429, "usage limit exceeded"), _ok()],
@@ -508,6 +509,7 @@ def test_a_poolside_usage_limit_429_holds_poolside_without_a_retry() -> None:
         assert lc._call_backend(cfg, _MESSAGES).status_code == 429
     assert post.call_count == 1
     assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert Backend.POOLSIDE not in [t.backend for t in lc._cloud_chain_tiers()]
 
 
 def _poolside_call(resp: httpx.Response) -> None:
@@ -541,6 +543,20 @@ def test_repeated_limit_refusals_hold_poolside_two_then_four_up_to_thirty(monkey
         now["t"] += _poolside_held_seconds(now["t"]) + 1
     assert seen == [2, 4, 8, 16, 30, 30]
     assert ("provider", "poolside", "paid", pytest.approx(1_000_000.0 + 120)) in published
+
+
+def test_repeated_limit_refusals_skip_poolside_then_it_is_asked_again(monkeypatch) -> None:
+    """A limit refusal holds Poolside (#1546), so the review reaches a tier
+    that can answer, and Poolside comes back on its own when the hold ends."""
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(lc.time, "time", lambda: now["t"])
+    _poolside_call(_err(429, "usage limit exceeded"))
+    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert Backend.POOLSIDE not in lc._usable_saas_fallback_backends()
+    assert Backend.POOLSIDE not in [t.backend for t in lc._cloud_chain_tiers()]
+    now["t"] += lc._LIMIT_HOLD_BASE_SECONDS + 1
+    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert Backend.POOLSIDE in [t.backend for t in lc._cloud_chain_tiers()]
 
 
 def test_a_second_refusal_during_a_hold_does_not_escalate(monkeypatch) -> None:

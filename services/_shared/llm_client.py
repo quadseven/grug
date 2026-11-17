@@ -1960,6 +1960,14 @@ def _limit_hold_error() -> str:
     return f"partial review: provider held after repeated usage limit refusals ({', '.join(held)})"
 
 
+def _with_limit_hold_error(result: LlmReviewResponse) -> LlmReviewResponse:
+    """A clean reviewed result made while a limit hold is open, marked
+    degraded with `_limit_hold_error`; any other result as it came."""
+    if result.kind != "reviewed" or result.error:
+        return result
+    return replace(result, error=_limit_hold_error())
+
+
 def _limit_hold_active(key: tuple[str, str], now: float) -> bool:
     with _provider_breaker_lock:
         return key in _limit_hold_level and _provider_blocked_until.get(key, 0.0) > now
@@ -6126,10 +6134,8 @@ def review_diff(
     else:
         result = review.run_staged(plan)
     note = _render_reviewability_note(assessment)
-    if result.kind == "reviewed" and not result.error:
-        result = replace(result, error=_limit_hold_error())
     return replace(
-        result,
+        _with_limit_hold_error(result),
         reviewability_note=note,
         reviewability_blocking=assessment.decision == "block",
         families=(
