@@ -1086,7 +1086,8 @@ entry that names no known backend or pool logs
 
 With `GRUG_OPENCODE_GO_FREE_DISCOVERY` enabled, Elder tries live-listed free
 Go models before configured paid Go models. Configured models that disappear
-from the catalog are skipped. `opencode_go_review_served` logs the model that
+from the catalog are skipped. If the catalog returns no models, the default
+paid model stays available. `opencode_go_review_served` logs the model that
 served a review.
 
 `GRUG_OPENCODE_GO_DAILY_CAP` bounds paid OpenCode Go calls per UTC day across
