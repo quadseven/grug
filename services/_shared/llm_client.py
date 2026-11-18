@@ -38,14 +38,13 @@ import json
 import logging
 import math
 import os
-import queue
 import re
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from enum import Enum
+from functools import partial
 from typing import (
     Any, Callable, Iterator, Literal, NotRequired, Optional, Sequence, TypedDict, cast,
     get_args,
@@ -54,11 +53,15 @@ from typing import (
 import httpx
 
 from code_review_prompt import _RULE_NAME_RE, PromptVariant, build_system_prompt
-from openrouter_free_limiter import (
-    RateLimitTimeoutError,
-    acquire_free_tier_slot,
-    is_free_tier_model,
+from openrouter_free_limiter import is_free_tier_model
+from llm_backend import Backend as Backend, BackendConfig as BackendConfig
+from llm_backend import _TIMEOUT_SECONDS
+from model_availability import (
+    BackendDisabledError as BackendDisabledError,
+    OpencodeGoCircuitOpenError as OpencodeGoCircuitOpenError,
 )
+from provider_wire import ReviewDeadlineReached as ReviewDeadlineReached
+from provider_wire import _BackendConfigError
 from repo_file_cache import RepoFileCache
 from voice_pack import VoiceSelection, apply_voice
 from review_types import (
@@ -84,8 +87,25 @@ from review_evidence import Hunk, ElderEvidence, seal
 from model_family import ReviewFamilies, model_family, review_families
 from datadog_switch import datadog_enabled
 import call_report
-import opencode_go_free
-import shared_benches
+import review_ladder
+from review_ladder import (
+    ChunkAttempt,
+    ReviewWalk,
+    _CAVE_REVIEW_CODER_DEFAULT_MODEL,
+    _CAVE_REVIEW_REASONER_DEFAULT_MODEL,
+    _ChunkLadder,
+    _CloudPrimaryResult,
+    _DEGENERATE_MAX_OUTPUT_TOKENS,
+    _cave_empty_is_trusted,
+    _empty_answers_agree,
+    _empty_confirms_nothing,
+    _free_empty_may_confirm,
+    _free_tier_found_nothing,
+    _gateway_outage_order,
+    _is_degenerate_empty_review,
+)
+import model_availability as availability
+import provider_wire
 import deep_shadow
 from secrets_loader import (
     get_opencode_go_api_key,
@@ -374,8 +394,6 @@ _OPENROUTER_FREE_REVIEW_EXTRA_BODY: dict[str, Any] = {
 # Shared low-latency calls retain the historical 60-second timeout. Deep code
 # reviews override this below because they run durably outside the webhook
 # request budget and need materially more reasoning time.
-_TIMEOUT_SECONDS = 60
-_RETRY_ATTEMPTS = 3
 # Each deep backend gets one long attempt. The default must clear a REAL
 # slow pass, not just an average one: a large-diff Elder review on the
 # reasoner arm (qwen3.5:122b) was measured at ~318s live on 2026-07-13 —
@@ -437,8 +455,6 @@ _CAPPED_ANSWER_MARKER = "hit the generation token cap"
 _REVIEW_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "grug_review_deadline", default=None,
 )
-# A call with less than this left is not sent: it could not finish a review.
-_DEADLINE_CALL_FLOOR_SECONDS = 10.0
 # What a cohort needs to be worth starting under a deadline: one slow cloud
 # answer (Poolside's 45s chain timeout) plus parsing. Replaces the
 # worst-case ladder walk as the scheduler's reserve.
@@ -450,20 +466,9 @@ _RUNG_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "grug_rung_deadline", default=None,
 )
 _SUBSCRIPTION_RESERVE_SECONDS = 60.0
-# Set once a lane-first walk has asked the lane, so its last rung does not.
-_LANE_ASKED: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "grug_lane_asked", default=False,
-)
 # A tight share still asks the first rungs: Go answers in about 8s, and a
 # healthy model must not lose every cohort of a long review to the lane's cap.
 _MIN_RUNG_SECONDS = 30.0
-
-
-class ReviewDeadlineReached(httpx.RequestError):
-    """A model call was cut, or never sent, because the staged review's
-    deadline passed. A RequestError (not a TimeoutException) on purpose:
-    every caller already treats it as a transport failure, and the slow bench
-    only counts real timeouts - a deadline cut says nothing about the model."""
 
 
 @contextlib.contextmanager
@@ -569,28 +574,12 @@ def _deadline_passed() -> bool:
     """Whether a deadline is set and too little of it is left for one call."""
     deadline = _REVIEW_DEADLINE.get()
     return deadline is not None and (
-        deadline - time.monotonic() < _DEADLINE_CALL_FLOOR_SECONDS
+        deadline - time.monotonic() < provider_wire._DEADLINE_CALL_FLOOR_SECONDS
     )
 
 
-def _deadline_timeout(timeout_seconds: float, deadline: float | None) -> float:
-    """`timeout_seconds` clamped to the time left before `deadline`.
-
-    Raises `ReviewDeadlineReached` when less than the call floor is left, so a
-    call that could not finish is never sent."""
-    if deadline is None:
-        return timeout_seconds
-    left = deadline - time.monotonic()
-    if left < _DEADLINE_CALL_FLOOR_SECONDS:
-        raise ReviewDeadlineReached(
-            f"staged review deadline reached ({max(left, 0.0):.1f}s left)"
-        )
-    return min(timeout_seconds, left)
-
-# One extra attempt per cohort. A second failure is treated as real: further
-# attempts spend budget the remaining cohorts need, and the failure modes that
-# survive one retry (a sustained backend outage, a model that cannot produce
-# parseable output for this input) are not fixed by a third.
+# Each cohort gets one retry. Further attempts spend budget later cohorts
+# need and rarely resolve sustained failures like an outage or unparseable output.
 _DEFAULT_COHORT_ATTEMPTS = 2
 
 
@@ -687,47 +676,6 @@ def _reviewability_policy() -> ReviewabilityPolicy:
 
 _REVIEW_RETRY_ATTEMPTS = 3
 _REVIEW_TRANSPORT_RETRY_ATTEMPTS = 1
-# Exponential backoff applies on every attempt except the final one,
-# which either returns the response or raises.
-_RETRY_BASE_DELAY = 0.5
-
-# 429 (rate limit) + 503 (CF edge blip / temporary backend overload)
-# are routinely transient on both Poolside and OpenRouter. Other 5xx
-# (500, 502, 504) return immediately; review_diff then falls back to
-# the secondary backend rather than burning retries on what may be a
-# permanent issue.
-_RETRYABLE_STATUSES: frozenset[int] = frozenset((429, 503))
-
-
-class Backend(str, Enum):
-    """LLM backends. String-valued so DD LLM Obs tags + structured logs
-    can `backend=str(backend)` without a cast."""
-
-    POOLSIDE = "poolside"
-    OPENROUTER = "openrouter"
-    # Owned in-cluster review ensemble (ADR-0009), both fronted by the same
-    # spark-gateway (it routes by model name to whichever Spark carries it,
-    # warm-first). CAVE = the coder arm (qwen3-coder-next on one GPU host),
-    # CAVE_REASONER = the reasoner arm (default below is Laguna, and BOTH
-    # deployments override it to `spark:warm-any` - see #843). Deep
-    # review runs BOTH and merges - the brain+hands split that is now the
-    # PRIMARY review path (POOLSIDE/OPENROUTER above are a bounded overload
-    # fallback only - see _saas_overload_fallback_config). The exposed-secret
-    # judge (#439) also routes to CAVE.
-    CAVE = "cave"
-    # A distinct vendor identity (grug#910), NOT a POOLSIDE/OPENROUTER alias -
-    # different endpoint, different key, different provenance for telemetry.
-    # Sits ahead of Cave in the grug#906/#910 "cloud" priority chain, never
-    # in the default ("cave") priority path.
-    OPENCODE_GO = "opencode-go"
-    CAVE_REASONER = "cave-reasoner"
-    # The spark-gateway's free provider pool on its free route (grug#1269):
-    # free cloud models only, never a Spark. The last cloud chain tier, ahead
-    # of the Cave.
-    FREE_POOL = "free-pool"
-    # The operator's own subscription plans run headless (Claude Code / Codex)
-    # as the last-resort fallback after self-hosted and free tiers fail (grug#1276).
-    SUBSCRIPTION = "subscription"
 
 
 # `Severity` + `SEVERITIES` now live in the shared leaf `review_types` (#250)
@@ -849,75 +797,6 @@ def concludes_omit(finding: "Finding") -> bool:
 
 
 @dataclass(frozen=True, slots=True)
-class BackendConfig:
-    """All the data a single backend dispatch needs. Replacing per-backend
-    if/else branches with a `BackendConfig` lookup means adding a third
-    backend is one new entry, not four scattered edits."""
-
-    backend: Backend
-    url: str
-    model: str
-    key_loader: Callable[[], str]
-    # Vendor-specific chat-completions body params merged for THIS backend
-    # only. Poolside's laguna-s-2.1 runs thinking ON by default — ~87% of output
-    # was reasoning tokens, which (a) blew past the 30s read timeout (measured
-    # 72s for even a tiny diff → ReadTimeout → Elder posted nothing for days)
-    # and (b) leaked reasoning prose into `content`, breaking JSON parse. The
-    # vLLM `chat_template_kwargs.enable_thinking=false` switch disables it
-    # (verified live: 72s→<1s, reasoning_tokens 1106→0). claude/OpenRouter
-    # rejects this key, so it MUST be per-backend, never on the shared body.
-    extra_body: dict = field(default_factory=dict)
-    # Vendor-agnostic outgoing headers, merged before Authorization (which
-    # always wins - _call_backend rejects an extra_headers entry named
-    # Authorization outright). Today this is only the Cave arms'
-    # X-Spark-Priority: interactive (quadseven/infra#1768) - the spark-gateway
-    # priority queue that keeps Grug's short-timeout calls from starving
-    # behind Hermes's long agentic turns on a shared, single-generation-slot
-    # Ollama target. SaaS backends don't look at it; harmless to send
-    # everywhere it's set.
-    extra_headers: dict = field(default_factory=dict)
-    # Headers whose VALUE must be computed per call, not once at config
-    # definition time (grug#984). opencode Go's `x-opencode-session`
-    # needs a value that is fresh per outgoing request - re-sending the
-    # same literal string for the process's entire lifetime would still
-    # satisfy the "header present" check that actually gates the 400
-    # below, but would defeat the routing/prompt-caching optimization the
-    # header exists for (every unrelated PR's review would collide on one
-    # cache key) and reads as exactly the kind of static, non-conversation
-    # -scoped traffic opencode Go's abuse monitoring is watching for.
-    # Callable, same lazy-at-call-time shape as `key_loader` above, for
-    # the same reason: a bare value captured here would be frozen at
-    # `_BACKEND_CONFIGS` module-load time, not regenerated per call. A
-    # callable that returns None leaves its header off that call.
-    dynamic_headers: dict[str, Callable[[], str | None]] = field(default_factory=dict)
-    timeout_seconds: float = _TIMEOUT_SECONDS
-    retry_attempts: int = _RETRY_ATTEMPTS
-    # Long review calls should still retry quick 429/503 responses, but must not
-    # repeat a full _review_llm_timeout_s() transport timeout. None follows
-    # retry_attempts.
-    transport_retry_attempts: Optional[int] = None
-    # Which HTTP wire protocol this backend speaks. "chat" is the
-    # OpenAI chat-completions shape every backend here used until
-    # gpt-5.6-luna: `messages` in, `choices[0].message.content` out.
-    #
-    # "responses" is OpenAI's Responses API, which opencode Go documents as
-    # the ONLY endpoint for gpt-5.6-luna, grok-4.6 and muse-spark (its other
-    # models are chat-completions or anthropic /v1/messages). It differs in
-    # three ways that all matter here: the field is `input` not `messages`,
-    # JSON mode is `text.format` not `response_format`, and the reply is an
-    # `output[]` list of typed blocks rather than `choices[]`.
-    #
-    # Sending the chat shape to a responses-only model is not a graceful
-    # 400 - measured 2026-08-31, gpt-5.6-luna returns HTTP 500 "Internal
-    # server error" on BOTH /v1/chat/completions and /v1/messages, for every
-    # request variant tried (max_tokens, max_completion_tokens, no token
-    # param, reasoning_effort). Six other models answered 200 on the
-    # identical request with the identical key, so a 500 here reads like a
-    # provider outage rather than the routing mistake it actually is.
-    wire: Literal["chat", "responses"] = "chat"
-
-
-@dataclass(frozen=True, slots=True)
 class LlmReviewResponse:
     """Result of one review_diff call.
 
@@ -978,123 +857,6 @@ class LlmReviewResponse:
 
 
 # grug#1196: one failed model call inside a chunk's ladder walk.
-@dataclass(frozen=True, slots=True)
-class _LadderAttempt:
-    backend: str
-    model: str
-    reason: str
-    # Seconds to wait before asking this model again, for a rate limit (429)
-    # that a wait can clear. 0 means the failure is final for this chunk
-    # (grug#1494).
-    retry_after: float = 0.0
-    through_gateway: bool = False
-    outage_failure: bool = False
-
-    @property
-    def label(self) -> str:
-        return f"{self.model} ({self.reason})"
-
-
-_GATEWAY_OUTAGE_REASON = "inference gateway outage"
-# A gateway call the review deadline cut short failed neither way: it does not
-# show the gateway down, and it does not show it up.
-_NEUTRAL_GATEWAY_REASONS = frozenset({ReviewDeadlineReached.__name__})
-
-
-def _with_gateway_outage_named(trail: list[_LadderAttempt]) -> list[_LadderAttempt]:
-    """Name the outage on one failed walk's gateway attempts (grug#1467).
-
-    Only when every gateway attempt failed that way: one arm timing out while
-    the other answers is a slow model. The labels reach the check title and
-    summary through coverage, and `tried` keeps them past the chunk retry,
-    whose skipped calls reach no model and could not name the outage."""
-    gateway = [
-        attempt for attempt in trail
-        if attempt.through_gateway and attempt.reason not in _NEUTRAL_GATEWAY_REASONS
-    ]
-    if not gateway or not all(attempt.outage_failure for attempt in gateway):
-        return trail
-    return [
-        replace(attempt, reason=f"{_GATEWAY_OUTAGE_REASON}: {attempt.reason}")
-        if attempt.through_gateway and attempt.outage_failure else attempt
-        for attempt in trail
-    ]
-
-
-@dataclass(frozen=True, slots=True)
-class _GatewayCall:
-    """One model call through the inference gateway in a ladder walk
-    (grug#1467). `neutral` marks a call the review deadline cut short, which
-    says nothing about whether the gateway is up."""
-
-    backend: str
-    model: str
-    outage: bool
-    neutral: bool
-
-
-# Every gateway call of the current ladder walk, the cloud chain and the Cave
-# arms alike. Set per walk by `_walk_review_ladder` (and by the Cave path for
-# a direct caller); None elsewhere, so the judge and the deep append are
-# untouched. A deep-mode arm thread gets the same list through its context
-# copy.
-_WALK_GATEWAY_CALLS: contextvars.ContextVar[list[_GatewayCall] | None] = (
-    contextvars.ContextVar("grug_walk_gateway_calls", default=None)
-)
-
-
-def _gateway_down(calls: Sequence[_GatewayCall]) -> bool:
-    """True when the walk reached the gateway and every call that ran to an
-    answer failed the way a down or load-shedding gateway fails. One arm
-    answering, or failing any other way, means the gateway is up."""
-    counted = [call for call in calls if not call.neutral]
-    return bool(counted) and all(call.outage for call in counted)
-
-
-def _record_gateway_call(
-    backend: str, model: str, config: BackendConfig, outcome: AttemptOutcome,
-) -> None:
-    calls = _WALK_GATEWAY_CALLS.get()
-    if calls is None or not _routes_through_gateway(config.url):
-        return
-    reason = _ladder_failure_reason(outcome)
-    calls.append(_GatewayCall(
-        backend=backend,
-        model=model,
-        outage=reason is not None and _is_outage_failure(outcome, reason),
-        neutral=reason in _NEUTRAL_GATEWAY_REASONS,
-    ))
-
-
-# Set by `_ChunkLadder.run` around one chunk's dispatch. `_run_llm_attempt` is
-# the single seam every review model call passes through, so it records each
-# failure into the trail and skips models the chunk already saw fail. Both
-# default to "off", so every other caller (judge, deep append, ask) is
-# unaffected.
-_LADDER_TRAIL: contextvars.ContextVar[list[_LadderAttempt] | None] = (
-    contextvars.ContextVar("grug_ladder_trail", default=None)
-)
-_LADDER_SKIP: contextvars.ContextVar[frozenset[tuple[str, str]]] = (
-    contextvars.ContextVar("grug_ladder_skip", default=frozenset())
-)
-# Set by `_review_diff_dispatch` for a pull request with a known author family
-# (grug#1437): (author family, same_family_only). The first walk runs with
-# False and skips the author's family; the walk back runs with True and asks
-# only that family, so no other model is asked twice.
-_FAMILY_GATE: contextvars.ContextVar[tuple[str, bool] | None] = (
-    contextvars.ContextVar("grug_family_gate", default=None)
-)
-
-
-def _family_gated(model: str) -> bool:
-    """True when the current walk must not ask `model`."""
-    gate = _FAMILY_GATE.get()
-    if gate is None:
-        return False
-    author_family, same_family_only = gate
-    return (model_family(model) == author_family) != same_family_only
-
-
 # Test hook — replaced with a no-op in unit tests to avoid real sleeps.
 def _RETRY_SLEEP(seconds: float) -> None:
     time.sleep(seconds)
@@ -1151,17 +913,6 @@ def _opencode_go_extra_body(model: str, wire: str) -> dict:
 # Room for a chunk at its largest (46k chars took 25s of Haiku alone) plus the
 # wait for a slot on a lane that serves one or two calls at a time.
 _SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS = 120.0
-_subscription_cap_lock = threading.Lock()
-_subscription_daily_calls: dict[str, int] = {}
-
-
-def _subscription_daily_cap() -> int:
-    try:
-        val = int(os.getenv("GRUG_SUBSCRIPTION_DAILY_CAP", "50"))
-        return max(0, val)
-    except (ValueError, TypeError):
-        return 50
-
 
 def _subscription_timeout_s() -> float:
     raw = os.getenv("GRUG_SUBSCRIPTION_TIMEOUT_S", "")
@@ -1172,33 +923,8 @@ def _subscription_timeout_s() -> float:
     return value if math.isfinite(value) and value > 0 else _SUBSCRIPTION_FALLBACK_TIMEOUT_SECONDS
 
 
-def _subscription_today_key() -> str:
-    import datetime
-    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-
-
-def _subscription_calls_today() -> int:
-    with _subscription_cap_lock:
-        return _subscription_daily_calls.get(_subscription_today_key(), 0)
-
-
-def _is_subscription_cap_reached() -> bool:
-    return _subscription_calls_today() >= _subscription_daily_cap()
-
-
-def _record_subscription_call() -> None:
-    with _subscription_cap_lock:
-        key = _subscription_today_key()
-        _subscription_daily_calls[key] = _subscription_daily_calls.get(key, 0) + 1
-
-
 def _subscription_lane_can_answer() -> bool:
-    config = _subscription_fallback_config()
-    return (
-        config is not None
-        and _backend_usable(config.backend, config.model)
-        and not _is_subscription_cap_reached()
-    )
+    return availability.subscription_status(_subscription_fallback_config()) == "ready"
 
 
 def _subscription_url() -> str:
@@ -1222,34 +948,11 @@ def _subscription_fallback_enabled() -> bool:
     return bool(os.getenv("GRUG_SUBSCRIPTION_URL", "").strip())
 
 
-def _validate_subscription_key(key: str) -> None:
-    """Ensure subscription fallback uses headless subscription lanes, never
-    pay-per-token API keys (e.g. sk-ant-*, sk-*)."""
-    if key.startswith("sk-") or "api-key" in key.lower():
-        raise _BackendConfigError(
-            "subscription backend must use headless subscription lanes, never pay-per-token API keys"
-        )
-
-
-def _author_family_answered(model: str) -> bool:
-    """The lane picks its own model, so the header is a request: a walk that
-    keeps the author's family off the review checks who really answered."""
-    gate = _FAMILY_GATE.get()
-    return gate is not None and not gate[1] and model_family(model) == gate[0]
-
-
 def _load_subscription_key() -> str:
     return get_subscription_lane_token() or "in-cluster"
 
 
-def _review_author_family() -> str | None:
-    """The author's family for this walk, so a lane that serves two families
-    can keep a model off its own family's work (#1437)."""
-    gate = _FAMILY_GATE.get()
-    return gate[0] if gate else None
-
-
-def _subscription_fallback_config() -> BackendConfig | None:
+def _subscription_fallback_config(author_family: str | None = None) -> BackendConfig | None:
     """Operator's subscription plan run headless as the last resort."""
     if not _subscription_fallback_enabled():
         return None
@@ -1263,7 +966,7 @@ def _subscription_fallback_config() -> BackendConfig | None:
         model=model,
         key_loader=_load_subscription_key,
         dynamic_headers={
-            "X-Review-Author-Family": _review_author_family,
+            "X-Review-Author-Family": lambda: author_family,
             "X-Spark-Data-Class": _spark_data_class_header,
         },
         extra_headers={
@@ -1399,101 +1102,6 @@ def _opencode_go_fallback_chain_config() -> "BackendConfig | None":
     return _opencode_go_extra_model_config(model, _CLOUD_CHAIN_TIMEOUT_SECONDS)
 
 
-# Free-model discovery. OpenCode Go publishes a price for every model, and the
-# free set changes often, so Elder reads the list (cached, `opencode_go_free`)
-# and tries the listed free models before the configured paid ones. Opt-in:
-# nothing is fetched or added unless `GRUG_OPENCODE_GO_FREE_DISCOVERY` is true.
-# Knobs: `_TTL_SECONDS` (cache, default 2700), `_MAX_TIERS` (discovered tiers
-# per walk, default 2), `_HOURLY_CEILING` (calls per hour per pod to all free
-# Go models, default 240), `_CONCURRENCY` (calls in flight, default 2).
-# Private code still reaches only `_OPENCODE_GO_PRIVATE_SAFE_MODELS`.
-_opencode_go_free_catalog: "opencode_go_free.FreeModelCatalog | None" = None
-_opencode_go_free_gate: "opencode_go_free.FreeCallGate | None" = None
-_opencode_go_free_lock = threading.Lock()
-
-
-def _opencode_go_free_models_fetch() -> httpx.Response:
-    return opencode_go_free._default_fetch()
-
-
-def _env_number(name: str, default: float, cast: Callable[[str], Any] = float) -> Any:
-    try:
-        return cast(os.getenv(name, "").strip() or default)
-    except ValueError:
-        log.warning("grug_opencode_go_free_setting_invalid", extra={"setting": name})
-        return default
-
-
-def _opencode_go_free_discovery_on() -> bool:
-    return os.getenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "").strip().lower() in ("1", "true", "yes")
-
-
-def _opencode_go_free_catalog_get() -> "opencode_go_free.FreeModelCatalog":
-    global _opencode_go_free_catalog
-    with _opencode_go_free_lock:
-        if _opencode_go_free_catalog is None:
-            _opencode_go_free_catalog = opencode_go_free.FreeModelCatalog(
-                lambda: _opencode_go_free_models_fetch(),
-                ttl_seconds=_env_number(
-                    "GRUG_OPENCODE_GO_FREE_TTL_SECONDS", opencode_go_free.DEFAULT_TTL_SECONDS,
-                ),
-            )
-        return _opencode_go_free_catalog
-
-
-def _opencode_go_free_gate_get() -> "opencode_go_free.FreeCallGate":
-    global _opencode_go_free_gate
-    with _opencode_go_free_lock:
-        if _opencode_go_free_gate is None:
-            _opencode_go_free_gate = opencode_go_free.FreeCallGate(
-                hourly_ceiling=_env_number("GRUG_OPENCODE_GO_FREE_HOURLY_CEILING", 240, int),
-                max_concurrent=_env_number("GRUG_OPENCODE_GO_FREE_CONCURRENCY", 2, int),
-            )
-        return _opencode_go_free_gate
-
-
-def _opencode_go_chain_configs(
-    configured: list[BackendConfig | None],
-) -> list[BackendConfig | None]:
-    """Try configured free tiers, then discovered free tiers, then paid tiers."""
-    if not _opencode_go_free_discovery_on():
-        return configured
-    free, priced = _opencode_go_free_catalog_get().model_prices()
-    if priced is None or (not free and not priced):
-        return [tier for tier in configured if tier and not _opencode_go_model_is_free(tier.model)]
-    configured_free = [tier for tier in configured if tier and tier.model in free]
-    configured_paid = [tier for tier in configured if tier and tier.model in priced]
-    limit = _env_number("GRUG_OPENCODE_GO_FREE_MAX_TIERS", 2, int)
-    gate = _opencode_go_free_gate_get()
-    if limit <= 0 or gate.ceiling_reached():
-        return [*configured_free, *configured_paid]
-    have = {tier.model for tier in configured_free}
-    found = [m for m in free if m not in have and not gate.cooling(m)]
-    found.sort(key=lambda m: m not in _OPENCODE_GO_PRIVATE_SAFE_MODELS)
-    discovered = [
-        _opencode_go_extra_model_config(m, _CLOUD_CHAIN_TIMEOUT_SECONDS) for m in found[:limit]
-    ]
-    return [*configured_free, *discovered, *configured_paid]
-
-
-@contextlib.contextmanager
-def _opencode_go_free_slot(config: BackendConfig):
-    """Pace a call to a free Go model: refuse before the network at the hourly
-    ceiling, a cool-down or full concurrency, and release the slot after."""
-    if config.backend != Backend.OPENCODE_GO or not _opencode_go_model_is_free(config.model):
-        yield
-        return
-    gate = _opencode_go_free_gate_get()
-    if not gate.enter(config.model):
-        raise OpencodeGoCircuitOpenError(
-            f"free Go model {config.model} is paced off (hourly ceiling, cool-down or busy)"
-        )
-    try:
-        yield
-    finally:
-        gate.leave()
-
-
 def _opencode_go_chain_config() -> BackendConfig:
     """opencode Go as the FIRST cloud chain tier (grug#910)."""
     return replace(
@@ -1512,604 +1120,12 @@ def _opencode_go_chain_config() -> BackendConfig:
     )
 
 
-# OpenCode Go circuit breaker. A usage-limit refusal (HTTP 429,
-# `GoUsageLimitError`) does not clear for hours or days: on 2026-09-26 it
-# carried `Retry-After: 105419` and `limitName: monthly`. Calling Go on every
-# review until then bought nothing but a refused request each time, so the
-# first such refusal opens this breaker and Go is skipped until Retry-After
-# has passed. The open breaker is shared with every pod and survives a
-# restart (`shared_benches`, grug#1286), so the account pays one refused call
-# per window rather than one per pod.
-_OPENCODE_GO_DEFAULT_BLOCK_SECONDS = 3600.0
-_OPENCODE_GO_MAX_BLOCK_SECONDS = 7 * 86400.0
-_opencode_go_breaker_lock = threading.Lock()
-_opencode_go_blocked_until = 0.0
-
-
-class OpencodeGoCircuitOpenError(httpx.RequestError):
-    """OpenCode Go is skipped: its usage-limit breaker is open, its daily cap
-    is reached, or the cap's store cannot answer. Subclasses
-    `httpx.RequestError` so every caller degrades exactly as it does for a
-    transport failure."""
-
-
-# The Go models a private repo's code may reach, each read against OpenCode's
-# published terms on 2026-11-01. Check the terms before adding one. A model off
-# this list serves known-public repos only, so a training model can never see
-# private code. Unknown visibility counts as private.
-#   deepseek-v4.1-flash: not used for training, 0 days under a zero-retention
-#     agreement valid through 2026-11-30, renewed monthly.
-#   beam-free: not used for training, retained 30 days for safety.
-_OPENCODE_GO_PRIVATE_SAFE_MODELS = frozenset({"deepseek-v4.1-flash", "beam-free"})
-
-
-def _opencode_go_model_is_free(model: str) -> bool:
-    """OpenCode Go's free models (`*-free`, e.g. `longcat-2.5-preview-free`)
-    never count against the paid quota the usage-limit breaker protects, so
-    the breaker must not gate them. When the published price list is cached,
-    it overrules the name: a listed price makes the model paid, a listed zero
-    makes it free (a free model need not carry the suffix). With no list the
-    name rule stands."""
-    listed = _opencode_go_free_catalog_get().verdict(model)
-    if listed is not None:
-        return listed
-    return model.endswith("-free")
-
-
-def _opencode_go_available(now: float | None = None) -> bool:
-    current = time.time() if now is None else now
-    with _opencode_go_breaker_lock:
-        local = _opencode_go_blocked_until
-    return current >= max(local, shared_benches.blocked_until("go", Backend.OPENCODE_GO.value))
-
-
-def _retry_after_seconds(resp: httpx.Response) -> float:
-    raw = (resp.headers.get("retry-after") or "").strip()
-    try:
-        seconds = float(raw)
-    except ValueError:
-        return _OPENCODE_GO_DEFAULT_BLOCK_SECONDS
-    if not math.isfinite(seconds) or seconds <= 0:
-        return _OPENCODE_GO_DEFAULT_BLOCK_SECONDS
-    return min(seconds, _OPENCODE_GO_MAX_BLOCK_SECONDS)
-
-
-def _is_opencode_go_usage_limit(resp: httpx.Response) -> bool:
-    if resp.status_code != 429:
-        return False
-    try:
-        body = resp.json()
-    except (ValueError, json.JSONDecodeError):
-        return False
-    error = body.get("error") if isinstance(body, dict) else None
-    if not isinstance(error, dict):
-        return False
-    return (
-        error.get("type") == "GoUsageLimitError"
-        or "usage limit" in str(error.get("message", "")).lower()
-    )
-
-
-def _log_opencode_go_usage(model: str, resp: httpx.Response) -> None:
-    """What the call cost, from the `usage.opencode` block on each answer."""
-    try:
-        allowance = float(resp.json()["usage"]["opencode"]["allowance"])
-    except (ValueError, KeyError, TypeError):
-        return
-    log.info("opencode_go_usage", extra={"model": model, "allowance": allowance})
-
-
-def _note_opencode_go_response(resp: httpx.Response) -> None:
-    """Open the breaker on a usage-limit 429; ordinary overload 429s pass."""
-    if not _is_opencode_go_usage_limit(resp):
-        return
-    seconds = _retry_after_seconds(resp)
-    limit_name = ""
-    try:
-        metadata = resp.json().get("metadata") or {}
-        limit_name = str(metadata.get("limitName", ""))
-    except (ValueError, AttributeError, json.JSONDecodeError):
-        pass
-    _hold_opencode_go_until(time.time() + seconds)
-    log.warning(
-        "opencode_go_circuit_open",
-        extra={"block_seconds": seconds, "limit_name": limit_name},
-    )
-
-
-# OpenCode Go daily cap (grug#1575). The breaker above reacts only after the
-# plan is spent, and the key is shared with other work. The 5-hour, weekly and
-# monthly allowances are percentages of each model's monthly dollar limit, so
-# a fixed count of paid calls per UTC day bounds a month's spend.
-# `GRUG_OPENCODE_GO_DAILY_CAP` is that count, shared by every pod through
-# `pg_rate_limit_store`. Unset means no cap; a garbled value admits nothing.
-# At the cap the breaker holds Go until the next UTC day. A store error refuses
-# the call without a hold: no counter, no bound, but no lost day either. Free
-# models spend no allowance and are never counted.
-_OPENCODE_GO_CAP_LIMITER = "opencode_go_paid"
-
-
-def _opencode_go_daily_cap() -> int | None:
-    raw = os.getenv("GRUG_OPENCODE_GO_DAILY_CAP", "").strip()
-    if not raw:
-        return None
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        log.warning("grug_opencode_go_daily_cap_invalid", extra={"value": raw})
-        return 0
-
-
-def _next_utc_midnight() -> float:
-    return (math.floor(time.time() / 86400) + 1) * 86400.0
-
-
-def _hold_opencode_go_until(until: float) -> None:
-    global _opencode_go_blocked_until
-    with _opencode_go_breaker_lock:
-        _opencode_go_blocked_until = max(_opencode_go_blocked_until, until)
-    shared_benches.publish("go", Backend.OPENCODE_GO.value, "", until)
-
-
-def _reserve_opencode_go_call(config: BackendConfig) -> None:
-    """`_call_backend`'s daily cap: count one paid Go call, or raise before
-    any network call, so the caller moves to its next tier."""
-    if config.backend != Backend.OPENCODE_GO or _opencode_go_model_is_free(config.model):
-        return
-    cap = _opencode_go_daily_cap()
-    if cap is None:
-        return
-    try:
-        from adapters.pg_rate_limit_store import try_reserve_slot  # late: pg-backed
-
-        # The minute window never binds first: it fills only as the day does.
-        result = try_reserve_slot(
-            name=_OPENCODE_GO_CAP_LIMITER, minute_limit=max(cap, 1), day_limit=cap,
-        )
-    except Exception as e:  # noqa: BLE001 - fail CLOSED, see the comment above
-        log.warning("opencode_go_daily_cap_store_error", extra={"kind": type(e).__name__})
-        raise OpencodeGoCircuitOpenError("opencode Go daily cap: store unavailable") from e
-    if result.admitted:
-        return
-    _hold_opencode_go_until(_next_utc_midnight())
-    log.warning(
-        "opencode_go_daily_cap_reached",
-        extra={"cap": cap, "day_count": result.day_count},
-    )
-    raise OpencodeGoCircuitOpenError("opencode Go daily cap reached")
-
-
-# Per-model bench. A withdrawn model (an ended free promotion, a retired
-# name) starts answering every call with the same client error. Three such
-# failures within ten minutes bench the (backend, model) pair for an hour,
-# doubling to twelve hours on repeat; a success un-benches it at once.
-# Transport errors and 5xx are outages, not withdrawal, and never count.
-# Rate limits and usage/quota refusals have their own handling, and a
-# request-specific error (oversized context) says nothing about the model.
-# Counted per process; an open bench is shared with every pod and survives
-# a restart through `shared_benches` (grug#1286), like both breakers.
-_BENCH_FAILURE_THRESHOLD = 3
-_BENCH_WINDOW_SECONDS = 600.0
-_BENCH_BASE_SECONDS = 3600.0
-_BENCH_MAX_SECONDS = 12 * 3600.0
-_BENCH_CLOUD_BACKENDS = frozenset({Backend.OPENCODE_GO, Backend.OPENROUTER, Backend.POOLSIDE})
-_LIMIT_HOLD_BACKENDS = _BENCH_CLOUD_BACKENDS | {Backend.FREE_POOL}
-# Statuses that are never withdrawal: timeout, too-large, rate limit.
-_BENCH_IGNORED_STATUSES = frozenset({408, 413, 425, 429})
-_BENCH_QUOTA_MARKERS = ("usage limit", "rate limit", "quota", "insufficient credit", "key limit")
-_BENCH_REQUEST_MARKERS = (
-    "context length", "context window", "context_length", "maximum context",
-    "too long", "too many tokens", "reduce the length", "prompt is too large",
-)
-
-
-@dataclass
-class _BenchEntry:
-    failures: list[float] = field(default_factory=list)
-    benched_until: float = 0.0
-    next_seconds: float = _BENCH_BASE_SECONDS
-
-
-_bench_lock = threading.Lock()
-_bench_state: dict[tuple[str, str], _BenchEntry] = {}
-
-
-def _model_is_benched(backend: str, model: str, now: float | None = None) -> bool:
-    current = time.time() if now is None else now
-    with _bench_lock:
-        entry = _bench_state.get((backend, model))
-        local = entry.benched_until if entry is not None else 0.0
-    return current < max(local, shared_benches.blocked_until("bench", backend, model))
-
-
-def _is_benchable_failure(resp: httpx.Response) -> bool:
-    """A 4xx that is not a rate limit, quota refusal, or request-specific."""
-    status = resp.status_code
-    if not 400 <= status < 500 or status in _BENCH_IGNORED_STATUSES:
-        return False
-    text = (resp.text or "").lower()
-    return not any(m in text for m in _BENCH_QUOTA_MARKERS + _BENCH_REQUEST_MARKERS)
-
-
-def _record_model_failure(backend: str, model: str, status: int, now: float) -> float | None:
-    """Count one failure; return the bench duration when it trips the bench."""
-    with _bench_lock:
-        entry = _bench_state.setdefault((backend, model), _BenchEntry())
-        if now < entry.benched_until:
-            return None
-        entry.failures = [t for t in entry.failures if now - t < _BENCH_WINDOW_SECONDS]
-        entry.failures.append(now)
-        if len(entry.failures) < _BENCH_FAILURE_THRESHOLD:
-            return None
-        seconds = entry.next_seconds
-        entry.benched_until = now + seconds
-        entry.next_seconds = min(seconds * 2, _BENCH_MAX_SECONDS)
-        entry.failures = []
-        return seconds
-
-
-def _announce_model_benched(backend: str, model: str, status: int, seconds: float) -> None:
-    log.warning(
-        "llm_model_benched",
-        extra={"backend": backend, "model": model, "status": status, "bench_seconds": seconds},
-    )
-    try:
-        from observability import emit_count  # type: ignore  # late: webhook-image only
-
-        emit_count(
-            "grug.elder.model_benched", 1,
-            tags={"backend": backend, "model": model, "status": str(status)},
-        )
-    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
-        log.debug("model_benched_metric_failed", extra={"kind": type(e).__name__})
-
-
-def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
-    """Feed one cloud response to the per-model bench."""
-    if config.backend not in _BENCH_CLOUD_BACKENDS:
-        return
-    key = (config.backend.value, config.model)
-    if resp.status_code < 400:
-        with _bench_lock:
-            _bench_state.pop(key, None)
-            _slow_bench_state.pop(key, None)
-        shared_benches.clear("bench", *key)
-        shared_benches.clear("slow", *key)
-        return
-    if not _is_benchable_failure(resp):
-        return
-    now = time.time()
-    seconds = _record_model_failure(*key, resp.status_code, now)
-    if seconds is not None:
-        shared_benches.publish("bench", *key, now + seconds)
-        _announce_model_benched(*key, resp.status_code, seconds)
-
-
-# Switched-off backends and the provider breaker (grug#1225).
-#
-# `GRUG_DISABLED_BACKENDS` turns a backend off by configuration: a comma-
-# separated list of backend names (`opencode-go`, `openrouter`, `poolside`),
-# each optionally narrowed to one pool with `:free` or `:paid`
-# (`openrouter:paid` keeps the `:free` models). A disabled backend is never
-# called: the cloud review chain, the SaaS overload fallback, the judge and
-# the interactive order all skip it, and `_call_backend` refuses it as the
-# last guard. Read on every call, so re-enabling one is removing its entry
-# and rolling out. Unset (the default) disables nothing.
-#
-# The provider breaker covers a provider nobody has switched off yet. A 401
-# (key wrong or expired), a 402 (unpaid), or a refusal whose body says a
-# limit is spent (OpenRouter's `403 Key limit exceeded (total limit)` and
-# `429 ... free-models-per-day`, OpenCode Go's monthly usage limit) does not
-# clear within a review, so the first one stops calls to that provider for
-# Retry-After, else an hour. A 401 covers the whole key; the others only the
-# pool (free or paid) that answered, because OpenRouter's free models keep
-# answering on a key whose paid limit is zero. A plain 429 is overload and
-# never trips it. Per process, like the bench above. Measured before it
-# existed (402 Elder runs, 2026-10-17): 36 OpenCode Go 401s, 11 OpenRouter
-# paid "total limit" refusals and 139 OpenRouter free per-day 429s, each one
-# spent cohort time before a working backend was reached. An open breaker is
-# shared with every pod and survives a restart (`shared_benches`, grug#1286).
-_PROVIDER_POOLS = ("free", "paid", "subscription")
-_SPENT_LIMIT_MARKERS = (
-    "usage limit", "quota", "credit", "key limit", "total limit", "spend limit",
-)
-# A 429 trips it only when the body names a daily or monthly allowance.
-# Poolside answers short-lived throttling with `429 usage limit exceeded` and
-# no Retry-After; reading that as spent blocked the one working cloud tier
-# for an hour (live, 2026-10-17). It can also last: on 2026-10-31 it ran 75
-# minutes, 1,473 `llm_backend_rate_limited` across both consumer pods and
-# still firing, and over seven days 7,203 of 13,199 Poolside calls were
-# refused. So that body is held by the short escalating limit hold below, not
-# by this one-hour trip. OpenCode Go's monthly 429 carries the
-# `GoUsageLimitError` type, and its own breaker above honours Retry-After.
-_SPENT_RATE_MARKERS = ("per-day", "per day", "daily", "monthly", "gousagelimiterror")
-_provider_breaker_lock = threading.Lock()
-_provider_blocked_until: dict[tuple[str, str], float] = {}
-# A limit that outlasts a throttle reads the same on one response, so the hold
-# escalates instead: the first limit refusal holds the provider for two
-# minutes, and each refusal that follows a hold doubles it, up to thirty. The
-# first success clears it, so Poolside is back the moment its limit resets.
-# While held the provider is not called at all, so no call retries the body,
-# and a review that ran during the hold ends degraded. On 2026-10-31 Poolside
-# answered 1,892 of these in nine hours and the free pool 57, each costing a
-# chunk its retry and its wait before the subscription tier could run. The
-# open hold is shared with every pod; the escalation step stays per process.
-_LIMIT_HOLD_BASE_SECONDS = 120.0
-_LIMIT_HOLD_MAX_SECONDS = 1800.0
-_LIMIT_REFUSAL_MARKERS = ("usage limit", "capacity is reserved")
-_limit_hold_level: dict[tuple[str, str], int] = {}
-_warned_disabled_entries: set[str] = set()
-
-
-class BackendDisabledError(httpx.RequestError):
-    """The backend is switched off (`GRUG_DISABLED_BACKENDS`) or its provider
-    breaker is open. Subclasses `httpx.RequestError` so every caller degrades
-    exactly as it does for a transport failure."""
-
-
-def _backend_pool(backend: Backend, model: str) -> str:
-    """"free" for a provider's no-cost models, "paid" for everything else."""
-    if backend == Backend.OPENROUTER and is_free_tier_model(model):
-        return "free"
-    if backend == Backend.OPENCODE_GO and _opencode_go_model_is_free(model):
-        return "free"
-    if backend == Backend.FREE_POOL:
-        return "free"
-    if backend == Backend.SUBSCRIPTION:
-        return "subscription"
-    return "paid"
-
-
-def _disabled_backend_entries() -> frozenset[str]:
-    entries = frozenset(
-        e.strip().lower()
-        for e in os.getenv("GRUG_DISABLED_BACKENDS", "").split(",")
-        if e.strip()
-    )
-    known = {b.value for b in Backend}
-    for entry in entries - _warned_disabled_entries:
-        name, _, pool = entry.partition(":")
-        if name not in known or pool not in ("", *_PROVIDER_POOLS):
-            # A typo must not read as "switched off" while the backend runs.
-            log.warning("grug_disabled_backends_unknown_entry", extra={"entry": entry})
-        _warned_disabled_entries.add(entry)
-    return entries
-
-
-def _backend_enabled(backend: Backend, model: str) -> bool:
-    """False when `GRUG_DISABLED_BACKENDS` names this backend or its pool."""
-    entries = _disabled_backend_entries()
-    if not entries:
-        return True
-    name = backend.value
-    return name not in entries and f"{name}:{_backend_pool(backend, model)}" not in entries
-
-
-def _provider_available(backend: Backend, model: str, now: float | None = None) -> bool:
-    current = time.time() if now is None else now
-    key = (backend.value, _backend_pool(backend, model))
-    with _provider_breaker_lock:
-        local = _provider_blocked_until.get(key, 0.0)
-    return current >= max(local, shared_benches.blocked_until("provider", *key))
-
-
-def _backend_usable(backend: Backend, model: str) -> bool:
-    """Switched on and its provider breaker closed."""
-    return _backend_enabled(backend, model) and _provider_available(backend, model)
-
-
-def _is_spent_quota_refusal(resp: httpx.Response) -> bool:
-    """A refusal that says the money or the allowance is gone, not overload."""
-    status = resp.status_code
-    if status == 402:
-        return True
-    if status not in (403, 429):
-        return False
-    text = (resp.text or "").lower()
-    markers = _SPENT_LIMIT_MARKERS if status == 403 else _SPENT_RATE_MARKERS
-    return any(m in text for m in markers)
-
-
-def _is_limit_refusal(resp: httpx.Response) -> bool:
-    """A 429 whose body says a usage limit or reserved capacity, the kind the
-    limit hold escalates on."""
-    text = (resp.text or "").lower()
-    return resp.status_code == 429 and any(m in text for m in _LIMIT_REFUSAL_MARKERS)
-
-
-def _next_limit_hold(config: BackendConfig, resp: httpx.Response) -> float | None:
-    """Seconds to hold the provider after this answer, or None for no new hold.
-
-    A limit refusal from a provider that is not already held steps the hold up
-    (2, 4, ... 30 minutes); one from a call that was in flight when another
-    opened the hold adds nothing. A success clears the escalation and the
-    hold, locally and in the shared store."""
-    pool = _backend_pool(config.backend, config.model)
-    key = (config.backend.value, pool)
-    now = time.time()
-    if resp.is_success:
-        with _provider_breaker_lock:
-            was_held = _limit_hold_level.pop(key, None) is not None
-            if was_held:
-                _provider_blocked_until.pop(key, None)
-        if was_held:
-            shared_benches.clear("provider", *key)
-            shared_benches.clear("limit", *key)
-        return None
-    if not _is_limit_refusal(resp):
-        return None
-    held_until = shared_benches.blocked_until("provider", *key)
-    with _provider_breaker_lock:
-        if now < max(_provider_blocked_until.get(key, 0.0), held_until):
-            return None
-        level = _limit_hold_level.get(key, 0)
-        _limit_hold_level[key] = level + 1
-    return min(_LIMIT_HOLD_BASE_SECONDS * 2 ** level, _LIMIT_HOLD_MAX_SECONDS)
-
-
-def _limit_hold_error() -> str:
-    """A `partial review:` error naming a provider held by the limit hold, so
-    a review made during one ends degraded; empty when none is held."""
-    now = time.time()
-    held = sorted(
-        f"{backend.value}:{pool}"
-        for backend in _LIMIT_HOLD_BACKENDS
-        for pool in _PROVIDER_POOLS
-        if shared_benches.blocked_until("limit", backend.value, pool) > now
-        or _limit_hold_active((backend.value, pool), now)
-    )
-    if not held:
-        return ""
-    return f"partial review: provider held after repeated usage limit refusals ({', '.join(held)})"
-
-
 def _with_limit_hold_error(result: LlmReviewResponse) -> LlmReviewResponse:
     """A clean reviewed result made while a limit hold is open, marked
     degraded with `_limit_hold_error`; any other result as it came."""
     if result.kind != "reviewed" or result.error:
         return result
-    return replace(result, error=_limit_hold_error())
-
-
-def _limit_hold_active(key: tuple[str, str], now: float) -> bool:
-    with _provider_breaker_lock:
-        return key in _limit_hold_level and _provider_blocked_until.get(key, 0.0) > now
-
-
-def _note_provider_response(config: BackendConfig, resp: httpx.Response) -> None:
-    """Open the provider breaker on a 401, a 402, a spent-limit refusal, or a
-    limit refusal (the escalating hold), and clear that hold on a success."""
-    pool = _backend_pool(config.backend, config.model)
-    if config.backend in _BENCH_CLOUD_BACKENDS:
-        # Same default (an hour) and cap (a week) as the OpenCode Go breaker.
-        if resp.status_code == 401:
-            _open_provider_breaker(config, resp, _PROVIDER_POOLS, time.time() + _retry_after_seconds(resp))
-            return
-        if _is_spent_quota_refusal(resp):
-            _open_provider_breaker(config, resp, (pool,), time.time() + _retry_after_seconds(resp))
-            return
-    if config.backend not in _LIMIT_HOLD_BACKENDS:
-        return
-    seconds = _next_limit_hold(config, resp)
-    if seconds is not None:
-        until = time.time() + seconds
-        _open_provider_breaker(config, resp, (pool,), until)
-        shared_benches.publish("limit", config.backend.value, pool, until)
-
-
-def _open_provider_breaker(
-    config: BackendConfig, resp: httpx.Response, pools: tuple[str, ...], until: float,
-) -> None:
-    seconds = until - time.time()
-    with _provider_breaker_lock:
-        for pool in pools:
-            key = (config.backend.value, pool)
-            _provider_blocked_until[key] = max(_provider_blocked_until.get(key, 0.0), until)
-    for pool in pools:
-        shared_benches.publish("provider", config.backend.value, pool, until)
-    log.warning(
-        "llm_provider_circuit_open",
-        extra={
-            "backend": config.backend.value, "model": config.model,
-            "status": resp.status_code, "pools": list(pools), "block_seconds": seconds,
-        },
-    )
-
-
-def _refuse_unusable_backend(config: BackendConfig) -> None:
-    """`_call_backend`'s guard: raise before any network call to a backend
-    that is switched off or whose breaker is open."""
-    if not _backend_enabled(config.backend, config.model):
-        raise BackendDisabledError(
-            f"{config.backend.value} is switched off (GRUG_DISABLED_BACKENDS)"
-        )
-    if (
-        config.backend == Backend.OPENCODE_GO
-        and config.model not in _OPENCODE_GO_PRIVATE_SAFE_MODELS
-        and _spark_data_class_header() != "public"
-    ):
-        raise BackendDisabledError(
-            f"{config.model} has no verified data terms for private code"
-        )
-    if config.backend in _BENCH_CLOUD_BACKENDS and not _provider_available(
-        config.backend, config.model,
-    ):
-        raise BackendDisabledError(
-            f"{config.backend.value} provider breaker open after an auth or quota refusal"
-        )
-    if (
-        config.backend == Backend.OPENCODE_GO
-        and not _opencode_go_model_is_free(config.model)
-        and not _opencode_go_available()
-    ):
-        raise OpencodeGoCircuitOpenError("opencode Go usage limit: breaker open")
-
-
-# Slow bench. A model that is merely slow (not withdrawn) times out on large
-# cohorts and burns its whole timeout before the next tier starts. Three
-# httpx timeouts within ten minutes bench the (backend, model) pair for ten
-# minutes, doubling per repeat up to an hour; any successful response clears
-# it at once. Separate from the 4xx bench above: a timeout never counts
-# there and a 4xx never counts here. Only cloud backends are covered (the
-# Cave is never slow-benched), and the chain never drops its last usable
-# cloud tier (`_cloud_chain_tiers`).
-_SLOW_BENCH_FAILURE_THRESHOLD = 3
-_SLOW_BENCH_WINDOW_SECONDS = 600.0
-_SLOW_BENCH_BASE_SECONDS = 600.0
-_SLOW_BENCH_MAX_SECONDS = 3600.0
-_slow_bench_state: dict[tuple[str, str], _BenchEntry] = {}
-
-
-def _model_is_slow_benched(backend: str, model: str, now: float | None = None) -> bool:
-    current = time.time() if now is None else now
-    with _bench_lock:
-        entry = _slow_bench_state.get((backend, model))
-        local = entry.benched_until if entry is not None else 0.0
-    return current < max(local, shared_benches.blocked_until("slow", backend, model))
-
-
-def _record_model_timeout(backend: str, model: str, now: float) -> float | None:
-    """Count one timeout; return the bench duration when it trips the bench."""
-    with _bench_lock:
-        entry = _slow_bench_state.setdefault(
-            (backend, model), _BenchEntry(next_seconds=_SLOW_BENCH_BASE_SECONDS),
-        )
-        if now < entry.benched_until:
-            return None
-        entry.failures = [t for t in entry.failures if now - t < _SLOW_BENCH_WINDOW_SECONDS]
-        entry.failures.append(now)
-        if len(entry.failures) < _SLOW_BENCH_FAILURE_THRESHOLD:
-            return None
-        seconds = entry.next_seconds
-        entry.benched_until = now + seconds
-        entry.next_seconds = min(seconds * 2, _SLOW_BENCH_MAX_SECONDS)
-        entry.failures = []
-        return seconds
-
-
-def _announce_model_slow_benched(backend: str, model: str, seconds: float) -> None:
-    log.warning(
-        "llm_model_slow_benched",
-        extra={"backend": backend, "model": model, "bench_seconds": seconds},
-    )
-    try:
-        from observability import emit_count  # type: ignore  # late: webhook-image only
-
-        emit_count("grug.elder.model_slow_benched", 1, tags={"backend": backend, "model": model})
-    except Exception as e:  # noqa: BLE001 - telemetry must never break the review
-        log.debug("model_slow_benched_metric_failed", extra={"kind": type(e).__name__})
-
-
-def _note_model_timeout(backend: Backend, model: str, exc: BaseException) -> None:
-    """Feed one transport failure to the slow bench (timeouts only)."""
-    if backend not in _BENCH_CLOUD_BACKENDS or not isinstance(exc, httpx.TimeoutException):
-        return
-    key = (backend.value, model)
-    now = time.time()
-    seconds = _record_model_timeout(*key, now)
-    if seconds is not None:
-        shared_benches.publish("slow", *key, now + seconds)
-        _announce_model_slow_benched(*key, seconds)
+    return replace(result, error=availability._limit_hold_error())
 
 
 def _free_tier_chain_config() -> "BackendConfig | None":
@@ -2177,57 +1193,14 @@ def _cloud_chain_tiers() -> list[BackendConfig]:
         _opencode_go_fallback_chain_config(),
     ]
     candidates: list["BackendConfig | None"] = [
-        *_opencode_go_chain_configs(go_tiers),
+        *availability.go_chain_tiers(
+            go_tiers, lambda model: _opencode_go_extra_model_config(model, _CLOUD_CHAIN_TIMEOUT_SECONDS),
+        ),
         _free_tier_chain_config(),
         _poolside_chain_config(),
         _free_pool_chain_config(),
     ]
-    tiers = _usable_tiers(candidates, skip_slow=True)
-    if tiers:
-        return tiers
-    # Every usable tier is slow-benched: keep the one that recovers soonest
-    # rather than send every review straight to the Cave.
-    return sorted(
-        _usable_tiers(candidates, skip_slow=False), key=_slow_bench_expiry,
-    )[:1]
-
-
-def _usable_tiers(
-    candidates: "list[BackendConfig | None]", *, skip_slow: bool,
-) -> list[BackendConfig]:
-    tiers: list[BackendConfig] = []
-    for tier in candidates:
-        if tier is not None and _tier_is_usable(tier, tiers, skip_slow=skip_slow):
-            tiers.append(tier)
-    return tiers
-
-
-def _slow_bench_expiry(tier: BackendConfig) -> float:
-    key = (tier.backend.value, tier.model)
-    with _bench_lock:
-        entry = _slow_bench_state.get(key)
-        local = entry.benched_until if entry is not None else 0.0
-    return max(local, shared_benches.blocked_until("slow", *key))
-
-
-def _tier_is_usable(
-    tier: BackendConfig, chosen: list[BackendConfig], *, skip_slow: bool = True,
-) -> bool:
-    """A tier runs unless it duplicates one already chosen, is switched off
-    or behind an open provider breaker (`_backend_usable`), is benched (4xx
-    bench, or slow bench when `skip_slow`), or is a paid OpenCode Go model
-    while the usage-limit breaker is open."""
-    if any((c.backend, c.model) == (tier.backend, tier.model) for c in chosen):
-        return False
-    if not _backend_usable(tier.backend, tier.model):
-        return False
-    if _model_is_benched(tier.backend.value, tier.model):
-        return False
-    if skip_slow and _model_is_slow_benched(tier.backend.value, tier.model):
-        return False
-    if tier.backend == Backend.OPENCODE_GO and not _opencode_go_model_is_free(tier.model):
-        return _opencode_go_available()
-    return True
+    return availability.cloud_tiers(candidates)
 
 
 # Poolside tier: 45s, not the 25s shared by the other tiers. Its laguna-s-2.1
@@ -2410,8 +1383,7 @@ def _cave_judge_config() -> "BackendConfig | None":
 # Laguna scores 0/12 on test-gap and regresses security/upstream-semantics.
 # Production does not use this literal - both deployments set
 # GRUG_CAVE_REASONER_MODEL=spark:warm-any.
-_CAVE_REVIEW_CODER_DEFAULT_MODEL = "qwen3-coder-next:q8_0"
-_CAVE_REVIEW_REASONER_DEFAULT_MODEL = "qwen3.5:122b"
+
 
 # #609: require-keys response schema for the Cave arms. The gateway's ollama
 # backends map a bare `{"type": "json_object"}` to `format=json`, which
@@ -2645,7 +1617,7 @@ def _usable_saas_fallback_backends() -> tuple[Backend, ...]:
     off or behind an open provider breaker (grug#1225)."""
     return tuple(
         b for b in (Backend.POOLSIDE, Backend.OPENROUTER)
-        if _backend_usable(b, _BACKEND_CONFIGS[b].model)
+        if availability.backend_usable(b, _BACKEND_CONFIGS[b].model)
     )
 
 
@@ -2656,7 +1628,7 @@ def _free_provider_fallback_configs() -> list[BackendConfig]:
     """
     configs: list[BackendConfig] = []
     pool = _free_pool_chain_config()
-    if pool is not None and _backend_usable(pool.backend, pool.model):
+    if pool is not None and availability.backend_usable(pool.backend, pool.model):
         configs.append(pool)
     for backend in _usable_saas_fallback_backends():
         configs.append(_saas_overload_fallback_config(backend))
@@ -2731,27 +1703,6 @@ BackendFailureClass = Literal["unusable", "rate_limited", "transient"]
 # wrong. Live 2026-09-22/23: `403 Key limit exceeded (total limit)`; OpenRouter
 # documents 402 as `Insufficient credits` and 429 as `Rate limit exceeded`.
 _OPENROUTER_LIMIT_MARKERS = ("limit", "credit", "quota")
-
-
-def _backend_error_message(resp: httpx.Response) -> str:
-    """The provider's own error message from a non-2xx body, redacted and
-    capped, or "" when the body carries none. OpenAI-compatible providers
-    answer `{"error": {"message": ...}}`; a bare string `error` or a
-    top-level `message` is accepted too."""
-    try:
-        body = resp.json()
-    except ValueError:
-        return ""
-    if not isinstance(body, dict):
-        return ""
-    err = body.get("error")
-    if isinstance(err, dict):
-        msg = err.get("message")
-    elif isinstance(err, str):
-        msg = err
-    else:
-        msg = body.get("message")
-    return _redact_secrets(msg)[:200] if isinstance(msg, str) else ""
 
 
 def classify_backend_failure(
@@ -2857,7 +1808,7 @@ def select_backend(installation_id: int) -> Backend:
     # A switched-off or breaker-blocked pick hands the call to the other one
     # (grug#1225); with both unusable the pick stands and `_call_backend`
     # refuses it before any network call.
-    if not _backend_usable(preferred, _BACKEND_CONFIGS[preferred].model) and _backend_usable(
+    if not availability.backend_usable(preferred, _BACKEND_CONFIGS[preferred].model) and availability.backend_usable(
         other, _BACKEND_CONFIGS[other].model,
     ):
         return other
@@ -3036,376 +1987,14 @@ def _build_messages(
     ]
 
 
-class _BackendConfigError(Exception):
-    """Backend is misconfigured (empty key, missing env var, SSM
-    failure). Distinct from transport errors so the caller can fall
-    back to the other backend without retry-burning the broken one."""
-
-
-def _post_with_retries(
-    url: str, body: dict[str, Any], headers: dict[str, str],
-    timeout_seconds: float, retry_attempts: int, transport_attempts: int,
-    deadline: float | None = None,
-) -> httpx.Response:
-    """The actual 429/503-retrying HTTP call, shared by both `_call_backend`
-    paths below. Always goes through the bare `httpx.post()` convenience
-    function (not an explicit `httpx.Client`) - tests mock `httpx.post`
-    directly, and this keeps that working unmodified for every caller.
-
-    `deadline` (grug#1216) is passed explicitly, not read from the context
-    var, because the cancellable path runs this on a fresh thread that does
-    not inherit it. Each attempt is clamped to the time left; a timeout that
-    only fired because of the clamp is re-raised as `ReviewDeadlineReached`."""
-    for attempt in range(retry_attempts):
-        attempt_timeout = _deadline_timeout(timeout_seconds, deadline)
-        try:
-            resp = httpx.post(url, json=body, headers=headers, timeout=attempt_timeout)
-        except httpx.RequestError as e:
-            if isinstance(e, httpx.TimeoutException) and attempt_timeout < timeout_seconds:
-                raise ReviewDeadlineReached(
-                    f"staged review deadline cut the call after {attempt_timeout:.1f}s"
-                ) from e
-            if attempt < transport_attempts - 1:
-                _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
-                continue
-            raise
-        if (
-            resp.status_code in _RETRYABLE_STATUSES
-            and attempt < retry_attempts - 1
-            # A spent daily or monthly allowance does not clear in a backoff,
-            # and a limit refusal opens a hold, so asking again only repeats it.
-            and not _is_spent_quota_refusal(resp)
-            and not _is_limit_refusal(resp)
-        ):
-            _RETRY_SLEEP(_RETRY_BASE_DELAY * (2 ** attempt))
-            continue
-        return resp
-    # Unreachable: every iteration either returns, continues, or raises.
-    raise AssertionError("retry loop exited without producing a response")
-
-
-def _build_request_body(
-    config: BackendConfig, messages: list[dict[str, str]],
-) -> dict[str, Any]:
-    """The outgoing body for one backend call, in that backend's wire shape.
-
-    Extracted from `_call_backend` rather than inlined: adding the second
-    wire took that function from cyclomatic 15 to 17, past the Elder cap,
-    and the body shape is a self-contained decision with no bearing on the
-    retry/cancellation logic around it.
-
-    "responses" is OpenAI's Responses API - `input` not `messages`, JSON
-    mode under `text.format` not `response_format`, and `max_output_tokens`
-    not `max_tokens`. The cap is TRANSLATED rather than dropped, so a
-    runaway generation stays bounded on this wire too (grug#883).
-    """
-    if config.wire != "responses":
-        return {
-            "model": config.model,
-            "messages": messages,
-            "response_format": {"type": "json_object"},
-            **config.extra_body,
-        }
-    extra = dict(config.extra_body)
-    max_tokens = extra.pop("max_tokens", None)
-    body: dict[str, Any] = {
-        "model": config.model,
-        "input": messages,
-        "text": {"format": {"type": "json_object"}},
-        **extra,
-    }
-    if max_tokens is not None:
-        body["max_output_tokens"] = max_tokens
-    return body
-
-
-def _merged_headers(config: BackendConfig, key: str) -> dict[str, str]:
-    """The final outgoing header set for one call: static `extra_headers`,
-    then `dynamic_headers` resolved at call time, then the bearer token -
-    in that order, so Authorization always wins the merge even if a caller
-    tried to sneak a same-named entry into either of the other two dicts.
-    Extracted from `_call_backend` purely to shed one branch from that
-    function's own complexity score (grug#984 follow-up); no behavior
-    change - FLINT #618's guard now covers both header dicts."""
-    if any(
-        name.lower() == "authorization"
-        for name in (*config.extra_headers, *config.dynamic_headers)
-    ):
-        raise _BackendConfigError(
-            f"{config.backend.value} extra_headers must not contain Authorization"
-        )
-    dynamic = {name: fn() for name, fn in config.dynamic_headers.items()}
-    return {
-        **config.extra_headers,
-        **{name: value for name, value in dynamic.items() if value is not None},
-        "Authorization": f"Bearer {key}",
-    }
-
-
-def _validated_transport_attempts(config: BackendConfig) -> int:
-    """Resolve and validate the retry budget; raises `_BackendConfigError`."""
-    if config.retry_attempts < 1:
-        raise _BackendConfigError(
-            f"{config.backend.value} retry_attempts must be positive"
-        )
-    transport_attempts = (
-        config.transport_retry_attempts
-        if config.transport_retry_attempts is not None
-        else config.retry_attempts
-    )
-    if transport_attempts < 1:
-        raise _BackendConfigError(
-            f"{config.backend.value} transport_retry_attempts must be positive"
-        )
-    if transport_attempts > config.retry_attempts:
-        # The dispatch loop is bounded by retry_attempts, so a larger transport
-        # budget can never be spent - and worse, a transport error on the final
-        # attempt takes the `continue` branch (attempt < transport_attempts - 1
-        # still holds), exhausts the loop, and raises the spurious
-        # AssertionError below instead of re-raising the real transport error.
-        raise _BackendConfigError(
-            f"{config.backend.value} transport_retry_attempts "
-            f"({transport_attempts}) must not exceed retry_attempts "
-            f"({config.retry_attempts})"
-        )
-    return transport_attempts
-
 def _call_backend(
     config: BackendConfig, messages: list[dict[str, str]],
     cancel_event: threading.Event | None = None,
 ) -> httpx.Response:
-    """Single backend call with 429/503 retry + backoff. Raises
-    `httpx.RequestError`/`httpx.TimeoutException` on transport failure
-    or `_BackendConfigError` on misconfig — caller catches and falls
-    back. Narrow exception scope deliberately: `httpx.InvalidURL`,
-    `httpx.UnsupportedProtocol`, `httpx.CookieConflict` are config
-    bugs that should crash loudly, not retry silently.
-
-    `cancel_event` (#635 follow-up, mid-flight review cancellation): closing
-    an `httpx.Client` from another thread does NOT actually interrupt an
-    in-flight synchronous request - verified against a real local HTTP
-    server before settling on this design, not assumed. So instead of
-    trying to truly kill the blocked call, the request runs on a background
-    thread and this function races it against `cancel_event`: whichever
-    resolves first wins. If cancellation wins, `_call_backend` returns
-    control to the caller immediately - the background thread is abandoned
-    (daemon, unjoined) and keeps running to its own natural conclusion, its
-    result silently discarded. This does NOT reduce server-side Spark
-    compute (ollama has no way to know the caller gave up - a separate,
-    already-documented limitation). What it DOES do is stop a superseded
-    review from holding its queue slot / SQS message for the network call's
-    full remaining duration, so the PR's next (current) commit doesn't have
-    to wait behind it.
-
-    Every other caller (the judge, the walkthrough summary, the SaaS
-    overload fallback) passes no `cancel_event` and takes the direct,
-    unmodified path below - no extra thread, no behavior change.
-
-    OpenRouter free-tier gate (grug#870, epic #869): a `:free`-suffixed
-    OpenRouter model first acquires a slot from the shared, cross-process
-    limiter in `openrouter_free_limiter.py` before any network call is
-    made. See that module's docstring for why an in-process limiter
-    cannot enforce OpenRouter's account-wide caps against grug's 4
-    replicas. Exhausting the bounded queue wait raises
-    `RateLimitTimeoutError`, an `httpx.RequestError` subclass every
-    caller below already catches - it falls back / degrades exactly like
-    a transport failure, never like a call that quietly succeeded. Cave
-    and Poolside never carry the `:free` suffix, so `is_free_tier_model`
-    is the entire cost this gate adds to their calls."""
-    if cancel_event is not None and cancel_event.is_set():
-        raise httpx.RequestError("cancelled before dispatch")
-    _refuse_unusable_backend(config)
-    if config.backend == Backend.OPENROUTER and is_free_tier_model(config.model):
-        outcome = acquire_free_tier_slot(config.model, cancel_event=cancel_event)
-        if not outcome.admitted:
-            raise RateLimitTimeoutError(
-                "openrouter free-tier limiter exhausted its queue wait "
-                f"({outcome.waited_seconds:.1f}s; minute={outcome.minute_count}/"
-                f"{outcome.minute_limit}, day={outcome.day_count}/{outcome.day_limit}) "
-                f"for model {config.model!r}"
-            )
-    _reserve_opencode_go_call(config)
-    try:
-        key = config.key_loader()
-    except Exception as e:
-        # secrets_loader.RuntimeError("SSM parameter name is empty…")
-        # or boto3 ClientError on a missing param. Wrap so the caller's
-        # except clause is uniform.
-        raise _BackendConfigError(
-            f"{config.backend.value} key_loader failed: {type(e).__name__}: {e}"
-        ) from e
-    if not key:
-        raise _BackendConfigError(
-            f"{config.backend.value} key_loader returned empty string"
-        )
-    if config.backend == Backend.SUBSCRIPTION:
-        _validate_subscription_key(key)
-
-    body = _build_request_body(config, messages)
-    headers = _merged_headers(config, key)
-
-    transport_attempts = _validated_transport_attempts(config)
-    deadline = _call_deadline(config.backend)
-    with _opencode_go_free_slot(config):
-        if cancel_event is None:
-            resp = _post_with_retries(
-                config.url, body, headers, config.timeout_seconds,
-                config.retry_attempts, transport_attempts, deadline,
-            )
-        else:
-            resp = _post_with_retries_cancellable(
-                config, body, headers, transport_attempts, cancel_event, deadline,
-            )
-    if config.backend == Backend.OPENCODE_GO:
-        _log_opencode_go_usage(config.model, resp)
-        _note_opencode_go_response(resp)
-        if _opencode_go_model_is_free(config.model):
-            _opencode_go_free_gate_get().note_response(config.model, resp)
-    _note_provider_response(config, resp)
-    _note_model_response(config, resp)
-    return resp
-
-
-# --- abandoned-LLM-call in-flight metric (#638) ------------------------------
-
-# grug#637 added mid-flight review cancellation: when a newer commit lands,
-# the waiter stops waiting on an in-flight backend call and returns
-# immediately. The background call is abandoned, not killed - it keeps
-# running to its own natural conclusion and still competes for the
-# backend's generation slot (e.g. spark-gateway's single slot for the Cave
-# target). Under rapid PR churn several abandoned generations for stale
-# commits can stack up silently. This tracker counts the abandoned calls
-# that are still running so the pileup is observable.
-
-
-class _AbandonedCallTracker:
-    """Thread-safe count of abandoned `_do_call` background calls still
-    running. Incremented when the waiting side gives up on a still-running
-    call, decremented when that call's real request finishes - regardless
-    of whether the waiter already gave up. A call that finished before the
-    abandon is never counted: it was never in flight AS abandoned."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._in_flight = 0
-
-    @property
-    def in_flight(self) -> int:
-        with self._lock:
-            return self._in_flight
-
-    def note_abandoned(self, call_state: dict, backend: str) -> None:
-        """The waiting side gave up. `call_state` is this call's
-        {"abandoned", "finished"} flags, shared with `_do_call`'s finally
-        block; both transitions hold the same lock, so the count is exact
-        even when abandon and finish race."""
-        emit_count: int | None = None
-        with self._lock:
-            call_state["abandoned"] = True
-            if not call_state["finished"]:
-                self._in_flight += 1
-                emit_count = self._in_flight
-        if emit_count is not None:
-            _emit_abandoned_in_flight_gauge(emit_count, backend)
-
-    def call_finished(self, call_state: dict, backend: str) -> None:
-        """The background call's real request finished (ok or error). Only
-        decrements if this call was previously counted as abandoned."""
-        emit_count: int | None = None
-        with self._lock:
-            call_state["finished"] = True
-            if call_state["abandoned"]:
-                self._in_flight -= 1
-                emit_count = self._in_flight
-        if emit_count is not None:
-            _emit_abandoned_in_flight_gauge(emit_count, backend)
-
-
-_abandoned_calls = _AbandonedCallTracker()
-
-
-def _emit_abandoned_in_flight_gauge(count: int, backend: str) -> None:
-    """Dual emission for the abandoned-call gauge, same shape as
-    `openrouter_free_limiter._emit_telemetry`: one structured log token
-    (the operator-grep / DD-log-monitor token) plus the DogStatsD gauge a
-    dashboard graphs directly. Emitted on every transition (abandon and
-    drain), so the gauge always reflects the current count - a silent
-    series must never be read as "zero abandoned".
-
-    Expected range, for a future alert (no alert yet - this ships the
-    signal, per #638's out-of-scope boundary):
-    - 0 nearly always: abandoned calls drain as their real requests finish.
-    - Brief 1-3 under rapid PR churn (several pushes inside one review's
-      ~330-660s budget): normal; each drains within the backend timeout.
-    - Sustained > 5, or a count that climbs without draining: abandoned
-      generations are piling up faster than they finish and competing
-      with live reviews for the backend slot - the silent pileup #638
-      describes. Alert candidate: max over 5m > 5.
-
-    Never raises into the call path it describes."""
-    log.info(
-        "llm_abandoned_call_in_flight",
-        extra={"backend": backend, "abandoned_in_flight": count},
+    return provider_wire.call(
+        config, messages, cancel_event, deadline=_call_deadline(config.backend),
+        public=_spark_data_class_header() == "public", sleep=_RETRY_SLEEP,
     )
-    try:
-        from observability import emit_gauge  # type: ignore  # late: webhook-image only
-    except Exception:  # noqa: BLE001 - telemetry must never break the call it describes
-        return
-    emit_gauge("grug.llm.abandoned_calls_in_flight", float(count), {"backend": backend})
-
-
-def _post_with_retries_cancellable(
-    config: BackendConfig, body: dict[str, Any], headers: dict[str, str],
-    transport_attempts: int, cancel_event: threading.Event,
-    deadline: float | None = None,
-) -> httpx.Response:
-    """`_call_backend`'s cancellable path (#635 follow-up), split out to keep
-    that function's own branch count down. Runs the real call on a
-    background thread, races it against `cancel_event` via a 1-item queue -
-    whichever resolves first wins. See `_call_backend`'s docstring for why
-    this is "abandon the loser", not "kill the loser"."""
-    result_q: queue.Queue = queue.Queue(maxsize=1)
-    # Shared with _do_call's finally block; the tracker resolves the
-    # abandon-vs-finish race under its own lock (#638).
-    call_state = {"abandoned": False, "finished": False}
-    backend_tag = config.backend.value
-
-    def _do_call() -> None:
-        try:
-            resp = _post_with_retries(
-                config.url, body, headers, config.timeout_seconds,
-                config.retry_attempts, transport_attempts, deadline,
-            )
-            result_q.put(("ok", resp))
-        except Exception as e:  # noqa: BLE001 - re-raised on the waiting side
-            result_q.put(("error", e))
-        finally:
-            _abandoned_calls.call_finished(call_state, backend_tag)
-
-    # Re-check immediately before spawning (FLINT, #637): _call_backend's
-    # own top-level guard only catches cancellation that was ALREADY set
-    # before key_loader()/body/header construction ran - if it fires during
-    # that window, this is the last chance to skip starting a doomed
-    # background request instead of spawning it just to abandon it moments
-    # later in the loop below.
-    if cancel_event.is_set():
-        raise httpx.RequestError("cancelled before dispatch")
-    threading.Thread(target=_do_call, daemon=True).start()
-    while True:
-        if cancel_event.is_set():
-            # The background call is abandoned, not killed: it keeps
-            # running to its own conclusion. Count it while it is still
-            # in flight (#638).
-            _abandoned_calls.note_abandoned(call_state, backend_tag)
-            raise httpx.RequestError("cancelled mid-flight")
-        try:
-            kind, payload = result_q.get(timeout=0.25)
-            break
-        except queue.Empty:
-            continue
-    if kind == "error":
-        raise payload
-    return payload
 
 
 # Defined with the Cave schema above, which enforces it too (grug#989).
@@ -3690,46 +2279,6 @@ def _diagnose_non_string_content(choice: object, message: object, content: objec
     return detail
 
 
-def _responses_envelope_to_chat(body: dict[str, Any]) -> dict[str, Any]:
-    """Rewrite an OpenAI Responses API reply into the chat-completions shape.
-
-    `output` is a list of typed blocks, and a reasoning model emits
-    `reasoning` blocks alongside the `message` one - so this picks the
-    message block rather than assuming output[0], which would hand the
-    parser a reasoning block and produce a confusing "missing content"
-    instead of the real answer sitting one element later.
-
-    Within that block, `content` is itself a list of typed parts; the answer
-    is the `output_text` part. Anything unexpected degrades to
-    `content: None`, which _parse_response already diagnoses precisely
-    (grug#881) rather than raising.
-
-    `status` is carried into `finish_reason` because "incomplete" is this
-    wire's equivalent of `length` - the truncation signal grug#851 exists to
-    surface, which must never read as a clean empty review.
-    """
-    text: str | None = None
-    for block in body.get("output") or []:
-        if not isinstance(block, dict) or block.get("type") != "message":
-            continue
-        for part in block.get("content") or []:
-            if isinstance(part, dict) and part.get("type") == "output_text":
-                value = part.get("text")
-                if isinstance(value, str):
-                    text = value
-                break
-        break
-    status = body.get("status")
-    return {
-        "model": body.get("model", ""),
-        "choices": [{
-            "message": {"content": text},
-            "finish_reason": "length" if status == "incomplete" else status,
-        }],
-        "usage": body.get("usage", {}),
-    }
-
-
 def _coerce_findings(raw_findings: list[Any], model_name: str) -> tuple[Finding, ...]:
     """Coerce a validated list of raw finding dicts, dropping and LOGGING
     each one that will not coerce.
@@ -3881,7 +2430,7 @@ def _parse_review(resp: httpx.Response) -> ParsedReview:
         # and _parse_response only receives an httpx.Response, so a flag would
         # mean touching its call sites to carry information the payload
         # already states.
-        body = _responses_envelope_to_chat(body)
+        body = provider_wire.responses_envelope_to_chat(body)
     model_name = body.get("model", "")
     try:
         choice = body["choices"][0]
@@ -3984,10 +2533,10 @@ def _interactive_backend_order(installation_id: int) -> tuple[Backend, ...]:
         Backend.OPENROUTER if primary == Backend.POOLSIDE else Backend.POOLSIDE
     )
     order = [primary, failover]
-    if os.getenv("GRUG_OPENCODE_GO_API_KEY_SSM", "").strip() and _opencode_go_available():
+    if availability.interactive_go_available():
         order.append(Backend.OPENCODE_GO)
     # Switched-off and breaker-blocked backends are left out (grug#1225).
-    return tuple(b for b in order if _backend_usable(b, _BACKEND_CONFIGS[b].model))
+    return tuple(b for b in order if availability.backend_usable(b, _BACKEND_CONFIGS[b].model))
 
 
 def _interactive_tags(
@@ -4006,7 +2555,7 @@ def _choices_content(body: Any) -> str:
     if not isinstance(body, dict):
         return ""
     if "choices" not in body and "output" in body:
-        body = _responses_envelope_to_chat(body)
+        body = provider_wire.responses_envelope_to_chat(body)
     choices = body.get("choices") or []
     if choices and isinstance(choices[0], dict):
         return (choices[0].get("message") or {}).get("content", "") or ""
@@ -4230,7 +2779,7 @@ def _record_learn_http_failure(
     failure_class = _log_backend_failure(
         backend_value=backend.value, status=resp.status_code,
         error=f"http_{resp.status_code}",
-        error_message=_backend_error_message(resp),
+        error_message=availability._backend_error_message(resp),
     )
     status_tag = f"{backend.value}:http_{resp.status_code}"
     if failure_class == "unusable":
@@ -5512,11 +4061,11 @@ def _review_reasoner_diff_once(
     )
     pr_tags = _llmobs_tags(pr_context)
     arm = deep_shadow.resolve_deep_arm()
-    with _reviewed_diff_scope(hunks):
-        response = _deep_response(
-            hunks, messages, variant, pr_tags, installation_id, pr_context,
-            cancel_event, arm,
-        )
+    walk = ReviewWalk(diff_chars=sum(len(hunk.body) for hunk in hunks))
+    response = _deep_response(
+        hunks, messages, variant, pr_tags, installation_id, pr_context,
+        cancel_event, arm, walk,
+    )
     cancelled = cancel_event is not None and cancel_event.is_set()
     if arm is not None and arm.mode == "shadow" and not cancelled:
         deep_shadow.submit(
@@ -5534,6 +4083,7 @@ def _deep_response(
     pr_context: Optional[PrContext],
     cancel_event: threading.Event | None,
     arm: "deep_shadow.DeepArm | None",
+    walk: ReviewWalk,
 ) -> LlmReviewResponse:
     """The deep pass's published answer: the cloud chain under `cloud`
     priority, then the reasoner arm (`_run_deep_arm`)."""
@@ -5541,12 +4091,12 @@ def _deep_response(
     low_confidence: LlmReviewResponse | None = None
     if _cloud_chain_enabled():
         cloud_result = _try_cloud_primary(
-            hunks, messages, variant, pr_tags, installation_id, pr_context, cancel_event,
+            hunks, messages, variant, pr_tags, installation_id, pr_context, cancel_event, walk=walk,
         )
         if cloud_result.answer is not None:
             return cloud_result.answer
         low_confidence = cloud_result.low_confidence
-    outcome = _run_deep_arm(messages, variant, pr_tags, cancel_event, arm)
+    outcome = _run_deep_arm(messages, variant, pr_tags, cancel_event, arm, walk)
     if outcome.kind == "success":
         assert outcome.model is not None
         origin = _finding_origin(
@@ -5592,6 +4142,7 @@ def _run_deep_arm(
     pr_tags: dict[str, str],
     cancel_event: threading.Event | None,
     arm: "deep_shadow.DeepArm | None",
+    walk: ReviewWalk,
 ) -> _ArmOutcome:
     """The reasoner arm's one call (grug#1191). In `serve` mode the resident
     vLLM arm answers; when it is not resident or fails, the Cave reasoner
@@ -5599,7 +4150,7 @@ def _run_deep_arm(
     if arm is not None and arm.mode == "serve" and deep_shadow.is_resident(arm):
         served = _run_review_arm(
             Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
-            config_override=_deep_vllm_config(arm),
+            config_override=_deep_vllm_config(arm), walk=walk,
         )
         if served.kind == "success":
             return served
@@ -5608,7 +4159,7 @@ def _run_deep_arm(
             extra={"model": arm.model, "kind": served.kind, "error": served.error_text[:200]},
         )
     return _run_review_arm(
-        Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event,
+        Backend.CAVE_REASONER, messages, variant, pr_tags, cancel_event, walk=walk,
     )
 
 
@@ -5649,101 +4200,6 @@ def _shadow_deep_vllm(
             "overlap": len(production & shadow),
         },
     )
-
-
-# The longest the chunk retry waits out a 429's Retry-After, and the wait when
-# the 429 names none. The staged deadline still clamps the retried call.
-_RATE_LIMIT_WAIT_CAP_SECONDS = 30.0
-_RATE_LIMIT_WAIT_DEFAULT_SECONDS = 5.0
-
-
-def _rate_limit_wait(outcome: "AttemptOutcome") -> float:
-    """Seconds a 429 asks the caller to wait, or 0.0 when this failure is not
-    a rate limit a wait can clear (any other failure, or a spent allowance)."""
-    resp = outcome.raw_response
-    if outcome.status_code != 429 or resp is None or _is_spent_quota_refusal(resp):
-        return 0.0
-    try:
-        seconds = float((resp.headers.get("retry-after") or "").strip())
-    except ValueError:
-        return _RATE_LIMIT_WAIT_DEFAULT_SECONDS
-    if not math.isfinite(seconds) or seconds <= 0:
-        return _RATE_LIMIT_WAIT_DEFAULT_SECONDS
-    return min(seconds, _RATE_LIMIT_WAIT_CAP_SECONDS)
-
-
-class _ChunkLadder:
-    """Per-chunk memory of failed model calls across attempts (grug#1196).
-
-    The staged scheduler retries a failed chunk once. That retry used to walk
-    the same ladder again from the top, so it re-asked the models that had
-    just failed and was a coin flip (one large PR failed three times in a row).
-    Here the retry skips every model that already failed on this chunk and
-    goes on to the next one in the ladder; when none is left it costs no
-    network call. A failed chunk's response carries every attempt so the
-    neutral check can name the models tried and why each failed."""
-
-    def __init__(self) -> None:
-        self._tried: dict[int, list[_LadderAttempt]] = {}
-        # grug#1494: the wait a chunk's last walk was told to make by a 429.
-        self._wait: dict[int, float] = {}
-        self._parse_failed: dict[int, LlmReviewResponse] = {}
-
-    def run(
-        self, key: int, call: Callable[[], LlmReviewResponse],
-    ) -> LlmReviewResponse:
-        response = self._run_once(key, call)
-        # A model that answered unparseably is a more specific failure than a
-        # retry that reached no model at all, so `parse_failed` keeps winning
-        # over `all_failed` across attempts, exactly as it does inside one.
-        # The FIRST unparseable answer keeps the attribution, as it does there.
-        if response.kind == "parse_failed":
-            self._parse_failed.setdefault(key, response)
-        if response.kind != "reviewed" and key in self._parse_failed:
-            response = replace(self._parse_failed[key], attempts=response.attempts)
-        return response
-
-    def _run_once(
-        self, key: int, call: Callable[[], LlmReviewResponse],
-    ) -> LlmReviewResponse:
-        tried = self._tried.setdefault(key, [])
-        # A rate-limited model is asked again after its wait; only models that
-        # really failed are skipped (grug#1494).
-        skip = frozenset(
-            (attempt.backend, attempt.model)
-            for attempt in tried if not attempt.retry_after
-        )
-        wait = self._wait.pop(key, 0.0)
-        if wait:
-            _RETRY_SLEEP(wait)
-        trail: list[_LadderAttempt] = []
-        trail_token = _LADDER_TRAIL.set(trail)
-        skip_token = _LADDER_SKIP.set(skip)
-        try:
-            response = call()
-        finally:
-            _LADDER_SKIP.reset(skip_token)
-            _LADDER_TRAIL.reset(trail_token)
-        if skip:
-            log.info(
-                "llm_chunk_retry_next_model",
-                extra={
-                    "chunk": key + 1,
-                    "skipped_models": sorted(model for _, model in skip),
-                    "new_attempts": [attempt.label for attempt in trail],
-                    "kind": response.kind,
-                },
-            )
-        tried.extend(
-            trail if response.kind == "reviewed" else _with_gateway_outage_named(trail)
-        )
-        waits = [attempt.retry_after for attempt in trail if attempt.retry_after]
-        if waits and response.kind != "reviewed":
-            self._wait[key] = max(waits)
-        if response.kind in ("all_failed", "parse_failed") and tried:
-            labels = tuple(dict.fromkeys(attempt.label for attempt in tried))
-            return replace(response, attempts=labels)
-        return response
 
 
 def _file_split_targets(
@@ -5892,7 +4348,7 @@ class _Tier1Review:
             yield
 
     def _dispatch(
-        self, evidence: ElderEvidence, review_map: str = "",
+        self, evidence: ElderEvidence, review_map: str = "", *, chunk: ChunkAttempt,
     ) -> LlmReviewResponse:
         return _review_diff_dispatch(
             evidence,
@@ -5900,10 +4356,11 @@ class _Tier1Review:
             self.voice,
             self.cancel_event,
             review_map,
+            chunk=chunk,
         )
 
     def _run_cohort(
-        self, cohort: ReviewCohort, index: int, count: int, review_map: str,
+        self, cohort: ReviewCohort, index: int, count: int, review_map: str, chunk: ChunkAttempt,
     ) -> LlmReviewResponse:
         oversized = _oversized_cohort_failure(
             cohort,
@@ -5926,19 +4383,20 @@ class _Tier1Review:
                 ),
             ),
             review_map,
+            chunk=chunk,
         )
 
     def _schedule(
         self,
         cohorts: Sequence[ReviewCohort],
-        run_chunk: Callable[[int], LlmReviewResponse],
+        run_chunk: Callable[[int, ChunkAttempt], LlmReviewResponse],
         budget_seconds: float,
     ) -> list[LlmReviewResponse]:
-        ladder = _ChunkLadder()
+        ladder = _ChunkLadder(_RETRY_SLEEP)
 
         def run_in_share(index: int) -> LlmReviewResponse:
             with _cohort_share(index, len(cohorts)):
-                return ladder.run(index, lambda: run_chunk(index))
+                return ladder.run(index, lambda chunk: run_chunk(index, chunk))
 
         return _run_staged_cohorts(
             cohort_count=len(cohorts),
@@ -5956,10 +4414,10 @@ class _Tier1Review:
             return self._run_whole_diff(plan)
 
     def _run_whole_diff(self, plan: ReviewPlan) -> LlmReviewResponse:
-        ladder = _ChunkLadder()
+        ladder = _ChunkLadder(_RETRY_SLEEP)
 
-        def call() -> LlmReviewResponse:
-            return self._dispatch(self.evidence)
+        def call(chunk: ChunkAttempt) -> LlmReviewResponse:
+            return self._dispatch(self.evidence, chunk=chunk)
 
         response = ladder.run(0, call)
         if _is_retryable_cohort_failure(response) and self._can_retry():
@@ -6009,8 +4467,8 @@ class _Tier1Review:
         with self._deadline():
             responses = self._schedule(
                 plan.cohorts,
-                lambda index: self._run_cohort(
-                    plan.cohorts[index], index, count, review_map,
+                lambda index, chunk: self._run_cohort(
+                    plan.cohorts[index], index, count, review_map, chunk,
                 ),
                 _staged_review_budget_s(),
             )
@@ -6071,7 +4529,7 @@ class _Tier1Review:
         )
         sub_responses = self._schedule(
             flat,
-            lambda index: self._run_cohort(flat[index], index, len(flat), review_map),
+            lambda index, chunk: self._run_cohort(flat[index], index, len(flat), review_map, chunk),
             budget,
         )
         return _splice_file_chunks(plan, responses, chunks, sub_responses)
@@ -6251,25 +4709,6 @@ class _ArmOutcome:
         return () if self.model_unconfirmed else _served_models(self.model)
 
 
-# A model that answers a 10-20k-token diff with `{"findings": []}` in 7
-# output tokens and 2-4s did not review it (nemotron-3-super:free, 25 such
-# calls in 3 hours on 2026-09-26, each published as a clean pass).
-_DEGENERATE_MAX_OUTPUT_TOKENS = 50
-_DEGENERATE_MIN_INPUT_TOKENS = 2_000
-# grug#1642: input tokens count the whole prompt, and the fixed review context
-# alone is about 20,000 tokens, so every short empty answer cleared the 2,000
-# bar however small the diff. The bar was meant for the diff: 2,000 tokens at
-# about 4 characters per token is 8,000 characters. A diff under that is small
-# enough that an empty answer is a real clean review.
-_DEGENERATE_MIN_DIFF_CHARS = _DEGENERATE_MIN_INPUT_TOKENS * 4
-# The character count of the diff the current review call is reviewing (the
-# sum of its hunk bodies, as `ReviewCohort.diff_chars` counts it). Set by each
-# review entry through `_reviewed_diff_scope`; None outside one, where the
-# rule falls back to prompt tokens alone.
-_REVIEWED_DIFF_CHARS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
-    "grug_reviewed_diff_chars", default=None,
-)
-
 # grug#1097: the `error` prefix of a review whose only answer was a short empty
 # one. Some of those are real clean reviews, so when every later tier also
 # fails the answer is kept rather than failing the cohort. A failed cohort is
@@ -6277,39 +4716,6 @@ _REVIEWED_DIFF_CHARS: contextvars.ContextVar[int | None] = contextvars.ContextVa
 # unattempted. `evaluate_diff` maps this prefix to
 # degraded_reason="low_confidence_review", which keeps the check advisory.
 _LOW_CONFIDENCE_PREFIX = "low confidence: "
-
-
-def _is_degenerate_empty_review(
-    findings: Sequence["Finding"], usage: dict[str, int | float],
-) -> bool:
-    """No findings, under 50 output tokens, over 2k input tokens, on a diff
-    of at least `_DEGENERATE_MIN_DIFF_CHARS` (grug#1642). Missing usage
-    counts is not evidence either way, so it never flags. An unknown diff
-    size keeps the token rule alone."""
-    if findings:
-        return False
-    diff_chars = _REVIEWED_DIFF_CHARS.get()
-    if diff_chars is not None and diff_chars < _DEGENERATE_MIN_DIFF_CHARS:
-        return False
-    output_tokens = usage.get("output_tokens")
-    input_tokens = usage.get("input_tokens")
-    if output_tokens is None or input_tokens is None:
-        return False
-    return (
-        output_tokens < _DEGENERATE_MAX_OUTPUT_TOKENS
-        and input_tokens > _DEGENERATE_MIN_INPUT_TOKENS
-    )
-
-
-@contextlib.contextmanager
-def _reviewed_diff_scope(hunks: Sequence[Hunk]) -> Iterator[None]:
-    """Name the diff every review call inside this block reviews, for
-    `_is_degenerate_empty_review`."""
-    token = _REVIEWED_DIFF_CHARS.set(sum(len(hunk.body) for hunk in hunks))
-    try:
-        yield
-    finally:
-        _REVIEWED_DIFF_CHARS.reset(token)
 
 
 def _record_degenerate_review(backend: "Backend", model: str, usage: dict) -> None:
@@ -6496,7 +4902,7 @@ def _reparse_attempt_body(resp: httpx.Response, backend: Backend) -> dict:
     if not isinstance(body, dict):
         return {}
     if "choices" not in body and "output" in body:
-        return _responses_envelope_to_chat(body)
+        return provider_wire.responses_envelope_to_chat(body)
     return body
 
 
@@ -6509,46 +4915,6 @@ def _extract_attempt_content(body: dict) -> tuple[str, str]:
         content = (choices[0].get("message") or {}).get("content", "")
         finish_reason = choices[0].get("finish_reason") or ""
     return content, finish_reason
-
-
-_GATEWAY_OUTAGE_STATUSES = frozenset({503, 504})
-# By name, because `AttemptOutcome` keeps only the class name. Not the base
-# `httpx.RequestError`: a cancelled call, a passed deadline and a disabled
-# backend all raise a subclass of it and none of them is an outage.
-_GATEWAY_OUTAGE_TRANSPORT_ERRORS = frozenset(
-    error.__name__
-    for error in (
-        httpx.ConnectError,
-        httpx.ConnectTimeout,
-        httpx.ReadError,
-        httpx.ReadTimeout,
-        httpx.RemoteProtocolError,
-    )
-)
-
-
-def _routes_through_gateway(url: str) -> bool:
-    base = os.getenv("GRUG_CAVE_GATEWAY_URL", "").strip().rstrip("/")
-    return bool(base) and url.startswith(f"{base}/")
-
-
-def _is_outage_failure(outcome: AttemptOutcome, reason: str) -> bool:
-    """Is this failure what a down or load-shedding gateway produces?"""
-    if outcome.error_kind == "transport":
-        return reason in _GATEWAY_OUTAGE_TRANSPORT_ERRORS
-    return outcome.status_code in _GATEWAY_OUTAGE_STATUSES
-
-
-def _ladder_failure_reason(outcome: AttemptOutcome) -> str | None:
-    """Short reason for a failed attempt, or None when it answered usably."""
-    if outcome.error_kind is None:
-        return None
-    if outcome.error_kind == "config":
-        return "misconfigured"
-    if outcome.error_kind == "parse_failed":
-        return "parse_failed"
-    text = outcome.error_text or outcome.error_kind
-    return text.rsplit(": ", 1)[-1]
 
 
 # Backends Elder calls directly, past the inference gateway. The gateway
@@ -6575,6 +4941,7 @@ def _begin_direct_call(backend: Backend, config: BackendConfig) -> int | None:
 
 def _report_direct_call(
     backend: Backend, config: BackendConfig, outcome: "AttemptOutcome", latency_s: float,
+    diff_chars: int | None,
 ) -> None:
     """One `call_report` row for a direct call that reached the network. A
     config miss made no call and is not reported. Never raises."""
@@ -6582,7 +4949,7 @@ def _report_direct_call(
         return
     try:
         degenerate = outcome.error_kind is None and _is_degenerate_empty_review(
-            outcome.findings, outcome.usage_metrics,
+            outcome.findings, outcome.usage_metrics, diff_chars,
         )
         result, reason = call_report.outcome_for(
             outcome.error_kind, outcome.status_code, degenerate,
@@ -6610,34 +4977,15 @@ def _run_llm_attempt(
     success_kind: str = "reviewed",
     response_parser: Callable[[httpx.Response], ParsedReview] = _parse_review,
     report_direct_call: bool = True,
+    walk: ReviewWalk | None = None,
 ) -> AttemptOutcome:
-    """`_call_llm_attempt` plus the chunk ladder bookkeeping (grug#1196).
-
-    Inside `_ChunkLadder.run`, a model that already failed on this chunk is
-    skipped without a network call, so a retry moves on to the next model in
-    the ladder instead of re-asking the one that just failed. A model the
-    family gate rules out for this walk is skipped the same way (grug#1437).
-    The skip reads as a config miss, which every caller already steps past.
-    Each real failure is appended to the chunk's trail so the neutral check can name
-    it. Outside a chunk both context variables are empty and this is a plain
-    pass-through. Interactive callers supply a response parser and span name;
-    they skip review-specific direct-call reporting."""
-    key = (backend.value, config.model)
-    if _family_gated(config.model):
+    """Run one model call and record its outcome when invoked by a review walk."""
+    reason = walk.skip_reason(backend, config.model) if walk else ""
+    if reason:
         return AttemptOutcome(
             backend=backend, model=None, findings=(), content="",
-            error_kind="config",
-            error_text=f"{backend.value}: {config.model} is gated out by model family",
-            status_code=None, finish_reason="", usage_metrics={},
-            span_context=None, raw_response=None,
-        )
-    if key in _LADDER_SKIP.get():
-        return AttemptOutcome(
-            backend=backend, model=None, findings=(), content="",
-            error_kind="config",
-            error_text=f"{backend.value}: {config.model} already failed on this chunk",
-            status_code=None, finish_reason="", usage_metrics={},
-            span_context=None, raw_response=None,
+            error_kind="config", error_text=reason, status_code=None,
+            finish_reason="", usage_metrics={}, span_context=None, raw_response=None,
         )
     started = time.monotonic()
     running = _begin_direct_call(backend, config) if report_direct_call else None
@@ -6652,17 +5000,12 @@ def _run_llm_attempt(
     finally:
         call_report.end(running)
     if report_direct_call:
-        _report_direct_call(backend, config, outcome, time.monotonic() - started)
-    _record_gateway_call(key[0], key[1], config, outcome)
-    trail = _LADDER_TRAIL.get()
-    reason = _ladder_failure_reason(outcome)
-    if trail is not None and reason is not None:
-        trail.append(_LadderAttempt(
-            backend=key[0], model=key[1], reason=reason,
-            retry_after=_rate_limit_wait(outcome),
-            through_gateway=_routes_through_gateway(config.url),
-            outage_failure=_is_outage_failure(outcome, reason),
-        ))
+        _report_direct_call(
+            backend, config, outcome, time.monotonic() - started,
+            walk.diff_chars if walk else None,
+        )
+    if walk is not None:
+        walk.record(config, outcome)
     return outcome
 
 
@@ -6735,7 +5078,7 @@ def _call_llm_attempt(
                 transport_log_event,
                 extra={"backend": backend.value, "kind": type(e).__name__},
             )
-            _note_model_timeout(backend, config.model, e)
+            availability._note_model_timeout(backend, config.model, e)
             _annotate_attempt_error(
                 span=span,
                 backend=backend,
@@ -6820,13 +5163,13 @@ def _run_review_arm(
     pr_tags: dict[str, str],
     cancel_event: threading.Event | None = None,
     config_override: "BackendConfig | None" = None,
+    *, walk: ReviewWalk | None = None,
 ) -> _ArmOutcome:
     """Run one review arm: resolve config, call the backend, parse, annotate
     the LLM-Obs span. Extracted verbatim from the original sequential loop
     body (arm parallelization) so deep mode can run two of these
-    concurrently via ThreadPoolExecutor -- this function reads only its own
-    arguments and touches no caller-owned state, so it is safe to call from
-    either a plain loop (fast mode) or a worker thread (deep mode).
+    concurrently via ThreadPoolExecutor. Each worker receives the walk
+    explicitly and can append outcomes before the fallback reads them.
 
     `cancel_event` (#635 follow-up) is passed straight through to
     `_call_backend`, which aborts its in-flight request the moment the event
@@ -6886,24 +5229,25 @@ def _run_review_arm(
         variant=variant,
         pr_tags=pr_tags,
         cancel_event=cancel_event,
+        walk=walk,
     )
+    err = attempt.error_text or ""
     if attempt.error_kind == "config":
         return _ArmOutcome(
             backend=backend,
             kind="config_error",
-            error_text=attempt.error_text or "",
+            error_text=err,
         )
     if attempt.error_kind == "transport":
         return _ArmOutcome(
             backend=backend,
             kind="transport_error",
-            error_text=attempt.error_text or "",
+            error_text=err,
         )
     # Completed attempt: map to the arm's outcome. `raw_response` is never
     # None here - config/transport errors returned above.
     resp = attempt.raw_response
     assert resp is not None
-    err = attempt.error_text or ""
     model = attempt.model
     findings = attempt.findings
 
@@ -6920,7 +5264,7 @@ def _run_review_arm(
                     "findings_truncated": attempt.findings_truncated,
                 },
             )
-        if _is_degenerate_empty_review(findings, attempt.usage_metrics):
+        if _is_degenerate_empty_review(findings, attempt.usage_metrics, walk.diff_chars if walk else None):
             # Model answered "no findings" while spending real tokens -
             # keep a record of the (empty) LLM Obs span for
             # post-incident forensics.
@@ -6963,7 +5307,7 @@ def _run_review_arm(
         backend_value=backend.value,
         status=resp.status_code,
         error=err,
-        error_message=_backend_error_message(resp),
+        error_message=availability._backend_error_message(resp),
     )
     return _ArmOutcome(
         backend=backend,
@@ -7207,17 +5551,6 @@ def _cloud_chain_enabled() -> bool:
     return _review_backend_priority() != "cave"
 
 
-def _lane_reviews_first() -> bool:
-    """Public repos only. Both lane plans are consumer plans: whether they
-    train on a prompt turns on an account setting, not on the plan's terms.
-    ChatGPT: "Improve the model for everyone", which also covers Codex.
-    https://help.openai.com/en/articles/5722486-how-your-data-is-used-to-improve-model-performance
-    Claude: the Model Improvement setting, with 30-day retention when it is off
-    and 5 years when on. https://code.claude.com/docs/en/data-usage
-    Nothing here can read those settings, so a private diff is not sent first."""
-    return _review_backend_priority() == "subscription" and _spark_data_class_header() == "public"
-
-
 def _cloud_tier_success(
     outcome: "_ArmOutcome", hunks: list[Hunk], pr_context: Optional[PrContext],
 ) -> "LlmReviewResponse":
@@ -7268,31 +5601,6 @@ def _untrusted_empty_review(
     )
 
 
-# The models whose empty answer the Cave path trusts. Everything else is
-# untrusted: the route spills to whatever is free while the Sparks are away,
-# and no name pattern can tell a spill from a resident model.
-_TRUSTED_EMPTY_CAVE_MODELS = frozenset({
-    _CAVE_REVIEW_CODER_DEFAULT_MODEL, _CAVE_REVIEW_REASONER_DEFAULT_MODEL,
-})
-
-
-def _trusted_empty_cave_models() -> frozenset[str]:
-    """`GRUG_CAVE_TRUSTED_EMPTY_MODELS` (comma-separated), else the defaults."""
-    raw = os.getenv("GRUG_CAVE_TRUSTED_EMPTY_MODELS", "")
-    named = frozenset(m.strip() for m in raw.split(",") if m.strip())
-    return named or _TRUSTED_EMPTY_CAVE_MODELS
-
-
-def _cave_empty_is_trusted(outcome: "_ArmOutcome") -> bool:
-    """A named, listed model that took a real look. A reply naming no model
-    fails closed."""
-    return (
-        not outcome.degenerate
-        and not outcome.model_unconfirmed
-        and outcome.model in _trusted_empty_cave_models()
-    )
-
-
 def _low_confidence_success(
     outcome: _ArmOutcome, hunks: list[Hunk], pr_context: PrContext | None,
 ) -> LlmReviewResponse:
@@ -7312,129 +5620,6 @@ def _low_confidence_success(
             "output tokens and no later model answered"
         ),
     )
-
-
-@dataclass(frozen=True, slots=True)
-class _CloudPrimaryResult:
-    """What the cloud chain produced for one review chunk.
-
-    `answer` is the review when a tier answered; the caller returns it as-is.
-    With no answer, `low_confidence` is the first short empty answer, if any:
-    the caller still tries the Cave and keeps this only when the Cave fails
-    too (grug#1097)."""
-
-    answer: LlmReviewResponse | None = None
-    low_confidence: LlmReviewResponse | None = None
-
-
-def _empty_confirms_nothing(key: "tuple[Backend, str]") -> bool:
-    """A short empty answer from a model that gives one almost every time.
-
-    OpenRouter's `:free` model answers empty in about 7 tokens on 10k-44k
-    token cohorts (seen deciding a vote 2026-10-05, and on every call
-    2026-10-19). The gateway's free pool is whichever free model had room,
-    gemma4:31b among them, which did the same on 2026-10-19. Neither side of
-    a vote may be one of these: with the free tiers first in the chain
-    (grug#1269), the first empty was always one, and the old check looked
-    only at the second, so two lazy answers passed PRs as clean."""
-    backend, model = key
-    if backend == Backend.OPENROUTER and is_free_tier_model(model):
-        return True
-    # Go's free models are unranked on review quality (grug#1561); Beam Free
-    # answered empty on a 33k-token diff DeepSeek found faults in (2026-11-01).
-    if backend == Backend.OPENCODE_GO and _opencode_go_model_is_free(model):
-        return True
-    return backend == Backend.FREE_POOL
-
-
-def _free_tier_found_nothing(tier: BackendConfig, outcome: _ArmOutcome) -> bool:
-    """An empty answer from a free tier is never a clean pass. The short-
-    answer check misses it: Beam Free spent 1792 output tokens, all reasoning,
-    on the empty answer above, and an answer with no usage is never flagged."""
-    return not outcome.findings and _empty_confirms_nothing((tier.backend, tier.model))
-
-
-# grug#1601: the narrow relaxation of the rule above. A free Go model answered
-# empty on a 33k-token diff where the paid primary found faults, so the default
-# stands: a free model's empty answer confirms nothing. On a small cohort, a
-# free model measured at a false-empty rate of 5 percent or less may confirm
-# an empty answer from a paid or ranked model.
-# Off unless GRUG_OPENCODE_GO_FREE_CONFIRM is set.
-_FREE_CONFIRM_DEFAULT_MAX_TOKENS = 10_000
-_CHARS_PER_TOKEN = 4
-
-
-def _free_confirm_on() -> bool:
-    return os.getenv("GRUG_OPENCODE_GO_FREE_CONFIRM", "").strip().lower() in ("1", "true", "yes")
-
-
-def _free_confirm_cohort_is_small() -> bool:
-    """The cohort under review is at most the configured tokens, from its diff
-    characters at about four to a token. An unknown size is never small."""
-    chars = _REVIEWED_DIFF_CHARS.get()
-    if chars is None:
-        return False
-    limit = _env_number(
-        "GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_TOKENS", _FREE_CONFIRM_DEFAULT_MAX_TOKENS, int,
-    )
-    return limit > 0 and chars <= limit * _CHARS_PER_TOKEN
-
-
-def _free_confirm_allowlist() -> frozenset[str]:
-    max_age = _env_number(
-        "GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_AGE_DAYS", opencode_go_free.DEFAULT_REPORT_MAX_AGE_DAYS, int,
-    )
-    path = os.getenv("GRUG_OPENCODE_GO_FREE_CONFIRM_REPORT", "").strip() or None
-    return opencode_go_free.qualified_models(
-        opencode_go_free.load_eval_report(path), max_age_days=max_age,
-    )
-
-
-def _free_empty_may_confirm(current: "tuple[Backend, str]") -> bool:
-    """May this free model's empty answer count as the second opinion? Only for
-    a Go model that is free now, on a small cohort, when it is on the measured
-    allowlist and the flag is on. The caller has already required that the
-    first empty answer came from a paid or ranked model."""
-    backend, model = current
-    return (
-        _free_confirm_on()
-        and backend == Backend.OPENCODE_GO
-        and _opencode_go_model_is_free(model)
-        and _free_confirm_cohort_is_small()
-        and model in _free_confirm_allowlist()
-    )
-
-
-def _empty_answers_agree(
-    first_empty: "tuple[Backend, str] | None",
-    current: "tuple[Backend, str]",
-    pr_context: "Optional[PrContext]",
-) -> bool:
-    """True when a second, DIFFERENT model also gave a short empty answer.
-
-    One short empty answer can be a skim; two independent models agreeing is
-    a clean review. Walking on burned the staged budget and starved later
-    cohorts (2026-10-05). The same model twice is not agreement."""
-    if first_empty is None or first_empty == current:
-        return False
-    if _empty_confirms_nothing(first_empty):
-        return False
-    relaxed = _empty_confirms_nothing(current)
-    if relaxed and not _free_empty_may_confirm(current):
-        return False
-    log.info(
-        "llm_cloud_empty_consensus",
-        extra={
-            "relaxed": relaxed,
-            "first_backend": first_empty[0].value,
-            "first_model": first_empty[1],
-            "second_backend": current[0].value,
-            "second_model": current[1],
-            "repo": (pr_context or {}).get("repo"),
-            "pr_number": (pr_context or {}).get("pr_number"),
-        },
-    )
-    return True
 
 
 def _cloud_chain_exhausted(
@@ -7481,6 +5666,7 @@ def _try_cloud_primary(
     pr_context: Optional[PrContext],
     cancel_event: threading.Event | None,
     held_empty: "tuple[Backend, str] | None" = None,
+    *, walk: ReviewWalk,
 ) -> _CloudPrimaryResult:
     """Try the grug#910 cloud chain - opencode Go, then OpenRouter `:free`
     if configured - as the PRIMARY review attempt (grug#906).
@@ -7513,25 +5699,27 @@ def _try_cloud_primary(
     for tier in _cloud_chain_tiers():
         backend = tier.backend
         outcome = _run_review_arm(
-            backend, messages, variant, pr_tags, cancel_event, config_override=tier,
+            backend, messages, variant, pr_tags, cancel_event, config_override=tier, walk=walk,
         )
         if outcome.kind == "success" and (
             outcome.degenerate or _free_tier_found_nothing(tier, outcome)
         ):
             last_error = f"{backend.value}: degenerate empty review"
             key = (backend, tier.model)
-            if _empty_answers_agree(first_empty, key, pr_context):
+            if _empty_answers_agree(first_empty, key, pr_context, walk.diff_chars):
                 return _CloudPrimaryResult(
                     answer=_cloud_tier_success(outcome, hunks, pr_context),
                 )
             if first_empty is None:
                 if not _empty_confirms_nothing(key):
                     first_empty = key
-                    if confirming_free and _empty_answers_agree(key, confirming_free[0], pr_context):
+                    if confirming_free and _empty_answers_agree(
+                        key, confirming_free[0], pr_context, walk.diff_chars,
+                    ):
                         return _CloudPrimaryResult(
                             answer=_cloud_tier_success(confirming_free[1], hunks, pr_context),
                         )
-                elif confirming_free is None and _free_empty_may_confirm(key):
+                elif confirming_free is None and _free_empty_may_confirm(key, walk.diff_chars):
                     confirming_free = (key, outcome)
             if first_empty_outcome is None and held_empty is None:
                 first_empty_outcome = outcome
@@ -7581,159 +5769,71 @@ def _review_diff_dispatch(
     voice: VoiceSelection,
     cancel_event: threading.Event | None,
     review_map: str = "",
-) -> "LlmReviewResponse":
-    """Dispatch one review chunk, keeping the author's model family off it
-    while any other family can answer (grug#1437).
-
-    With no known author family this is the plain ladder walk. Otherwise the
-    whole ladder runs once without that family, in its usual order, so a
-    failed arm hands on to the next one as it always does. Only when nothing
-    answered does a second walk ask the author's family, and only that family:
-    a same-family review beats no review, and the check says which it was. A
-    second walk with nothing to ask leaves the first walk's failure standing.
-    """
-    author_family = (evidence.pr_context or {}).get("author_family")
-
-    def walk(gate: tuple[str, bool] | None) -> "LlmReviewResponse":
-        token = _FAMILY_GATE.set(gate)
-        calls_token = _WALK_GATEWAY_CALLS.set([])
-        lane_token = _LANE_ASKED.set(False)
-        try:
-            with _reviewed_diff_scope(evidence.hunks):
-                return _walk_review_ladder(
-                    evidence, installation_id, voice, cancel_event, review_map,
-                )
-        finally:
-            _LANE_ASKED.reset(lane_token)
-            _WALK_GATEWAY_CALLS.reset(calls_token)
-            _FAMILY_GATE.reset(token)
-
-    if not author_family:
-        return walk(None)
-    response = walk((author_family, False))
-    if response.kind == "reviewed" or (cancel_event and cancel_event.is_set()):
-        return response
-    same_family = walk((author_family, True))
-    return same_family if same_family.kind == "reviewed" else response
+    *,
+    chunk: ChunkAttempt | None = None,
+) -> LlmReviewResponse:
+    pr_context = evidence.pr_context
+    return review_ladder.walk_review(
+        author_family=(pr_context or {}).get("author_family"),
+        diff_chars=sum(len(hunk.body) for hunk in evidence.hunks),
+        chunk=chunk,
+        cancel_event=cancel_event,
+        priority=_review_backend_priority(),
+        repo_public=(pr_context or {}).get("repo_private") is False,
+        cloud=partial(_review_cloud_primary, evidence, installation_id, voice, cancel_event, review_map),
+        cave=partial(_review_cave_primary, evidence, installation_id, voice, cancel_event, review_map),
+        pr_context=pr_context,
+    )
 
 
-def _walk_review_ladder(
+def _review_cloud_primary(
     evidence: ElderEvidence,
     installation_id: int,
     voice: VoiceSelection,
     cancel_event: threading.Event | None,
-    review_map: str = "",
-) -> "LlmReviewResponse":
-    """Walk the review ladder once, per `GRUG_REVIEW_BACKEND_PRIORITY`
-    (grug#906).
-
-    "cave" (default): delegates straight to
-    `_review_diff_dispatch_cave_primary`, UNCHANGED - every deployment
-    that has not opted in gets byte-identical behavior.
-
-    "cloud": try cloud FIRST via `_try_cloud_primary`. Only on TOTAL
-    cloud failure does control reach the cave-primary function - which is
-    completely unmodified, so the fallback IS today's whole well-tested
-    review pipeline, not a reimplementation of it. `messages`/`variant`
-    get rebuilt a second time inside the cave-primary call on that
-    (hopefully rare) fallback path - a deliberate, small cost accepted so
-    that function's body never has to know this caller exists.
-
-    grug#1097: when the cloud chain's only answer was a short empty one and
-    the Cave fails too, that answer is returned as a low-confidence clean
-    result instead of failing the chunk."""
+    review_map: str,
+    walk: ReviewWalk,
+) -> _CloudPrimaryResult:
+    """Build the cloud prompt and try the optional first subscription rung."""
     low_confidence: LlmReviewResponse | None = None
     pr_context = evidence.pr_context
     held_empty: tuple[Backend, str] | None = None
-    if _cloud_chain_enabled():
-        depth = _review_depth()
-        variant: PromptVariant = (
-            "v2" if depth != "fast" else select_prompt_variant(installation_id)
-        )
-        messages = _build_messages(
-            evidence, variant,
-            team_practices=_team_practices_block(pr_context),
-            few_shot_examples=_few_shot_block(pr_context),
-            learnings=_repo_learnings_block(pr_context),
-            guidelines=_repo_guidelines_block(pr_context),
-            voice=voice,
-            review_map=review_map,
-        )
-        pr_tags = _llmobs_tags(pr_context)
-        if _lane_reviews_first():
-            # The operator's plans review first; the lane paces itself against
-            # its plan windows and says so with a refusal, and the chain below
-            # then serves the chunk. It is not asked again in this walk.
-            lane = _run_subscription_fallback(
-                messages, variant, pr_tags, list(evidence.hunks), pr_context, installation_id,
-            )
-            _LANE_ASKED.set(True)
-            if lane is not None and lane.kind == "reviewed":
-                if not (lane.error or "").startswith(_LOW_CONFIDENCE_PREFIX):
-                    return lane
-                # A short empty: another model must confirm it.
-                low_confidence = lane
-                held_empty = (Backend.SUBSCRIPTION, lane.model_name or "")
-        cloud_result = _try_cloud_primary(
-            list(evidence.hunks), messages, variant, pr_tags, installation_id,
-            pr_context, cancel_event, held_empty,
-        )
-        answer = cloud_result.answer
-        if answer is not None:
-            if answer.kind == "reviewed" and answer.backend_used == Backend.OPENCODE_GO:
-                log.info("opencode_go_review_served", extra={"model": answer.model_name})
-            return answer
-        low_confidence = low_confidence or cloud_result.low_confidence
-        # Total cloud failure: fall through, unconditionally, to the exact
-        # path every "cave" deployment runs - "if that fails, use my local
-        # sparks" (the operator, 2026-08-27) is not itself configurable away.
-    response = route_elder_model_call(
-        evidence, installation_id, voice, cancel_event, review_map,
+    depth = _review_depth()
+    variant: PromptVariant = (
+        "v2" if depth != "fast" else select_prompt_variant(installation_id)
     )
-    if low_confidence is not None and response.kind in ("all_failed", "parse_failed"):
-        log.warning(
-            "llm_review_low_confidence_kept",
-            extra={
-                "backend": low_confidence.backend_used.value
-                if low_confidence.backend_used is not None
-                else None,
-                "model": low_confidence.model_name,
-                "cave_kind": response.kind,
-                "repo": (pr_context or {}).get("repo"),
-                "pr_number": (pr_context or {}).get("pr_number"),
-            },
-        )
-        return low_confidence
-    return response
-
-
-def _gateway_outage_order(configs: list[BackendConfig]) -> list[BackendConfig]:
-    """Tier 2's order for this walk (grug#1467).
-
-    Unchanged unless the gateway is down. Then the off-gateway backends come
-    first, so the review's one retry outside the gateway runs before the
-    deadline is spent on a gateway that is not answering, and a gateway arm
-    this walk already saw fail is dropped. A gateway arm not yet tried stays
-    last: the gateway may still serve it."""
-    calls = _WALK_GATEWAY_CALLS.get()
-    if not calls or not _gateway_down(calls):
-        return configs
-    failed = {(call.backend, call.model) for call in calls}
-    off_gateway = [c for c in configs if not _routes_through_gateway(c.url)]
-    untried_gateway = [
-        c for c in configs
-        if _routes_through_gateway(c.url) and (c.backend.value, c.model) not in failed
-    ]
-    ordered = off_gateway + untried_gateway
-    log.warning(
-        "llm_gateway_outage_fallback",
-        extra={
-            "gateway_calls": len(calls),
-            "order": [f"{c.backend.value}/{c.model}" for c in ordered],
-            "off_gateway": len(off_gateway),
-        },
+    messages = _build_messages(
+        evidence, variant,
+        team_practices=_team_practices_block(pr_context),
+        few_shot_examples=_few_shot_block(pr_context),
+        learnings=_repo_learnings_block(pr_context),
+        guidelines=_repo_guidelines_block(pr_context),
+        voice=voice,
+        review_map=review_map,
     )
-    return ordered
+    pr_tags = _llmobs_tags(pr_context)
+    if walk.lane_first:
+        # The operator's plans review first; the lane paces itself against
+        # its plan windows and says so with a refusal, and the chain below
+        # then serves the chunk. It is not asked again in this walk.
+        lane = _run_subscription_fallback(
+            messages, variant, pr_tags, list(evidence.hunks), pr_context, installation_id, walk=walk,
+        )
+        walk.lane_asked = True
+        if lane is not None and lane.kind == "reviewed":
+            if not (lane.error or "").startswith(_LOW_CONFIDENCE_PREFIX):
+                return _CloudPrimaryResult(answer=lane)
+            # A short empty: another model must confirm it.
+            low_confidence = lane
+            held_empty = (Backend.SUBSCRIPTION, lane.model_name or "")
+    cloud_result = _try_cloud_primary(
+        list(evidence.hunks), messages, variant, pr_tags, installation_id,
+        pr_context, cancel_event, held_empty, walk=walk,
+    )
+    answer = cloud_result.answer
+    if answer is not None and answer.kind == "reviewed" and answer.backend_used == Backend.OPENCODE_GO:
+        log.info("opencode_go_review_served", extra={"model": answer.model_name})
+    return replace(cloud_result, low_confidence=low_confidence or cloud_result.low_confidence)
 
 
 def _run_free_provider_fallback(
@@ -7743,6 +5843,7 @@ def _run_free_provider_fallback(
     hunks: list[Hunk],
     pr_context: Optional[PrContext],
     installation_id: int,
+    *, walk: ReviewWalk,
 ) -> tuple[
     Optional[LlmReviewResponse],
     Optional[tuple[Backend, Optional[str], str]],
@@ -7761,7 +5862,7 @@ def _run_free_provider_fallback(
     first_parse_fail: Optional[tuple[Backend, Optional[str], str]] = None
     low_confidence: Optional[LlmReviewResponse] = None
     last_error = ""
-    for config in _gateway_outage_order(_free_provider_fallback_configs()):
+    for config in _gateway_outage_order(_free_provider_fallback_configs(), walk.gateway_calls):
         backend = config.backend
         attempt = _run_llm_attempt(
             backend=backend,
@@ -7769,6 +5870,7 @@ def _run_free_provider_fallback(
             messages=messages,
             variant=variant,
             pr_tags=pr_tags,
+            walk=walk,
             transport_log_event="llm_saas_overload_fallback_transport_failed",
         )
         if attempt.error_kind in ("config", "transport"):
@@ -7783,7 +5885,7 @@ def _run_free_provider_fallback(
         if not err:
             resolved_model = model or config.model
             untrusted_empty = not findings and (
-                _is_degenerate_empty_review(findings, attempt.usage_metrics)
+                _is_degenerate_empty_review(findings, attempt.usage_metrics, walk.diff_chars)
                 or _empty_confirms_nothing((backend, config.model))
             )
             if untrusted_empty:
@@ -7847,7 +5949,7 @@ def _run_free_provider_fallback(
             backend_value=backend.value,
             status=resp.status_code,
             error=err,
-            error_message=_backend_error_message(resp),
+            error_message=availability._backend_error_message(resp),
         )
         last_error = f"{backend.value}: {err}"
     return None, first_parse_fail, last_error, low_confidence
@@ -7860,19 +5962,21 @@ def _run_subscription_fallback(
     hunks: list[Hunk],
     pr_context: Optional[PrContext],
     installation_id: int,
+    *, walk: ReviewWalk,
 ) -> Optional[LlmReviewResponse]:
     """Tier 3: Try operator's subscription fallback as last resort (grug#1276)."""
-    sub_config = _subscription_fallback_config()
-    if sub_config is None or not _backend_usable(sub_config.backend, sub_config.model):
+    sub_config = _subscription_fallback_config(walk.author_family)
+    status = availability.subscription_status(sub_config)
+    if status == "unavailable" or sub_config is None:
         return None
 
-    if _is_subscription_cap_reached():
+    if status == "capped":
         log.warning(
             "elder_subscription_cap_reached",
             extra={
                 "tier": "subscription",
-                "calls_today": _subscription_calls_today(),
-                "daily_cap": _subscription_daily_cap(),
+                "calls_today": availability._subscription_calls_today(),
+                "daily_cap": availability._subscription_daily_cap(),
                 "installation_id": installation_id,
             },
         )
@@ -7889,6 +5993,7 @@ def _run_subscription_fallback(
         messages=messages,
         variant=variant,
         pr_tags=pr_tags,
+        walk=walk,
         transport_log_event="llm_subscription_fallback_transport_failed",
     )
     if attempt.error_kind in ("config", "transport"):
@@ -7904,7 +6009,7 @@ def _run_subscription_fallback(
     err = attempt.error_text or ""
     span_context = attempt.span_context
 
-    if resp.status_code == 429 or _is_spent_quota_refusal(resp):
+    if resp.status_code == 429 or availability._is_spent_quota_refusal(resp):
         log.warning(
             "elder_subscription_cap_reached",
             extra={
@@ -7923,8 +6028,8 @@ def _run_subscription_fallback(
 
     if not err:
         resolved_model = model or sub_config.model
-        _record_subscription_call()
-        if _author_family_answered(resolved_model):
+        availability._record_subscription_call()
+        if walk.author_family_answered(resolved_model):
             return LlmReviewResponse(
                 kind="all_failed",
                 error=f"{Backend.SUBSCRIPTION.value}: {resolved_model} is the author's family",
@@ -7937,14 +6042,14 @@ def _run_subscription_fallback(
         # re-checked against.
         if not findings:
             usage = attempt.usage_metrics
-            degenerate = _is_degenerate_empty_review(findings, usage)
+            degenerate = _is_degenerate_empty_review(findings, usage, walk.diff_chars)
             log.info(
                 "elder_subscription_lane_empty",
                 extra={
                     "model": resolved_model,
                     "input_tokens": usage.get("input_tokens"),
                     "output_tokens": usage.get("output_tokens"),
-                    "diff_chars": _REVIEWED_DIFF_CHARS.get(),
+                    "diff_chars": walk.diff_chars,
                     "trusted": not degenerate,
                 },
             )
@@ -8003,7 +6108,7 @@ def _run_subscription_fallback(
         backend_value=Backend.SUBSCRIPTION.value,
         status=resp.status_code,
         error=err,
-        error_message=_backend_error_message(resp),
+        error_message=availability._backend_error_message(resp),
     )
     return LlmReviewResponse(
         kind="all_failed",
@@ -8026,7 +6131,7 @@ def review_second_lineage(
     if cancel_event is not None and cancel_event.is_set():
         return LlmReviewResponse(kind="all_failed", error="cancelled")
     # Half the daily cap stays for the last resort the primary pass may need.
-    if _subscription_calls_today() * 2 >= _subscription_daily_cap():
+    if availability.second_lineage_share_spent():
         return LlmReviewResponse(kind="all_failed", error="second-lineage share spent")
     # One call has no cohort planner, so a diff past one cohort cannot fit.
     if sum(len(hunk.body) for hunk in evidence.hunks) > review_cohort_char_budget():
@@ -8037,27 +6142,25 @@ def review_second_lineage(
     known = [family for family in map(model_family, primary_models) if family]
     avoid = (pr_context or {}).get("author_family") or (known[0] if known else "")
     messages = _build_messages(evidence, "v2")
-    token = _FAMILY_GATE.set((avoid, False)) if avoid else None
-    try:
-        with _reviewed_diff_scope(evidence.hunks):
-            response = _run_subscription_fallback(
-                messages, "v2", _llmobs_tags(pr_context), list(evidence.hunks),
-                pr_context, installation_id,
-            )
-    finally:
-        if token is not None:
-            _FAMILY_GATE.reset(token)
+    walk = ReviewWalk(
+        diff_chars=sum(len(hunk.body) for hunk in evidence.hunks), author_family=avoid or None,
+    )
+    response = _run_subscription_fallback(
+        messages, "v2", _llmobs_tags(pr_context), list(evidence.hunks),
+        pr_context, installation_id, walk=walk,
+    )
     if response is None:
         return LlmReviewResponse(kind="all_failed", error="subscription lane unavailable")
     return response
 
 
-def _review_diff_dispatch_cave_primary(
+def _review_cave_primary(
     evidence: ElderEvidence,
     installation_id: int,
     voice: VoiceSelection,
     cancel_event: threading.Event | None,
-    review_map: str = "",
+    review_map: str,
+    walk: ReviewWalk,
 ) -> LlmReviewResponse:
     # Owned review ensemble, PRIMARY: coder arm + optional reasoner arm via
     # the Cave gateway. Modes (#645):
@@ -8130,13 +6233,13 @@ def _review_diff_dispatch_cave_primary(
         # `list(...)` fully consumes the lazy iterator before the with-block
         # exits so both outcomes are captured.
         # One context copy per arm, taken on THIS thread, so a worker still
-        # sees the chunk ladder's trail and skip set (grug#1196). Pool
-        # threads do not inherit context variables on their own.
+        # sees the staged deadline and gateway job headers. The routing
+        # state is passed explicitly to both arms.
         arm_contexts = [contextvars.copy_context() for _ in review_backends]
         with ThreadPoolExecutor(max_workers=len(review_backends)) as pool:
             arm_outcomes = list(pool.map(
                 lambda ctx, b: ctx.run(
-                    _run_review_arm, b, messages, variant, pr_tags, cancel_event,
+                    _run_review_arm, b, messages, variant, pr_tags, cancel_event, walk=walk,
                 ),
                 arm_contexts,
                 review_backends,
@@ -8147,7 +6250,7 @@ def _review_diff_dispatch_cave_primary(
         review_backends = (Backend.CAVE, Backend.CAVE_REASONER)
         arm_outcomes = []
         for backend in review_backends:
-            outcome = _run_review_arm(backend, messages, variant, pr_tags, cancel_event)
+            outcome = _run_review_arm(backend, messages, variant, pr_tags, cancel_event, walk=walk)
             arm_outcomes.append(outcome)
             if outcome.kind == "success":
                 break
@@ -8155,7 +6258,7 @@ def _review_diff_dispatch_cave_primary(
         # tiered: coder only (async deep append is the reasoner path).
         review_backends = (Backend.CAVE,)
         arm_outcomes = [
-            _run_review_arm(Backend.CAVE, messages, variant, pr_tags, cancel_event),
+            _run_review_arm(Backend.CAVE, messages, variant, pr_tags, cancel_event, walk=walk),
         ]
 
     for outcome in arm_outcomes:
@@ -8245,6 +6348,7 @@ def _review_diff_dispatch_cave_primary(
             hunks=hunks,
             pr_context=pr_context,
             installation_id=installation_id,
+            walk=walk,
         )
         if free_resp is not None:
             return free_resp
@@ -8257,13 +6361,14 @@ def _review_diff_dispatch_cave_primary(
         # Only after every self-hosted target and every free provider has failed.
         # Uses headless subscription lanes, never pay-per-token API keys.
         # Bounded by configured daily cap.
-        sub_resp = None if _LANE_ASKED.get() else _run_subscription_fallback(
+        sub_resp = None if walk.lane_asked else _run_subscription_fallback(
             messages=messages,
             variant=variant,
             pr_tags=pr_tags,
             hunks=hunks,
             pr_context=pr_context,
             installation_id=installation_id,
+            walk=walk,
         )
         # The lane's own failure outranks only a walk with nothing better to
         # report; a parse failure stays the more specific answer below.
@@ -8344,35 +6449,6 @@ def _review_diff_dispatch_cave_primary(
         kind="all_failed",
         error=last_error or "all backends failed",
     )
-
-
-def route_elder_model_call(
-    evidence: ElderEvidence,
-    installation_id: int = 1,
-    voice: VoiceSelection = "caveman",
-    cancel_event: threading.Event | None = None,
-    review_map: str = "",
-) -> LlmReviewResponse:
-    """Attempt model providers in fixed order:
-    1. self-hosted (Cave coder/reasoner)
-    2. free provider pool (gateway free pool + free SaaS)
-    3. subscription (operator's headless subscription lanes: Claude Code / Codex)
-    Order is fixed: never reordered by load or latency, except that a down
-    inference gateway sends step 2 off the gateway first (grug#1467).
-    """
-    # A walk already tracks its gateway calls; a direct caller gets its own.
-    token = _WALK_GATEWAY_CALLS.set([]) if _WALK_GATEWAY_CALLS.get() is None else None
-    try:
-        return _review_diff_dispatch_cave_primary(
-            evidence=evidence,
-            installation_id=installation_id,
-            voice=voice,
-            cancel_event=cancel_event,
-            review_map=review_map,
-        )
-    finally:
-        if token is not None:
-            _WALK_GATEWAY_CALLS.reset(token)
 
 
 # ---------------------------------------------------------------------------

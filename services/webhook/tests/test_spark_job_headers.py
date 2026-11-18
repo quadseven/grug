@@ -16,6 +16,7 @@ import llm_client as lc
 import rerun
 from llm_client import Backend, Hunk, review_diff
 from review_evidence import assemble_evidence
+import provider_wire
 
 _CAVE_ARMS = ("judge", Backend.CAVE, Backend.CAVE_REASONER)
 _PUBLIC = {"repo": "quadseven/grug", "pr_number": 7, "repo_private": False}
@@ -41,7 +42,7 @@ def _cave_config(arm):
 
 def _headers(config, pr_context):
     with lc._spark_job_scope(pr_context):
-        return lc._merged_headers(config, "k")
+        return provider_wire._merged_headers(config, "k")
 
 
 def _reply(body: str) -> httpx.Response:
@@ -88,7 +89,7 @@ def test_job_header_is_absent_unless_it_is_owner_repo_number(pr_context) -> None
 
 
 def test_cave_call_outside_a_review_is_private_and_unnamed() -> None:
-    headers = lc._merged_headers(_cave_config(Backend.CAVE), "k")
+    headers = provider_wire._merged_headers(_cave_config(Backend.CAVE), "k")
     assert "X-Spark-Job" not in headers
     assert headers["X-Spark-Data-Class"] == "private"
 

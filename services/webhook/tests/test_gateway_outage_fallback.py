@@ -14,6 +14,8 @@ import httpx
 import llm_client as lc
 import pytest
 from personas.code_reviewer import dispatch as cr_dispatch
+import model_availability as availability
+import review_ladder
 
 _GATEWAY = "http://cave.test"
 _POOLSIDE = "inference.poolside.ai"
@@ -119,11 +121,11 @@ def _elder(monkeypatch):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "")
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda _s: None)
     monkeypatch.setattr(
-        lc, "acquire_free_tier_slot",
+        availability, "acquire_free_tier_slot",
         lambda *a, **k: type("Admit", (), {"admitted": True})(),
     )
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", _GATEWAY)
@@ -230,10 +232,10 @@ def test_failures_a_down_gateway_does_not_produce_are_not_outages() -> None:
         outcome("transport", "cave: BackendDisabledError", None),
     ]
     for failed in not_outages:
-        reason = lc._ladder_failure_reason(failed)
+        reason = review_ladder._ladder_failure_reason(failed)
         assert reason is not None
-        assert not lc._is_outage_failure(failed, reason)
-    assert not lc._routes_through_gateway(f"https://{_POOLSIDE}/v1/chat/completions")
+        assert not review_ladder._is_outage_failure(failed, reason)
+    assert not review_ladder._routes_through_gateway(f"https://{_POOLSIDE}/v1/chat/completions")
 
 
 # The gateway's free provider pool is a gateway arm too (`/free` and
@@ -308,23 +310,19 @@ def test_one_gateway_arm_answering_with_the_free_pool_on_makes_no_fallback_call(
 # `_gateway_outage_order` on its own: which gateway calls count as an outage,
 # and what tier 2 keeps.
 def _gateway_call(*, outage: bool, neutral: bool = False, model: str = "spark:warm-any"):
-    return lc._GatewayCall(backend="cave", model=model, outage=outage, neutral=neutral)
+    return review_ladder._GatewayCall(backend="cave", model=model, outage=outage, neutral=neutral)
 
 
 def _tier_two(monkeypatch) -> tuple[lc.BackendConfig, lc.BackendConfig]:
     monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
     free_pool = lc._free_pool_chain_config()
     assert free_pool is not None
-    assert lc._routes_through_gateway(free_pool.url)
+    assert review_ladder._routes_through_gateway(free_pool.url)
     return free_pool, lc._saas_overload_fallback_config(lc.Backend.POOLSIDE)
 
 
 def _order(calls, configs):
-    token = lc._WALK_GATEWAY_CALLS.set(list(calls))
-    try:
-        return lc._gateway_outage_order(list(configs))
-    finally:
-        lc._WALK_GATEWAY_CALLS.reset(token)
+    return review_ladder._gateway_outage_order(list(configs), calls)
 
 
 def test_a_gateway_arm_not_yet_tried_stays_last_not_dropped(monkeypatch) -> None:
@@ -339,9 +337,9 @@ def test_a_deadline_cut_gateway_call_does_not_decide_the_outage(monkeypatch) -> 
     free_pool, poolside = _tier_two(monkeypatch)
     calls = [_gateway_call(outage=True), _gateway_call(outage=False, neutral=True)]
 
-    assert lc._gateway_down(calls)
+    assert review_ladder._gateway_down(calls)
     assert _order(calls, [free_pool, poolside]) == [poolside, free_pool]
-    assert not lc._gateway_down([_gateway_call(outage=False, neutral=True)])
+    assert not review_ladder._gateway_down([_gateway_call(outage=False, neutral=True)])
 
 
 @pytest.mark.parametrize("other", ["rate_limited", "answered"])
@@ -350,5 +348,5 @@ def test_a_mixed_gateway_walk_keeps_the_usual_order(monkeypatch, other) -> None:
     free_pool, poolside = _tier_two(monkeypatch)
     calls = [_gateway_call(outage=True), _gateway_call(outage=False, model=other)]
 
-    assert not lc._gateway_down(calls)
+    assert not review_ladder._gateway_down(calls)
     assert _order(calls, [free_pool, poolside]) == [free_pool, poolside]

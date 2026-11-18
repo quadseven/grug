@@ -18,6 +18,8 @@ import llm_client as lc
 import opencode_go_free as og
 import pytest
 from llm_client import Backend
+import model_availability as availability
+import review_ladder
 
 _FREE = "longcat-2.5-free"
 _FREE_NO_SUFFIX = "big-pickle"
@@ -320,10 +322,10 @@ def test_a_good_answer_clears_the_cool_down_streak() -> None:
 def _env(monkeypatch):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_opencode_go_free_catalog", None, raising=False)
-    monkeypatch.setattr(lc, "_opencode_go_free_gate", None, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_free_catalog", None, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_free_gate", None, raising=False)
     monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/test/opencode-go")
     monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "beam-free")
     monkeypatch.delenv("GRUG_OPENCODE_GO_SECOND_MODEL", raising=False)
@@ -338,7 +340,7 @@ def _listed(monkeypatch, *models: dict, enabled: bool = True) -> _Fetch:
     fetch = _Fetch(_ok(*models, _model(lc._OPENCODE_GO_MODEL, 1, 1)))
     if enabled:
         monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
-    monkeypatch.setattr(lc, "_opencode_go_free_models_fetch", fetch, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_free_models_fetch", fetch, raising=False)
     return fetch
 
 
@@ -372,7 +374,7 @@ def test_a_priced_model_is_never_a_tier(monkeypatch) -> None:
 def test_an_empty_list_leaves_the_paid_chain_as_it_was(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "second-paid")
     monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
-    monkeypatch.setattr(lc, "_opencode_go_free_models_fetch", _Fetch(_ok()))
+    monkeypatch.setattr(availability, "_opencode_go_free_models_fetch", _Fetch(_ok()))
     assert _chain() == [lc._OPENCODE_GO_MODEL, "second-paid", "poolside/laguna-s-2.1"]
 
 
@@ -386,7 +388,7 @@ def test_a_dead_list_endpoint_preserves_paid_go(monkeypatch) -> None:
     before = _chain()
     monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
     monkeypatch.setattr(
-        lc, "_opencode_go_free_models_fetch", _Fetch(httpx.ConnectError("down")), raising=False,
+        availability, "_opencode_go_free_models_fetch", _Fetch(httpx.ConnectError("down")), raising=False,
     )
     assert _chain() == [model for model in before if model != "beam-free"]
 
@@ -403,7 +405,7 @@ def test_the_number_of_discovered_tiers_is_bounded(monkeypatch) -> None:
 def test_a_cooling_model_is_skipped_and_the_next_free_one_takes_its_place(monkeypatch) -> None:
     _listed(monkeypatch, _model("a-free"), _model("b-free"), _model("c-free"))
     assert [m for m in _chain() if m[1:] == "-free" and m[0] in "abc"] == ["a-free", "b-free"]
-    lc._opencode_go_free_gate_get().note_response(
+    availability._opencode_go_free_gate_get().note_response(
         "a-free", httpx.Response(429, headers={"retry-after": "600"}),
     )
     assert [m for m in _chain() if m[1:] == "-free" and m[0] in "abc"] == ["b-free", "c-free"]
@@ -420,22 +422,22 @@ def test_a_discovered_tier_is_a_chat_tier_with_a_bounded_output(monkeypatch) -> 
 
 def test_the_catalogue_overrules_the_name_when_it_lists_a_price(monkeypatch) -> None:
     _listed(monkeypatch, _model("beam-free", 0.3, 0.9), _model(_FREE))
-    lc._opencode_go_free_catalog_get().models()
-    assert lc._opencode_go_model_is_free(_FREE) is True
-    assert lc._opencode_go_model_is_free("beam-free") is False  # priced now: counts as paid
-    assert lc._opencode_go_model_is_free("unlisted-free") is True  # no data: the old name rule
+    availability._opencode_go_free_catalog_get().models()
+    assert availability._opencode_go_model_is_free(_FREE) is True
+    assert availability._opencode_go_model_is_free("beam-free") is False  # priced now: counts as paid
+    assert availability._opencode_go_model_is_free("unlisted-free") is True  # no data: the old name rule
 
 
 def test_a_free_model_without_the_suffix_counts_as_free_for_the_cap(monkeypatch) -> None:
     _listed(monkeypatch, _model(_FREE_NO_SUFFIX))
-    lc._opencode_go_free_catalog_get().models()
-    assert lc._opencode_go_model_is_free(_FREE_NO_SUFFIX) is True
+    availability._opencode_go_free_catalog_get().models()
+    assert availability._opencode_go_model_is_free(_FREE_NO_SUFFIX) is True
 
 
 def test_private_code_still_reaches_only_models_with_verified_terms(monkeypatch) -> None:
     _listed(monkeypatch, _model(_FREE))
     tier = next(t for t in lc._cloud_chain_tiers() if t.model == _FREE)
-    assert _FREE not in lc._OPENCODE_GO_PRIVATE_SAFE_MODELS
+    assert _FREE not in availability._OPENCODE_GO_PRIVATE_SAFE_MODELS
     with patch.object(httpx, "post") as post, pytest.raises(lc.BackendDisabledError):
         lc._call_backend(tier, [{"role": "user", "content": "x"}])
     post.assert_not_called()
@@ -460,7 +462,7 @@ def test_a_429_on_a_free_model_starts_its_cool_down_from_retry_after(monkeypatch
     with patch.object(httpx, "post", return_value=limited):
         resp = lc._call_backend(tier, [{"role": "user", "content": "x"}])
     assert resp.status_code == 429
-    assert lc._opencode_go_free_gate_get().cooling(_FREE)
+    assert availability._opencode_go_free_gate_get().cooling(_FREE)
     assert _FREE not in _chain()
 
 
@@ -492,8 +494,8 @@ def test_the_ceiling_is_released_slot_by_slot_when_a_call_fails(monkeypatch) -> 
 def test_an_empty_answer_from_a_discovered_free_model_is_still_not_a_second_opinion() -> None:
     """The rule in `_empty_answers_agree` is unchanged: a free Go model's empty
     answer never confirms another empty answer (grug#1601 holds the question)."""
-    assert lc._empty_confirms_nothing((Backend.OPENCODE_GO, _FREE))
-    assert not lc._empty_answers_agree(
+    assert review_ladder._empty_confirms_nothing((Backend.OPENCODE_GO, _FREE))
+    assert not review_ladder._empty_answers_agree(
         (Backend.OPENCODE_GO, lc._OPENCODE_GO_MODEL), (Backend.OPENCODE_GO, _FREE), None,
     )
 

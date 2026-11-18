@@ -23,6 +23,7 @@ import httpx
 import llm_client as lc
 import pytest
 from llm_client import Backend
+import provider_wire
 
 
 @pytest.fixture()
@@ -31,12 +32,12 @@ def tracker(monkeypatch):
     emission captured instead of sent."""
     emitted: list[tuple[float, str]] = []
     monkeypatch.setattr(
-        lc,
+        provider_wire,
         "_emit_abandoned_in_flight_gauge",
         lambda count, backend: emitted.append((count, backend)),
     )
-    t = lc._AbandonedCallTracker()
-    monkeypatch.setattr(lc, "_abandoned_calls", t)
+    t = provider_wire._AbandonedCallTracker()
+    monkeypatch.setattr(provider_wire, "_abandoned_calls", t)
     t.emitted = emitted  # type: ignore[attr-defined]
     return t
 
@@ -101,7 +102,7 @@ def test_cancellable_path_wires_abandon_to_tracker(tracker, monkeypatch) -> None
         assert release.wait(10), "background call never released"
         return httpx.Response(200, json={"ok": True})
 
-    monkeypatch.setattr(lc, "_post_with_retries", _blocking_post)
+    monkeypatch.setattr(provider_wire, "_post_with_retries", _blocking_post)
     config = lc.BackendConfig(
         backend=Backend.CAVE,
         url="http://127.0.0.1:9/v1/chat/completions",
@@ -115,7 +116,7 @@ def test_cancellable_path_wires_abandon_to_tracker(tracker, monkeypatch) -> None
 
     def _run() -> None:
         try:
-            lc._post_with_retries_cancellable(config, {}, {}, 1, cancel_event)
+            provider_wire._post_with_retries_cancellable(config, {}, {}, 1, cancel_event)
         except Exception as e:  # noqa: BLE001 - recording, the assert below checks it
             outcome["exc"] = e
 
@@ -140,7 +141,7 @@ def test_cancellable_path_no_abandon_no_metric(tracker, monkeypatch) -> None:
     """No cancellation: the call completes normally and the tracker
     stays silent, exactly like the pre-#638 code path."""
     monkeypatch.setattr(
-        lc,
+        provider_wire,
         "_post_with_retries",
         lambda *args, **kwargs: httpx.Response(200, json={"ok": True}),
     )
@@ -152,7 +153,7 @@ def test_cancellable_path_no_abandon_no_metric(tracker, monkeypatch) -> None:
         timeout_seconds=5.0,
         retry_attempts=1,
     )
-    resp = lc._post_with_retries_cancellable(
+    resp = provider_wire._post_with_retries_cancellable(
         config,
         {},
         {},

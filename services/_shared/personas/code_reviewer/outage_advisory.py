@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 
 import shared_benches
+import model_availability as availability
 
 log = logging.getLogger("grug.code_reviewer.outage_advisory")
 
@@ -252,8 +253,7 @@ def failed_backends(coverage: Any) -> tuple[str, ...]:
             config = lc._BACKEND_CONFIGS.get(backend)  # noqa: SLF001
             if (
                 config is not None
-                and lc._backend_enabled(backend, config.model)  # noqa: SLF001
-                and not lc._provider_available(backend, config.model)  # noqa: SLF001
+                and availability.provider_breaker_open(backend, config.model)
             ):
                 names.append(f"{backend.value} (breaker open)")
     except Exception:  # noqa: BLE001 - naming is best effort

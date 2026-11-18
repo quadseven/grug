@@ -1,6 +1,6 @@
 """Elder's benches and breakers, shared across pods and restarts (#1286).
 
-`llm_client` benches a model after repeated 4xx answers or timeouts, and
+`model_availability` benches a model after repeated 4xx answers or timeouts, and
 opens a breaker on a provider whose key or allowance is spent. That state
 lived in each process, so every other pod, and any pod after a restart,
 gave a known-bad model a fresh start and paid for it with cohort time. This
@@ -48,7 +48,7 @@ EXIT_FLUSH_WAIT_S = 3.0
 # A row outlives its block by this much, so the hourly purge never removes
 # one a reader still needs; readers compare `until` themselves.
 TTL_SLACK_S = 60
-# The kinds llm_client shares: the 4xx bench and the slow bench per
+# The kinds model_availability shares: the 4xx bench and the slow bench per
 # (backend, model), the provider breaker per (backend, pool), and the
 # OpenCode Go usage-limit breaker. "limit" marks a provider hold that came
 # from usage-limit refusals, so a review made during one ends degraded.

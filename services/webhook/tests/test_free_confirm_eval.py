@@ -12,6 +12,8 @@ from elder_eval import free_confirm as fc
 from elder_eval import free_confirm_corpus as corpus
 from elder_eval.runner import diff_to_hunks
 from unittest.mock import patch
+import model_availability as availability
+import review_ladder
 
 CASES = corpus.build_cases()
 
@@ -50,7 +52,7 @@ def test_every_case_is_sized_where_the_relaxation_applies() -> None:
     the 10,000-token limit of the relaxation."""
     for case in CASES:
         chars = sum(len(h.body) for h in diff_to_hunks(corpus.diff_for(case)))
-        assert chars >= lc._DEGENERATE_MIN_DIFF_CHARS, case.case_id
+        assert chars >= review_ladder._DEGENERATE_MIN_DIFF_CHARS, case.case_id
         assert chars <= 10_000 * 4, case.case_id
 
 
@@ -135,9 +137,9 @@ def test_the_report_names_the_date_corpus_and_models() -> None:
 def _go(monkeypatch):
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-key")
     monkeypatch.setattr(lc, "_spark_data_class_header", lambda: "public")
-    monkeypatch.setattr(lc, "_opencode_go_free_catalog", None, raising=False)
-    monkeypatch.setattr(lc, "_opencode_go_free_gate", None, raising=False)
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_free_catalog", None, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_free_gate", None, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
     monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
     monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/test/opencode-go")
     listing = {"object": "list", "data": [{
@@ -146,7 +148,7 @@ def _go(monkeypatch):
         "api": {"chat-completions": {"base_url": "https://example.invalid/v1"}},
     }]}
     monkeypatch.setattr(
-        lc, "_opencode_go_free_models_fetch", lambda: httpx.Response(200, json=listing),
+        availability, "_opencode_go_free_models_fetch", lambda: httpx.Response(200, json=listing),
         raising=False,
     )
 
