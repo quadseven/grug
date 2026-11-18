@@ -1,0 +1,8 @@
+diff --git a/src/api.py b/src/api.py
+--- a/src/api.py
++++ b/src/api.py
+@@ -1,2 +1,2 @@
+-def fetch(record_id, **kwargs):
+-    return {"id": record_id, "tenant": kwargs.get("tenant")}
++def fetch(record_id, *, tenant):
++    return {"id": record_id, "tenant": tenant}

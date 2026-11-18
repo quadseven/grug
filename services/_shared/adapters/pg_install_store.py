@@ -21,7 +21,7 @@ Semantics deliberately preserved from the DDB adapter:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from collections.abc import Mapping
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
@@ -29,6 +29,7 @@ from psycopg.types.json import Jsonb
 
 from adapters import pg_base
 from adapters.pg_base import TTL_LIVE, decode_item, encode_attrs, get_pool
+from ledger import SECOND_LINEAGE_REVIEWER
 from review_types import verdict as _derive_verdict  # leaf import (no cycle)
 
 log = logging.getLogger("grug.adapters.pg_install_store")
@@ -1233,7 +1234,7 @@ def _ledger_sk(finding_class: str, pr: int | None, reviewer: str, digest: str) -
     return f"{finding_class}#{pr_part}#{reviewer}#{digest}"
 
 
-def _ledger_digest(row: dict[str, Any]) -> str:
+def _ledger_digest(row: dict[str, Any], *, preserve_first: bool = False) -> str:
     """Stable 12-hex identity of a finding from its content (finding text +
     timestamp + evidence) - independent of ingest order."""
     import hashlib
@@ -1241,7 +1242,7 @@ def _ledger_digest(row: dict[str, Any]) -> str:
     material = "\x1f".join(
         (
             str(row.get("finding", "")),
-            str(row.get("ts", "")),
+            "" if preserve_first else str(row.get("ts", "")),
             str(row.get("evidence", "")),
         )
     )
@@ -1254,12 +1255,18 @@ def put_ledger_row(row: dict[str, Any]) -> None:
     evidence, ts, commit}). The key is CONTENT-derived, so re-ingesting the
     corpus (even reordered) heals rows in place instead of duplicating."""
     repo = str(row["repo"])
+    # A timestamp dates a second-only finding without changing its key,
+    # including for older rows written with a blank timestamp.
+    preserve_first = (
+        row["reviewer"] == SECOND_LINEAGE_REVIEWER and row["verdict"] == "second-only"
+    )
     with get_pool().connection() as conn:
         conn.execute(
             """
             INSERT INTO grug_kv (pk, sk, data)
             VALUES (%(pk)s, %(sk)s, %(data)s)
             ON CONFLICT (pk, sk) DO UPDATE SET data = %(data)s
+            WHERE NOT %(preserve_first)s
             """,
             {
                 "pk": _ledger_pk(repo),
@@ -1270,9 +1277,10 @@ def put_ledger_row(row: dict[str, Any]) -> None:
                     # same rows parse_row was silently dropping (#764).
                     int(row["pr"]) if row.get("pr") is not None else None,
                     str(row["reviewer"]),
-                    _ledger_digest(row),
+                    _ledger_digest(row, preserve_first=preserve_first),
                 ),
                 "data": encode_attrs(dict(row)),
+                "preserve_first": preserve_first,
             },
         )
 
@@ -1303,6 +1311,38 @@ def list_ledger_rows(
             params,
         ).fetchall()
     return [decode_item(pk, sk, data) for pk, sk, data in rows]
+
+
+def list_second_lineage_rows(start: date, end: date) -> list[dict[str, Any]]:
+    """Read dated second-lineage telemetry across repos in a UTC date range."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT pk, sk, data FROM grug_kv
+            WHERE pk LIKE 'LEDGER#%%' AND {TTL_LIVE}
+              AND data->>'reviewer' = %s
+              AND data->>'ts' >= %s AND data->>'ts' < %s
+            """,
+            (SECOND_LINEAGE_REVIEWER, start.isoformat(), end.isoformat()),
+        ).fetchall()
+    return [decode_item(pk, sk, data) for pk, sk, data in rows]
+
+
+def get_second_lineage_report(week_start: date) -> dict[str, Any] | None:
+    return _get_item("SECOND_LINEAGE_REPORT", week_start.isoformat())
+
+
+def put_second_lineage_report(week_start: date, report: dict[str, Any]) -> bool:
+    """Save the weekly report once and tell the caller whether it won."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data) VALUES ('SECOND_LINEAGE_REPORT', %s, %s)
+            ON CONFLICT DO NOTHING RETURNING pk
+            """,
+            (week_start.isoformat(), Jsonb(report)),
+        ).fetchone()
+    return row is not None
 
 
 def put_repo_practices(repo: str, practices: list[dict[str, Any]]) -> None:

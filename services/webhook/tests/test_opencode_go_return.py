@@ -24,6 +24,7 @@ from review_evidence import assemble_evidence
 _RESERVE = "adapters.pg_rate_limit_store.try_reserve_slot"
 _PAID = "deepseek-v4.1-flash"
 _FREE_GO = "beam-free"
+_NEXT_FREE_GO = "iceman-contributor-free"
 _MANIFESTS = ("consumer-deployment.yaml", "webhook-deployment.yaml", "poller-cronjob.yaml")
 _GO_USAGE_LIMIT = httpx.Response(
     429,
@@ -86,14 +87,32 @@ class _Http:
         return answer
 
 
-def _finding() -> httpx.Response:
+def _finding(model: str = "m") -> httpx.Response:
     content = (
         '{"findings": [{"path": "src/x.py", "line": 1, "rule": "lost-error", '
         '"severity": "high", "message": "bug"}]}'
     )
     return httpx.Response(200, json={
-        "choices": [{"message": {"content": content, "role": "assistant"}}], "model": "m",
+        "choices": [{"message": {"content": content, "role": "assistant"}}], "model": model,
     })
+
+
+@pytest.fixture
+def live_free_models(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
+    monkeypatch.setattr(availability, "_opencode_go_free_catalog", None)
+    monkeypatch.setattr(availability, "_opencode_go_free_gate", None)
+    monkeypatch.setattr(availability, "_opencode_go_free_models_fetch", lambda: httpx.Response(200, json={
+        "data": [
+            {
+                "id": model,
+                "type": "chat",
+                "api": {"chat-completions": {}},
+                "cost": {"text": {"input": {"price": price}, "output": {"price": price}}},
+            }
+            for model, price in ((_FREE_GO, 0), (_NEXT_FREE_GO, 0), (_PAID, 1))
+        ],
+    }))
 
 
 def _review(
@@ -114,6 +133,28 @@ def test_go_serves_the_review_while_the_day_has_room() -> None:
     assert out.backend_used == Backend.OPENCODE_GO
     assert http.models == [_PAID]
     assert counter.used == 1
+
+
+@pytest.mark.usefixtures("live_free_models")
+def test_a_retired_free_model_is_skipped_and_a_live_free_model_serves(monkeypatch, caplog) -> None:
+    retired = "longcat-2.5-preview-free"
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", retired)
+    http = _Http({retired: _finding(retired), _FREE_GO: _finding(_FREE_GO)})
+    with caplog.at_level("INFO"):
+        out = _review(http, _Counter(), _PUBLIC)
+    assert http.models == [_FREE_GO]
+    assert out.model_name == _FREE_GO
+    served = [r.model for r in caplog.records if r.getMessage() == "opencode_go_review_served"]
+    assert served == [_FREE_GO]
+
+
+@pytest.mark.usefixtures("live_free_models")
+def test_paid_go_runs_only_after_all_live_free_tiers_fail() -> None:
+    failure = httpx.Response(503)
+    http = _Http({_FREE_GO: failure, _NEXT_FREE_GO: failure, _PAID: _finding(_PAID)})
+    out = _review(http, _Counter(), _PUBLIC)
+    assert http.models == [_FREE_GO, _NEXT_FREE_GO, _PAID]
+    assert out.model_name == _PAID
 
 
 def test_at_the_daily_cap_no_paid_call_is_made_and_the_free_tier_answers(caplog) -> None:

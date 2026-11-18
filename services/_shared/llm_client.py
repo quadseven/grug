@@ -65,7 +65,7 @@ from provider_wire import _BackendConfigError
 from repo_file_cache import RepoFileCache
 from voice_pack import VoiceSelection, apply_voice
 from review_types import (
-    CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, Severity,
+    CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, EvidenceReference, Severity,
     category_or_default,
 )
 from review_pipeline import (
@@ -99,6 +99,7 @@ from review_ladder import (
     _cave_empty_is_trusted,
     _empty_answers_agree,
     _empty_confirms_nothing,
+    _free_empty_may_confirm,
     _free_tier_found_nothing,
     _gateway_outage_order,
     _is_degenerate_empty_review,
@@ -350,8 +351,8 @@ _OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 # tokens, 0% timeouts, 3-4s median, about $0.0078 per 40k-token review. OpenCode
 # Go limits are monthly dollars per model ($60 on the $10 plan), so that is
 # ~7.7k reviews a month at 40k tokens and ~22k at 10k, against ~3k real ones.
-# Behind it: the free `GRUG_OPENCODE_GO_FALLBACK_MODEL=beam-free` (10s on 33k
-# tokens at low effort, unranked on quality). `mimo-v2.5` is retired (HTTP 410)
+# With discovery on, the configured paid slot follows the free tiers.
+# `mimo-v2.5` is retired (HTTP 410)
 # and `mimo-v2.6-flash` took 34s on 8k tokens and timed out at 70s on 33k
 # (2026-11-01), so `GRUG_OPENCODE_GO_SECOND_MODEL` stays unset. Muse and Iceman
 # Contributor train on prompts: never here, Elder reads private repos.
@@ -752,6 +753,7 @@ class Finding:
     # A duplicate candidate can be independently produced by both models. Keep
     # every source so judge and human feedback train both originating spans.
     origins: tuple[FindingOrigin, ...] = field(default_factory=tuple, compare=False)
+    evidence_ref: EvidenceReference | None = None
 
 
 # grug#1397 backstop for a model that ignores `is_finding`: the candidate's
@@ -1100,21 +1102,6 @@ def _opencode_go_fallback_chain_config() -> "BackendConfig | None":
     return _opencode_go_extra_model_config(model, _CLOUD_CHAIN_TIMEOUT_SECONDS)
 
 
-def _opencode_go_discovered_chain_configs(
-    configured: "list[BackendConfig | None]",
-) -> "list[BackendConfig]":
-    """Chain tiers for the Go models priced zero right now, in list order with
-    the private-safe ones first, skipping any already in the chain, any
-    cooling after a 429, and all of them at the hourly ceiling. Empty when
-    discovery is off, the list is empty or unreachable."""
-    excluded = {c.model for c in configured if c is not None} | {_OPENCODE_GO_MODEL}
-    return [
-        _opencode_go_extra_model_config(model, _CLOUD_CHAIN_TIMEOUT_SECONDS)
-        for model in availability.discover_go_models(excluded)
-    ]
-
-
-
 def _opencode_go_chain_config() -> BackendConfig:
     """opencode Go as the FIRST cloud chain tier (grug#910)."""
     return replace(
@@ -1190,9 +1177,9 @@ def _free_tier_chain_config() -> "BackendConfig | None":
 
 
 def _cloud_chain_tiers() -> list[BackendConfig]:
-    """The ordered cloud chain: opencode Go (skipped while its usage-limit
-    breaker is open), an optional second free Go model, an optional paid Go
-    fallback model, OpenRouter `:free` (only if configured), Poolside
+    """The ordered cloud chain: OpenCode Go (free first with discovery on,
+    with paid tiers skipped while the usage-limit breaker is open),
+    OpenRouter `:free` (only if configured), Poolside
     laguna-s-2.1, then the spark-gateway's free provider pool (grug#1269),
     with the Cave after all of them. Poolside was dropped in
     grug#910 as unfunded; it answers again (2026-09-26) and has the best eval
@@ -1206,8 +1193,9 @@ def _cloud_chain_tiers() -> list[BackendConfig]:
         _opencode_go_fallback_chain_config(),
     ]
     candidates: list["BackendConfig | None"] = [
-        *go_tiers,
-        *_opencode_go_discovered_chain_configs(go_tiers),
+        *availability.go_chain_tiers(
+            go_tiers, lambda model: _opencode_go_extra_model_config(model, _CLOUD_CHAIN_TIMEOUT_SECONDS),
+        ),
         _free_tier_chain_config(),
         _poolside_chain_config(),
         _free_pool_chain_config(),
@@ -1470,6 +1458,15 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                             "category": {"type": "string", "enum": sorted(CATEGORIES - {DEFAULT_CATEGORY})},
                             "outside_diff_reason": {
                                 "type": "string", "maxLength": MAX_FINDING_MESSAGE_CHARS,
+                            },
+                            "evidence_ref": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string", "maxLength": CAVE_MAX_PATH_CHARS},
+                                    "line": {"type": "integer", "minimum": 1},
+                                },
+                                "required": ["path", "line"],
+                                "additionalProperties": False,
                             },
                             "is_finding": {"type": "boolean"},
                         },
@@ -1970,6 +1967,15 @@ def _build_messages(
         learnings=learnings,
         guidelines=guidelines,
     )
+    if evidence.cross_file_contents:
+        system += (
+            "\n\nWhen unchanged cross-file context proves a finding, anchor the "
+            "finding's path and line on the changed diff line. Add one optional "
+            '`"evidence_ref": {"path": "src/caller.py", "line": 42}` field '
+            "using the exact path and original line number from the snippet. "
+            "For caller-not-updated, put the caller or test location in this field. "
+            "Describe the breakage in the message without repeating the citation."
+        )
     # The review prompt is redacted on EVERY backend, Cave included (#438):
     # a PR diff can carry a committed credential, and the Elder reviews code
     # structure, not the literal secret value, so masking does not cost
@@ -1994,6 +2000,18 @@ def _call_backend(
 # Defined with the Cave schema above, which enforces it too (grug#989).
 _MAX_FINDING_MESSAGE_CHARS = MAX_FINDING_MESSAGE_CHARS
 _MAX_SUGGESTION_CHARS = CAVE_MAX_SUGGESTION_CHARS
+
+
+def _coerce_evidence_ref(raw: object) -> EvidenceReference | None:
+    if not isinstance(raw, dict):
+        return None
+    path, line = raw.get("path"), raw.get("line")
+    if (
+        isinstance(path, str) and path and _redact_secrets(path) == path
+        and type(line) is int and line > 0
+    ):
+        return EvidenceReference(path, line)
+    return None
 
 
 def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
@@ -2073,6 +2091,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
         suggestion=suggestion, effort=effort, category=category,
         outside_diff_reason=outside_diff_reason, withdrawn=withdrawn,
+        evidence_ref=_coerce_evidence_ref(raw.get("evidence_ref")),
     ), ""
 
 
@@ -3370,6 +3389,12 @@ def _merge_review_findings(
             severity = finding.severity if incoming_rank > current_rank else current.severity
             preferred = finding if incoming_rank > current_rank else current
             other = current if preferred is finding else finding
+            explanation = (
+                finding
+                if incoming_rank == current_rank
+                and len(finding.message) > len(current.message)
+                else preferred
+            )
             merged[key] = replace(
                 current,
                 # Both sides are out here. A preferred message need not carry
@@ -3379,12 +3404,8 @@ def _merge_review_findings(
                 # Prefer the explanation from the model that assigned the
                 # stronger severity; use length only as a same-severity
                 # tiebreaker so the merged finding keeps the most evidence.
-                message=(
-                    finding.message
-                    if incoming_rank == current_rank
-                    and len(finding.message) > len(current.message)
-                    else preferred.message
-                ),
+                message=explanation.message,
+                evidence_ref=explanation.evidence_ref,
                 suggestion=preferred.suggestion or other.suggestion,
                 effort=preferred.effort or other.effort,
                 category=(
@@ -5669,9 +5690,10 @@ def _try_cloud_primary(
     failure, and on total failure it rides along as `low_confidence`
     (grug#1097)."""
     first_parse_fail: tuple[Backend, str | None, str] | None = None
-    # The first model whose answer was a short empty review. A second,
-    # DIFFERENT model answering empty too is agreement, and ends the chain.
+    # Only a trusted empty can anchor consensus. Keep a qualified free empty
+    # in case a trusted model answers later in the free-first walk.
     first_empty: tuple[Backend, str] | None = held_empty
+    confirming_free: tuple[tuple[Backend, str], _ArmOutcome] | None = None
     first_empty_outcome: _ArmOutcome | None = None
     last_error = ""
     for tier in _cloud_chain_tiers():
@@ -5689,7 +5711,16 @@ def _try_cloud_primary(
                     answer=_cloud_tier_success(outcome, hunks, pr_context),
                 )
             if first_empty is None:
-                first_empty = key
+                if not _empty_confirms_nothing(key):
+                    first_empty = key
+                    if confirming_free and _empty_answers_agree(
+                        key, confirming_free[0], pr_context, walk.diff_chars,
+                    ):
+                        return _CloudPrimaryResult(
+                            answer=_cloud_tier_success(confirming_free[1], hunks, pr_context),
+                        )
+                elif confirming_free is None and _free_empty_may_confirm(key, walk.diff_chars):
+                    confirming_free = (key, outcome)
             if first_empty_outcome is None and held_empty is None:
                 first_empty_outcome = outcome
             continue
@@ -5799,6 +5830,9 @@ def _review_cloud_primary(
         list(evidence.hunks), messages, variant, pr_tags, installation_id,
         pr_context, cancel_event, held_empty, walk=walk,
     )
+    answer = cloud_result.answer
+    if answer is not None and answer.kind == "reviewed" and answer.backend_used == Backend.OPENCODE_GO:
+        log.info("opencode_go_review_served", extra={"model": answer.model_name})
     return replace(cloud_result, low_confidence=low_confidence or cloud_result.low_confidence)
 
 

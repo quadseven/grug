@@ -325,9 +325,9 @@ def _free_tier_found_nothing(tier: BackendConfig, outcome: _ArmOutcome) -> bool:
 
 # grug#1601: the narrow relaxation of the rule above. A free Go model answered
 # empty on a 33k-token diff where the paid primary found faults, so the default
-# stands: a free model's empty answer confirms nothing. On a small cohort, after
-# a paid or ranked model already answered empty, a free model that an eval
-# measured at a false-empty rate of 5 percent or less may be the second opinion.
+# stands: a free model's empty answer confirms nothing. On a small cohort, a
+# free model measured at a false-empty rate of 5 percent or less may confirm
+# an empty answer from a paid or ranked model.
 # Off unless GRUG_OPENCODE_GO_FREE_CONFIRM is set.
 _FREE_CONFIRM_DEFAULT_MAX_TOKENS = 10_000
 _CHARS_PER_TOKEN = 4
@@ -361,8 +361,8 @@ def _free_confirm_allowlist() -> frozenset[str]:
 def _free_empty_may_confirm(current: tuple[Backend, str], diff_chars: int | None) -> bool:
     """May this free model's empty answer count as the second opinion? Only for
     a Go model that is free now, on a small cohort, when it is on the measured
-    allowlist and the flag is on. The caller has already required that the
-    first empty answer came from a paid or ranked model."""
+    allowlist and the flag is on. Consensus also requires an empty answer
+    from a paid or ranked model."""
     backend, model = current
     return (
         _free_confirm_on()

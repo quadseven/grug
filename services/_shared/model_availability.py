@@ -58,7 +58,7 @@ def _record_subscription_call() -> None:
 
 # Free-model discovery. OpenCode Go publishes a price for every model, and the
 # free set changes often, so Elder reads the list (cached, `opencode_go_free`)
-# and tries the models priced exactly zero behind the configured ones. Opt-in:
+# and tries the listed free models before the configured paid ones. Opt-in:
 # nothing is fetched or added unless `GRUG_OPENCODE_GO_FREE_DISCOVERY` is true.
 # Knobs: `_TTL_SECONDS` (cache, default 2700), `_MAX_TIERS` (discovered tiers
 # per walk, default 2), `_HOURLY_CEILING` (calls per hour per pod to all free
@@ -85,20 +85,29 @@ def _opencode_go_free_discovery_on() -> bool:
     return os.getenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "").strip().lower() in ("1", "true", "yes")
 
 
-def discover_go_models(excluded: set[str]) -> list[str]:
-    """Free models with room for another call, with private-safe models first."""
+def go_chain_tiers(
+    configured: list[BackendConfig | None],
+    discovered_config: Callable[[str], BackendConfig],
+) -> list[BackendConfig | None]:
+    """Try configured free tiers, then discovered free tiers, then paid tiers."""
     if not _opencode_go_free_discovery_on():
-        return []
+        return configured
+    free, priced = _opencode_go_free_catalog_get().model_prices()
+    if priced is None or (not free and not priced):
+        return [tier for tier in configured if tier and not _opencode_go_model_is_free(tier.model)]
+    configured_free = [tier for tier in configured if tier and tier.model in free]
+    configured_paid = [tier for tier in configured if tier and tier.model in priced]
     limit = _env_number("GRUG_OPENCODE_GO_FREE_MAX_TIERS", 2, int)
     gate = _opencode_go_free_gate_get()
     if limit <= 0 or gate.ceiling_reached():
-        return []
+        return [*configured_free, *configured_paid]
+    have = {tier.model for tier in configured_free}
     found = [
-        model for model in _opencode_go_free_catalog_get().models()
-        if model not in excluded and not gate.cooling(model)
+        model for model in free if model not in have and not gate.cooling(model)
     ]
     found.sort(key=lambda model: model not in _OPENCODE_GO_PRIVATE_SAFE_MODELS)
-    return found[:limit]
+    discovered = [discovered_config(model) for model in found[:limit]]
+    return [*configured_free, *discovered, *configured_paid]
 
 
 def _opencode_go_free_catalog_get() -> "opencode_go_free.FreeModelCatalog":

@@ -1,0 +1,32 @@
+[
+  {
+    "name": "stale-arguments",
+    "diff": "fetch.diff",
+    "context": {"src/job.py": "stale_job.py.txt"},
+    "expected_class": "correctness"
+  },
+  {
+    "name": "stale-return-test",
+    "diff": "status.diff",
+    "context": {"tests/test_api.py": "stale_status_test.py.txt"},
+    "expected_class": "correctness"
+  },
+  {
+    "name": "missed-second-caller",
+    "diff": "render.diff",
+    "context": {"src/cli.py": "stale_cli.py.txt"},
+    "expected_class": "correctness"
+  },
+  {
+    "name": "correct-arguments",
+    "diff": "fetch.diff",
+    "context": {"src/job.py": "correct_job.py.txt"},
+    "expected_class": null
+  },
+  {
+    "name": "correct-return-test",
+    "diff": "status.diff",
+    "context": {"tests/test_api.py": "correct_status_test.py.txt"},
+    "expected_class": null
+  }
+]

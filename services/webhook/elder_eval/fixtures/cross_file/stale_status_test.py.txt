@@ -1,0 +1,4 @@
+from src.status import status
+
+def test_status():
+    assert status() is True

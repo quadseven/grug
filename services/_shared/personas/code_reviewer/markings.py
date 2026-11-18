@@ -930,12 +930,16 @@ def _inline_comment_body(
     )
     if f.effort:
         chip += f" | {_effort_chip(f.effort)}"
+    evidence = ""
+    if f.evidence_ref is not None:
+        evidence = f"**Evidence:** `{_md_code_span(f.evidence_ref.path)}:{f.evidence_ref.line}`\n\n"
     head = (
         f"{chip}\n\n"
         # grug#1398 publish-time check: a Where the model wrote into the
         # message names the anchor, the same line the footer renders.
         f"**What Elder sees**\n\n"
         f"{_defused(repair_where_refs(f.message, f.file, f.line))}\n\n"
+        f"{evidence}"
         f"**Why it matters**\n\n{_defused(_why_it_matters(f.rule_name))}\n\n"
         f"**Where:** `{_md_code_span(f.file)}:{f.line}`"
     )

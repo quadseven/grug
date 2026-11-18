@@ -333,6 +333,21 @@ def test_each_second_only_blocking_finding_gets_a_ledger_row(monkeypatch):
     run.review()
 
     assert [r["verdict"] for r in run.rows] == ["second-only", "second-lineage-run"]
+    assert run.rows[0]["ts"] == run.rows[1]["ts"]
+
+
+def test_no_incremental_findings_have_no_cost_per_finding():
+    row = parse_row({
+        "repo": "o/r", "pr": 1, "reviewer": "elder-second-lineage",
+        "class": "second-lineage", "finding": "run", "verdict": "single-lineage",
+        "model_calls": 1,
+    })
+    assert row is not None
+
+    report = second_lineage_yield([row])
+
+    assert report["model_calls"] == 1
+    assert report["calls_per_finding"] is None
 
 
 def test_ledger_reports_yield_and_cost_per_incremental_finding():

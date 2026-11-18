@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import delivery_replay
+from adapters import install_store
 from adapters.install_store import (  # type: ignore
     list_allowlisted_installs,
     list_comment_nudge_repos,
@@ -42,10 +43,12 @@ from adapters.install_store import (  # type: ignore
 import httpx
 from github_app_auth import TokenPurpose, with_install_token_retry
 from github_budget import NONURGENT_FRACTION, budget_is_low
+from ledger import parse_row, second_lineage_yield
 from observability import configure_logging
 from personas.code_reviewer.dispatch import deliver_pending_publication
 from personas.code_reviewer.living_review import sync_due_prs
 from personas.code_reviewer.publish_retry import retry_due_publications
+from personas.code_reviewer.quarantine import second_lineage_enabled
 from personas.code_reviewer.reaction_cadence import reaction_poll_due, tick_due
 from personas.code_reviewer.reactions import poll_and_annotate
 
@@ -192,6 +195,30 @@ _LOW_BUDGET_FRACTION = NONURGENT_FRACTION
 
 def _now_epoch() -> float:
     return time.time()
+
+
+def _report_second_lineage() -> None:
+    if not second_lineage_enabled():
+        return
+    today = datetime.fromtimestamp(_now_epoch(), timezone.utc).date()
+    end = today - timedelta(days=today.weekday())
+    start = end - timedelta(weeks=1)
+    try:
+        if install_store.get_second_lineage_report(start) is not None:
+            return
+        raw_rows = install_store.list_second_lineage_rows(end - timedelta(weeks=4), end)
+        rows = [row for raw in raw_rows if (row := parse_row(raw)) is not None]
+        weekly = second_lineage_yield([row for row in rows if row.ts >= start.isoformat()])
+        report = {
+            "week_start": start.isoformat(),
+            "week_end": end.isoformat(),
+            "weekly": weekly,
+            "trailing_four_weeks": second_lineage_yield(rows),
+        }
+        if install_store.put_second_lineage_report(start, report):
+            log.info("elder_second_lineage_weekly", extra=report)
+    except Exception as e:  # noqa: BLE001 - retry the report on the next poll
+        log.warning("elder_second_lineage_report_failed", extra={"kind": type(e).__name__})
 
 
 def _deep_publish_retry_pass() -> tuple[int, int]:
@@ -556,6 +583,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, int | str]:
     installs = list_allowlisted_installs()
     if os.getenv("GRUG_POLLER_SMOKE", "").strip() not in ("", "0"):
         return _smoke_check(installs)
+    _report_second_lineage()
     polled_records, submitted, failed_installs = _reaction_poll_pass(installs)
     # Scheduled reports wait while the budget is low. The passes that repair
     # reviews and checks, and ruleset detection, run on every installation.
