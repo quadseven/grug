@@ -9,11 +9,10 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import httpx
-
+import pytest
 from personas.code_reviewer import cross_file
 from personas.code_reviewer.diff_parser import parse_diff
 from review_evidence import assemble_evidence
-
 
 _DIFF_CHANGED_SIG = """diff --git a/src/api.py b/src/api.py
 --- a/src/api.py
@@ -68,6 +67,96 @@ def test_extract_symbols_ignores_builtins_and_caps():
 
 def test_extract_symbols_empty_diff():
     assert cross_file.extract_symbols(()) == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "hunk", "expected"),
+    [
+        (
+            "src/users.ts",
+            """@@ -1 +1 @@
+-export function loadUser(id: string) { return id; }
++export function loadUser(id: string) { return String(readUser(id)); }
+""",
+            ("loadUser", "readUser"),
+        ),
+        (
+            "src/users.js",
+            """@@ -1 +1,5 @@
++const loadUser = async (id) => fetchUser(id);
+ class Users {
++  async saveUser(id) {
++    if (id) storeUser(id);
++  }
+""",
+            ("loadUser", "saveUser", "fetchUser", "storeUser"),
+        ),
+        (
+            "src/users.go",
+            """@@ -1 +1,2 @@
+-func (s *Store) Load() []User { return s.users }
++func (s *Store) Load(limit int) []User {
++    return append(s.users, readUser(limit))
+""",
+            ("Load", "readUser"),
+        ),
+        (
+            "src/users.cpp",
+            """@@ -10,2 +10,2 @@ int Store::count() const {
+-    return 1;
++    return getCount();
+ }
+""",
+            ("count", "getCount"),
+        ),
+        (
+            "src/users.c",
+            """@@ -1,4 +1,4 @@
+ int count_users(void)
+ {
+-    return 0;
++    return printf("%d", count_records());
+ }
+""",
+            ("count_users", "count_records"),
+        ),
+        (
+            "src/users.rb",
+            """@@ -1,2 +1,2 @@
+ def load_user(id)
+-  puts("Previous message")
++  read_user(id)
+""",
+            (),
+        ),
+    ],
+    ids=("typescript", "javascript", "go", "cpp", "c", "unsupported"),
+)
+def test_extract_symbols_uses_the_changed_files_language(path, hunk, expected):
+    diff = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n{hunk}"
+    assert cross_file.extract_symbols(parse_diff(diff)) == expected
+
+
+def test_extract_symbols_finds_typescript_method_outside_the_diff():
+    diff = """diff --git a/src/users.ts b/src/users.ts
+--- a/src/users.ts
++++ b/src/users.ts
+@@ -4 +4 @@
+-      return 0;
++      return readUser();
+"""
+    content = """class Users {
+  private countUsers(): number {
+    if (ready) {
+      return readUser();
+    }
+  }
+}
+"""
+    hunks = parse_diff(diff)
+    assert cross_file.extract_symbols(hunks, {"src/users.ts": content}) == (
+        "countUsers", "readUser",
+    )
 
 
 def _search_response(paths):
