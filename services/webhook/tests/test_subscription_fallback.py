@@ -460,7 +460,7 @@ def test_the_lane_bearer_comes_from_ssm_when_a_path_is_set(monkeypatch) -> None:
     assert provider_wire._merged_headers(cfg, cfg.key_loader())["Authorization"] == "Bearer lane-token"
 
 
-def test_the_author_family_reaches_the_lane_only_inside_a_gated_walk(monkeypatch) -> None:
+def test_the_author_family_header_is_sent_only_when_a_family_is_given(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
     cfg = lc._subscription_fallback_config()
     assert "X-Review-Author-Family" not in provider_wire._merged_headers(cfg, "k")
