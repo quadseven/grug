@@ -1571,7 +1571,9 @@ def build_review_result(
     # grug#1749: a low or medium finding that only asks the author to verify,
     # ensure or confirm, with no failing input or wrong line, stays in the
     # check summary with no inline comment.
-    new_findings = tuple(f for f in new_findings if not is_summary_only(f))
+    new_findings = tuple(
+        f for f in new_findings if not is_summary_only(f.message, f.severity)
+    )
     if repo_config is not None:
         # `.grug.yaml` min_inline_severity: lower findings stay in the check
         # summary (built from the full evaluation) but get no inline comment.
