@@ -198,6 +198,29 @@ model leaving a weaker one in the chain: search `llm_model_benched`); failures
 across every model right after a deploy point at a prompt or parser
 regression.
 
+### Elder: "Grug cannot read this pull request: 403 from GitHub"
+
+Elder logs `elder_pr_read_forbidden` when GitHub denies its initial
+`GET /repos/<owner>/<repo>/pulls/<n>` after one token refresh. The event includes
+`install_id`, `repo`, `pr`, `head_sha`, `status`, and `github_request_id`.
+The job ends as `pr_read_forbidden` without calling a model. When the job
+has a queued head, Elder posts a failing check on that commit. If that
+check fails to publish, the queue retries the job. Jobs without a queued
+head record the denial in the log.
+
+The original incident's specific cause is unconfirmed. Ask the owner of
+the installation identified by `install_id` to open its GitHub App
+configuration, confirm the affected repository is selected, and accept any
+pending **Pull requests** permission grant. See [App permissions](app-permissions.md).
+
+If the settings already grant access, reproduce the same GET from the
+consumer's network using `get_install_token(install_id, force_refresh=True)`
+with the default review purpose. Record the response status, GitHub request
+ID, and `X-Accepted-GitHub-Permissions` header in the private incident record.
+Use those details to check the token grant and the organization's IP policy
+with the installation owner. After the GET returns 200, comment
+`/grug improve` on the affected PR.
+
 ## Missed-delivery replay (#407)
 
 The DoR/TPM check runs inline on the webhook. GitHub does not automatically

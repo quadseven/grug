@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+from functools import partial
 from urllib.parse import quote as _q
 
 import httpx  # type: ignore
@@ -352,7 +353,7 @@ def _wake_elder(
     succeed, so a failed enqueue leaves the PR exactly as it was."""
     if enqueue is None:
         from rerun import enqueue_rerun  # type: ignore
-        enqueue = enqueue_rerun
+        enqueue = partial(enqueue_rerun, requested_head_sha=head_sha)
     coords = {"install_id": install_id, "repo": f"{owner}/{repo}", "pr_number": pr_number}
     if defer_until:
         return _defer_elder_review(
@@ -416,7 +417,9 @@ def _run_persona_rerun(
     persona = "code_reviewer" if verb == "improve" else "smasher"
     if enqueue is None:
         from rerun import enqueue_rerun  # type: ignore
-        enqueue = enqueue_rerun
+        enqueue = partial(
+            enqueue_rerun, requested_head_sha=head_sha if verb == "improve" else "",
+        )
     repo_full = f"{owner}/{repo}"
     elder_state = "idle"
     # The command comment rides the job, so the consumer can swap the eyes

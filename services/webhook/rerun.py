@@ -34,7 +34,7 @@ import boto3
 import httpx
 
 from adapters.install_store import get_repo_config, is_elder_paused  # type: ignore
-from github_app_auth import get_app_id, with_install_token_retry
+from github_app_auth import get_app_id, is_github_permission_denied, with_install_token_retry
 from github_budget import count_review_calls
 from check_run_reconciler import _STUCK_IN_PROGRESS_MAX_AGE_MINUTES
 from github_checks_client import (
@@ -72,6 +72,7 @@ from personas.smasher.dispatch import dispatch_smasher_review
 from personas.walkthrough.dispatch import dispatch_walkthrough_review
 from personas.tribe import CHECK_ELDER, acceptable_check_names
 from rerun_personas import (
+    CODE_REVIEWER as _CODE_REVIEWER,
     GUARD as _GUARD,
     RERUNNABLE as _RERUNNABLE,
     SMASHER as _SMASHER,
@@ -135,6 +136,7 @@ def enqueue_rerun(
     comment_id: int = 0,
     queued_at: float = 0.0,
     hold_started_at: float = 0.0,
+    requested_head_sha: str = "",
 ) -> None:
     """Send a `RerunJob` to `grug-rerun-jobs` (the webhook-side producer used by
     Elder self-recovery, #418). Same job shape + FIFO dedup as the api producer:
@@ -177,6 +179,7 @@ def enqueue_rerun(
         comment_id=comment_id,
         queued_at=float(queued_at or _now()) if comment_id else 0.0,
         hold_started_at=hold_started_at,
+        requested_head_sha=requested_head_sha,
     )
     _sqs.send_message(QueueUrl=_RERUN_QUEUE_URL, **encoded.message_kwargs())
     log.info(
@@ -920,12 +923,22 @@ def _run_one(
     # Fetch the PR's CURRENT head (+ the repo id, for RepoConfig). A 5xx/
     # RequestError raises -> ESM retry -> DLQ. with_install_token_retry refreshes
     # a stale token once.
-    pr = with_install_token_retry(
-        install_id,
-        lambda tok: _gh_get(
-            tok, f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}/pulls/{pr_number}"
-        ),
-    )
+    try:
+        pr = _fetch_current_pr(install_id, owner, repo_name, pr_number)
+    except httpx.HTTPStatusError as error:
+        if persona not in _CODE_REVIEWER:
+            raise
+        head_sha = str(job.get("requested_head_sha") or "")
+        if not _complete_forbidden_pr_read(
+            error, install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number, head_sha=head_sha,
+        ):
+            raise
+        _settle_command_reaction(
+            job, install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number, done=False,
+        )
+        return decide_review(job, None).status
     repo_id = int(pr["base"]["repo"]["id"])
 
     payload = _review_payload(
@@ -1147,13 +1160,14 @@ def _deferred_rerun_status(
 
 def _command_fields(job: dict[str, Any]) -> dict[str, Any]:
     """The command identity a requeued copy of `job` must keep (grug#1430):
-    the same comment, the same `queued_at`, the same hold start."""
+    the same comment, queued time, hold start, and last known head."""
     if not job.get("comment_id"):
         return {}
     return {
         "comment_id": int(job["comment_id"]),
         "queued_at": float(job.get("queued_at", 0) or 0),
         "hold_started_at": float(job.get("hold_started_at", 0) or 0),
+        "requested_head_sha": str(job.get("requested_head_sha") or ""),
     }
 
 
@@ -1380,6 +1394,7 @@ def _command_queue_status(
         return "rerun_hold_cap_reached"
     fields = _command_fields(job)
     fields["hold_started_at"] = hold_started
+    fields["requested_head_sha"] = head_sha
     enqueue_rerun(
         install_id=install_id, repo=repo_full, pr_number=pr_number,
         persona=str(job.get("persona", "elder")),
@@ -1493,16 +1508,58 @@ def _dispatch_elder_rerun(
         )
 
 
+def _current_pr_url(owner: str, repo_name: str, pr_number: int) -> str:
+    return f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}/pulls/{pr_number}"
+
+
 def _fetch_current_pr(
     install_id: int, owner: str, repo_name: str, pr_number: int,
 ) -> dict[str, Any]:
     return with_install_token_retry(
         install_id,
-        lambda tok: _gh_get(
-            tok,
-            f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo_name, safe='')}/pulls/{pr_number}",
-        ),
+        lambda tok: _gh_get(tok, _current_pr_url(owner, repo_name, pr_number)),
     )
+
+
+def _complete_forbidden_pr_read(
+    error: httpx.HTTPStatusError, *, install_id: int, owner: str,
+    repo_name: str, pr_number: int, head_sha: str,
+) -> bool:
+    """Complete an Elder job whose PR read was denied by GitHub."""
+    if (
+        not is_github_permission_denied(error.response)
+        or error.request.method != "GET"
+        or error.request.url != _current_pr_url(owner, repo_name, pr_number)
+    ):
+        return False
+    log.error(
+        "elder_pr_read_forbidden",
+        extra={
+            "install_id": install_id,
+            "repo": f"{owner}/{repo_name}",
+            "pr": pr_number,
+            "status": 403,
+            "head_sha": head_sha[:8],
+            "github_request_id": error.response.headers.get("X-GitHub-Request-Id", ""),
+        },
+    )
+    posted = _complete_elder_check_open(
+        install_id=install_id,
+        owner=owner,
+        repo_name=repo_name,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        title="Grug cannot read this pull request: 403 from GitHub",
+        summary=(
+            "GitHub denied Elder's pull request read with HTTP 403. "
+            "Confirm the GitHub App installation can access the repository "
+            "and has Pull requests permission before re-running Elder."
+        ),
+        conclusion="failure",
+    )
+    if not posted:
+        raise RuntimeError("Elder 403 check completion did not land") from error
+    return True
 
 
 def _fetch_pr_if_changed(
@@ -1964,36 +2021,12 @@ def _run_hot_review(
     try:
         before = _fetch_current_pr(install_id, owner, repo_name, pr_number)
     except httpx.HTTPStatusError as error:
-        if error.response.status_code != 403:
+        if not _complete_forbidden_pr_read(
+            error, install_id=install_id, owner=owner, repo_name=repo_name,
+            pr_number=pr_number, head_sha=str(job.get("requested_head_sha") or ""),
+        ):
             raise
         forbidden = decide_review(job, None)
-        queued_head_sha = str(job.get("requested_head_sha") or "")
-        log.error(
-            "elder_pr_read_forbidden",
-            extra={
-                "install_id": install_id,
-                "repo": repo_full,
-                "pr": pr_number,
-                "status": 403,
-                "head_sha": queued_head_sha[:8],
-            },
-        )
-        posted = _complete_elder_check_open(
-            install_id=install_id,
-            owner=owner,
-            repo_name=repo_name,
-            pr_number=pr_number,
-            head_sha=queued_head_sha,
-            title="Grug cannot read this pull request: 403 from GitHub",
-            summary=(
-                "GitHub denied Elder's pull request read with HTTP 403. "
-                "Review the GitHub App installation's repository access, "
-                "token permissions, and repository rules before re-running Elder."
-            ),
-            conclusion="failure",
-        )
-        if not posted:
-            raise RuntimeError("Elder 403 check completion did not land") from error
         return _review_step(forbidden.step, forbidden.status, **where)
     head_sha = str((before.get("head") or {}).get("sha") or "")
     if not head_sha:
@@ -2377,7 +2410,7 @@ def handle_rerun_jobs(event: dict[str, Any]) -> dict[str, int]:
             1 for status in statuses
             if status in {
                 "skipped_persona", "duplicate_snapshot", "stale_snapshot",
-                "draft_skipped", "pr_ineligible", "superseded_at_entry",
+                "draft_skipped", "pr_ineligible", "pr_read_forbidden", "superseded_at_entry",
                 "intent_drift_exhausted", "replay_already_reviewed",
                 "replay_review_posted", "rejected_invalid",
             }
