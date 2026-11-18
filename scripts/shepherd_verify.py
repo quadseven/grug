@@ -16,6 +16,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -201,16 +202,30 @@ def _baselines(raw: list[str]) -> dict[str, str]:
     return baselines
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Verify stated PR claims after deploy")
-    body = parser.add_mutually_exclusive_group(required=True)
-    body.add_argument("--body-file", help="PR body file")
-    body.add_argument("--pr", type=int, help="PR number to fetch with gh")
-    parser.add_argument("--repo", help="OWNER/NAME for --pr")
+def _verify_with_command(body: str, deploy_epoch: int, args: argparse.Namespace) -> Verdict:
+    criteria = {
+        (claim.source, claim.target): claim.criterion for claim in parse_observables(body)
+    }
+
+    def query(source: str, signal: str) -> int:
+        return int(_run([
+            *args.query_command,
+            source,
+            signal,
+            str(deploy_epoch),
+            str(int(time.time())),
+            criteria.get((source, signal), ""),
+        ]))
+
+    return verify_claims(
+        body, query, baselines=_baselines(args.baseline),
+        attempts=args.attempts, retry_seconds=args.retry_seconds,
+    )
+
+
+def _query_options(parser: argparse.ArgumentParser, *, required: bool) -> None:
     parser.add_argument(
-        "--query-command",
-        nargs="+",
-        required=True,
+        "--query-command", nargs="+", required=required,
         help="command prefix; called with source, signal, start, end, criterion",
     )
     parser.add_argument(
@@ -218,6 +233,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--attempts", type=int, default=2)
     parser.add_argument("--retry-seconds", type=float, default=30)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Verify stated PR claims after deploy")
+    body = parser.add_mutually_exclusive_group(required=True)
+    body.add_argument("--body-file", help="PR body file")
+    body.add_argument("--pr", type=int, help="PR number to fetch with gh")
+    parser.add_argument("--repo", help="OWNER/NAME for --pr")
+    _query_options(parser, required=True)
     parser.add_argument(
         "--since-epoch",
         type=int,
@@ -230,36 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.since_epoch < 0 or args.since_epoch > time.time():
         parser.error("--since-epoch must be a past Unix timestamp")
     try:
-        pr_body = _body(args)
-        baselines = _baselines(args.baseline)
-        criteria = {
-            (claim.source, claim.target): claim.criterion
-            for claim in parse_observables(pr_body)
-        }
-
-        def query(source: str, signal: str) -> int:
-            raw = _run(
-                [
-                    *args.query_command,
-                    source,
-                    signal,
-                    str(args.since_epoch),
-                    str(int(time.time())),
-                    criteria.get((source, signal), ""),
-                ]
-            )
-            count = int(raw)
-            if count < 0:
-                raise ValueError("query count must not be negative")
-            return count
-
-        verdict = verify_claims(
-            pr_body,
-            query,
-            baselines=baselines,
-            attempts=args.attempts,
-            retry_seconds=args.retry_seconds,
-        )
+        verdict = _verify_with_command(_body(args), args.since_epoch, args)
     except (
         OSError,
         ValueError,
@@ -271,6 +266,132 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     print(f"{verdict.status}: {verdict.evidence}")
     return {"observed": 0, "missing": 1, "unverifiable": 2}[verdict.status]
+
+
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _timestamp(value: str) -> float:
+    if not isinstance(value, str):
+        raise TypeError("missing timestamp")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp has no time zone")
+    return parsed.timestamp()
+
+
+def _rollout(workload: dict) -> tuple[float | None, str]:
+    generation = workload["metadata"]["generation"]
+    status = workload.get("status", {})
+    observed = status.get("observedGeneration")
+    desired = workload["spec"].get("replicas", 1)
+    total = status.get("replicas", 0)
+    updated = status.get("updatedReplicas", 0)
+    available = status.get("availableReplicas", 0)
+    evidence = (
+        f"generation {observed}/{generation}, replicas "
+        f"{updated} updated, {available} available, {total} total, {desired} desired"
+    )
+    if observed == generation and desired > 0 and desired == total == updated == available:
+        for condition in status.get("conditions", []):
+            if (
+                condition["type"] == "Progressing"
+                and condition["status"] == "True"
+                and condition["reason"] == "NewReplicaSetAvailable"
+            ):
+                finished = condition["lastUpdateTime"]
+                return _timestamp(finished), f"{evidence}, rollout completed at {finished}"
+    return None, evidence
+
+
+def _report_deploy(args: argparse.Namespace, pr: int) -> int:
+    evidence = f"https://github.com/{args.repo}/pull/{pr}"
+    stage = "merge"
+    try:
+        pr_data = json.loads(_run([
+            "gh", "pr", "view", str(pr), "-R", args.repo, "--json",
+            "state,mergeCommit,mergedAt,body",
+        ]))
+        if pr_data["state"] != "MERGED":
+            print(f"{evidence}: unfinished; PR state is {pr_data['state']}")
+            return 1
+        merge = pr_data["mergeCommit"]["oid"]
+        if not re.fullmatch(r"[0-9a-f]{40}", merge):
+            raise ValueError("invalid merge SHA")
+        merged_at = _timestamp(pr_data["mergedAt"])
+
+        stage = "artifact"
+        tag = f"{args.image}:{merge}"
+        evidence += f"; registry manifest {tag}"
+        digest = _run([
+            "docker", "buildx", "imagetools", "inspect", "--format",
+            "{{.Manifest.Digest}}", tag,
+        ])
+        if not _DIGEST.fullmatch(digest):
+            raise ValueError("missing or invalid manifest digest")
+        expected = f"{args.image}@{digest}"
+        evidence += f" built at {digest}"
+
+        stage = "deployment"
+        evidence += f"; deployment {args.namespace}/{args.deployment} container {args.container}"
+        deployment_command = [
+            "kubectl", "--namespace", args.namespace, "get", "deployment",
+            args.deployment, "-o", "json",
+        ]
+        workload = json.loads(_run(deployment_command))
+        containers = workload["spec"]["template"]["spec"]["containers"]
+        pin = next((c["image"] for c in containers if c["name"] == args.container), "")
+        evidence += f" references {pin or '(no image)'}"
+        image, _, pinned_digest = pin.partition("@")
+        if not _DIGEST.fullmatch(pinned_digest):
+            print(f"{evidence}; unfinished, unverified deployment pin")
+            return 2
+        if re.sub(r":[^/:]+$", "", image) != args.image or pinned_digest != digest:
+            print(f"{evidence}; unfinished, merged-but-not-deployed (expected {expected})")
+            return 1
+
+        deployed_at, rollout_evidence = _rollout(workload)
+        evidence += f"; {rollout_evidence}"
+        if deployed_at is None or not merged_at <= deployed_at <= time.time():
+            print(f"{evidence}; unfinished, post-merge rollout unverified")
+            return 2
+        body = pr_data["body"] or ""
+        if not parse_observables(body):
+            print(f"{evidence}; deployed; acceptance criteria name no observable")
+            return 0
+        stage = "acceptance"
+        if not args.query_command:
+            print(f"{evidence}; unfinished, acceptance unverified; supply --query-command")
+            return 2
+        verdict = _verify_with_command(body, int(deployed_at), args)
+        stage = "deployment recheck"
+        latest = json.loads(_run(deployment_command))["metadata"]
+        original = workload["metadata"]
+        if (latest["uid"], latest["generation"]) != (original["uid"], original["generation"]):
+            print(
+                f"{evidence}; unfinished, deployment changed during acceptance checks "
+                f"(now generation {latest['generation']})"
+            )
+            return 2
+        status = "verified" if verdict.status == "observed" else "unfinished"
+        print(f"{evidence}; {status}, acceptance {verdict.status}\n{verdict.evidence}")
+        return {"observed": 0, "missing": 1, "unverifiable": 2}[verdict.status]
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, KeyError, TypeError, ValueError):
+        print(f"{evidence}; unfinished, {stage} evidence unavailable")
+        return 2
+
+
+def deploy_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Verify merged PRs against a live deployment")
+    parser.add_argument("--repo", required=True, help="GitHub repository OWNER/NAME")
+    parser.add_argument("--pr", type=int, action="append", required=True)
+    parser.add_argument("--image", required=True, help="registry image repository without a tag")
+    parser.add_argument("--namespace", required=True)
+    parser.add_argument("--deployment", required=True)
+    parser.add_argument("--container", required=True)
+    _query_options(parser, required=False)
+    args = parser.parse_args(argv)
+    return max(_report_deploy(args, pr) for pr in args.pr)
 
 
 if __name__ == "__main__":

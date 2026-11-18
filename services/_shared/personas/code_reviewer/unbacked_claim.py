@@ -11,19 +11,19 @@ boxes and Elder read them as context, so each claim stood.
 One medium `unbacked-claim` finding per PR, naming every such box: a box
 the body ticks (`- [x]`) whose criterion is a live, host or measurement
 check, when the box cites no number, link or command output and the body
-carries no run link or fenced output block. A box about tests is skipped:
-the diff itself can back it. Medium, not high: a ticked box can be true,
-and the evidence may sit where this check does not look (a comment, the
-ticket), so the finding flags the claim without blocking the PR.
+carries no run link or fenced output block. An operational behavior box
+can also be backed by a matching test in the diff. Medium, not high: a
+ticked box can be true, and the evidence may sit where this check does not
+look (a comment, the ticket), so the finding flags it without blocking the PR.
 
 The box text is split at the first " -- " or " - " the lane added after
 the criterion: the part before is what is claimed, the part after is the
 evidence offered. When the box repeats an in-scope linked criterion, the
 finding names it by issue and number.
 
-Bounded: one pass over the body's lines, each ticked box compared with at
-most `MAX_CRITERIA` criteria. Past `MAX_BODY_CHARS`, `MAX_BOXES` or
-`MAX_CRITERIA` the check is not evaluated (no finding).
+Bounded: one pass over the body's lines and the added test lines, each
+ticked box compared with at most `MAX_CRITERIA` criteria. Past
+`MAX_BODY_CHARS`, `MAX_BOXES` or `MAX_CRITERIA` the check is not evaluated.
 
 Pure: PR body, in-scope criteria and parsed hunks in; findings out.
 """
@@ -36,7 +36,7 @@ from personas.code_reviewer.criteria_coverage import (
     LinkedCriterion,
     is_future_post_merge_observation,
 )
-from personas.code_reviewer.diff_parser import DiffHunk
+from personas.code_reviewer.diff_parser import DiffHunk, added_lines
 from personas.code_reviewer.persona import Finding
 from personas.code_reviewer.test_paths import is_test_file
 
@@ -47,17 +47,30 @@ MAX_BOXES = 200
 MAX_CRITERIA = 200
 
 _TICKED_RE = re.compile(r"^\s*[-*+]\s+\[[xX]\]\s+(\S.*)$")
-# A check only a run against a live system can satisfy.
+_OBSERVE = r"\b(?:check(?:ed)?|confirm(?:ed)?|verif(?:y|ied)|observ(?:e|ed)|measur(?:e|ed|ements?)|record(?:ed)?)\b"
+_DEPLOYED = (
+    r"(?<![\w-])(?:post[- ]deploy(?:ment)?|after (?:the )?deploy(?:ment)?|"
+    r"(?:deployed|running|live) (?:service|system|environment)|"
+    r"(?:on|from) (?:the )?dashboard|(?:production|live) dashboard)\b(?!-)"
+)
+# Observations of the running system, including a recorded live check outcome.
 _LIVE_CLAIM_RE = re.compile(
-    r"\blive[- ](?:verif\w*|traffic|runs?|round[- ]trips?|checks?|proof|sync|capture"
-    r"|servers?|hosts?|devices?|handsets?|cluster|system|store|deploy\w*|environment)\b"
-    r"|\bverified live\b|\bverif(?:y|ied) (?:on|against) (?:a |an |the )?"
-    r"(?:live|real|running|production|deployed)\b|^\s*verify\b"
+    r"^\s*live\s*:"
+    r"|(?<![\w-])live[- ](?:verification|checks?|runs?) (?:outcomes?|results?|output)\b"
+    r"|\bverified live\b|\b(?:on|against) (?:a |an |the )?"
+    r"(?:live|real|running|production|deployed) (?:\w+[- ])?"
+    r"(?:services?|systems?|servers?|hosts?|devices?|clusters?|environments?)\b"
     r"|\bin production\b|\bon (?:the |each |both |every |all )?"
     r"(?:hosts?|servers?|handsets?|phones?|routers?|cluster)\b"
     r"|\bmeasured (?:live|on|in production|over|across)\b|\bmeasured\s+\w+\s+traffic\b"
-    r"|\breal (?:traffic|requests?|devices?|handsets?|phones?|servers?|hosts?)\b"
-    r"|\bservice account\b|\bquota\b|\bkubectl\b|\bssh\b",
+    rf"|{_OBSERVE}[^.;]{{0,100}}{_DEPLOYED}|{_DEPLOYED}[^.;]{{0,100}}{_OBSERVE}",
+    re.IGNORECASE,
+)
+# Admission and access checks can be run or exercised by tests of the policy.
+_OPERATIONAL_CHECK_RE = re.compile(
+    r"^\s*(?:verify|check|confirm)\b[^.;]{0,80}"
+    r"(?:\bservice account is (?:allowed|denied)\b[^.;]{0,100}\bin\b[^.;]{0,60}\bnamespaces?\b"
+    r"|\bpod is rejected\b[^.;]{0,80}\bquota\b)",
     re.IGNORECASE,
 )
 _TEST_RE = re.compile(
@@ -73,6 +86,7 @@ _LINK_RE = re.compile(r"https?://")
 _RUN_LINK_RE = re.compile(r"https?://\S+/(?:actions/)?runs?/\d+")
 _FENCE_RE = re.compile(r"^\s*(?:```|~~~)", re.MULTILINE)
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_TEST_FILLER = frozenset({"a", "an", "the", "is", "are", "with", "that", "verify", "check", "confirm"})
 
 
 def _words(text: str) -> list[str]:
@@ -140,7 +154,9 @@ def _ticked_boxes(body: str, criteria: tuple[LinkedCriterion, ...]) -> list[str]
     return ticked
 
 
-def _unbacked_name(text: str, known: list[_Known]) -> str | None:
+def _unbacked_name(
+    text: str, known: list[_Known], test_words: list[set[str]],
+) -> str | None:
     """How the finding names this box when it claims an unbacked live
     check, else None."""
     match = _criterion_for(text, known)
@@ -149,8 +165,13 @@ def _unbacked_name(text: str, known: list[_Known]) -> str | None:
     # A CI run after the merge cannot have happened yet: no evidence backs
     # a tick on it before the merge (#1509).
     if not is_future_post_merge_observation(claim):
-        if not _LIVE_CLAIM_RE.search(claim) or _TEST_RE.search(claim):
-            return None
+        prose = _CODE_SPAN_RE.sub(" ", claim)
+        if not _LIVE_CLAIM_RE.search(prose):
+            if not _OPERATIONAL_CHECK_RE.search(prose) or _TEST_RE.search(prose):
+                return None
+            words = set(_words(claim)) - _TEST_FILLER
+            if any(words <= added for added in test_words):
+                return None
         if _backed(evidence) or (criterion is None and _backed(claim)):
             return None
     label = f"#{criterion.issue} criterion {criterion.number}: " if criterion else ""
@@ -185,10 +206,15 @@ def scan_unbacked_claims(
 ) -> tuple[Finding, ...]:
     """One medium finding naming every unbacked live box the body ticks."""
     ticked = _ticked_boxes(pr_body or "", criteria)
-    if ticked is None:
+    if not ticked:
         return ()
     known = [(c, _words(c.text)) for c in criteria]
-    names = (_unbacked_name(text, known) for text in ticked)
+    test_words = [
+        {word for _, line in added_lines(hunk) if _TEST_RE.search(line) for word in _words(line)}
+        for hunk in hunks
+        if is_test_file(hunk.file_path)
+    ]
+    names = (_unbacked_name(text, known, test_words) for text in ticked)
     # dict.fromkeys keeps the first occurrence of each name, in order.
     unbacked = list(dict.fromkeys(n for n in names if n is not None))
     if not unbacked:
