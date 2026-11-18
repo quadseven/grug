@@ -129,7 +129,18 @@ def test_degraded_says_so_rather_than_claiming_clear():
     """A degraded pass must never render as 'Trail clear' - that is grug
     asserting an all-clear it did not actually establish."""
     h = board.render_header("#4", 0, 0, degraded=True)
-    assert "cloudy" in h and "Trail clear" not in h
+    assert "could not review" in h and "Trail clear" not in h
+
+
+def test_the_blackout_verdict_is_the_checks_voice():
+    """#818: the board verdict and the check say "no review happened" in the
+    same words, and both say an operator was alerted."""
+    from personas.code_reviewer.degraded_gate import COULD_NOT_REVIEW_VERDICT
+
+    h = board.render_header("#4", 0, 0, degraded=True)
+    assert COULD_NOT_REVIEW_VERDICT in h
+    assert "operator has been alerted" in h.lower()
+    assert "cloudy" not in h and "read for self" not in h
 
 
 def test_partial_coverage_does_not_claim_clear():
@@ -141,13 +152,13 @@ def test_partial_coverage_does_not_claim_clear():
 
 
 def test_partial_coverage_is_not_the_blackout_message():
-    """'Grug eyes cloudy - read for self' means Elder saw NOTHING. Using it
+    """'Grug could not review this pass' means Elder saw NOTHING. Using it
     for a pass that reviewed most cohorts and published real findings tells
     the author to ignore work that was actually done."""
     partial = board.render_header("#8", 0, 0, partial=True)
     blackout = board.render_header("#8", 0, 0, degraded=True)
-    assert "cloudy" in blackout
-    assert "cloudy" not in partial
+    assert "could not review" in blackout
+    assert "could not review" not in partial
     assert partial != blackout
 
 
@@ -161,7 +172,7 @@ def test_blocking_findings_outrank_partial_coverage():
 
 def test_total_blackout_still_outranks_partial():
     h = board.render_header("#10", 0, 0, degraded=True, partial=True)
-    assert "cloudy" in h
+    assert "could not review" in h
 
 
 def test_header_is_replaced_not_duplicated_across_passes():

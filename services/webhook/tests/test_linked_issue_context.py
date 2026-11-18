@@ -27,6 +27,7 @@ from personas.code_reviewer.lane_work import lane_work_findings
 from personas.code_reviewer.linked_issue import (
     build_linked_issue_context,
     extract_criteria,
+    is_live_criterion,
     linked_issue_numbers,
     render_linked_issue_block,
 )
@@ -213,6 +214,38 @@ def test_build_renders_fetched_criteria():
     out = build_linked_issue_context("Closes #904", fetch_issue=lambda n: ISSUE)
     assert out is not None
     assert "#904 criterion 1 [open]: First criterion about caching" in out
+
+
+def test_live_proof_criterion_is_left_out_of_block():
+    issue = "## Acceptance criteria\n\n- [ ] Live proof (left to the brain): on the next 10 lane PRs\n- [ ] Ordinary behavior works"
+    out = build_linked_issue_context("Refs #904", fetch_issue=lambda _n: issue)
+    assert out is not None
+    assert "Ordinary behavior works" in out
+    assert "Live proof" not in out
+
+
+@pytest.mark.parametrize("text", [
+    "Live:", "Live proof:", "Live proof (left to the brain):", "live (operator):",
+    "  **Live:** check after deploy", "_Live proof:_ check after deploy",
+])
+def test_is_live_criterion_matches_post_deploy_prefixes(text):
+    assert is_live_criterion(text)
+
+
+@pytest.mark.parametrize("text", ["Liveness probe returns 200", "The live log shows X"])
+def test_is_live_criterion_rejects_unrelated_live_text(text):
+    assert not is_live_criterion(text)
+
+
+def test_live_criteria_count_is_reported_separately_from_rendered_block():
+    counts = []
+    issue = "## Acceptance criteria\n\n- [ ] Live: verify later\n- [ ] Ordinary behavior works"
+    out = build_linked_issue_context(
+        "Refs #904", fetch_issue=lambda _n: issue, live_criteria_count=counts,
+    )
+    assert counts == [1]
+    assert out is not None and "Ordinary behavior works" in out
+    assert "criterion 1 [open]: Live:" not in out
 
 
 def test_build_degrades_to_none_on_fetch_failure_and_logs_kind(caplog):

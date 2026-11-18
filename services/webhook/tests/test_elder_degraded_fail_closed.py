@@ -331,7 +331,9 @@ def _patch_claims(monkeypatch):
         )
 
 
-def _run_terminal(monkeypatch, *, degraded_reason: str, blocking: bool) -> list:
+def _run_terminal(
+    monkeypatch, *, degraded_reason: str, blocking: bool, receive_count: int = 0,
+) -> list:
     import rerun
 
     pr = _pr_data()
@@ -364,8 +366,46 @@ def _run_terminal(monkeypatch, *, degraded_reason: str, blocking: bool) -> list:
             "degraded_reason": degraded_reason,
         }),
     )
-    rerun._run_one(_job())
+    rerun._run_one(_job(), receive_count=receive_count)
     return posted
+
+
+@pytest.mark.parametrize(
+    "reason", ["freshness_check_failed", "something_nobody_modelled"],
+)
+def test_rerun_fail_open_speaks_the_one_voice_and_pages(monkeypatch, caplog, reason):
+    """#818: the durable lane's terminal check says what every other no-review
+    surface says, and the operator page it promises is logged before it."""
+    from personas.code_reviewer.degraded_gate import could_not_review_title
+
+    with caplog.at_level("ERROR"):
+        posted = _run_terminal(monkeypatch, degraded_reason=reason, blocking=False)
+
+    assert [p.title for p in posted] == [could_not_review_title(reason)]
+    assert "an operator has been alerted" in posted[0].summary
+    pages = [r for r in caplog.records if r.getMessage() == "elder_could_not_review"]
+    assert [(r.reason, r.surface) for r in pages] == [(reason, "fail_open")]
+
+
+@pytest.mark.parametrize("receive_count", [1, 2, 3])
+def test_a_github_brownout_is_retried_before_it_fails_open(monkeypatch, receive_count):
+    """#818: a freshness re-fetch that GitHub refused is transient. While the
+    queue still has a re-run scheduled the job raises for it and posts
+    nothing; only the last scheduled delivery fails open."""
+    with pytest.raises(RuntimeError, match="freshness_check_failed"):
+        _run_terminal(
+            monkeypatch, degraded_reason="freshness_check_failed",
+            blocking=True, receive_count=receive_count,
+        )
+
+
+def test_a_github_brownout_fails_open_on_the_last_scheduled_delivery(monkeypatch):
+    posted = _run_terminal(
+        monkeypatch, degraded_reason="freshness_check_failed",
+        blocking=True, receive_count=4,
+    )
+
+    assert [p.conclusion for p in posted] == ["failure"]
 
 
 @pytest.mark.parametrize(

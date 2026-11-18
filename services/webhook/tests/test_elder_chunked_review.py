@@ -158,7 +158,7 @@ def test_retry_moves_to_the_next_model_and_the_title_names_every_failure() -> No
 
     evaluation = evaluate_diff((), out)
     title, summary = cr_dispatch._summary_markdown(evaluation, review_phase="tier1")
-    assert title.startswith("WARN Grug eyes clouded (parse_failed: tried ")
+    assert title.startswith("Grug could not review this pass (parse_failed: tried ")
     assert f"{coder} (parse_failed)" in title
     assert f"{reasoner} (ReadTimeout)" in title
     assert f"{lc._POOLSIDE_MODEL} (http_503)" in title
@@ -243,8 +243,8 @@ def test_the_title_caps_how_many_models_it_names() -> None:
     )
     title, _summary = cr_dispatch._summary_markdown(evaluation, review_phase="tier1")
     assert title == (
-        "WARN Grug eyes clouded (all_failed: tried m0 (http_429), m1 (http_429), "
-        "m2 (http_429), m3 (http_429) (+2 more))"
+        "Grug could not review this pass (all_failed: tried m0 (http_429), "
+        "m1 (http_429), m2 (http_429), m3 (http_429) (+2 more)) - operator alerted"
     )
 
 

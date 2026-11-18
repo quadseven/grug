@@ -284,12 +284,28 @@ def _finding(path: str, line: int, problems: list[str]) -> Finding:
     )
 
 
+# The most paths one fetch call takes: fetch_file_contents raises
+# ContextFilesTruncated above its 20-file context cap, and one raise used to
+# mark every lock in the PR unread (infra PR 7173 changed 25).
+FETCH_BATCH = 20
+
+
+def _fetch_all(
+    paths: tuple[str, ...], fetch: Callable[[tuple[str, ...], str], dict[str, str]],
+    ref: str,
+) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for i in range(0, len(paths), FETCH_BATCH):
+        out.update(fetch(paths[i:i + FETCH_BATCH], ref))
+    return out
+
+
 def _fetch_both(
     paths: tuple[str, ...], fetch: Callable[[tuple[str, ...], str], dict[str, str]],
     head_sha: str, base_sha: str,
 ) -> tuple[dict[str, str], dict[str, str]] | None:
     try:
-        return fetch(paths, head_sha), fetch(paths, base_sha)
+        return _fetch_all(paths, fetch, head_sha), _fetch_all(paths, fetch, base_sha)
     except Exception:  # noqa: BLE001 - an unread lock is a finding, never a pass
         return None
 

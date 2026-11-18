@@ -32,11 +32,19 @@ from personas.review_publish import LOW_CONFIDENCE
 # queue redelivers it. A partial or low-confidence review with nothing
 # blocking in it rides the same bound: dispatch leaves it pending and marks
 # the result `rerun_scheduled`, which raises below. Deliveries below this
-# number leave a blocking repo's Elder check pending; from this one on the
-# failure is published, so a long provider outage still ends in a red check
-# instead of waiting forever. The queue's own dead-letter limit stays the
-# outer bound.
-ALL_FAILED_AUTO_RERUN_DELIVERIES = 3
+# number leave the Elder check pending; from this one on the failure is
+# published, so a long provider outage still ends in a terminal check
+# instead of waiting forever.
+#
+# grug#818: the bound is the queue's own, not a guess below it. The review
+# queue's dead-letter limit is `REVIEW_QUEUE_MAX_RECEIVES` deliveries
+# (`maxReceiveCount` in infra/pulumi/__main__.py, pinned by a test), and the
+# terminal publish takes the last-but-one, so every retry the queue grants
+# runs before any surface says Grug did not review, and one delivery is
+# still left for a consumer killed mid-publish (grug#515). It was 3, which
+# published "could not review" with two retries still to come.
+REVIEW_QUEUE_MAX_RECEIVES = 5
+ALL_FAILED_AUTO_RERUN_DELIVERIES = REVIEW_QUEUE_MAX_RECEIVES - 1
 
 # Skip reasons where a retry can plausibly succeed (model backend outage,
 # unparseable model output, transient diff-fetch error). These raise for SQS
@@ -50,9 +58,15 @@ ALL_FAILED_AUTO_RERUN_DELIVERIES = 3
 # grew a member here only, that promise would silently become a lie.
 RETRYABLE_SKIP_REASONS = RETRIED_DEGRADATIONS
 
+# grug#818: skips that are transient but whose job used to fail open on the
+# first delivery. A GitHub brownout while re-checking freshness clears on its
+# own, so while the queue still has a re-run scheduled it redrives like the
+# reasons above; only the last scheduled delivery fails open.
+RETRIED_FAIL_OPEN_REASONS = frozenset({"freshness_check_failed"})
+
 # Skips that ALREADY published their own terminal check, so the fail-open net
-# must leave them alone. Re-posting a generic "Elder skipped - <reason>" over
-# one of these replaces real content with strictly less.
+# must leave them alone. Re-posting the generic fail-open "could not review"
+# check over one of these replaces real content with strictly less.
 #
 # `partial_review` belongs here and was missing: it publishes a full check
 # naming which cohorts completed, yet fell through to the "unknown skip"
@@ -147,17 +161,25 @@ class ReviewResult:
     rerun_scheduled: bool = False
 
     @classmethod
-    def from_dispatch(cls, result: Mapping[str, Any]) -> ReviewResult:
+    def from_dispatch(
+        cls, result: Mapping[str, Any], *, rerun_ahead: bool = False,
+    ) -> ReviewResult:
+        """`rerun_ahead` is `rerun_pending(delivery_count)`: with a re-run
+        still scheduled, a `RETRIED_FAIL_OPEN_REASONS` skip counts as
+        `rerun_scheduled` even though dispatch did not mark it."""
+        reason = str(result.get("degraded_reason", "") or "")
         return cls(
             result=result.get("result"),
-            degraded_reason=str(result.get("degraded_reason", "") or ""),
-            rerun_scheduled=bool(result.get("rerun_scheduled")),
+            degraded_reason=reason,
+            rerun_scheduled=bool(result.get("rerun_scheduled")) or (
+                rerun_ahead and reason in RETRIED_FAIL_OPEN_REASONS
+            ),
         )
 
 
 def rerun_pending(delivery_count: int) -> bool:
     """True while a failed review still has a queue re-run ahead of it, so
-    dispatch leaves a blocking repo's check pending instead of failing it."""
+    dispatch leaves the check pending instead of completing it degraded."""
     return 1 <= delivery_count < ALL_FAILED_AUTO_RERUN_DELIVERIES
 
 
@@ -246,16 +268,18 @@ def _after_review(
         return Decision(NextStep.REDRIVE, "Elder review publication failed")
     # `review_rejected` (#770) completes like pass/fail: GitHub's 4xx on the
     # inline review is deterministic, and the check already landed.
+    if status == "skipped" and review.rerun_scheduled:
+        # grug#1494: the queue's re-run is the bounded lane; the last
+        # delivery publishes the degraded failure and completes. Checked
+        # before the freshness fail-open (grug#818), so a GitHub brownout
+        # is retried before it closes the check.
+        return Decision(
+            NextStep.REDRIVE, f"Elder review degraded: {reason}; re-run scheduled",
+        )
     if status == "skipped" and reason == "freshness_check_failed":
         return Decision(NextStep.FAIL_OPEN, "fail_open_freshness")
     if status == "skipped" and reason in RETRYABLE_SKIP_REASONS:
         return Decision(NextStep.REDRIVE, f"Elder review degraded: {reason}")
-    if status == "skipped" and review.rerun_scheduled:
-        # grug#1494: the queue's re-run is the bounded lane; the last
-        # delivery publishes the degraded failure and completes.
-        return Decision(
-            NextStep.REDRIVE, f"Elder review degraded: {reason}; re-run scheduled",
-        )
     if status == "skipped" and reason not in SELF_COMPLETING_SKIP_REASONS:
         # An unknown skip completes the check rather than redrive forever.
         return Decision(NextStep.FAIL_OPEN, f"fail_open_{reason or 'skipped'}")

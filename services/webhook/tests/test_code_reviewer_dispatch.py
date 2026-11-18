@@ -451,6 +451,14 @@ def test_intent_paragraph_is_first_and_sensitive_is_explicit():
     assert "acceptance criteria were checked" in paragraph
 
 
+def test_linked_issue_summary_reports_live_criteria_left_for_after_deploy():
+    note = cr_dispatch._linked_issue_summary_note(
+        "### LINKED ISSUE ACCEPTANCE CRITERIA\n#904 criterion 1 [open]: ordinary",
+        live_count=2,
+    )
+    assert "#904 (1 criteria; 2 live criteria left for after deploy)." in note
+
+
 def test_pr_labels_normalises_and_skips_malformed():
     """#1174: label parsing lifted out of dispatch_code_review."""
     pr = {"labels": [{"name": " Class:Sensitive "}, "bare-string", {"name": None}]}
@@ -2332,8 +2340,8 @@ def test_review_stack_degraded_empty_findings_not_nothing_to_remediate():
     )
     stack = cr_dispatch._review_stack_body(ev, conclusion="neutral")
     assert "nothing to remediate" not in stack.lower()
-    assert "review degraded" in stack.lower()
-    assert "no usable findings" in stack.lower()
+    assert "could not review this pass (`all_failed`)" in stack.lower()
+    assert "nothing here is a verdict on the code" in stack.lower()
 
 
 def test_partial_review_stays_advisory_but_publishes_validated_findings():
@@ -2480,7 +2488,7 @@ def test_board_speaks_partial_coverage_not_blackout():
     stack = cr_dispatch._review_stack_body(ev, conclusion="neutral")
 
     assert "cloudy" not in stack
-    assert "could not see" not in stack
+    assert "could not review" not in stack
     assert "Partial coverage" in stack
     assert "not walked" in stack
 
@@ -2519,8 +2527,8 @@ def test_board_still_speaks_blackout_for_a_real_outage():
 
     stack = cr_dispatch._review_stack_body(ev, conclusion="neutral")
 
-    assert "cloudy" in stack
-    assert "could not see" in stack
+    assert "could not review" in stack
+    assert "operator has been alerted" in stack
 
 
 def test_summary_markdown_appends_bounded_consolidated_agent_prompt():
@@ -3398,19 +3406,18 @@ def test_no_diff_is_not_an_alarm():
                                degraded_reason="no_diff")
     assert not cr_dispatch.worth_an_email(nod)
     body = cr_dispatch._review_stack_body(nod, conclusion="neutral", pr_title="t")
-    assert "cloudy" not in body and "Trail clear" in body
-    assert "Review degraded" not in body
+    assert "could not review" not in body and "Trail clear" in body
 
     # A REAL degradation must still alarm and still mail - the fix must not
     # silence the case where silence gets read as approval. Uses a TERMINAL
     # reason: a retried one is not the last word, so it no longer mails
-    # (see worth_an_email / infra#2157). The BODY still says "cloudy" for any
+    # (see worth_an_email). The BODY still says "could not review" for any
     # blackout, retried or not - that surface is an edit, not an email.
     bad = CodeReviewEvaluation(findings=(), conclusion="neutral",
                                degraded_reason="degraded_no_backend")
     assert cr_dispatch.worth_an_email(bad)
     body = cr_dispatch._review_stack_body(bad, conclusion="neutral", pr_title="t")
-    assert "cloudy" in body and "Review degraded" in body
+    assert body.count("Grug could not review this pass") == 2  # verdict + body
 
     retried = CodeReviewEvaluation(findings=(), conclusion="neutral",
                                    degraded_reason="all_failed")
@@ -3579,7 +3586,7 @@ def test_degraded_review_does_not_claim_clear():
     ev = CodeReviewEvaluation(findings=(), conclusion="neutral",
                               degraded_reason="all_failed")
     body = cr_dispatch._review_stack_body(ev, conclusion="neutral")
-    assert "Trail clear" not in body and "cloudy" in body
+    assert "Trail clear" not in body and "could not review" in body
 
 
 # --- infra#2157: do not mail a verdict a retry is about to overwrite --------
