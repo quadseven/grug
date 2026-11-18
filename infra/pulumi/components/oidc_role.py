@@ -138,29 +138,40 @@ def create(
                 "Version": "2012-10-17",
                 "Statement": [
                     {
-                        # IAM: READ ONLY (#1625). The deploy role may refresh the
-                        # stack's own principals (role/grug-* and user/grug-*)
-                        # but never write IAM. The former lifecycle grant
-                        # (Create/Put/Update/Tag on those principals, plus
-                        # CreateAccessKey) let any job that assumes this role
-                        # mint a grug-* user with a `*:*` inline policy and an
-                        # access key, or PutRolePolicy on ITSELF: account admin
-                        # either way. The boundary that now holds: a change to
-                        # grug-gha-deploy or grug-cave-connector (their trust,
-                        # inline policies or tags) is applied by the operator
-                        # with admin credentials (`pulumi up` locally), never by
-                        # CI. A CI deploy whose diff touches them fails with
-                        # AccessDenied on purpose. The access key for
-                        # grug-cave-connector was always minted out of band.
+                        # IAM lifecycle for the stack's OWN principals only.
+                        # Replaces the former `iam:*` on `*`, which was
+                        # privilege-escalation-complete (CreateAccessKey /
+                        # AttachUserPolicy / CreateRole on ANY principal ->
+                        # self-grant admin). Scoped to role/grug-* + user/grug-*.
                         "Effect": "Allow",
                         "Action": [
-                            "iam:GetRole", "iam:GetRolePolicy",
+                            "iam:CreateRole", "iam:GetRole", "iam:DeleteRole",
+                            "iam:UpdateRole", "iam:UpdateAssumeRolePolicy",
+                            "iam:TagRole", "iam:UntagRole",
                             "iam:ListRolePolicies", "iam:ListAttachedRolePolicies",
-                            "iam:ListInstanceProfilesForRole", "iam:ListRoleTags",
-                            "iam:GetUser", "iam:GetUserPolicy",
+                            # grug#952: AWS's DeleteRole internally calls this
+                            # before it will delete a role, even with nothing
+                            # attached - missing it 403s the delete outright,
+                            # which failed `pulumi up` on every single push
+                            # once grug-gha-leak-guard was removed from source
+                            # (page-tier CI-dead alert, 2026-09-12).
+                            "iam:ListInstanceProfilesForRole",
+                            "iam:ListRoleTags",
+                            "iam:PutRolePolicy", "iam:GetRolePolicy",
+                            "iam:DeleteRolePolicy",
+                            "iam:CreateUser", "iam:GetUser", "iam:DeleteUser",
+                            "iam:TagUser", "iam:UntagUser",
                             "iam:ListUserPolicies", "iam:ListAttachedUserPolicies",
-                            "iam:ListUserTags", "iam:ListAccessKeys",
-                            "iam:ListGroupsForUser",
+                            "iam:ListUserTags",
+                            "iam:PutUserPolicy", "iam:GetUserPolicy",
+                            "iam:DeleteUserPolicy",
+                            "iam:CreateAccessKey", "iam:DeleteAccessKey",
+                            "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed",
+                            # #389 teardown: the AWS provider lists (and
+                            # would remove) group memberships before
+                            # DeleteUser - the retirement up died here,
+                            # the audit-6 serial-denial class.
+                            "iam:ListGroupsForUser", "iam:RemoveUserFromGroup",
                         ],
                         "Resource": [
                             "arn:aws:iam::*:role/grug-*",
@@ -263,8 +274,9 @@ def create(
                         # creds, but the SCOPED deploy role 403'd on
                         # sqs:CreateQueue at apply time (deploy run 27137871238 —
                         # an apply-time auth check preview can't see). Scoped to
-                        # grug-* queues, not "*". (The connector user + its
-                        # policy are operator-applied since #1625.)
+                        # grug-* queues, not "*". (lambda:* above already covers
+                        # the event-source mapping; iam:* covers the connector
+                        # user + policy.)
                         "Effect": "Allow",
                         "Action": "sqs:*",
                         "Resource": "arn:aws:sqs:*:*:grug-*",
