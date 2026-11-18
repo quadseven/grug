@@ -1,0 +1,42 @@
+diff --git a/docs/usage.md b/docs/usage.md
+index 0a0a0a0..1b1b1b1 100644
+--- a/docs/usage.md
++++ b/docs/usage.md
+@@ -3,3 +3,4 @@ Usage
+ Call `slugify(title)` to build a URL slug.
+ 
+ Slugs are lower case.
++Repeated separators collapse to one dash.
+diff --git a/src/text/slug.py b/src/text/slug.py
+index 2c2c2c2..3d3d3d3 100644
+--- a/src/text/slug.py
++++ b/src/text/slug.py
+@@ -1,6 +1,8 @@
+ import re
+ 
++_SEPARATORS = re.compile(r"[^a-z0-9]+")
++
+ 
+ def slugify(title):
+-    return title.lower().replace(" ", "-")
++    return _SEPARATORS.sub("-", title.lower()).strip("-")
+@@ -20,3 +22,7 @@ def is_slug(value):
+     if not value:
+         return False
+     return value == slugify(value)
++
++
++def slug_length(title):
++    return len(slugify(title))
+diff --git a/tests/test_slug.py b/tests/test_slug.py
+index 4e4e4e4..5f5f5f5 100644
+--- a/tests/test_slug.py
++++ b/tests/test_slug.py
+@@ -5,3 +5,7 @@ from text.slug import slugify
+ 
+ def test_lower_case():
+     assert slugify("Hello World") == "hello-world"
++
++
++def test_collapses_separators():
++    assert slugify("a  --  b") == "a-b"
