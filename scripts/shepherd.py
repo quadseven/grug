@@ -1,14 +1,8 @@
 """shepherd.py
 
-This module implements the Shepherd functionality to verify that a merged PR
-actually deployed, and to escalate a broken chain once, naming the stage that
-broke.
-
-It is intentionally minimal for the current exercise but should be
-expanded to interact with the registry and the k8s deployments.
-
-The CLI reports a digest mismatch as merged-but-not-deployed and missing
-reference evidence as unverified.
+Shepherd reports PR readiness and verifies deployments. The pr-deploy command
+uses the merged PR, registry manifest, and live Kubernetes deployment to
+establish whether post-deploy acceptance checks can run.
 
 Escalation (T832): a chain is a sequence of named stages, each checked by a
 stage check returning a StageVerdict. The first broken stage is reported
@@ -37,7 +31,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 DEFAULT_STATE_PATH = os.environ.get("GRUG_SHEPHERD_STATE", ".shepherd-state.json")
@@ -120,7 +114,7 @@ def save_chain_state(path: str, state: ChainState) -> None:
         json.dump(data, fh)
 
 
-def load_ready_tracker(path: str = DEFAULT_STATE_PATH) -> dict[int, float]:
+def load_ready_tracker(path: str = DEFAULT_STATE_PATH) -> dict[str, float]:
     """Load PR ready timestamps from state so ready duration persists across runs."""
     try:
         with open(path) as fh:
@@ -135,13 +129,13 @@ def load_ready_tracker(path: str = DEFAULT_STATE_PATH) -> dict[int, float]:
     tracker = {}
     for k, v in raw.items():
         try:
-            tracker[int(k)] = float(v)
+            tracker[k] = float(v)
         except (ValueError, TypeError):
             continue
     return tracker
 
 
-def save_ready_tracker(path: str, tracker: dict[int, float]) -> None:
+def save_ready_tracker(path: str, tracker: dict[str, float]) -> None:
     """Persist PR ready timestamps so time-since-ready is tracked monotonically."""
     data = {}
     try:
@@ -151,7 +145,7 @@ def save_ready_tracker(path: str, tracker: dict[int, float]) -> None:
                 data = existing
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         data = {}
-    data["pr_ready_since"] = {str(k): float(v) for k, v in tracker.items()}
+    data["pr_ready_since"] = tracker
     with open(path, "w") as fh:
         json.dump(data, fh)
 
@@ -294,6 +288,11 @@ def main(service: str = "webhook", *args: str) -> int:
     When called with 'pr-queue' (or flags), reports the PR queue across CI and
     bot surfaces. Takes no action on any PR -- reports only.
     """
+    if service == "pr-deploy":
+        from shepherd_verify import deploy_main
+
+        return deploy_main(list(args))
+
     if service == "pr-queue" or service.startswith("--"):
         import argparse
 
@@ -310,10 +309,14 @@ def main(service: str = "webhook", *args: str) -> int:
         )
         cli_args = [service] + list(args) if service != "pr-queue" else list(args)
         parsed_args = parser.parse_args(cli_args)
-        report = report_shepherd_pr_queue(
-            repo=parsed_args.repo,
-            state_path=parsed_args.state_path,
-        )
+        try:
+            report = report_shepherd_pr_queue(
+                repo=parsed_args.repo,
+                state_path=parsed_args.state_path,
+            )
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, KeyError, TypeError):
+            print(f"UNVERIFIED: open PR queue unavailable for {parsed_args.repo}", file=sys.stderr)
+            return 2
         print(report)
         return 0
 
@@ -353,7 +356,7 @@ Runner = Callable[[list[str]], str]
 
 def _subprocess_runner(argv: list[str]) -> str:
     """Execute a command and return stdout. Raises RuntimeError on failure."""
-    proc = subprocess.run(argv, capture_output=True, text=True, check=False)
+    proc = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=30)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or f"{argv[0]} exited {proc.returncode}")
     return proc.stdout
@@ -362,13 +365,11 @@ def _subprocess_runner(argv: list[str]) -> str:
 def _normalize_check_status(status: str) -> str:
     """Normalize raw check status/conclusion into passed, failed, or pending."""
     s = (status or "").lower()
-    if s in ("success", "pass", "passed"):
+    if s in ("success", "pass", "passed", "neutral", "skipped"):
         return "passed"
     if s in ("failure", "failed", "error", "cancelled", "timed_out", "action_required"):
         return "failed"
-    if s in ("pending", "in_progress", "queued", "waiting", "requested"):
-        return "pending"
-    return "pending" if not s else s
+    return "pending"
 
 
 def _parse_iso_epoch(ts: str | None) -> float | None:
@@ -409,6 +410,7 @@ class BotFinding:
     bot_name: str
     message: str = ""
     created_at: float | None = None
+    url: str = ""
 
 
 @dataclass(frozen=True)
@@ -466,6 +468,10 @@ class PRState:
     checks: tuple[CICheck, ...] = ()
     bot_surfaces: BotSurfaces = BotSurfaces()
     ready_since: float | None = None
+    url: str = ""
+    head_sha: str = ""
+    unavailable: tuple[str, ...] = ()
+    draft: bool = False
 
     @property
     def ci_status(self) -> str:
@@ -496,7 +502,7 @@ class PRState:
     @property
     def is_ready(self) -> bool:
         """True only when simultaneously CI green and bot clean."""
-        return self.is_ci_green and self.is_bot_clean
+        return self.is_ci_green and self.is_bot_clean and not self.unavailable and not self.draft
 
     def time_since_ready(self, now: float) -> float | None:
         """Duration in seconds since the PR became ready, or None if not ready."""
@@ -554,7 +560,9 @@ def _summarize_pr_state(pr: PRState, duration: float | None) -> str:
             f"(CI: {check_count}/{check_count} passed, bot surfaces clean)"
         )
 
-    reasons = []
+    reasons = [f"{source} unavailable" for source in pr.unavailable]
+    if pr.draft:
+        reasons.append("draft")
     if pr.ci_status == "empty":
         reasons.append("CI empty rollup (no checks reported yet)")
     elif pr.ci_status == "failed":
@@ -567,6 +575,8 @@ def _summarize_pr_state(pr: PRState, duration: float | None) -> str:
             if c.status == "pending"
         ]
         reasons.append(f"CI pending: {', '.join(pending_desc)}")
+    else:
+        reasons.append("CI passed")
 
     if not pr.bot_surfaces.is_clean:
         findings_parts = []
@@ -587,6 +597,10 @@ def _summarize_pr_state(pr: PRState, duration: float | None) -> str:
                 f"{len(pr.bot_surfaces.issue_comments)} issue comment(s)"
             )
         reasons.append(f"bot findings: {', '.join(findings_parts)}")
+        reasons.extend(
+            f"{finding.surface}: {finding.url or finding.identifier} ({finding.bot_name})"
+            for finding in pr.bot_surfaces.all_findings
+        )
 
     return "; ".join(reasons)
 
@@ -614,7 +628,10 @@ def build_pr_queue(
             time_since_ready=dur,
             ci_status=pr.ci_status,
             findings_count=pr.bot_surfaces.total_findings,
-            summary=_summarize_pr_state(pr, dur),
+            summary="; ".join(filter(None, (
+                _summarize_pr_state(pr, dur),
+                f"{pr.url} (head {pr.head_sha})" if pr.url else "",
+            ))),
         )
         if pr.is_ready:
             ready_items.append(item)
@@ -671,27 +688,11 @@ def update_ready_tracker(
             else:
                 ready_since = now
                 tracker[pr.pr_number] = now
-            updated.append(
-                PRState(
-                    pr_number=pr.pr_number,
-                    title=pr.title,
-                    checks=pr.checks,
-                    bot_surfaces=pr.bot_surfaces,
-                    ready_since=ready_since,
-                )
-            )
+            updated.append(replace(pr, ready_since=ready_since))
         else:
             if pr.pr_number in tracker:
                 del tracker[pr.pr_number]
-            updated.append(
-                PRState(
-                    pr_number=pr.pr_number,
-                    title=pr.title,
-                    checks=pr.checks,
-                    bot_surfaces=pr.bot_surfaces,
-                    ready_since=None,
-                )
-            )
+            updated.append(replace(pr, ready_since=None))
     return updated
 
 
@@ -709,7 +710,7 @@ def parse_ci_checks(
         conclusion_raw = str(item.get("conclusion") or "")
 
         if status_raw == "completed":
-            effective_status = conclusion_raw or "success"
+            effective_status = conclusion_raw
         else:
             effective_status = "pending"
 
@@ -735,40 +736,54 @@ def parse_ci_checks(
     return checks
 
 
-def _find_thread_bot_author_and_msg(comments_nodes: list[dict]) -> tuple[str, str]:
-    for c in comments_nodes:
-        author_login = ((c.get("author") or {}).get("login") or "").lower()
-        if author_login.endswith("[bot]") or author_login.startswith("grug-"):
-            return author_login, str(c.get("body") or "")
-    return "bot", ""
-
-
 def _parse_unresolved_threads(threads_data: list[dict]) -> list[BotFinding]:
     unresolved_threads: list[BotFinding] = []
     for t in threads_data:
-        if not t.get("isResolved"):
-            t_id = str(t.get("id") or "")
-            comments_nodes = (t.get("comments") or {}).get("nodes") or []
-            bot_name, msg = _find_thread_bot_author_and_msg(comments_nodes)
-            unresolved_threads.append(BotFinding("review_thread", t_id, bot_name, msg))
+        comments = (t.get("comments") or {}).get("nodes") or []
+        if t.get("isResolved") or not comments:
+            continue
+        root = comments[0]
+        author = root.get("author") or {}
+        if _is_bot_account(author):
+            unresolved_threads.append(BotFinding(
+                "review_thread", str(t.get("id") or ""), author.get("login") or "bot",
+                root.get("body") or "", url=root.get("url") or "",
+            ))
     return unresolved_threads
 
 
 def _is_bot_account(user: dict) -> bool:
     login = (user.get("login") or "").lower()
-    return user.get("type") == "Bot" or login.endswith("[bot]")
+    return user.get("type", user.get("__typename")) == "Bot" or login.endswith("[bot]")
 
 
-def _parse_unanswered_reviews(reviews_data: list[dict]) -> list[BotFinding]:
+def _linked_reply(item: dict, comments: list[dict]) -> bool:
+    url = item.get("html_url")
+    return bool(url) and any(
+        comment.get("user")
+        and not _is_bot_account(comment["user"])
+        and url in (comment.get("body") or "")
+        for comment in comments
+    )
+
+
+def _parse_unanswered_reviews(
+    reviews_data: list[dict], issue_comments: list[dict],
+) -> list[BotFinding]:
     unanswered_reviews: list[BotFinding] = []
     for r in reviews_data:
         u = r.get("user") or {}
         body = (r.get("body") or "").strip()
         state = (r.get("state") or "").upper()
-        if _is_bot_account(u) and body and state != "APPROVED":
+        if (
+            _is_bot_account(u) and body and state not in {"APPROVED", "DISMISSED"}
+            and not _linked_reply(r, issue_comments)
+        ):
             r_id = str(r.get("id") or "")
             u_login = (u.get("login") or "").lower()
-            unanswered_reviews.append(BotFinding("review_body", r_id, u_login, body))
+            unanswered_reviews.append(BotFinding(
+                "review_body", r_id, u_login, body, url=r.get("html_url") or "",
+            ))
     return unanswered_reviews
 
 
@@ -780,7 +795,10 @@ def _parse_non_passing_bot_check_runs(check_runs_data: list[dict]) -> list[BotFi
         is_bot = bool(app_slug or name.startswith("Grug") or "bot" in name.lower())
         status = cr.get("status")
         conclusion = cr.get("conclusion")
-        if is_bot and (status != "completed" or conclusion != "success"):
+        passed = _normalize_check_status(conclusion) == "passed"
+        if name == "Grug - Elder":
+            passed = conclusion == "success"
+        if is_bot and (status != "completed" or not passed):
             cr_id = str(cr.get("id") or name)
             non_passing_checks.append(
                 BotFinding(
@@ -788,6 +806,7 @@ def _parse_non_passing_bot_check_runs(check_runs_data: list[dict]) -> list[BotFi
                     cr_id,
                     app_slug or "bot",
                     f"{name}: status={status}, conclusion={conclusion}",
+                    url=cr.get("html_url") or cr.get("details_url") or "",
                 )
             )
     return non_passing_checks
@@ -795,13 +814,15 @@ def _parse_non_passing_bot_check_runs(check_runs_data: list[dict]) -> list[BotFi
 
 def _parse_issue_bot_comments(issue_comments_data: list[dict]) -> list[BotFinding]:
     issue_comments: list[BotFinding] = []
-    for ic in issue_comments_data:
+    for index, ic in enumerate(issue_comments_data):
         u = ic.get("user") or {}
         body = (ic.get("body") or "").strip()
-        if _is_bot_account(u) and body:
+        if _is_bot_account(u) and body and not _linked_reply(ic, issue_comments_data[index + 1:]):
             ic_id = str(ic.get("id") or "")
             u_login = (u.get("login") or "").lower()
-            issue_comments.append(BotFinding("issue_comment", ic_id, u_login, body))
+            issue_comments.append(BotFinding(
+                "issue_comment", ic_id, u_login, body, url=ic.get("html_url") or "",
+            ))
     return issue_comments
 
 
@@ -814,7 +835,7 @@ def parse_bot_surfaces(
     """Parse raw GitHub data into findings on all four bot comment surfaces."""
     return BotSurfaces(
         unresolved_review_threads=tuple(_parse_unresolved_threads(threads_data)),
-        unanswered_review_bodies=tuple(_parse_unanswered_reviews(reviews_data)),
+        unanswered_review_bodies=tuple(_parse_unanswered_reviews(reviews_data, issue_comments_data)),
         non_passing_bot_check_runs=tuple(
             _parse_non_passing_bot_check_runs(check_runs_data)
         ),
@@ -822,29 +843,39 @@ def parse_bot_surfaces(
     )
 
 
-def fetch_open_prs(
-    repo: str,
-    runner: Runner = _subprocess_runner,
-) -> list[dict]:
-    """Fetch open PRs for a repo. Takes no action on any PR (reports only)."""
-    raw = runner(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--repo",
-            repo,
-            "--state",
-            "open",
-            "--json",
-            "number,title,headRefOid",
-        ]
-    )
-    try:
-        prs = json.loads(raw or "[]")
-        return prs if isinstance(prs, list) else []
-    except (json.JSONDecodeError, TypeError):
-        return []
+def _github_pages(runner: Runner, *args: str) -> list:
+    pages = json.loads(runner(["gh", "api", "--paginate", "--slurp", *args]))
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("missing GitHub response pages")
+    return pages
+
+
+def fetch_open_prs(repo: str, runner: Runner = _subprocess_runner) -> list[dict]:
+    """Fetch every open PR through the paginated GitHub REST API."""
+    return [
+        item
+        for page in _github_pages(runner, f"repos/{repo}/pulls?state=open&per_page=100")
+        for item in page
+    ]
+
+
+_REVIEW_THREADS_QUERY = """
+query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved
+          comments(first: 1) {
+            nodes { author { __typename login } body url }
+          }
+        }
+      }
+    }
+  }
+}
+"""
 
 
 def fetch_pr_state(
@@ -852,108 +883,60 @@ def fetch_pr_state(
     pr_info: dict,
     runner: Runner = _subprocess_runner,
     now: float | None = None,
-    ready_since: float | None = None,
 ) -> PRState:
-    """Fetch and construct PRState for one open PR across CI and bot surfaces."""
-    pr_number = int(pr_info.get("number") or 0)
-    title = str(pr_info.get("title") or "")
-    head_sha = str(pr_info.get("headRefOid") or "")
+    """Fetch the CI and bot evidence for one open PR."""
+    pr_number = pr_info["number"]
+    head_sha = pr_info["head"]["sha"]
+    owner, name = repo.split("/", 1)
+    unavailable = []
 
-    check_runs_data: list[dict] = []
-    if head_sha:
+    def fetch(source: str, *args: str, select: Callable = lambda page: page) -> list:
         try:
-            raw_cr = runner(
-                [
-                    "gh",
-                    "api",
-                    f"repos/{repo}/commits/{head_sha}/check-runs",
-                    "--jq",
-                    ".check_runs",
-                ]
-            )
-            parsed = json.loads(raw_cr or "[]")
-            if isinstance(parsed, list):
-                check_runs_data = parsed
-        except (RuntimeError, json.JSONDecodeError):
-            check_runs_data = []
+            items = []
+            for page in _github_pages(runner, *args):
+                entries = select(page)
+                if not isinstance(entries, list) or not all(isinstance(i, dict) for i in entries):
+                    raise ValueError("unexpected GitHub response")
+                items.extend(entries)
+            return items
+        except (
+            OSError, RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError,
+        ):
+            unavailable.append(source)
+            return []
 
-    checks = parse_ci_checks(check_runs_data, now=now)
-
-    threads_data: list[dict] = []
-    try:
-        owner, name = repo.split("/", 1)
-        raw_threads = runner(
-            [
-                "gh",
-                "api",
-                "graphql",
-                "-F",
-                f"owner={owner}",
-                "-F",
-                f"name={name}",
-                "-F",
-                f"pr={pr_number}",
-                "-f",
-                (
-                    "query=query($owner:String!,$name:String!,$pr:Int!){"
-                    "repository(owner:$owner,name:$name){"
-                    "pullRequest(number:$pr){"
-                    "reviewThreads(first:100){nodes{id,isResolved,"
-                    "comments(first:10){nodes{author{login},body}}}}}}}"
-                ),
-                "--jq",
-                ".data.repository.pullRequest.reviewThreads.nodes",
-            ]
-        )
-        parsed_threads = json.loads(raw_threads or "[]")
-        if isinstance(parsed_threads, list):
-            threads_data = parsed_threads
-    except (RuntimeError, json.JSONDecodeError, ValueError):
-        threads_data = []
-
-    reviews_data: list[dict] = []
-    try:
-        raw_revs = runner(
-            [
-                "gh",
-                "api",
-                f"repos/{repo}/pulls/{pr_number}/reviews",
-            ]
-        )
-        parsed_revs = json.loads(raw_revs or "[]")
-        if isinstance(parsed_revs, list):
-            reviews_data = parsed_revs
-    except (RuntimeError, json.JSONDecodeError):
-        reviews_data = []
-
-    issue_comments_data: list[dict] = []
-    try:
-        raw_ics = runner(
-            [
-                "gh",
-                "api",
-                f"repos/{repo}/issues/{pr_number}/comments",
-            ]
-        )
-        parsed_ics = json.loads(raw_ics or "[]")
-        if isinstance(parsed_ics, list):
-            issue_comments_data = parsed_ics
-    except (RuntimeError, json.JSONDecodeError):
-        issue_comments_data = []
-
-    bot_surfaces = parse_bot_surfaces(
-        threads_data=threads_data,
-        reviews_data=reviews_data,
-        check_runs_data=check_runs_data,
-        issue_comments_data=issue_comments_data,
+    check_runs = fetch(
+        "check runs",
+        f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100&filter=latest",
+        select=lambda page: page["check_runs"],
     )
+    commit_statuses = fetch(
+        "commit statuses", f"repos/{repo}/commits/{head_sha}/statuses?per_page=100",
+    )
+    checks = parse_ci_checks(check_runs, now=now)
+    seen_contexts = set()
+    for status in commit_statuses:  # GitHub lists statuses newest first.
+        context = status["context"]
+        if context not in seen_contexts:
+            checks.append(CICheck(context, status.get("state") or ""))
+            seen_contexts.add(context)
 
+    threads = fetch(
+        "review threads", "graphql", "-F", f"owner={owner}", "-F", f"name={name}",
+        "-F", f"pr={pr_number}", "-f", f"query={_REVIEW_THREADS_QUERY}",
+        select=lambda page: page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"],
+    )
+    reviews = fetch("review bodies", f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100")
+    comments = fetch("issue comments", f"repos/{repo}/issues/{pr_number}/comments?per_page=100")
     return PRState(
         pr_number=pr_number,
-        title=title,
+        title=pr_info.get("title") or "",
         checks=tuple(checks),
-        bot_surfaces=bot_surfaces,
-        ready_since=ready_since,
+        bot_surfaces=parse_bot_surfaces(threads, reviews, check_runs, comments),
+        url=f"https://github.com/{repo}/pull/{pr_number}",
+        head_sha=head_sha,
+        unavailable=tuple(unavailable),
+        draft=bool(pr_info.get("draft")),
     )
 
 
@@ -969,21 +952,16 @@ def report_shepherd_pr_queue(
     """
     current_time = now if now is not None else datetime.now(timezone.utc).timestamp()
     open_prs_info = fetch_open_prs(repo, runner=runner)
-    tracker = load_ready_tracker(state_path)
-
-    pr_states = [
-        fetch_pr_state(
-            repo,
-            pr_info,
-            runner=runner,
-            now=current_time,
-            ready_since=tracker.get(int(pr_info.get("number") or 0)),
-        )
-        for pr_info in open_prs_info
-    ]
-
+    saved = load_ready_tracker(state_path)
+    pr_states = [fetch_pr_state(repo, info, runner, current_time) for info in open_prs_info]
+    prefix = f"{repo.lower()}#"
+    keys = {pr.pr_number: f"{prefix}{pr.pr_number}@{pr.head_sha}" for pr in pr_states}
+    tracker = {number: saved[key] for number, key in keys.items() if key in saved}
     updated_prs = update_ready_tracker(pr_states, tracker, now=current_time)
-    save_ready_tracker(state_path, tracker)
+
+    saved = {key: value for key, value in saved.items() if not key.startswith(prefix)}
+    saved.update({keys[number]: value for number, value in tracker.items()})
+    save_ready_tracker(state_path, saved)
 
     queue = build_pr_queue(updated_prs, now=current_time)
     return format_queue_report(queue)

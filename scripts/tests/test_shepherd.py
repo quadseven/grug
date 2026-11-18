@@ -68,7 +68,8 @@ def test_broken_chain_notifies_once_names_stage_and_evidence(tmp_path):
     def notify(message, stage, evidence):
         notified.append((message, stage, evidence))
 
-    check = lambda: _broken("build", "exit code 1: build failed")
+    def check():
+        return _broken("build", "exit code 1: build failed")
 
     first = escalate_once([("build", check)], state_path=str(state), notify=notify)
     assert first == "broken"
@@ -136,7 +137,8 @@ def test_cancelled_counts_as_broken_only_success_is_success(tmp_path):
     def notify(message, stage, evidence):
         notified.append((message, stage, evidence))
 
-    cancelled = lambda: _broken("schedule", "scheduled run cancelled")
+    def cancelled():
+        return _broken("schedule", "scheduled run cancelled")
 
     assert (
         escalate_once([("schedule", cancelled)], state_path=str(state), notify=notify)
@@ -641,9 +643,7 @@ def test_parse_bot_surfaces_ignores_clean_or_human_items():
         check_runs_data=check_runs,
         issue_comments_data=issue_comments,
     )
-    assert len(surfaces.unresolved_review_threads) == 1
-    assert surfaces.unresolved_review_threads[0].bot_name == "bot"
-    assert surfaces.unresolved_review_threads[0].identifier == "thread-no-bot"
+    assert len(surfaces.unresolved_review_threads) == 0
     assert len(surfaces.unanswered_review_bodies) == 0
     assert len(surfaces.non_passing_bot_check_runs) == 0
     assert len(surfaces.issue_comments) == 0
@@ -666,36 +666,39 @@ def test_report_shepherd_pr_queue_end_to_end(tmp_path):
 
     def mock_runner(cmd: list[str]) -> str:
         cmd_str = " ".join(cmd)
-        if "gh pr list" in cmd_str:
+        assert cmd[:4] == ["gh", "api", "--paginate", "--slurp"]
+        if "/pulls?state=open" in cmd_str:
             return json.dumps(
                 [
-                    {
+                    [{
                         "number": 701,
                         "title": "add metrics adapter",
-                        "headRefOid": "sha111",
-                    },
-                    {
+                        "head": {"sha": "sha111"},
+                    }],
+                    [{
                         "number": 702,
                         "title": "fix timeout regression",
-                        "headRefOid": "sha222",
-                    },
+                        "head": {"sha": "sha222"},
+                    }],
                 ]
             )
         if "commits/sha111/check-runs" in cmd_str:
             return json.dumps(
-                [{"name": "test-suite", "status": "completed", "conclusion": "success"}]
+                [{"check_runs": [
+                    {"name": "test-suite", "status": "completed", "conclusion": "success"}
+                ]}]
             )
         if "commits/sha222/check-runs" in cmd_str:
             return json.dumps(
-                [{"name": "test-suite", "status": "completed", "conclusion": "failure"}]
+                [{"check_runs": [
+                    {"name": "test-suite", "status": "completed", "conclusion": "failure"}
+                ]}]
             )
         if "graphql" in cmd_str:
-            return "[]"
-        if "/reviews" in cmd_str:
-            return "[]"
-        if "/comments" in cmd_str:
-            return "[]"
-        return "[]"
+            return json.dumps([{"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+            }}}}])
+        return "[[]]"
 
     report = report_shepherd_pr_queue(
         "example/repo",
@@ -714,7 +717,7 @@ def test_report_shepherd_pr_queue_end_to_end(tmp_path):
     assert state_file.exists()
     with open(state_file) as fh:
         saved = json.load(fh)
-    assert saved["pr_ready_since"]["701"] == now
+    assert saved["pr_ready_since"]["example/repo#701@sha111"] == now  # leak-guard-allow: placeholder repo built by the test
 
 
 def test_shepherd_main_cli_pr_queue(monkeypatch, capsys):
