@@ -503,10 +503,14 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
     if entry is None:
         return [f"FAIL: {path} - exactly one `dispatch_code_review` expected"]
     # The entry point delegates the pass inside a try/finally for approval
-    # cleanup. Require a direct return so an unused helper cannot attest it.
+    # cleanup. Require a direct return and a `finally` that calls the cleanup
+    # helper, so neither an unused helper nor a removed `finally` can attest.
     body = entry.body[1:] if ast.get_docstring(entry) is not None else entry.body
     match body:
-        case [ast.Try(body=[ast.Return(value=ast.Call(func=ast.Name(id="_review_pass")) as call)])]:
+        case [ast.Try(
+            body=[ast.Return(value=ast.Call(func=ast.Name(id="_review_pass")) as call)],
+            finalbody=[ast.Expr(value=ast.Call(func=ast.Name(id="_withdraw_other_commit_approvals")))],
+        )]:
             blocking = _kwarg_value(call, "blocking")
             if not isinstance(blocking, ast.Name) or blocking.id != "blocking":
                 return [f"FAIL: {path} - dispatch_code_review must forward blocking to _review_pass"]

@@ -20,7 +20,12 @@ def test_dispatch_attestation_accepts_wrapped_review_pass():
     ("original", "replacement", "expected"),
     [
         ("return _review_pass(", "return _other_pass(", "return _review_pass"),
-        ("payload, blocking=blocking,", "payload, blocking=False,", "forward blocking"),
+        (
+            "    finally:\n        _withdraw_other_commit_approvals(payload)\n",
+            "    finally:\n        pass\n",
+            "return _review_pass",
+        ),
+        ("payload, blocking=blocking,","payload, blocking=False,", "forward blocking"),
         (
             'mode: ReviewMode = "blocking" if blocking else "advisory"',
             'mode: ReviewMode = "advisory"',
