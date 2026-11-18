@@ -99,6 +99,28 @@ def test_unticked_test_and_code_behavior_boxes_are_fine():
     assert _scan(_body(*behavior), ()) == ()
 
 
+def test_a_label_and_queue_behavior_do_not_claim_a_live_check():
+    claim = "An awaiting-live-check or claimed ticket remains held; an ordinary ticket still queues"
+    assert _scan(_body(claim), (LinkedCriterion(83, 1, claim),)) == ()
+    assert _scan(_body("Verify the `live-check` label keeps a ticket held."), ()) == ()
+
+
+def test_a_ticked_post_deploy_measurement_without_evidence_is_flagged():
+    claim = "Measure request latency on the dashboard after deployment."
+    findings = _scan(_body(claim), ())
+    assert [f.rule_name for f in findings] == [RULE]
+
+
+def test_a_changed_test_can_back_a_ticked_behavior_box():
+    diff = (
+        "diff --git a/tests/test_admission.py b/tests/test_admission.py\n"
+        "--- /dev/null\n+++ b/tests/test_admission.py\n@@ -0,0 +1,2 @@\n"
+        "+def test_over_budget_pod_is_rejected_with_a_quota_error():\n"
+        "+    assert admit(over_budget_pod) == QUOTA_ERROR\n"
+    )
+    assert scan_unbacked_claims(_body(_C2), criteria=_CRITERIA, hunks=parse_diff(diff)) == ()
+
+
 def test_a_box_no_criterion_matches_is_still_read_on_its_own():
     assert len(_scan(_body("Record the live-verification outcome in the issue."), ())) == 1
     backed = _body("Measured live: 77 events over 7 days on the ingest route.")
