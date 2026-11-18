@@ -680,6 +680,90 @@ _BODY_SETEXT_PAT = re.compile(r"=+|-+")
 _BODY_TABLE_DELIMITER_PAT = re.compile(r"(?=.*\|)\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?")
 
 
+@dataclass
+class _BodyRow:
+    """One source line of a body, classified for the wrap scan."""
+
+    line: str
+    indent: int
+    item: re.Match[str] | None
+    setext: bool
+    heading_or_rule: bool
+    quote: bool
+    table: bool
+
+    @property
+    def breaks_paragraph(self) -> bool:
+        return bool(
+            not self.line or self.item or self.setext
+            or self.quote or self.table or self.heading_or_rule
+        )
+
+    @property
+    def is_prose_item(self) -> bool:
+        """A list item that starts a paragraph of its own text."""
+        return bool(
+            self.item and self.line and not self.heading_or_rule
+            and not self.setext and not self.quote and not self.table
+        )
+
+
+def _body_row(raw: str, following: str, list_indent: int) -> _BodyRow:
+    indent = len(raw[:len(raw) - len(raw.lstrip())].expandtabs(4))
+    item = _BODY_LIST_ITEM_PAT.match(raw) if indent < list_indent + 4 else None
+    line = raw[item.end():].strip() if item else raw.strip()
+    return _BodyRow(
+        line=line,
+        indent=indent,
+        item=item,
+        setext=bool(_BODY_SETEXT_PAT.fullmatch(line)),
+        heading_or_rule=bool(_BODY_HEADING_OR_RULE_PAT.match(line)),
+        quote=line.startswith(">"),
+        table=bool(
+            "|" in line and following
+            and _BODY_TABLE_DELIMITER_PAT.fullmatch(following.strip())
+        ),
+    )
+
+
+class _WrapScan:
+    """Walks body lines, tracking the open paragraph and list indent."""
+
+    def __init__(self) -> None:
+        self.paragraph_start = 0
+        self.list_indent = 0
+        self.has_wrap = False
+        self.previous_in_range = False
+        self.in_quote_or_table = False
+
+    def close_paragraph(self, row: _BodyRow) -> int:
+        """End the open paragraph at a block break; its start line if it was wrapped.
+
+        A Setext underline ends the paragraph as a heading, not as prose.
+        """
+        wrapped = self.has_wrap and not (row.setext and row.indent >= self.list_indent)
+        start = self.paragraph_start if wrapped else 0
+        self.paragraph_start = 0
+        self.has_wrap = self.previous_in_range = False
+        self.in_quote_or_table = bool(
+            row.table or (row.quote and row.line.lstrip("> ").strip())
+        )
+        if row.line and row.indent < self.list_indent:
+            self.list_indent = 0
+        if row.item:
+            self.list_indent = len(row.item[0].expandtabs(4))
+        return start
+
+    def add_prose(self, number: int, line: str) -> None:
+        self.paragraph_start = self.paragraph_start or number
+        in_range = 60 <= len(line) <= 80
+        self.has_wrap |= self.previous_in_range and in_range
+        self.previous_in_range = in_range
+
+    def is_indented_code(self, row_raw_line: str, indent: int) -> bool:
+        return bool(row_raw_line and not self.paragraph_start and indent >= self.list_indent + 4)
+
+
 def _hard_wrapped_body_finding(body: str) -> CheckResult | None:
     """Report the first wrapped prose paragraph or list item, by source line."""
     prose = _BODY_MARKUP_PAT.sub(
@@ -687,50 +771,27 @@ def _hard_wrapped_body_finding(body: str) -> CheckResult | None:
         "\n".join(body.splitlines()),
     )
     lines = [*prose.split("\n"), ""]
-    paragraph_start = list_indent = 0
-    has_wrap = previous_in_range = in_quote_or_table = False
-
+    scan = _WrapScan()
     for number, raw in enumerate(lines, start=1):
-        line = raw.strip()
         indent = len(raw[:len(raw) - len(raw.lstrip())].expandtabs(4))
-        if line and not paragraph_start and indent >= list_indent + 4:
+        if scan.is_indented_code(raw.strip(), indent):
             continue
-        item = _BODY_LIST_ITEM_PAT.match(raw) if indent < list_indent + 4 else None
-        if item:
-            line = raw[item.end():].strip()
-        setext = _BODY_SETEXT_PAT.fullmatch(line)
-        heading_or_rule = _BODY_HEADING_OR_RULE_PAT.match(line)
-        quote = line.startswith(">")
-        table = (
-            "|" in line and number < len(lines)
-            and _BODY_TABLE_DELIMITER_PAT.fullmatch(lines[number].strip())
-        )
-        if not line or item or setext or quote or table or heading_or_rule:
-            # Wait for the end of a paragraph in case it is a Setext heading.
-            if has_wrap and not (setext and indent >= list_indent):
+        following = lines[number] if number < len(lines) else ""
+        row = _body_row(raw, following, scan.list_indent)
+        if row.breaks_paragraph:
+            if start := scan.close_paragraph(row):
                 return CheckResult(
                     HARD_WRAPPED_BODY, False,
-                    f"Hard-wrapped prose starts at line {paragraph_start}. "
+                    f"Hard-wrapped prose starts at line {start}. "
                     "Write one paragraph per line.",
                 )
-            paragraph_start = 0
-            has_wrap = previous_in_range = False
-            in_quote_or_table = bool(table or (quote and line.lstrip("> ").strip()))
-            if line and indent < list_indent:
-                list_indent = 0
-            if item:
-                list_indent = len(item[0].expandtabs(4))
-            if not item or not line or heading_or_rule or setext or quote or table:
+            if not row.is_prose_item:
                 continue
-        elif in_quote_or_table:
+        elif scan.in_quote_or_table:
             continue
-        elif not paragraph_start and indent < list_indent:
-            list_indent = 0
-
-        paragraph_start = paragraph_start or number
-        in_range = 60 <= len(line) <= 80
-        has_wrap |= previous_in_range and in_range
-        previous_in_range = in_range
+        elif not scan.paragraph_start and row.indent < scan.list_indent:
+            scan.list_indent = 0
+        scan.add_prose(number, row.line)
     return None
 
 
