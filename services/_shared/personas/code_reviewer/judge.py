@@ -161,13 +161,16 @@ def _finding_to_repr(f: Finding) -> JudgeFindingRepr:
     `Finding`; the TypedDict (defined down there) is the typed boundary,
     so a key typo here fails type-check rather than degrading to `?` in
     the judge prompt."""
+    message = f.message
+    if f.evidence_ref is not None:
+        message += f"\nEvidence: {f.evidence_ref.path}:{f.evidence_ref.line}"
     return {
         "rule_name": f.rule_name,
         "category": f.category,
         "file": f.file,
         "line": f.line,
         "severity": f.severity,
-        "message": f.message,
+        "message": message,
     }
 
 

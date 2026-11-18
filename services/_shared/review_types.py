@@ -9,7 +9,17 @@ another module dropped).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal, cast, get_args
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceReference:
+    """One original line in a cross-file context snippet."""
+
+    path: str
+    line: int
+
 
 Severity = Literal["low", "medium", "high", "critical"]
 

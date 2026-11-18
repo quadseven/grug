@@ -7,17 +7,18 @@ express (doc-truth, iac-hygiene, ...) are surfaced as `out_of_taxonomy`
 and EXCLUDED from scoring denominators - a class the reviewer has no way
 to name must never score as a miss.
 
-Rows arrive via the slice-1 corpus layer only: `rows_from_store` (the
-ingested `pg_install_store` rows) or `ledger.parse_jsonl` on the
-committed JSONL - never a third parser.
+Ledger rows arrive via `rows_from_store` or `ledger.parse_jsonl`.
+The default corpus also includes local diff and context fixtures.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 # Deliberate private import: the eval must bridge onto Elder's REAL closed
@@ -106,8 +107,15 @@ def expected_elder_classes(ledger_class: str) -> frozenset[str]:
 
 
 @dataclass(frozen=True)
+class EvalFixture:
+    name: str
+    diff: str
+    cross_file_contents: dict[str, str]
+
+
+@dataclass(frozen=True)
 class EvalCase:
-    """One ledger PR as a replay unit.
+    """One ledger PR or committed fixture as a replay unit.
 
     `expected_classes`: ledger class (normalized) -> the Elder classes that
     count as a catch. Only accepted (fixed/declined) in-taxonomy rows.
@@ -141,15 +149,26 @@ class EvalCase:
     anchor_head_sha: str | None = None
     anchor_fix_commit: str | None = None
     unresolvable_reason: str | None = None
+    fixture: EvalFixture | None = None
 
     @property
     def case_id(self) -> str:
+        if self.fixture is not None:
+            return f"fixture:{self.fixture.name}"
         return f"{self.repo}#{self.pr}"
 
     @property
     def scorable(self) -> bool:
         """Worth an LLM call: contributes to catch or noise denominators."""
-        return bool(self.expected_classes or self.fp_only_classes)
+        return bool(self.fixture or self.expected_classes or self.fp_only_classes)
+
+    @property
+    def clean(self) -> bool:
+        return self.fixture is not None and not self.expected_classes
+
+    @property
+    def cross_file_contents(self) -> dict[str, str] | None:
+        return self.fixture.cross_file_contents if self.fixture else None
 
     @property
     def anchored(self) -> bool:
@@ -287,6 +306,35 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
                 unresolvable_reason=_KNOWN_UNRESOLVABLE_CASES.get((repo, pr)),
             )
         )
+    return tuple(cases)
+
+
+def load_fixture_cases() -> tuple[EvalCase, ...]:
+    """Read committed diffs and number the unchanged source lines."""
+    root = Path(__file__).resolve().parent / "fixtures" / "cross_file"
+    cases: list[EvalCase] = []
+    for number, row in enumerate(json.loads((root / "corpus.json").read_text()), 1):
+        label = row["expected_class"]
+        if label is not None and label not in ELDER_CLASSES:
+            raise ValueError(f"Unknown fixture class: {label}")
+        cases.append(EvalCase(
+            repo="fixture/cross-file",
+            pr=number,
+            expected_classes={label: frozenset({label})} if label is not None else {},
+            fp_only_classes=frozenset(),
+            out_of_taxonomy={},
+            unknown_verdicts={},
+            fixture=EvalFixture(
+                name=row["name"],
+                diff=(root / row["diff"]).read_text(),
+                cross_file_contents={
+                    path: "\n".join(f"{i}: {line}" for i, line in enumerate(
+                        (root / fixture_file).read_text().splitlines(), 1
+                    ))
+                    for path, fixture_file in row["context"].items()
+                },
+            ),
+        ))
     return tuple(cases)
 
 

@@ -86,7 +86,7 @@ from ledger import parse_jsonl
 from personas.code_reviewer.reactions import ledger_label
 from personas.code_reviewer.verify_only import is_summary_only
 
-from .corpus import build_cases, rows_from_store
+from .corpus import build_cases, load_fixture_cases, rows_from_store
 from .gate import (
     BASELINE_PATH,
     compute_prompt_sha,
@@ -293,7 +293,7 @@ def _parse_args(
     src.add_argument(
         "--jsonl",
         default=str(_DEFAULT_JSONL),
-        help="committed-ledger path (slice-1 parse_jsonl)",
+        help="ledger JSONL path (the default also includes committed cross-file fixtures)",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--record", action="store_true", help="write baseline.json")
@@ -343,6 +343,8 @@ def _load_corpus(args):
         else parse_jsonl(Path(args.jsonl).read_text())
     )
     all_cases = build_cases(rows)
+    if not args.repo and Path(args.jsonl) == _DEFAULT_JSONL:
+        all_cases += load_fixture_cases()
     cases = tuple(case for case in all_cases if case.scorable)
     skipped = len(all_cases) - len(cases)
     if skipped:
