@@ -3443,13 +3443,13 @@ def _review_pass(
     # #1758: the review state is the verdict, whatever the mode. A clean
     # pass vouches for the head only when the carry-forward fold ran (or
     # there was nothing earlier to fold), every lock file was read, and the
-    # sensitive-path security pass finished.
+    # sensitive-path security pass finished with no paths left unreviewed.
+    review_complete = not (quarantine_gap or unreviewed_paths)
     verdict = _own_pr_event(author_login, verdict_event(
         evaluation, conclusion=conclusion, carried_blocking=carried_blocking,
         vouched=(
             not lock_check.unreviewed
-            and not quarantine_gap
-            and not unreviewed_paths
+            and review_complete
             and (action not in _RE_REVIEW_ACTIONS or listed_threads is not None)
         ),
     ))
@@ -3856,8 +3856,7 @@ def _review_pass(
             tier1_check_run_id=check_run_id,
             deep_plan=deep_plan,
             deferred_approval=deferred_approval,
-            security_pass_complete=not quarantine_gap,
-            unreviewed_paths=unreviewed_paths,
+            vouched=review_complete,
             run_started_at=run_started_at,
         )
     except Exception as e:  # noqa: BLE001 - deep append is best-effort
@@ -5474,8 +5473,7 @@ def _async_deep_append_if_needed(
     tier1_check_run_id: int | None = None,
     deep_plan: DeepEscalationDecision | None = None,
     deferred_approval: bool = False,
-    security_pass_complete: bool,
-    unreviewed_paths: tuple[str, ...],
+    vouched: bool,
     run_started_at: datetime,
 ) -> None:
     """Run reasoner after Tier-1 publish when tiered escalation fires (#646).
@@ -5489,6 +5487,7 @@ def _async_deep_append_if_needed(
     (`deferred_approval`), and this pass posts APPROVE only when it finishes
     clean, or REQUEST_CHANGES on a blocking finding. If it fails, degrades,
     is cancelled or is superseded, the head gets no approval (fail closed).
+    `vouched` requires a complete security pass and no unreviewed paths.
     """
     decision = deep_plan
     if (
@@ -5682,10 +5681,6 @@ def _async_deep_append_if_needed(
         pull_number=pull_number, head_sha=head_sha,
         tier1_check_run_id=tier1_check_run_id,
     )
-    # A run whose sensitive-path security pass did not finish, or that left
-    # a changed path unreviewed, never approves (ADR-0028); a blocking
-    # finding still requests changes.
-    vouched = security_pass_complete and not unreviewed_paths
     verdict = verdict_event(combined, conclusion=conclusion, vouched=vouched)
     # #1758: Tier-1 deferred its APPROVE to this pass; approve only if the
     # combined review is still clean (not degraded, nothing blocking) and
