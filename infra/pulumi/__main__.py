@@ -280,17 +280,9 @@ aws.s3.BucketLifecycleConfigurationV2(
 # Connector principal (grug-cave-connector, #316): consume jobs + send results,
 # nothing more. The access key is minted out-of-band by #316 — NOT in Pulumi
 # state — so this just establishes the permission boundary.
-_cave_connector_user = aws.iam.User(
-    "grug-cave-connector",
-    name="grug-cave-connector",
-    tags={"app": "grug", "service": "grug-cave"},
-)
-aws.iam.UserPolicy(
-    "grug-cave-connector-policy",
-    user=_cave_connector_user.name,
-    policy=pulumi.Output.all(
-        _cave_jobs_queue.arn, _cave_results_queue.arn, _cave_diff_bucket.arn
-    ).apply(
+_cave_connector_doc = pulumi.Output.all(
+    _cave_jobs_queue.arn, _cave_results_queue.arn, _cave_diff_bucket.arn
+).apply(
         lambda a: json.dumps(
             {
                 "Version": "2012-10-17",
@@ -326,7 +318,27 @@ aws.iam.UserPolicy(
                 ],
             }
         )
-    ),
+)
+# grug#1625: the same document is the user's permissions boundary, so no inline
+# policy the deploy role writes can ever exceed it. The deploy role can neither
+# edit this managed policy nor change or remove the user's boundary; creating it
+# and attaching it is an operator apply.
+_cave_connector_boundary = aws.iam.Policy(
+    "grug-cave-connector-boundary",
+    name=oidc_role.USER_BOUNDARY_POLICY,
+    description="Permissions boundary for grug-cave-connector (grug#1625)",
+    policy=_cave_connector_doc,
+)
+_cave_connector_user = aws.iam.User(
+    "grug-cave-connector",
+    name="grug-cave-connector",
+    permissions_boundary=_cave_connector_boundary.arn,
+    tags={"app": "grug", "service": "grug-cave"},
+)
+aws.iam.UserPolicy(
+    "grug-cave-connector-policy",
+    user=_cave_connector_user.name,
+    policy=_cave_connector_doc,
 )
 
 # --- Re-run queue (#305, ADR-0004): operator backfill for `errored` rows -----

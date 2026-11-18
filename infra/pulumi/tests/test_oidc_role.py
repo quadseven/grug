@@ -135,9 +135,9 @@ def test_deploy_role_can_list_instance_profiles_before_deleting_a_role():
             for stmt in doc.get("Statement", []):
                 actions = stmt.get("Action")
                 actions = [actions] if isinstance(actions, str) else actions
-                if any(a == "iam:DeleteRole" for a in actions):
+                if "iam:GetRole" in actions:
                     iam_lifecycle_statements.append(stmt)
-        assert iam_lifecycle_statements, "no iam:DeleteRole statement found"
+        assert iam_lifecycle_statements, "no iam:GetRole statement found"
         assert len(iam_lifecycle_statements) == 1, (
             f"expected 1 IAM-lifecycle statement, got {len(iam_lifecycle_statements)}"
         )
@@ -149,11 +149,59 @@ def test_deploy_role_can_list_instance_profiles_before_deleting_a_role():
         )
         resources = stmt.get("Resource")
         resources = [resources] if isinstance(resources, str) else resources
-        assert "arn:aws:iam::*:role/grug-*" in resources, (
-            "the grant must cover the same role/grug-* scope DeleteRole "
-            "already has, or it does nothing for the roles that need it"
-        )
+        # grug#1625: the role reads only itself; deleting or changing roles is
+        # an operator apply, so the grant names the exact role, not role/grug-*.
+        assert resources == ["arn:aws:iam::*:role/grug-gha-deploy-test"], resources
 
     return pulumi.Output.all(
         bundle.role.urn, bundle.iam_propagation_wait.urn
     ).apply(check)
+
+
+# grug#1625: the deploy role must not be able to escalate to account admin.
+_ESCALATING_IAM = (
+    "iam:Create", "iam:Put", "iam:Update", "iam:Attach", "iam:AddUserToGroup",
+    "iam:SetDefaultPolicyVersion", "iam:DeleteUserPermissionsBoundary",
+    "iam:DeleteRolePermissionsBoundary",
+)
+
+
+@pulumi.runtime.test
+def test_deploy_role_iam_grants_cannot_escalate():
+    pulumi.runtime.set_mocks(_PulumiMocks())
+    _CAPTURED.clear()
+    bundle = oidc_role.create(
+        name="grug-gha-deploy-test",
+        repo="quadseven/grug",
+        branches=["main"],
+    )
+
+    def check(_):
+        docs = [json.loads(i["policy"]) for i in _CAPTURED.values()
+                if isinstance(i.get("policy"), str)]
+        assert docs, "no RolePolicy synthesized"
+        for doc in docs:
+            for stmt in doc.get("Statement", []):
+                actions = stmt.get("Action")
+                actions = [actions] if isinstance(actions, str) else actions
+                res = stmt.get("Resource")
+                res = [res] if isinstance(res, str) else res
+                # A bare "*" or any IAM wildcard covers every escalating action.
+                assert "*" not in actions, f"wildcard action in {actions}"
+                iam = [a for a in actions if a.startswith("iam:")]
+                if not iam:
+                    continue
+                assert not any("*" in a for a in iam), f"wildcard IAM action in {iam}"
+                assert "iam:CreateAccessKey" not in iam, "deploy role must not mint access keys"
+                assert not any(r.endswith("/grug-*") for r in res), f"wildcard principal in {res}"
+                assert not any(":role/" in r for r in res if any(a.startswith(_ESCALATING_IAM) for a in iam)), \
+                    "deploy role must not modify any role, itself included"
+                writes = [a for a in iam if a.startswith(_ESCALATING_IAM)]
+                if writes:
+                    cond = (stmt.get("Condition") or {})
+                    bound = {**cond.get("StringEquals", {}), **cond.get("StringLike", {})}
+                    assert bound.get("iam:PermissionsBoundary", "").endswith(
+                        ":policy/" + oidc_role.USER_BOUNDARY_POLICY), \
+                        f"{writes} lack an iam:PermissionsBoundary condition"
+
+    return pulumi.Output.all(bundle.role.urn, bundle.iam_propagation_wait.urn).apply(check)
