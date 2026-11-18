@@ -1,0 +1,32 @@
+diff --git a/src/util/old_clock.py b/src/util/clock.py
+similarity index 80%
+rename from src/util/old_clock.py
+rename to src/util/clock.py
+index 6a6a6a6..7b7b7b7 100644
+--- a/src/util/old_clock.py
++++ b/src/util/clock.py
+@@ -1,5 +1,5 @@
+ import time
+ 
+ 
+-def now():
+-    return time.time()
++def now_seconds():
++    return int(time.time())
+diff --git a/src/util/legacy.py b/src/util/legacy.py
+deleted file mode 100644
+index 8c8c8c8..0000000
+--- a/src/util/legacy.py
++++ /dev/null
+@@ -1,3 +0,0 @@
+-def legacy_now():
+-    import time
+-    return time.time()
+diff --git a/src/util/shim.py b/src/util/shim.py
+new file mode 100644
+index 0000000..9d9d9d9
+--- /dev/null
++++ b/src/util/shim.py
+@@ -0,0 +1,2 @@
++def noop():
++    return None

@@ -1,0 +1,14 @@
+diff --git a/src/billing/invoice.py b/src/billing/invoice.py
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/billing/invoice.py
++++ b/src/billing/invoice.py
+@@ -10,7 +10,9 @@ def total(lines):
+     subtotal = 0
+     for line in lines:
+-        subtotal += line.price
++        if line.quantity <= 0:
++            continue
++        subtotal += line.price * line.quantity
+     return subtotal
+ 
+ 
