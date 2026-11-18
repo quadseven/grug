@@ -186,9 +186,12 @@ def test_deploy_role_iam_grants_cannot_escalate():
                 actions = [actions] if isinstance(actions, str) else actions
                 res = stmt.get("Resource")
                 res = [res] if isinstance(res, str) else res
+                # A bare "*" or any IAM wildcard covers every escalating action.
+                assert "*" not in actions, f"wildcard action in {actions}"
                 iam = [a for a in actions if a.startswith("iam:")]
                 if not iam:
                     continue
+                assert not any("*" in a for a in iam), f"wildcard IAM action in {iam}"
                 assert "iam:CreateAccessKey" not in iam, "deploy role must not mint access keys"
                 assert not any(r.endswith("/grug-*") for r in res), f"wildcard principal in {res}"
                 assert not any(":role/" in r for r in res if any(a.startswith(_ESCALATING_IAM) for a in iam)), \
