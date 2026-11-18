@@ -16,13 +16,14 @@ Ownership is conservative on every axis:
     the hidden `grug-rule` marker;
   - any comment in the thread by anyone else (a person may be disagreeing)
     leaves it untouched, as does a comment list too long to inspect in full;
-  - a reply from the PR author that starts with "Fixed in" is treated as
-    the author confirming the fix, so the thread may still be resolved;
+  - a reply from the PR author that starts with "Fixed in" confirms the
+    fix even when the anchor did not change;
   - "code changed" is GitHub's own `isOutdated`, which flips only when a
     later commit changed or removed the anchored lines. A deferred-ruff
     thread is the exception: its anchor can be a line the fix never touches,
     so the review no longer raising it is what says it is fixed (#1477);
-  - a thread whose original commit is gone (force-push) is skipped.
+  - a thread whose original commit is gone (force-push) or whose original
+    commit is the head under review is skipped.
 
 Entry point: `resolve_fixed_threads`. It never raises; every failure is
 logged with its exception kind and the review outcome is unaffected.
@@ -168,17 +169,7 @@ def _only_grug_comments(thread: dict, pr_author: str | None = None) -> list[dict
     if not is_grug((nodes[0].get("author") or {}).get("login")):
         return None
     for c in nodes[1:]:
-        login = (c.get("author") or {}).get("login")
-        if is_grug(login):
-            continue
-        # A deleted account's comment has no login; without the `not
-        # pr_author` check it would match an unknown author (None == None).
-        if not pr_author or login != pr_author:
-            return None
-        # GitHub may send a null body; `or ""` keeps `.lower()` safe and
-        # makes such a reply block like any non-"Fixed in" reply.
-        body = (c.get("body") or "").lower()
-        if not body.startswith(_FIXED_REPLY_PREFIX.lower()):
+        if not is_grug((c.get("author") or {}).get("login")) and not _is_author_fix_reply(c, pr_author):
             return None
     return nodes
 
@@ -207,11 +198,15 @@ def _owned_rule_and_line(thread: dict, pr_author: str | None = None) -> tuple[st
 _FIXED_REPLY_PREFIX = "Fixed in "
 
 
-def _fixed_prefix(head_sha: str) -> str:
-    return (
-        f"{_FIXED_REPLY_PREFIX}{head_sha[:7]}: the flagged code changed and "
-        "this review does not raise it again."
+def _is_author_fix_reply(comment: dict, pr_author: str | None) -> bool:
+    return bool(
+        pr_author and (comment.get("author") or {}).get("login") == pr_author
+        and (comment.get("body") or "").lower().startswith(_FIXED_REPLY_PREFIX.lower())
     )
+
+
+def _fixed_prefix(head_sha: str) -> str:
+    return f"{_FIXED_REPLY_PREFIX}{head_sha[:7]}: this review no longer raises the finding."
 
 
 def _blocked_by_person_reply(thread: dict, pr_author: str | None) -> bool:
@@ -223,16 +218,11 @@ def _blocked_by_person_reply(thread: dict, pr_author: str | None) -> bool:
         return False
     if not is_grug((nodes[0].get("author") or {}).get("login")):
         return True
-    prefix = _FIXED_REPLY_PREFIX.lower()
-    for c in nodes[1:]:
-        login = (c.get("author") or {}).get("login")
-        if is_grug(login):
-            continue
-        if not pr_author or login != pr_author:
-            return True
-        if not (c.get("body") or "").lower().startswith(prefix):
-            return True
-    return False
+    return any(
+        not is_grug((c.get("author") or {}).get("login"))
+        and not _is_author_fix_reply(c, pr_author)
+        for c in nodes[1:]
+    )
 
 
 def _is_remeasured(thread: dict) -> bool:
@@ -242,18 +232,26 @@ def _is_remeasured(thread: dict) -> bool:
 
 def select_fixed_threads(
     threads: list[dict], findings: tuple[Finding, ...],
-    *, pr_author: str | None = None,
+    *, head_sha: str, pr_author: str | None = None,
 ) -> tuple[list[str], int, int]:
-    """Node ids of threads that are Elder's, outdated (or re-measured on
-    every review), and not re-raised, plus skip counts for person replies
-    and re-raised findings."""
+    """Select prior-head Elder threads whose findings were not re-raised.
+
+    A changed anchor, an author fix reply, or a rule measured on every
+    review provides evidence of a fix. Also return skip counts.
+    """
     picked: list[str] = []
     skipped_person = 0
     skipped_reraised = 0
     for t in threads:
         if t.get("isResolved"):
             continue
-        if not t.get("isOutdated") and not _is_remeasured(t):
+        nodes = (t.get("comments") or {}).get("nodes") or []
+        if not nodes or (nodes[0].get("originalCommit") or {}).get("oid") == head_sha:
+            continue
+        if not (
+            t.get("isOutdated") or _is_remeasured(t)
+            or any(_is_author_fix_reply(c, pr_author) for c in nodes[1:])
+        ):
             continue
         owned = _owned_rule_and_line(t, pr_author)
         if owned is None:
@@ -261,6 +259,7 @@ def select_fixed_threads(
                 skipped_person += 1
             continue
         rule, path, line = owned
+        line = int(nodes[0].get("line") or line)
         if any(
             f.rule_name == rule and f.file == path
             and abs(f.line - line) <= _NEARBY_LINES
@@ -288,13 +287,16 @@ def _resolve_or_collapse(
     Returns ``resolved`` or ``collapsed``.
     """
     try:
-        with_install_token_retry(
+        data = with_install_token_retry(
             installation_id,
             lambda tok: _graphql(tok, _RESOLVE_MUTATION, {"thread": thread_id}),
             # resolveReviewThread needs contents:write, which the review
             # token no longer carries (grug#1577, docs/app-permissions.md).
             purpose=TokenPurpose.COMMIT,
         )
+        thread = (data.get("resolveReviewThread") or {}).get("thread") or {}
+        if not thread.get("isResolved"):
+            raise RuntimeError("Thread resolution was not confirmed")
         return "resolved"
     except GraphQLError as e:
         if "FORBIDDEN" not in e.types or not comment_id:
@@ -374,7 +376,7 @@ def resolve_fixed_threads(
     pass so a review lists once); None fetches it here. `pr_author` lets
     threads the PR author already answered "Fixed in" be closed.
     Closed threads are recorded on the board's findings section.
-    Returns the number of threads touched. Never raises.
+    Returns the number of threads resolved. Never raises.
     """
     pr_ref = f"{owner}/{repo}#{pull_number}"
     try:
@@ -384,7 +386,7 @@ def resolve_fixed_threads(
                 lambda tok: _fetch_threads(tok, owner, repo, pull_number),
             )
         targets, skipped_person, skipped_reraised = select_fixed_threads(
-            threads, findings, pr_author=pr_author,
+            threads, findings, head_sha=head_sha, pr_author=pr_author,
         )
         first_comments = {
             t["id"]: ((t.get("comments") or {}).get("nodes") or [{}])[0]
@@ -437,4 +439,4 @@ def resolve_fixed_threads(
                     "skipped_person": skipped_person,
                     "skipped_reraised": skipped_reraised,
                     "candidates": len(targets), "failed": failed})
-    return resolved + collapsed
+    return resolved
