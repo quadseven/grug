@@ -52,6 +52,9 @@ from personas.code_reviewer.dispatch import (
 from github_reviews_client import list_reviews
 from personas.code_reviewer.thread_resolver import is_grug
 from personas.code_reviewer.degraded_gate import (
+    alert_operator_could_not_review,
+    could_not_review_sentence,
+    could_not_review_title,
     degraded_conclusion,
     degraded_lead_line,
     gate_sentence,
@@ -2240,7 +2243,9 @@ def _run_hot_review(
                     )
             finally:
                 stop_staleness_watch(watch)
-            review = ReviewResult.from_dispatch(result)
+            review = ReviewResult.from_dispatch(
+                result, rerun_ahead=rerun_pending(receive_count),
+            )
             degraded_reason = result.get("degraded_reason", "")
             latest: dict[str, Any] = {}
             latest_snapshot = None
@@ -2321,29 +2326,35 @@ def _run_hot_review(
                 # (grug#1212): `failure` in BLOCK, `neutral` in WARN - the same
                 # `elder_blocking` the review itself ran under. Real model
                 # findings still use pass/fail.
+                # grug#818: both branches say what every other no-review
+                # surface says, and page an operator before they do.
+                title = could_not_review_title(degraded_reason)
                 if degraded_reason == "freshness_check_failed":
-                    title = "Elder eyes clouded - GitHub unavailable"
+                    # Reached only on the last scheduled delivery: earlier
+                    # ones redrove (`RETRIED_FAIL_OPEN_REASONS`).
                     lead = (
-                        "Could not re-fetch the PR to confirm snapshot freshness "
-                        "(GitHub 5xx / transport). "
+                        could_not_review_sentence(degraded_reason)
+                        + " GitHub would not serve the pull request to confirm "
+                        "the reviewed snapshot was still current. "
                         + gate_sentence(elder_blocking)
-                        + " Push again or re-run Elder when GitHub is healthy."
                     )
                     missed = "Elder fail-open completion did not land (freshness outage)"
                     note = "after fail-open"
                 else:
                     # Unknown skip: complete the check rather than redrive forever.
-                    title = f"Elder skipped - {degraded_reason or 'unknown'}"
                     lead = (
-                        f"Review returned skipped ({degraded_reason or 'unknown'}). "
+                        could_not_review_sentence(degraded_reason) + " "
                         + gate_sentence(elder_blocking)
-                        + " Re-run Elder if needed."
                     )
                     missed = (
                         "Elder fail-open completion did not land "
                         f"(skip: {degraded_reason or 'unknown'})"
                     )
                     note = "after fail-open skip"
+                alert_operator_could_not_review(
+                    degraded_reason, pr=f"{owner}/{repo_name}#{pr_number}",
+                    surface="fail_open",
+                )
                 posted = _complete_elder_check_open(
                     install_id=install_id,
                     owner=owner,
