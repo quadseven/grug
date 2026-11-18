@@ -242,9 +242,32 @@ make chief-check REPO=owner/name PR=123       # an open PR
   committed corpus. These call real models.
 - [`scripts/shepherd.py`](scripts/shepherd.py): read-only operator report.
   `python3 scripts/shepherd.py pr-queue --repo OWNER/NAME` lists open PRs
-  by readiness across CI and the bot comment surfaces;
-  `python3 scripts/shepherd.py webhook` says whether the last merged image
-  is the one deployed.
+  by readiness across CI and the four bot comment surfaces. The wait
+  starts when Shepherd first observes a clean, green head. For bot review
+  bodies and issue comments, cite the permalink in a reply on the PR to
+  record acknowledgment.
+- `python3 scripts/shepherd.py pr-deploy` traces a merged PR through its
+  registry manifest, the current Kubernetes image pin and rollout, and
+  the signals named in the PR's acceptance criteria.
+
+```bash
+python3 scripts/shepherd.py pr-deploy --repo example-org/example-repo \
+  --pr 123 --image registry.example.com/example-service \
+  --namespace production --deployment example-service --container app \
+  --query-command /path/to/your-query-adapter \
+  --baseline metric=your.known_live.metric
+```
+
+Use read access to GitHub, the registry (Docker Buildx), and the target
+Kubernetes context. Run it for each artifact-producing PR and workload.
+Repeat `--pr` to check multiple PRs against the same workload. The registry
+must tag the published image with the merge SHA, as the Grug deploy does.
+A different live digest leaves the PR unfinished against the current
+deployment. For acceptance checks, provide a read-only adapter and a
+baseline from the same service and data source as the target. Shepherd
+uses the rollout completion time as the start of the query window.
+Exit codes for the report are 0 complete, 1 unfinished, and 2 unverified.
+
 - [`scripts/shepherd_verify.py`](scripts/shepherd_verify.py): after a
   deploy, checks a PR's acceptance bullets that name a `Metric`,
   `Log event`, `Endpoint` or `GET` signal.
