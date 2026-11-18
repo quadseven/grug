@@ -27,7 +27,7 @@ wire 5xx). This version asserts AST *shape and reachability*:
           `degraded_fails_closed`, `mode == "blocking"` and
           `is_real_degradation(...)`, and sits BEFORE the neutral branch (so
           the neutral branch cannot shadow it); every `plan_publish` call
-          in `dispatch_code_review` passes `degraded_fails_closed=True`.
+          in `_review_pass` passes `degraded_fails_closed=True`.
     - blocking_failure_yields_failure_and_request_changes_per_dispatch
         → ("failure","REQUEST_CHANGES") is returned under a non-constant
           test referencing `conclusion`/`"failure"`.
@@ -35,7 +35,8 @@ wire 5xx). This version asserts AST *shape and reachability*:
         → exactly one `_gate`, returning 2-tuples; no dead
           (`if False`) branches anywhere in the gate or dispatch.
 
-  Publish-independence contract (`dispatch_code_review`):
+  Publish-independence contract (`_review_pass`, reached through
+  `dispatch_code_review` with the original `blocking` flag):
     - check_run_and_review_publish_independently_per_dispatch
         → post_check_run + post_review each in their own try; the
           check-run handler sets `check_publish_failed = True` (an Assign,
@@ -411,7 +412,7 @@ def _check_mode_derivation(f: ast.FunctionDef, path: Path) -> list[str]:
     fails: list[str] = []
     params = {a.arg for a in (f.args.args + f.args.kwonlyargs)}
     if "blocking" not in params:
-        fails.append(f"FAIL: {path} — dispatch_code_review has no `blocking` param")
+        fails.append(f"FAIL: {path} - {f.name} has no `blocking` param")
     mode_vals = _mode_values(f)
     if not mode_vals:
         fails.append(f"FAIL: {path} — `mode` is never assigned")
@@ -498,16 +499,30 @@ def _check_publish_handlers(
 
 
 def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
-    f = _find_funcdef(tree, "dispatch_code_review")
+    entry = _find_funcdef(tree, "dispatch_code_review")
+    if entry is None:
+        return [f"FAIL: {path} - exactly one `dispatch_code_review` expected"]
+    # The entry point delegates the pass inside a try/finally for approval
+    # cleanup. Require a direct return so an unused helper cannot attest it.
+    body = entry.body[1:] if ast.get_docstring(entry) is not None else entry.body
+    match body:
+        case [ast.Try(body=[ast.Return(value=ast.Call(func=ast.Name(id="_review_pass")) as call)])]:
+            blocking = _kwarg_value(call, "blocking")
+            if not isinstance(blocking, ast.Name) or blocking.id != "blocking":
+                return [f"FAIL: {path} - dispatch_code_review must forward blocking to _review_pass"]
+        case _:
+            return [f"FAIL: {path} - dispatch_code_review must directly return _review_pass"]
+
+    f = _find_funcdef(tree, "_review_pass")
     if f is None:
-        return [f"FAIL: {path} — exactly one `dispatch_code_review` expected"]
+        return [f"FAIL: {path} - exactly one `_review_pass` expected"]
     fails: list[str] = []
 
     # No dead-code guards anywhere (kills `... and False` around post_review etc).
     dead = _dead_branch_tests(f)
     if dead:
         fails.append(
-            f"FAIL: {path} — dispatch_code_review has dead-code branch test(s) at "
+            f"FAIL: {path} - {f.name} has dead-code branch test(s) at "
             f"line(s) {dead}; a constant-false guard hides a skipped publish surface"
         )
 
@@ -601,12 +616,12 @@ def _check_capture(tree: ast.AST, f: ast.FunctionDef, path: Path) -> list[str]:
     capture_tries = _try_blocks_containing(f, "get_review_comments")
     capture_helper = _find_funcdef(tree, "_capture_review_comments")
     if capture_helper is not None:
-        # When the helper exists, dispatch_code_review MUST call it -
+        # When the helper exists, the review pass MUST call it -
         # otherwise the synchronous path silently drops comment capture.
         if not _calls_named(f, "_capture_review_comments"):
             fails.append(
                 f"FAIL: {path} - _capture_review_comments helper exists but is "
-                "never called from dispatch_code_review"
+                f"never called from {f.name}"
             )
         # When the helper exists, it MUST contain a guarded get_review_comments
         # call - capture_tries is only for inline capture in dispatch.
