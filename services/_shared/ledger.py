@@ -288,7 +288,7 @@ def learning_metrics(rows: list[LedgerRow]) -> dict[str, object]:
     }
 
 
-def second_lineage_yield(rows: list[LedgerRow]) -> dict[str, float]:
+def second_lineage_yield(rows: list[LedgerRow]) -> dict[str, int | float | None]:
     """What the second pass cost and found (#1573), for the four-week review
     of its path list."""
     own = [r for r in rows if r.reviewer == SECOND_LINEAGE_REVIEWER]
@@ -299,7 +299,7 @@ def second_lineage_yield(rows: list[LedgerRow]) -> dict[str, float]:
         "second_only_blocking": second_only,
         "single_lineage": sum(1 for r in own if r.verdict == "single-lineage"),
         "model_calls": calls,
-        "calls_per_finding": calls / second_only if second_only else 0.0,
+        "calls_per_finding": calls / second_only if second_only else None,
     }
 
 
@@ -336,12 +336,14 @@ def format_metrics(rows: list[LedgerRow]) -> str:
         lines.append(f"  {tier}: {addressed}/{labeled} addressed")
     second = second_lineage_yield(rows)
     if second["runs"] or second["single_lineage"]:
+        cost = second["calls_per_finding"]
+        cost_text = f"{cost:.1f}" if cost is not None else "n/a"
         lines.append(
             f"second lineage: {second['runs']} runs, "
             f"{second['second_only_blocking']} second-only blocking, "
             f"{second['single_lineage']} single-lineage, "
             f"{second['model_calls']} calls, "
-            f"{second['calls_per_finding']:.1f} calls per finding"
+            f"{cost_text} calls per finding"
         )
     return "\n".join(lines)
 

@@ -3934,7 +3934,8 @@ def _second_lineage_rows(
     for the run. They carry no reaction label."""
     base = {
         "repo": repo, "pr": pull_number, "reviewer": SECOND_LINEAGE_REVIEWER,
-        "ts": "", "commit": head_sha or None, "head_sha": head_sha or None,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "commit": head_sha or None, "head_sha": head_sha or None,
     }
     rows = [
         {
@@ -3950,8 +3951,6 @@ def _second_lineage_rows(
     rows.append({
         **base, "severity": "", "class": "second-lineage", "finding": "run",
         "verdict": outcome, "evidence": f"second-lineage:{head_sha}",
-        # A real time: the row key includes it, so a rerun adds its own row.
-        "ts": datetime.now(timezone.utc).isoformat(),
         "model_calls": model_calls,
     })
     return rows

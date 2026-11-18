@@ -4,8 +4,11 @@ network. Webhook-only (the poller ships in the webhook image)."""
 
 from __future__ import annotations
 
+from datetime import date, datetime, timezone
+
 import poller_handler
 import pytest
+from adapters import install_store
 from github_rulesets_client import EnforcementDetection
 
 
@@ -82,6 +85,56 @@ def _wire(monkeypatch, *, installs, records_for, retry, poll):
         "_install_reconciliation_pass",
         lambda: (0, 0, 0),
     )
+
+
+def test_poller_reports_completed_second_lineage_weeks_once(monkeypatch, caplog):
+    _wire(monkeypatch, installs=[], records_for=None, retry=None, poll=None)
+    monkeypatch.setenv("GRUG_SECOND_LINEAGE_REVIEW", "1")
+    now = datetime(2026, 5, 11, 13, tzinfo=timezone.utc)
+    monkeypatch.setattr(poller_handler, "_now_epoch", now.timestamp)
+
+    def row(day, verdict, calls=0):
+        return {
+            "repo": "o/r", "pr": 1, "reviewer": "elder-second-lineage",
+            "class": "security", "finding": "finding", "verdict": verdict,
+            "ts": f"2026-05-{day:02d}T00:00:00+00:00", "model_calls": calls,
+        }
+
+    def ledger_rows(start, end):
+        assert (start, end) == (date(2026, 4, 13), date(2026, 5, 11))
+        return [
+            row(2, "second-lineage-run", 2), row(4, "second-lineage-run", 3),
+            row(4, "second-only"), row(9, "single-lineage", 1),
+        ]
+
+    reports = {}
+
+    def save(week_start, report):
+        if week_start in reports:
+            return False
+        reports[week_start] = report
+        return True
+
+    monkeypatch.setattr(install_store, "get_second_lineage_report", reports.get)
+    monkeypatch.setattr(install_store, "list_second_lineage_rows", ledger_rows)
+    monkeypatch.setattr(install_store, "put_second_lineage_report", save)
+
+    with caplog.at_level("INFO"):
+        poller_handler.handler({}, None)
+        poller_handler.handler({}, None)
+
+    logged = [r for r in caplog.records if r.getMessage() == "elder_second_lineage_weekly"]
+    assert len(logged) == 1
+    assert logged[0].week_start == "2026-05-04"
+    assert logged[0].week_end == "2026-05-11"
+    assert logged[0].weekly == {
+        "runs": 1, "second_only_blocking": 1, "single_lineage": 1,
+        "model_calls": 4, "calls_per_finding": 4.0,
+    }
+    assert logged[0].trailing_four_weeks == {
+        "runs": 2, "second_only_blocking": 1, "single_lineage": 1,
+        "model_calls": 6, "calls_per_finding": 6.0,
+    }
 
 
 def test_poller_polls_each_allowlisted_install(monkeypatch):
