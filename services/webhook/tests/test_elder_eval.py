@@ -61,6 +61,33 @@ def _row(
     )
 
 
+def test_verify_only_replay_counts_captured_findings_and_later_verdicts(monkeypatch, capsys):
+    from adapters import pg_install_store
+    from elder_eval import __main__ as cli
+
+    ask = {"finding_text": "Ensure the timeout is set.", "finding_tags": {"severity": "medium"}}
+    records = [
+        {**ask, "last_verdict": "confirmed", "trust_reactors": True},
+        {**ask, "resolution": {"state": "addressed"}, "trust_reactors": True},
+        {**ask, "last_verdict": "false_positive", "trust_reactors": True},
+        {**ask, "last_verdict": "confirmed"},
+        {**ask, "finding_tags": {"severity": "high"}},
+        {**ask, "finding_text": "An empty string crashes here. Verify the fallback."},
+    ]
+
+    def list_records(installation_id):
+        assert installation_id == 1
+        return records
+
+    monkeypatch.setattr(pg_install_store, "list_comment_records", list_records)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    assert cli.main(["--verify-only", "1"]) == 0
+    output = capsys.readouterr().out
+    assert "Would demote 4 of 6 captured Elder findings" in output
+    assert "Later marked real: 2" in output
+
+
 # --- class normalization + taxonomy bridge ---------------------------------
 
 

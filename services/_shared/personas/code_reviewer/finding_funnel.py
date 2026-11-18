@@ -7,7 +7,8 @@ spends a call on a finding they drop:
 
 1. correctness-only: a docs- or tests-only review keeps correctness rules;
 2. unreachable-defensive: a low or medium defensive finding that names no
-   reachable caller or input is dropped;
+   reachable caller or input is dropped, with verify-only asks kept for
+   the summary;
 3. checked-shell: a shell command whose exit status is already checked
    (#771) is not "unchecked";
 4. intent-mismatch: the evidence filter (#1170) and box scope (#1218).
@@ -43,6 +44,7 @@ from personas.code_reviewer.persona import (
 )
 from personas.code_reviewer.repo_config import _SEVERITY_RANK
 from personas.code_reviewer.shell_flow_filter import filter_checked_shell_findings
+from personas.code_reviewer.verify_only import is_summary_only
 from personas.tpm.ticket_compliance import closes_refs
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
@@ -115,6 +117,7 @@ def drop_unreachable_defensive_findings(
         if f.rule_name in DEFENSIVE_RULES
         and f.severity in ("low", "medium")
         and not REACHABLE_SOURCE_RE.search(f.message)
+        and not is_summary_only(f.message, f.severity)
     )
     if not dropped:
         return evaluation, 0

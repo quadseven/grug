@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import re
 
-from personas.code_reviewer.persona import Finding
-
 # One clause that is an ask to check something, with up to three polite or
 # hedged lead-ins. Each lead-in ends in a word and the separator class is
 # disjoint from it, and the repeat is bounded, so the match cannot backtrack
@@ -72,6 +70,6 @@ def is_verify_only(message: str) -> bool:
     return not any(_CLAIM_RE.search(s) for s in sentences if s not in asks)
 
 
-def is_summary_only(finding: Finding) -> bool:
+def is_summary_only(message: str, severity: str) -> bool:
     """A low or medium verify-only finding: summary, no inline comment."""
-    return finding.severity in _DEMOTABLE and is_verify_only(finding.message)
+    return severity in _DEMOTABLE and is_verify_only(message)

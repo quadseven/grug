@@ -1,8 +1,12 @@
 """Findings that only ask the author to verify, ensure or confirm (grug#1749)."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
+from llm_client import FindingJudgement
+from personas.code_reviewer.finding_funnel import publish_funnel
 from personas.code_reviewer.markings import build_review_result
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 from personas.code_reviewer.verify_only import is_summary_only, is_verify_only
@@ -69,12 +73,12 @@ def _finding(message, severity="medium", line=3):
 
 @pytest.mark.parametrize("severity", ["low", "medium"])
 def test_low_and_medium_verify_only_findings_are_summary_only(severity):
-    assert is_summary_only(_finding(VERIFY_ONLY[0], severity))
+    assert is_summary_only(VERIFY_ONLY[0], severity)
 
 
 @pytest.mark.parametrize("severity", ["high", "critical"])
 def test_high_and_critical_are_never_demoted(severity):
-    assert not is_summary_only(_finding(VERIFY_ONLY[0], severity))
+    assert not is_summary_only(VERIFY_ONLY[0], severity)
 
 
 def test_the_judge_rubric_grades_a_verify_only_ask_as_not_a_real_bug():
@@ -95,3 +99,24 @@ def test_the_review_posts_no_inline_comment_for_a_verify_only_finding():
     _, posted = build_review_result(evaluation, head_sha="abc123", event="COMMENT")
 
     assert [f.line for f in posted] == [4, 5]
+
+
+@pytest.mark.parametrize("rule_name", ["missing-validation", "correctness"])
+def test_the_funnel_keeps_a_judge_rejected_verify_request_for_the_summary(rule_name):
+    ask = replace(_finding(VERIFY_ONLY[0]), rule_name=rule_name)
+    evaluation = CodeReviewEvaluation(findings=(ask,), conclusion="success")
+
+    result = publish_funnel(
+        evaluation, {}, {},
+        grade=lambda current: tuple(
+            FindingJudgement(i, False, "The finding only asks for verification.", confidence=1.0)
+            for i, _ in enumerate(current.findings)
+        ),
+        verify=lambda current: current,
+        falsify=lambda findings, _graded, _verdicts: findings,
+    )
+
+    assert result.graded == (ask,)
+    assert result.evaluation.findings == (ask,)
+    _, posted = build_review_result(result.evaluation, head_sha="abc123", event="COMMENT")
+    assert posted == ()

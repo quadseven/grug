@@ -8350,6 +8350,7 @@ JUDGE_MAX_FINDINGS = 75
 # single judge request, not the persona's total bounded batch budget.
 _JUDGE_MAX_FINDINGS = JUDGE_BATCH_SIZE
 
+# The verify-only criterion adapts the MIT-licensed rubric credited in #1749.
 _JUDGE_SYSTEM_PROMPT = (
     "You are an adjudicator grading a code reviewer's findings to build a "
     "ground-truth dataset. For each numbered finding, decide whether it "
