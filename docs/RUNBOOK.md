@@ -670,15 +670,15 @@ model's empty answer confirms nothing, because one answered empty on a
 33k-token diff where the paid primary found faults.
 
 A narrow relaxation exists, off unless `GRUG_OPENCODE_GO_FREE_CONFIRM=1`. A free
-Go model's empty answer then counts as the second opinion only when all of these
-hold: a paid or ranked model already answered empty on the same cohort; the
-cohort is at most `GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_TOKENS` (default 10000,
-about four characters to a token); the model qualifies in
+Go model's empty answer then counts as the second opinion only when a paid or
+ranked model also answers empty on the same cohort. The cohort must fit within
+`GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_TOKENS` (default 10000, about four characters
+to a token). The free model must qualify in
 `services/_shared/opencode_go_free_eval.json` (a false-empty rate of 5 percent
-or less on at least 20 defect cases, computed from the counts, not from the
-stored list); and the report is no more than
-`GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_AGE_DAYS` old (default 60). The log line
-`llm_cloud_empty_consensus` carries `relaxed: true` when the relaxation decided.
+or less on at least 20 defect cases, computed from the counts). The report must
+be no more than `GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_AGE_DAYS` old (default 60).
+The `llm_cloud_empty_consensus` log carries `relaxed: true` when this rule
+confirms the review.
 
 To re-measure, from `services/webhook` with `PYTHONPATH=../_shared` and the
 OpenCode Go key in `GRUG_BENCH_OPENCODE_GO_KEY`:
@@ -1133,6 +1133,12 @@ let the deploy roll it out. Since 2026-11-01 the deployed value is
 `openrouter:paid`; OpenCode Go is back on (grug#1575, after grug#1225). An
 entry that names no known backend or pool logs
 `grug_disabled_backends_unknown_entry` and disables nothing.
+
+With `GRUG_OPENCODE_GO_FREE_DISCOVERY` enabled, Elder tries live-listed free
+Go models before configured paid Go models. A nonempty catalog excludes
+unlisted models. If the catalog is empty or unavailable, Elder keeps the
+configured Go models in order, skipping names that end in `-free`.
+`opencode_go_review_served` logs the model that served a review.
 
 `GRUG_OPENCODE_GO_DAILY_CAP` bounds paid OpenCode Go calls per UTC day across
 every pod, counted in `grug_kv`. At the cap grug logs
