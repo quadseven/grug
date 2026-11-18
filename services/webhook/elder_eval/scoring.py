@@ -9,8 +9,8 @@ Metrics:
 - CATCH (per ledger class, over non-errored cases that expect it): the
   replay emitted >= 1 finding in any of the class's bridged Elder classes.
 - OVERALL CATCH (micro): caught (case, class) cells / expected cells.
-- NOISE: replay findings landing on (case, class) cells the corpus knows
-  ONLY as false positives / all replay findings. 0.0 when nothing was
+- NOISE: findings on clean fixtures or (case, class) cells labeled as
+  false positives / all replay findings. 0.0 when nothing was
   emitted (vacuously noise-free, mirroring the SAST precision convention).
 - HONEST-ZERO RULE: an errored case is EXCLUDED from every denominator
   and listed in `errored_cases` - a non-run is not a miss, and an
@@ -230,7 +230,7 @@ def score(
                 caught_cells[ledger_cls] += 1
         for elder_cls, n in replay.emitted.items():
             total_emitted += n
-            if elder_cls in case.fp_only_classes:
+            if case.clean or elder_cls in case.fp_only_classes:
                 noise += n
 
     per_class = {

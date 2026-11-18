@@ -187,6 +187,21 @@ def test_export_then_plan_import_round_trips_into_an_empty_instance():
     assert plan.items[0]["learning"]["source_pr"] == 3
 
 
+def test_outcome_citations_survive_export_and_plan_import():
+    row = _row("prefer early returns", status="pending", source_prs=[12, 34],
+               history=[{"action": "proposed"}])
+    doc = cd.export_document([row])
+    assert doc["version"] == 1
+
+    plan = cd.plan_import(doc, target_repo=None, existing_ids=set())
+    assert plan.ok
+    [learning] = plan.to_create
+    assert learning["source_prs"] == [12, 34]
+    [exported] = doc["learnings"]
+    assert exported["origin"] == "outcome"
+    assert exported["source_prs"] == [12, 34]
+
+
 def test_plan_import_rejects_an_unknown_format_or_version():
     assert cd.plan_import({"format": "other", "version": 1, "learnings": []},
                           target_repo="o/r", existing_ids=set()).errors
@@ -342,6 +357,125 @@ def test_a_dismissal_that_explains_itself_is_a_reason():
 def test_export_carries_origin_reason_and_expiry():
     row = _taught(1, reason="the caller validates", finding_class="null-deref", author="dev")
     item = cd.export_document([row])["learnings"][0]
+    assert item["origin"] == "reply"
     assert item["reason"] == "the caller validates"
     assert item["finding_class"] == "null-deref"
     assert item["expires_at"] == cd.expires_at(row)
+
+
+# --- outcome-proposed rules (T1757) ---------------------------------------
+# An outcome row joins the ledger's written fields (repo, pr, class,
+# category, verdict - see reactions.record_ledger_learning / store.put_ledger_row)
+# with the reply's written reason and the ADR-0026 trust fields the reply gate
+# checks (declined_by, pr_author, commit_authors - see dispatcher's reply
+# handler). The proposer itself is pure: these are in-memory dicts, no store.
+
+def _outcome(
+    finding_class: str = "null-deref", *, repo: str = "o/r", pr: int = 12,
+    verdict: str = "declined", category: str = "correctness",
+    reason: str = "The caller validates the id before it is used downstream.",
+    declined_by: str = "reviewer-one", pr_author: str = "author-one",
+    commit_authors: list[str] | tuple[str, ...] = ("committer-one",),
+    actor_type: str = "",
+) -> dict:
+    return {
+        "repo": repo,
+        "finding_class": finding_class,
+        "category": category,
+        "verdict": verdict,
+        "reason": reason,
+        "pr": pr,
+        "declined_by": declined_by,
+        "pr_author": pr_author,
+        "commit_authors": list(commit_authors),
+        "actor_type": actor_type,
+    }
+
+
+def test_two_reasoned_declines_on_two_prs_propose_one_rule_citing_both():
+    proposals = cd.propose_rules([_outcome(pr=12), _outcome(pr=34)])
+    assert len(proposals) == 1
+    proposal = proposals[0]
+    assert proposal.repo == "o/r"
+    assert proposal.finding_class == "null-deref"
+    assert proposal.source_prs == (12, 34)
+    assert "#12" in proposal.text and "#34" in proposal.text
+    assert "null deref" in proposal.text
+
+    learning = proposal.as_learning(now=_NOW.isoformat())
+    assert learning["status"] == cd.STATUS_PENDING
+    assert learning["finding_class"] == "null-deref"
+    # A pending row never reaches a prompt: outcomes alone cannot quiet Elder.
+    assert cd.select_for_prompt([learning]).selected == []
+
+
+@pytest.mark.parametrize("prs", [(12,), (12, 12)])
+def test_fewer_than_two_distinct_prs_proposes_nothing(prs):
+    assert cd.propose_rules([_outcome(pr=pr) for pr in prs]) == []
+
+
+@pytest.mark.parametrize("decliner", ["author-one", "committer-one"])
+def test_a_decline_by_the_pr_author_or_a_commit_author_is_not_counted(decliner):
+    outcomes = [_outcome(pr=12, declined_by=decliner), _outcome(pr=34)]
+    assert cd.propose_rules(outcomes) == []
+
+
+def test_an_app_decliner_is_not_counted():
+    outcomes = [
+        _outcome(pr=12, declined_by="review-bot[bot]", actor_type="Bot"),
+        _outcome(pr=34),
+    ]
+    assert cd.propose_rules(outcomes) == []
+
+
+def test_a_bare_or_short_reason_is_not_counted():
+    outcomes = [_outcome(pr=12, reason="wrong"), _outcome(pr=34)]
+    assert cd.propose_rules(outcomes) == []
+
+
+@pytest.mark.parametrize(
+    ("finding_class", "category"),
+    [
+        ("sql-injection", "correctness"),   # SAST class
+        ("null-deref", "security"),         # security category
+        ("missing-authz-check", "correctness"),  # protected vocabulary
+    ],
+)
+def test_a_protected_class_proposes_nothing(finding_class, category):
+    outcomes = [
+        _outcome(pr=12, finding_class=finding_class, category=category),
+        _outcome(pr=34, finding_class=finding_class, category=category),
+    ]
+    assert cd.propose_rules(outcomes) == []
+
+
+def test_a_reason_naming_protected_territory_proposes_nothing():
+    outcomes = [
+        _outcome(pr=12, reason="This sql injection report is simply wrong here."),
+        _outcome(pr=34, reason="The sql injection here is expected by design."),
+    ]
+    assert cd.propose_rules(outcomes) == []
+
+
+def test_two_classes_propose_two_independent_rules():
+    outcomes = [
+        _outcome(pr=12, finding_class="null-deref"),
+        _outcome(pr=34, finding_class="null-deref"),
+        _outcome(pr=56, finding_class="unused-import"),
+        _outcome(pr=78, finding_class="unused-import"),
+    ]
+    proposals = {p.finding_class: p for p in cd.propose_rules(outcomes)}
+    assert set(proposals) == {"null-deref", "unused-import"}
+    assert proposals["unused-import"].source_prs == (56, 78)
+
+
+def test_the_same_outcomes_twice_write_no_second_row():
+    outcomes = [_outcome(pr=12), _outcome(pr=34)]
+    rows: dict[str, dict] = {}
+    for _ in range(2):
+        for proposal in cd.propose_rules(outcomes):
+            # The store keys by learning_id of the text with ON CONFLICT DO
+            # NOTHING, so the second run hits the same key and adds no row.
+            rows.setdefault(proposal.id, proposal.as_learning())
+    assert len(rows) == 1
+    assert next(iter(rows)) == cd.learning_id(cd.propose_rules(outcomes)[0].text)

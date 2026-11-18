@@ -56,7 +56,8 @@ from personas.code_reviewer.pinned_review import pin_line, pin_review
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 from personas.code_reviewer.verify_only import is_summary_only
 from personas.code_reviewer.degraded_gate import (
-    gate_sentence, lead_with_degraded_line,
+    could_not_review_sentence, could_not_review_title, gate_sentence,
+    lead_with_degraded_line,
 )
 
 # Grug's face on the review comment. The code-reviewer persona IS Elder,
@@ -499,7 +500,7 @@ def _summary_markdown(
     if review_phase == "deep" and is_blackout(evaluation.degraded_reason):
         # grug#848: a blackout in the deep phase is the REASONER arm's -
         # `_async_deep_decision` never starts the deep append over a
-        # blacked-out Tier-1 - so the generic "could not see the diff" below
+        # blacked-out Tier-1 - so the generic "could not review" below
         # would be false here: Tier-1 did see it and its verdict stands. The
         # news is that the second look Tier-1 promised ("reasoner may append
         # later if escalated") never happened, and this neutral is not the
@@ -520,10 +521,8 @@ def _summary_markdown(
             and bool(evaluation.coverage.unattempted_cohorts)
         )
         reason = evaluation.degraded_reason + _tried_models_title(evaluation.coverage)
-        title = (
-            f"WARN Grug eyes clouded ({reason}; some cohorts never attempted)"
-            if starved
-            else f"WARN Grug eyes clouded ({reason})"
+        title = could_not_review_title(
+            f"{reason}; some cohorts never attempted" if starved else reason,
         )
         starved_note = (
             "\n\nSome cohorts were never opened - the review budget ran out "
@@ -532,8 +531,7 @@ def _summary_markdown(
             else ""
         )
         return _hunt_title(title, living_range), (
-            "Grug Elder could not see the diff this pass. The mist: "
-            f"`{evaluation.degraded_reason}`. "
+            could_not_review_sentence(evaluation.degraded_reason) + " "
             + gate_sentence(blocking)
         ) + _tried_models_note(evaluation.coverage) + starved_note + held + hunt + defensive_note + tier_note
     if not evaluation.findings:
@@ -932,12 +930,16 @@ def _inline_comment_body(
     )
     if f.effort:
         chip += f" | {_effort_chip(f.effort)}"
+    evidence = ""
+    if f.evidence_ref is not None:
+        evidence = f"**Evidence:** `{_md_code_span(f.evidence_ref.path)}:{f.evidence_ref.line}`\n\n"
     head = (
         f"{chip}\n\n"
         # grug#1398 publish-time check: a Where the model wrote into the
         # message names the anchor, the same line the footer renders.
         f"**What Elder sees**\n\n"
         f"{_defused(repair_where_refs(f.message, f.file, f.line))}\n\n"
+        f"{evidence}"
         f"**Why it matters**\n\n{_defused(_why_it_matters(f.rule_name))}\n\n"
         f"**Where:** `{_md_code_span(f.file)}:{f.line}`"
     )
@@ -1032,11 +1034,11 @@ def worth_an_email(evaluation: CodeReviewEvaluation) -> bool:
     scanners and republishes them alongside whatever the LLM finds.
 
     The trade is explicit. If every retry also fails, the author gets no board
-    at all - but the check-run still carries the degraded verdict (rerun
-    fail-opens it to neutral rather than leaving it in_progress), so the
-    signal survives in the place a required check is read. A false "Grug could
-    not see" is worse than a quiet one, because it trains the author to
-    discount the surface entirely.
+    at all - but the check-run still carries the degraded verdict, published
+    on the last scheduled delivery (grug#818: earlier deliveries leave the
+    check pending), so the signal survives in the place a required check is
+    read. A false "Grug could not review" is worse than a quiet one, because
+    it trains the author to discount the surface entirely.
     """
     if evaluation.degraded_reason in RETRIED_DEGRADATIONS:
         return False
@@ -1175,7 +1177,7 @@ def _stack_closing_note(
             "",
         ]
     if is_partial_coverage(evaluation.degraded_reason):
-        # Elder DID review - just not all of it. "Grug could not see" would
+        # Elder DID review - just not all of it. "Grug could not review" would
         # discard real work and read as a tool failure.
         return ["", "---", "", _unwalked_ground_note(evaluation), ""]
     if is_low_confidence(evaluation.degraded_reason):
@@ -1196,8 +1198,7 @@ def _stack_closing_note(
             "",
             "---",
             "",
-            "Review degraded - no usable findings were produced. "
-            "Grug not say trail safe. Grug say Grug could not see.",
+            could_not_review_sentence(str(evaluation.degraded_reason)),
             "",
         ]
     return []
@@ -1571,7 +1572,9 @@ def build_review_result(
     # grug#1749: a low or medium finding that only asks the author to verify,
     # ensure or confirm, with no failing input or wrong line, stays in the
     # check summary with no inline comment.
-    new_findings = tuple(f for f in new_findings if not is_summary_only(f))
+    new_findings = tuple(
+        f for f in new_findings if not is_summary_only(f.message, f.severity)
+    )
     if repo_config is not None:
         # `.grug.yaml` min_inline_severity: lower findings stay in the check
         # summary (built from the full evaluation) but get no inline comment.

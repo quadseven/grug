@@ -10,6 +10,12 @@
     python -m elder_eval --production         # shipped staged discovery
     python -m elder_eval --production --published
                                              # findings surviving publication gates
+    python -m elder_eval --verify-only INSTALLATION_ID
+                                             # replay captured Elder comments
+
+The verify-only replay reads the installation's retained comment records
+from the database. It reports potential demotions and later trusted outcomes
+without a model call or GitHub token.
 
 Corpus source: `--repo <owner/name>` reads the INGESTED store rows (needs
 the DB env; the in-cluster path), else `--jsonl <path>` parses the
@@ -17,7 +23,7 @@ committed corpus via the slice-1 `ledger.parse_jsonl` layer (default:
 logs/review-ledger.jsonl at the repo root). Both flow through slice-1
 types - there is no third parser.
 
-All modes make REAL backend calls (`sast_benchmark.backends`
+Model replay modes make REAL backend calls (`sast_benchmark.backends`
 GRUG_BENCH_* env) and REAL GitHub diff fetches - never run in the per-PR
 CI suite. The per-PR suite exercises only the pure core + the prompt-sha
 gate (test_elder_eval.py). The baseline records the STATIC prompt run
@@ -77,8 +83,10 @@ import sys
 from pathlib import Path
 
 from ledger import parse_jsonl
+from personas.code_reviewer.reactions import ledger_label
+from personas.code_reviewer.verify_only import is_summary_only
 
-from .corpus import build_cases, rows_from_store
+from .corpus import build_cases, load_fixture_cases, rows_from_store
 from .gate import (
     BASELINE_PATH,
     compute_prompt_sha,
@@ -285,12 +293,16 @@ def _parse_args(
     src.add_argument(
         "--jsonl",
         default=str(_DEFAULT_JSONL),
-        help="committed-ledger path (slice-1 parse_jsonl)",
+        help="ledger JSONL path (the default also includes committed cross-file fixtures)",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--record", action="store_true", help="write baseline.json")
     mode.add_argument(
         "--check", action="store_true", help="exit 1 on regression vs baseline"
+    )
+    mode.add_argument(
+        "--verify-only", type=int, metavar="INSTALLATION_ID",
+        help="report verify-only demotions and outcomes from captured Elder comments",
     )
     parser.add_argument("--backend", help="run only this configured backend")
     parser.add_argument(
@@ -331,6 +343,8 @@ def _load_corpus(args):
         else parse_jsonl(Path(args.jsonl).read_text())
     )
     all_cases = build_cases(rows)
+    if not args.repo and Path(args.jsonl) == _DEFAULT_JSONL:
+        all_cases += load_fixture_cases()
     cases = tuple(case for case in all_cases if case.scorable)
     skipped = len(all_cases) - len(cases)
     if skipped:
@@ -495,10 +509,33 @@ def _check_report(report: EvalReport, backend_name: str, model: str) -> int:
     return 0
 
 
+def _report_verify_only_replay(installation_id: int) -> None:
+    from adapters.pg_install_store import list_comment_records
+
+    records = list_comment_records(installation_id)
+    demoted = [
+        record for record in records
+        if is_summary_only(
+            record.get("finding_text", ""), record["finding_tags"].get("severity", ""),
+        )
+    ]
+    real = sum(
+        bool(record.get("trust_reactors"))
+        and ledger_label(record.get("last_verdict"), record.get("resolution"))
+        in ("fixed", "declined")
+        for record in demoted
+    )
+    print(f"Would demote {len(demoted)} of {len(records)} captured Elder findings")
+    print(f"Later marked real: {real}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser, args = _parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    if args.verify_only is not None:
+        _report_verify_only_replay(args.verify_only)
+        return 0
     rows, all_cases, cases = _load_corpus(args)
     if not cases:
         print("corpus has no scorable cases - nothing to eval", file=sys.stderr)
@@ -540,4 +577,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from adapters.pg_base import close_pool
+
+    try:
+        sys.exit(main())
+    finally:
+        close_pool()

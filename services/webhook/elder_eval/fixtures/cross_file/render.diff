@@ -1,0 +1,11 @@
+diff --git a/src/render.py b/src/render.py
+--- a/src/render.py
++++ b/src/render.py
+@@ -1,5 +1,5 @@
+-def render(report, style="summary"):
++def render(report, *, style):
+     return f"{style}: {report}"
+ # Entry point used by the web handler.
+ def web_report():
+-    return render("daily", "table")
++    return render("daily", style="table")

@@ -77,6 +77,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
       "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/${OG_ASSET}" \
  && echo "${OG_SHA}  /opengrep" | sha256sum -c - \
  && chmod 0755 /opengrep
+# Unpack once at build time. A running engine must have no writable runtime
+# shared with other reviews. The extracted CLI can run directly.
+RUN HOME=/tmp XDG_CACHE_HOME=/tmp/opengrep-cache /opengrep --version \
+ && mv "/tmp/opengrep-cache/opengrep/v${OPENGREP_VERSION}" /opengrep-runtime \
+ && chmod -R a+rX /opengrep-runtime
+
+FROM debian:trixie-slim AS analyzer-sandbox-build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc libc6-dev libseccomp-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY _shared/personas/code_reviewer/analyzer_isolation.c /analyzer_isolation.c
+RUN cc -std=c11 -O2 -Wall -Wextra -Werror -static /analyzer_isolation.c \
+      -lseccomp -o /grug-analyzer-sandbox
 
 FROM python:3.13-slim AS runtime
 
@@ -109,12 +122,13 @@ COPY ${SERVICE}/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt "uvicorn>=0.34,<1"
 
 COPY --from=signing-helper /aws_signing_helper /usr/local/bin/aws_signing_helper
-# /usr/local/bin because the runtime user is created --no-create-home below,
-# so $HOME does not exist and anything installed into it would vanish.
-COPY --from=opengrep-fetch /opengrep /usr/local/bin/opengrep
+COPY --from=opengrep-fetch /opengrep-runtime/ /opt/grug-opengrep/
+COPY --from=analyzer-sandbox-build /grug-analyzer-sandbox /usr/local/bin/grug-analyzer-sandbox
+ENV GRUG_ANALYZER_SANDBOX=/usr/local/bin/grug-analyzer-sandbox
 # Exec it during the build: a scanner that is present but non-runnable is the
 # exact failure this replaces, and it must die pre-merge rather than in a pod.
-RUN /usr/local/bin/opengrep --version
+RUN ln -s /opt/grug-opengrep/opengrep.bin /usr/local/bin/opengrep \
+ && /usr/local/bin/opengrep --version
 COPY _shared/ ./_shared/
 COPY ${SERVICE}/ ./
 

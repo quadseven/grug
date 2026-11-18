@@ -198,6 +198,29 @@ model leaving a weaker one in the chain: search `llm_model_benched`); failures
 across every model right after a deploy point at a prompt or parser
 regression.
 
+### Elder: "Grug cannot read this pull request: 403 from GitHub"
+
+Elder logs `elder_pr_read_forbidden` when GitHub denies its initial
+`GET /repos/<owner>/<repo>/pulls/<n>` after one token refresh. The event includes
+`install_id`, `repo`, `pr`, `head_sha`, `status`, and `github_request_id`.
+The job ends as `pr_read_forbidden` without calling a model. When the job
+has a queued head, Elder posts a failing check on that commit. If that
+check fails to publish, the queue retries the job. Jobs without a queued
+head record the denial in the log.
+
+The original incident's specific cause is unconfirmed. Ask the owner of
+the installation identified by `install_id` to open its GitHub App
+configuration, confirm the affected repository is selected, and accept any
+pending **Pull requests** permission grant. See [App permissions](app-permissions.md).
+
+If the settings already grant access, reproduce the same GET from the
+consumer's network using `get_install_token(install_id, force_refresh=True)`
+with the default review purpose. Record the response status, GitHub request
+ID, and `X-Accepted-GitHub-Permissions` header in the private incident record.
+Use those details to check the token grant and the organization's IP policy
+with the installation owner. After the GET returns 200, comment
+`/grug improve` on the affected PR.
+
 ## Missed-delivery replay (#407)
 
 The DoR/TPM check runs inline on the webhook. GitHub does not automatically
@@ -647,15 +670,15 @@ model's empty answer confirms nothing, because one answered empty on a
 33k-token diff where the paid primary found faults.
 
 A narrow relaxation exists, off unless `GRUG_OPENCODE_GO_FREE_CONFIRM=1`. A free
-Go model's empty answer then counts as the second opinion only when all of these
-hold: a paid or ranked model already answered empty on the same cohort; the
-cohort is at most `GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_TOKENS` (default 10000,
-about four characters to a token); the model qualifies in
+Go model's empty answer then counts as the second opinion only when a paid or
+ranked model also answers empty on the same cohort. The cohort must fit within
+`GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_TOKENS` (default 10000, about four characters
+to a token). The free model must qualify in
 `services/_shared/opencode_go_free_eval.json` (a false-empty rate of 5 percent
-or less on at least 20 defect cases, computed from the counts, not from the
-stored list); and the report is no more than
-`GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_AGE_DAYS` old (default 60). The log line
-`llm_cloud_empty_consensus` carries `relaxed: true` when the relaxation decided.
+or less on at least 20 defect cases, computed from the counts). The report must
+be no more than `GRUG_OPENCODE_GO_FREE_CONFIRM_MAX_AGE_DAYS` old (default 60).
+The `llm_cloud_empty_consensus` log carries `relaxed: true` when this rule
+confirms the review.
 
 To re-measure, from `services/webhook` with `PYTHONPATH=../_shared` and the
 OpenCode Go key in `GRUG_BENCH_OPENCODE_GO_KEY`:
@@ -1050,6 +1073,33 @@ backends and since when. It is not an `Elder clear`, and nothing was reviewed.
 - Find advisories: check runs titled `Elder advisory: review backends down`.
   After the outage, re-run any PR that merged on one.
 
+## Grug could not review (`elder_could_not_review`)
+
+An author reads "Grug could not review this pass ... an operator has been
+alerted" only after the retries ran out. That sentence is the same on the
+board verdict, the board body, the check title and the check summary
+(grug#818); `elder_could_not_review` is the ERROR log the alert reads, logged
+before any of them is written. Its `reason` is the degraded reason and its
+`surface` is the writer: `dispatch` (no model produced a usable review),
+`fetch_or_parse` (GitHub would not serve the diff) or `fail_open` (the
+durable lane closed the check).
+
+How far the retries go first:
+
+- Every model failed, unparseable output, a failed diff fetch
+  (`RETRIED_DEGRADATIONS`), and a GitHub refusal while re-checking freshness:
+  the check stays pending in both WARN and BLOCK mode while the review queue
+  still has a re-run scheduled. The terminal check is published on delivery
+  `ALL_FAILED_AUTO_RERUN_DELIVERIES` (4), the last-but-one of the review
+  queue's `maxReceiveCount` (5), so one delivery is left for a consumer killed
+  mid-publish. A test fails if the two numbers drift apart.
+- A billing or key problem on one backend (401/402/403/404) pages on its own
+  as `llm_backend_unusable` (below) and falls through to the next backend; it
+  reaches the author only if every backend failed and every retry did too.
+
+To act: read `reason`, fix the backend or GitHub side, then comment
+`/grug improve` on each PR the log names.
+
 ## LLM backend unusable
 
 The `[grug] LLM backend unusable` monitor fires when a review backend answers
@@ -1083,6 +1133,12 @@ let the deploy roll it out. Since 2026-11-01 the deployed value is
 `openrouter:paid`; OpenCode Go is back on (grug#1575, after grug#1225). An
 entry that names no known backend or pool logs
 `grug_disabled_backends_unknown_entry` and disables nothing.
+
+With `GRUG_OPENCODE_GO_FREE_DISCOVERY` enabled, Elder tries live-listed free
+Go models before configured paid Go models. A nonempty catalog excludes
+unlisted models. If the catalog is empty or unavailable, Elder keeps the
+configured Go models in order, skipping names that end in `-free`.
+`opencode_go_review_served` logs the model that served a review.
 
 `GRUG_OPENCODE_GO_DAILY_CAP` bounds paid OpenCode Go calls per UTC day across
 every pod, counted in `grug_kv`. At the cap grug logs

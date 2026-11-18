@@ -126,14 +126,17 @@ def get_pool() -> ConnectionPool:
     return _pool
 
 
-def reset_pool_for_tests() -> None:
-    """Close + forget the pool. Tests call this between containers."""
+def close_pool() -> None:
+    """Close and forget the shared pool."""
     global _pool, _last_purge
     with _pool_lock:
         if _pool is not None:
             _pool.close()
         _pool = None
         _last_purge = 0.0
+
+
+reset_pool_for_tests = close_pool
 
 
 def _encode_value(v: Any) -> Any:

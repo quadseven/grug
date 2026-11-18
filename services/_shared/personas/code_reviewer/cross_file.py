@@ -16,8 +16,8 @@ contents API (SHA-accurate). A caller that exists only on the PR branch
 is invisible to search - accepted for the tracer (callers needing update
 live on the default branch).
 
-TRACER SCOPE: symbol extraction is Python-focused regex (defs + calls on
-added lines). The lazy tree-sitter repo index is #346 P1.2, deferred.
+TRACER SCOPE: symbol extraction uses regex for Python, JavaScript,
+TypeScript, Go, and C/C++. The lazy tree-sitter repo index is deferred.
 
 FAIL-SAFE contract: every error path degrades to `{}` - today's
 diff-only review - and logs `cross_file_context_degraded`. No cache:
@@ -33,6 +33,8 @@ import os
 import re
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass, replace
+from enum import Enum
 from urllib.parse import quote
 
 import httpx
@@ -83,6 +85,76 @@ _STOP_NAMES = frozenset({
 })
 
 
+@dataclass(frozen=True, slots=True)
+class _BraceLanguage:
+    definition: re.Pattern[str]
+    call: re.Pattern[str]
+    stop_names: frozenset[str]
+
+
+_NAME = r"[A-Za-z_]\w*"
+_IDENTIFIER_CALL = re.compile(rf"\b({_NAME})\s*\(")
+_JS_NAME = r"[A-Za-z_$][\w$]*"
+_JS_TYPE_PARAMS = r"(?:<[^>\n]+>)?"
+_JS = _BraceLanguage(
+    re.compile(
+        rf"\s*(?:(?:(?:export|default|async)\s+)*function(?:\s+|\s*\*\s*)"
+        rf"({_JS_NAME}){_JS_TYPE_PARAMS}\s*\("
+        rf"|(?:export\s+)?const\s+({_JS_NAME})(?:\s*:[^=]+)?\s*=\s*"
+        rf"(?:async\s+)?{_JS_TYPE_PARAMS}\s*(?:\([^;]*\)|{_JS_NAME})\s*(?::[^=]+)?=>"
+        rf"|(?:(?:public|private|protected|static|async|override|get|set)\s+)*"
+        rf"({_JS_NAME}){_JS_TYPE_PARAMS}\s*\([^;]*\)\s*(?::[^;{{]+)?\s*\{{)"
+    ),
+    re.compile(rf"(?<![\w$])({_JS_NAME})\s*\("),
+    frozenset({
+        "if", "for", "while", "switch", "catch", "with", "return", "throw", "typeof",
+        "void", "delete", "new", "super", "import", "async", "await", "function", "require",
+        "eval", "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURI", "decodeURI",
+        "encodeURIComponent", "decodeURIComponent", "setTimeout", "setInterval",
+        "clearTimeout", "clearInterval", "Array", "BigInt", "Boolean", "Date", "Error",
+        "Map", "Number", "Object", "Promise", "RegExp", "Set", "String", "Symbol", "WeakMap",
+        "WeakSet", "log", "stringify",
+    }),
+)
+_GO = _BraceLanguage(
+    re.compile(rf"\s*func\s+(?:\([^)]*\)\s*)?({_NAME})(?:\[[^\]]+\])?\s*\("),
+    _IDENTIFIER_CALL,
+    frozenset({
+        "if", "for", "switch", "select", "return", "defer", "go", "func", "append", "cap",
+        "clear", "close", "complex", "copy", "delete", "imag", "len", "make", "max", "min",
+        "new", "panic", "print", "println", "real", "recover", "bool", "byte", "complex64",
+        "complex128", "float32", "float64", "int", "int8", "int16", "int32", "int64", "rune",
+        "string", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "Print", "Printf",
+        "Println",
+    }),
+)
+_CXX_TYPE = rf"{_NAME}(?:::{_NAME})*(?:<[^<>;{{}}]*>)?"
+_CXX = _BraceLanguage(
+    re.compile(
+        rf"\s*(?:{_CXX_TYPE}\s+)*{_CXX_TYPE}(?:\s*[*&]+\s*|\s+)"
+        rf"(?:{_NAME}::)*({_NAME})\s*\([^;{{}}]*\)\s*"
+        r"(?:(?:const|volatile|noexcept|override|final)\b\s*|&\s*)*"
+        # The opening brace can be on the next line or outside the hunk.
+        r"(?:->\s*[^;{}]+)?(?:\{|$)"
+    ),
+    _IDENTIFIER_CALL,
+    frozenset({
+        "if", "for", "while", "switch", "catch", "return", "throw", "new", "delete", "sizeof",
+        "alignof", "_Alignof", "typeid", "decltype", "defined", "static_assert", "_Static_assert",
+        "constexpr", "noexcept", "static_cast", "dynamic_cast", "const_cast", "reinterpret_cast",
+        "assert", "printf", "fprintf", "snprintf", "sprintf", "scanf", "puts", "putchar", "malloc",
+        "calloc", "realloc", "free", "memcpy", "memmove", "memset", "strlen", "strcmp", "exit",
+        "abort", "bool", "char", "double", "float", "int", "long", "short", "unsigned", "void",
+        "size_t", "move", "forward",
+    }),
+)
+_BRACE_LANGUAGES = {
+    **dict.fromkeys((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"), _JS),
+    ".go": _GO,
+    **dict.fromkeys((".c", ".cc", ".cpp", ".h", ".hpp"), _CXX),
+}
+
+
 # A quoted string literal on a changed line. No quote characters inside, so
 # the value can ride into a code-search phrase query unescaped. Only
 # natural-language text qualifies (a word character AND whitespace, 4+ chars):
@@ -106,11 +178,6 @@ _MAX_SNIPPET_LINES = 80
 # cross-file snippets. Replaces the fixed _MAX_FILES count with a budget
 # that fits the prompt window. A file that does not fit is dropped whole.
 _MAX_CROSS_FILE_TOTAL_CHARS = 40_000
-
-# File classification for ranking (T1756).
-from enum import Enum
-from dataclasses import dataclass, replace
-
 
 class FileTag(Enum):
     """Priority order for cross-file context: callers matter most (they
@@ -246,16 +313,50 @@ def _symbol_snippet(content: str, symbols: tuple[str, ...]) -> str | None:
     return "\n".join(out)
 
 
-def _enclosing_def_from_content(content: str, first_added_line: int) -> str | None:
+def _definition_name(
+    pattern: re.Pattern[str], line: str, stop_names: frozenset[str],
+) -> str | None:
+    match = pattern.match(line)
+    # The JavaScript alternatives each capture the name in a separate group.
+    if match:
+        return next((name for name in match.groups() if name and name not in stop_names), None)
+    return None
+
+
+def _brace_hunk_symbols(
+    body: str, language: _BraceLanguage,
+) -> tuple[list[str], list[str], list[str]]:
+    added: list[str] = []
+    enclosing: list[str] = []
+    calls: list[str] = []
+    header, *lines = body.splitlines()
+    for line in lines:
+        if not line or line[0] not in "+ -" or line[1:].lstrip().startswith("//"):
+            continue
+        name = _definition_name(language.definition, line[1:], language.stop_names)
+        if name:
+            (added if line[0] == "+" else enclosing).append(name)
+        if line[0] == "+":
+            calls.extend(language.call.findall(line[1:]))
+    section = header.split("@@", 2)[-1]
+    name = _definition_name(language.definition, section, language.stop_names)
+    if name:
+        enclosing.append(name)
+    return added, enclosing, calls
+
+
+def _enclosing_def_from_content(
+    content: str, first_added_line: int, pattern: re.Pattern[str], stop_names: frozenset[str],
+) -> str | None:
     """Nearest `def` at or above `first_added_line` (1-based) in the full
     file content - the enclosing function of a body-only change whose def
     line sits OUTSIDE the diff context window (codex round 4, PR #480).
     Pure; None when no def precedes the line (module-level change)."""
     lines = content.splitlines()
     for i in range(min(first_added_line, len(lines)) - 1, -1, -1):
-        m = _PY_LINE_DEF.match(lines[i])
-        if m:
-            return m.group(1)
+        name = _definition_name(pattern, lines[i], stop_names)
+        if name:
+            return name
     return None
 
 
@@ -263,7 +364,7 @@ def _is_prose(lit: str) -> bool:
     return bool(re.search(r"\w", lit) and re.search(r"\s", lit))
 
 
-def _removed_literals(hunks: tuple[DiffHunk, ...]) -> list[str]:
+def _removed_literals(hunks: Iterable[DiffHunk]) -> list[str]:
     """String literals a hunk REMOVES and does not re-add (#847). A changed
     user-facing value has no def or call symbol, so these are the only handle
     for finding an UNCHANGED test that still asserts the old value (the
@@ -293,7 +394,7 @@ def extract_symbols(
     hunks: tuple[DiffHunk, ...],
     file_contents: dict[str, str] | None = None,
 ) -> tuple[str, ...]:
-    """Pull the diff's cross-file-interesting symbols:
+    """Pull cross-file-interesting symbols from supported source files:
 
     1. Function defs the diff adds/changes on a `+` line (their CALLERS
        elsewhere may break on the new signature) - listed first, they
@@ -316,29 +417,39 @@ def extract_symbols(
     defs: list[str] = []
     calls: list[str] = []
     defined_here: set[str] = set()
+    supported_hunks: list[DiffHunk] = []
     for h in hunks:
-        for name in _PY_DEF.findall(h.body):
-            defined_here.add(name)
-            if name not in defs:
-                defs.append(name)
-        enclosing = list(_PY_CONTEXT_DEF.findall(h.body))
-        enclosing += _PY_SECTION_DEF.findall(h.body)
+        extension = os.path.splitext(h.file_path)[1].lower()
+        language = _BRACE_LANGUAGES.get(extension)
+        if language:
+            added, enclosing, called = _brace_hunk_symbols(h.body, language)
+            line_def = language.definition
+            stop_names = language.stop_names
+        elif extension in {".py", ".pyi", ".pyw"}:
+            added = _PY_DEF.findall(h.body)
+            enclosing = _PY_CONTEXT_DEF.findall(h.body) + _PY_SECTION_DEF.findall(h.body)
+            called = _PY_CALL.findall(h.body)
+            line_def = _PY_LINE_DEF
+            stop_names = _STOP_NAMES
+        else:
+            continue
+        supported_hunks.append(h)
         content = contents.get(h.file_path)
         if content and h.new_lines:
-            name = _enclosing_def_from_content(content, min(h.new_lines))
+            name = _enclosing_def_from_content(
+                content, min(h.new_lines), line_def, stop_names if language else frozenset(),
+            )
             if name:
                 enclosing.append(name)
-        for name in enclosing:
-            # The enclosing def IS defined in this file - queue it for a
-            # caller search, never as a call target.
+        for name in added + enclosing:
             defined_here.add(name)
             if name not in defs:
                 defs.append(name)
-        for name in _PY_CALL.findall(h.body):
-            if name not in _STOP_NAMES and name not in calls:
+        for name in called:
+            if name not in stop_names and name not in calls:
                 calls.append(name)
 
-    literals = [lit for lit in _removed_literals(hunks) if lit not in defs]
+    literals = [lit for lit in _removed_literals(supported_hunks) if lit not in defs]
     out: list[str] = list(defs) + literals
     for name in calls:
         # A name defined in-diff needs no definition lookup; as a DEF it

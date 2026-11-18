@@ -24,6 +24,11 @@ from dataclasses import dataclass
 import pulumi_aws as aws
 import pulumiverse_time as ptime
 
+# grug#1625: the IAM users this stack manages (exact names, never a wildcard) and
+# the managed policy every one of them carries as its permissions boundary.
+MANAGED_USERS = ("grug-cave-connector",)
+USER_BOUNDARY_POLICY = "grug-cave-connector-boundary"
+
 
 def _ensure_oidc_provider() -> str:
     """Return ARN of the well-known GitHub OIDC provider.
@@ -138,45 +143,51 @@ def create(
                 "Version": "2012-10-17",
                 "Statement": [
                     {
-                        # IAM lifecycle for the stack's OWN principals only.
-                        # Replaces the former `iam:*` on `*`, which was
-                        # privilege-escalation-complete (CreateAccessKey /
-                        # AttachUserPolicy / CreateRole on ANY principal ->
-                        # self-grant admin). Scoped to role/grug-* + user/grug-*.
+                        # grug#1625: the deploy role reads its OWN role but can
+                        # never change it. With PutRolePolicy on itself it could
+                        # grant itself `*:*`. Changes to this role (its policy,
+                        # trust or tags) are an operator apply with operator
+                        # credentials, never a CI deploy.
                         "Effect": "Allow",
                         "Action": [
-                            "iam:CreateRole", "iam:GetRole", "iam:DeleteRole",
-                            "iam:UpdateRole", "iam:UpdateAssumeRolePolicy",
-                            "iam:TagRole", "iam:UntagRole",
-                            "iam:ListRolePolicies", "iam:ListAttachedRolePolicies",
-                            # grug#952: AWS's DeleteRole internally calls this
-                            # before it will delete a role, even with nothing
-                            # attached - missing it 403s the delete outright,
-                            # which failed `pulumi up` on every single push
-                            # once grug-gha-leak-guard was removed from source
-                            # (page-tier CI-dead alert, 2026-09-12).
-                            "iam:ListInstanceProfilesForRole",
+                            "iam:GetRole", "iam:ListRolePolicies",
+                            "iam:ListAttachedRolePolicies", "iam:GetRolePolicy",
                             "iam:ListRoleTags",
-                            "iam:PutRolePolicy", "iam:GetRolePolicy",
-                            "iam:DeleteRolePolicy",
-                            "iam:CreateUser", "iam:GetUser", "iam:DeleteUser",
-                            "iam:TagUser", "iam:UntagUser",
+                            # grug#952: the provider reads instance profiles
+                            # before any role delete.
+                            "iam:ListInstanceProfilesForRole",
+                        ],
+                        "Resource": f"arn:aws:iam::*:role/{name}",
+                    },
+                    {
+                        # Reads of the stack's one IAM user. Exact names, never
+                        # `user/grug-*`: a wildcard let this role create a new
+                        # grug-* user, give it `*:*` and mint it a key.
+                        "Effect": "Allow",
+                        "Action": [
+                            "iam:GetUser", "iam:TagUser", "iam:UntagUser",
                             "iam:ListUserPolicies", "iam:ListAttachedUserPolicies",
-                            "iam:ListUserTags",
-                            "iam:PutUserPolicy", "iam:GetUserPolicy",
-                            "iam:DeleteUserPolicy",
-                            "iam:CreateAccessKey", "iam:DeleteAccessKey",
+                            "iam:ListUserTags", "iam:GetUserPolicy",
                             "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed",
-                            # #389 teardown: the AWS provider lists (and
-                            # would remove) group memberships before
-                            # DeleteUser - the retirement up died here,
-                            # the audit-6 serial-denial class.
-                            "iam:ListGroupsForUser", "iam:RemoveUserFromGroup",
+                            "iam:ListGroupsForUser",
                         ],
-                        "Resource": [
-                            "arn:aws:iam::*:role/grug-*",
-                            "arn:aws:iam::*:user/grug-*",
-                        ],
+                        "Resource": [f"arn:aws:iam::*:user/{u}" for u in MANAGED_USERS],
+                    },
+                    {
+                        # The user's inline policy may change only while the
+                        # user carries the boundary policy, which caps it at its
+                        # SQS and S3 needs. This role can neither change nor
+                        # remove that boundary, and it mints no access keys
+                        # (the connector's key is issued out of band, #316).
+                        "Effect": "Allow",
+                        "Action": ["iam:PutUserPolicy", "iam:DeleteUserPolicy"],
+                        "Resource": [f"arn:aws:iam::*:user/{u}" for u in MANAGED_USERS],
+                        "Condition": {
+                            "StringLike": {
+                                "iam:PermissionsBoundary":
+                                    f"arn:aws:iam::*:policy/{USER_BOUNDARY_POLICY}",
+                            },
+                        },
                     },
                     {
                         # SSM reads. The stack's own `/grug/*`, the cross-repo

@@ -1,0 +1,7 @@
+diff --git a/src/status.py b/src/status.py
+--- a/src/status.py
++++ b/src/status.py
+@@ -1,2 +1,2 @@
+ def status():
+-    return True
++    return "ready"

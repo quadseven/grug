@@ -87,7 +87,7 @@ from personas.code_reviewer.suppression_scope import (
     PR_ADDED_NOTE, record, ruff_scope,
 )
 from personas.code_reviewer.analyzer_sandbox import (
-    AnalyzerSkip, read_only_tree, sandbox_env,
+    AnalyzerSkip, read_only_tree, run_analyzer, sandbox_env,
 )
 
 log = logging.getLogger("grug.code_reviewer.lint")
@@ -355,12 +355,11 @@ def _run_ruff(
             # PR wrote from hiding its own finding; suppression_scope puts
             # back the ones already on the base (#1579).
             with read_only_tree(tmp):
-                proc = subprocess.run(
+                proc = run_analyzer(
                     ["ruff", "check", "--isolated", "--select", _SELECT,
                      "--ignore", _IGNORE, "--ignore-noqa", "--output-format",
                      "json", "--no-cache", tmp],
-                    capture_output=True, text=True, timeout=timeout,
-                    check=False, env=sandbox_env(tmp),
+                    scan_root=tmp, timeout=timeout, env=sandbox_env(tmp),
                 )
             # ONLY >= 2 is an error. Exit 1 means violations were found and
             # stdout carries them - see the module docstring.
@@ -487,6 +486,8 @@ def _finding(
     severity = _severity_for(code)
     if code == "S608" and file_contents and _s608_is_constant(file_contents.get(path, ""), row):
         severity = "medium"
+    if code == "S105" and file_contents and _s105_is_sql(file_contents.get(path, ""), row):
+        severity = "medium"
     return Finding(
         file=path,
         line=row,
@@ -502,6 +503,39 @@ def _finding(
         suggestion=_fix_suggestion(fix, row, (file_contents or {}).get(path)),
         effort=None,
         check_output=f"{path}:{row}: {code} {msg}",
+    )
+
+
+def _s105_is_sql(source: str, row: int) -> bool:
+    """True when the string assigned on `row` reads as a SQL statement: it
+    opens with a statement keyword and also carries a clause keyword, so a
+    passphrase that merely starts with a word like "with" keeps high
+    severity. Repository code is parsed, never evaluated."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+
+    literals = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.lineno == row
+    ]
+    if len(literals) != 1:
+        return False
+    literal = literals[0]
+    parts = literal.value.split(maxsplit=1)
+    if len(parts) != 2 or parts[0].lower() not in {
+        "select", "insert", "update", "delete", "with", "create", "alter", "drop",
+        "merge", "upsert", "replace",
+    }:
+        return False
+    if not {"from", "into", "set", "table", "as", "values", "where", "index", "view"} & set(
+        parts[1].lower().replace("(", " ").replace(")", " ").split()
+    ):
+        return False
+    return any(
+        isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is literal
+        for node in ast.walk(tree)
     )
 
 

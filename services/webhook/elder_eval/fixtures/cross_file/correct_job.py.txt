@@ -1,0 +1,4 @@
+from src.api import fetch
+
+def run():
+    return fetch(7, tenant="east")

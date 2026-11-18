@@ -34,7 +34,7 @@ from llm_client import (
 from model_family import ReviewFamilies
 from personas.code_reviewer.diff_parser import DiffHunk
 from personas.code_reviewer.line_refs import align_line_refs, repair_where_refs
-from review_types import DEFAULT_CATEGORY, Category, Effort, Severity  # single source (#250)
+from review_types import DEFAULT_CATEGORY, Category, Effort, EvidenceReference, Severity
 from review_pipeline import ReviewCoverage
 
 # A finding at one of these severities flips the aggregate verdict.
@@ -94,10 +94,10 @@ def _is_static_declarative_scalar(
 
 def _snippet_has_line(snippet: str, line: int) -> bool:
     """Check for an original line number in the bounded cross-file snippet."""
+    line_number = str(line)
     return any(
-        raw.partition(":")[0].strip().isdigit()
-        and int(raw.partition(":")[0].strip()) == line
-        for raw in snippet.splitlines()
+        separator and prefix.strip() == line_number
+        for prefix, separator, _ in (raw.partition(":") for raw in snippet.splitlines())
     )
 
 
@@ -160,6 +160,7 @@ class Finding:
     # grug#1429: the check's own output line, quoted verbatim in the review
     # when the finding came from a deterministic check (ruff, opengrep).
     check_output: str | None = field(default=None, compare=False)
+    evidence_ref: EvidenceReference | None = None
 
     def __post_init__(self) -> None:
         assert self.line >= 1, (
@@ -418,6 +419,7 @@ def evaluate_diff(
         )
 
     line_index = _hunk_line_index(hunks)
+    cross_file = cross_file_contents or {}
     kept: list[Finding] = []
     dropped = 0
     withdrawn = 0
@@ -437,8 +439,8 @@ def evaluate_diff(
         outside_reason = raw.outside_diff_reason
         if outside_diff and not (
             outside_reason
-            and raw.path in (cross_file_contents or {})
-            and _snippet_has_line((cross_file_contents or {})[raw.path], raw.line)
+            and raw.path in cross_file
+            and _snippet_has_line(cross_file[raw.path], raw.line)
         ):
             # Anti-hallucination: the LLM named a file/line that isn't
             # in the diff. Drop + count. Count is surfaced on the
@@ -463,6 +465,14 @@ def evaluate_diff(
         )
         if outside_diff:
             message = f"OUTSIDE DIFF (advisory): {outside_reason} {message}"
+        evidence_ref = raw.evidence_ref
+        if evidence_ref is not None and (
+            outside_diff
+            or evidence_ref.path in line_index
+            or evidence_ref.path not in cross_file
+            or not _snippet_has_line(cross_file[evidence_ref.path], evidence_ref.line)
+        ):
+            evidence_ref = None
         severity = "medium" if outside_diff else _capped_severity(raw.rule, raw.severity, message)
         kept.append(
             Finding(
@@ -479,6 +489,7 @@ def evaluate_diff(
                 category=raw.category,
                 origins=raw.origins,
                 outside_diff_reason=outside_reason if outside_diff else None,
+                evidence_ref=evidence_ref,
             )
         )
 

@@ -21,7 +21,7 @@ Semantics deliberately preserved from the DDB adapter:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from collections.abc import Mapping
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
@@ -29,6 +29,7 @@ from psycopg.types.json import Jsonb
 
 from adapters import pg_base
 from adapters.pg_base import TTL_LIVE, decode_item, encode_attrs, get_pool
+from ledger import SECOND_LINEAGE_REVIEWER
 from review_types import verdict as _derive_verdict  # leaf import (no cycle)
 
 log = logging.getLogger("grug.adapters.pg_install_store")
@@ -1233,7 +1234,7 @@ def _ledger_sk(finding_class: str, pr: int | None, reviewer: str, digest: str) -
     return f"{finding_class}#{pr_part}#{reviewer}#{digest}"
 
 
-def _ledger_digest(row: dict[str, Any]) -> str:
+def _ledger_digest(row: dict[str, Any], *, preserve_first: bool = False) -> str:
     """Stable 12-hex identity of a finding from its content (finding text +
     timestamp + evidence) - independent of ingest order."""
     import hashlib
@@ -1241,7 +1242,7 @@ def _ledger_digest(row: dict[str, Any]) -> str:
     material = "\x1f".join(
         (
             str(row.get("finding", "")),
-            str(row.get("ts", "")),
+            "" if preserve_first else str(row.get("ts", "")),
             str(row.get("evidence", "")),
         )
     )
@@ -1254,12 +1255,18 @@ def put_ledger_row(row: dict[str, Any]) -> None:
     evidence, ts, commit}). The key is CONTENT-derived, so re-ingesting the
     corpus (even reordered) heals rows in place instead of duplicating."""
     repo = str(row["repo"])
+    # A timestamp dates a second-only finding without changing its key,
+    # including for older rows written with a blank timestamp.
+    preserve_first = (
+        row["reviewer"] == SECOND_LINEAGE_REVIEWER and row["verdict"] == "second-only"
+    )
     with get_pool().connection() as conn:
         conn.execute(
             """
             INSERT INTO grug_kv (pk, sk, data)
             VALUES (%(pk)s, %(sk)s, %(data)s)
             ON CONFLICT (pk, sk) DO UPDATE SET data = %(data)s
+            WHERE NOT %(preserve_first)s
             """,
             {
                 "pk": _ledger_pk(repo),
@@ -1270,9 +1277,10 @@ def put_ledger_row(row: dict[str, Any]) -> None:
                     # same rows parse_row was silently dropping (#764).
                     int(row["pr"]) if row.get("pr") is not None else None,
                     str(row["reviewer"]),
-                    _ledger_digest(row),
+                    _ledger_digest(row, preserve_first=preserve_first),
                 ),
                 "data": encode_attrs(dict(row)),
+                "preserve_first": preserve_first,
             },
         )
 
@@ -1303,6 +1311,38 @@ def list_ledger_rows(
             params,
         ).fetchall()
     return [decode_item(pk, sk, data) for pk, sk, data in rows]
+
+
+def list_second_lineage_rows(start: date, end: date) -> list[dict[str, Any]]:
+    """Read dated second-lineage telemetry across repos in a UTC date range."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT pk, sk, data FROM grug_kv
+            WHERE pk LIKE 'LEDGER#%%' AND {TTL_LIVE}
+              AND data->>'reviewer' = %s
+              AND data->>'ts' >= %s AND data->>'ts' < %s
+            """,
+            (SECOND_LINEAGE_REVIEWER, start.isoformat(), end.isoformat()),
+        ).fetchall()
+    return [decode_item(pk, sk, data) for pk, sk, data in rows]
+
+
+def get_second_lineage_report(week_start: date) -> dict[str, Any] | None:
+    return _get_item("SECOND_LINEAGE_REPORT", week_start.isoformat())
+
+
+def put_second_lineage_report(week_start: date, report: dict[str, Any]) -> bool:
+    """Save the weekly report once and tell the caller whether it won."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data) VALUES ('SECOND_LINEAGE_REPORT', %s, %s)
+            ON CONFLICT DO NOTHING RETURNING pk
+            """,
+            (week_start.isoformat(), Jsonb(report)),
+        ).fetchone()
+    return row is not None
 
 
 def put_repo_practices(repo: str, practices: list[dict[str, Any]]) -> None:
@@ -1369,6 +1409,8 @@ class Learning(TypedDict):
     repo: str
     scope_path: NotRequired[str]
     source_pr: NotRequired[int]
+    # #1757: every PR an outcome-proposed rule cites as its evidence.
+    source_prs: NotRequired[list[int]]
     source_comment_id: NotRequired[int]
     author: NotRequired[str]
     created_at: NotRequired[str]
@@ -1902,9 +1944,9 @@ def import_learnings(
                     "version": 1,
                     "history": [_history_entry("imported", actor)],
                 }
-                for link in ("supersedes", "conflicts_with"):
-                    if item.get(link):
-                        data[link] = item[link]
+                for field in ("supersedes", "conflicts_with", "source_prs"):
+                    if item.get(field):
+                        data[field] = item[field]
                 conn.execute(
                     "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s)",
                     (pk, sk, encode_attrs(data), _learning_ttl()),
@@ -1913,6 +1955,86 @@ def import_learnings(
     except psycopg.errors.UniqueViolation as e:
         raise LearningImportConflict(str(e).splitlines()[0]) from e
     return ids
+
+
+def put_rule_proposals(proposals: list[Any], *, actor: str = "outcome-proposer") -> list[str]:
+    """Persist outcome-proposed rules (#1757) as pending Cave Drawings rows.
+
+    Each row is keyed by `learning_id` of its rule text and written with
+    `ON CONFLICT DO NOTHING`, so a rerun over the same outcomes adds no second
+    row and never overwrites a decision an operator already made. A pending
+    row never reaches a review prompt (`select_for_prompt` selects active
+    rows only), so an outcome alone cannot quiet Elder.
+
+    Returns the ids written or already present, in input order.
+    """
+    from cave_drawings import STATUS_PENDING, learning_id as _lid
+
+    now = _now_iso()
+    ids: list[str] = []
+    for proposal in proposals:
+        data: dict[str, Any] = dict(proposal.as_learning(now=now))
+        text = str(data.get("text") or "").strip()
+        repo = str(data.get("repo") or "").strip()
+        if not (text and repo):
+            continue
+        lid = _lid(text)
+        data.update({
+            "text": text,
+            "repo": repo,
+            "status": STATUS_PENDING,
+            "active": False,
+            "history": [_history_entry("proposed", actor)],
+        })
+        with get_pool().connection() as conn, conn.transaction():
+            conn.execute(
+                "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (pk, sk) DO NOTHING",
+                (_learning_pk(repo), _learning_sk(lid), encode_attrs(data), _learning_ttl()),
+            )
+        ids.append(lid)
+    return ids
+
+
+def _decline_outcome_pk(repo: str) -> str:
+    return f"OUTCOME#{repo}"
+
+
+def put_decline_outcome(repo: str, comment_id: int, outcome: Mapping[str, Any]) -> None:
+    """Keep one reasoned-decline outcome (#1757), keyed by the reply comment.
+
+    `ON CONFLICT DO NOTHING`, so a redelivered reply stores nothing twice."""
+    if not (repo and comment_id):
+        return
+    with get_pool().connection() as conn, conn.transaction():
+        conn.execute(
+            "INSERT INTO grug_kv (pk, sk, data, ttl) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (pk, sk) DO NOTHING",
+            (
+                _decline_outcome_pk(repo), f"DECLINE#{int(comment_id)}",
+                encode_attrs(dict(outcome)), _learning_ttl(),
+            ),
+        )
+
+
+# One literal, nothing interpolated: the live-row predicate is spelled out
+# as pg_base.TTL_LIVE has it, and a test holds the two equal (#1757).
+_DECLINE_OUTCOMES_SQL = """
+    SELECT pk, sk, data FROM grug_kv
+    WHERE pk = %s AND sk LIKE 'DECLINE#%%'
+      AND (ttl IS NULL OR ttl > EXTRACT(EPOCH FROM now()))
+    ORDER BY sk COLLATE "C" ASC
+"""
+
+
+def list_decline_outcomes(repo: str) -> list[dict[str, Any]]:
+    """Every live decline outcome kept for a repo, oldest key first."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            _DECLINE_OUTCOMES_SQL,
+            (_decline_outcome_pk(repo),),
+        ).fetchall()
+    return [dict(decode_item(pk, sk, data)) for pk, sk, data in rows]
 
 
 def _learning_fired_pk(repo: str) -> str:

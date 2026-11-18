@@ -16,6 +16,12 @@ doc covers running it yourself.
   `GRUG_DATADOG_ENABLED` is set.
 - A registered GitHub App (you create this once via UI)
 - Python 3.13, uv, Docker, gh CLI
+- Linux with Landlock ABI 3 or later and seccomp for the reviewer image. The
+  runtime seccomp profile must allow the `landlock_*` syscalls. Analyzer runs
+  are skipped if the launcher cannot install its restrictions. Keep
+  credentials out of the image's analyzer runtime and rule directories.
+  Deploy from the reviewer image to load the launcher. Source test runs
+  without the launcher exercise the engines directly.
 
 ## One-time setup
 

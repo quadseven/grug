@@ -62,7 +62,7 @@ from openrouter_free_limiter import (
 from repo_file_cache import RepoFileCache
 from voice_pack import VoiceSelection, apply_voice
 from review_types import (
-    CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, Severity,
+    CATEGORIES, DEFAULT_CATEGORY, EFFORTS, SEVERITIES, Category, Effort, EvidenceReference, Severity,
     category_or_default,
 )
 from review_pipeline import (
@@ -331,8 +331,8 @@ _OPENCODE_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 # tokens, 0% timeouts, 3-4s median, about $0.0078 per 40k-token review. OpenCode
 # Go limits are monthly dollars per model ($60 on the $10 plan), so that is
 # ~7.7k reviews a month at 40k tokens and ~22k at 10k, against ~3k real ones.
-# Behind it: the free `GRUG_OPENCODE_GO_FALLBACK_MODEL=beam-free` (10s on 33k
-# tokens at low effort, unranked on quality). `mimo-v2.5` is retired (HTTP 410)
+# With discovery on, the configured paid slot follows the free tiers.
+# `mimo-v2.5` is retired (HTTP 410)
 # and `mimo-v2.6-flash` took 34s on 8k tokens and timed out at 70s on 33k
 # (2026-11-01), so `GRUG_OPENCODE_GO_SECOND_MODEL` stays unset. Muse and Iceman
 # Contributor train on prompts: never here, Elder reads private repos.
@@ -805,6 +805,7 @@ class Finding:
     # A duplicate candidate can be independently produced by both models. Keep
     # every source so judge and human feedback train both originating spans.
     origins: tuple[FindingOrigin, ...] = field(default_factory=tuple, compare=False)
+    evidence_ref: EvidenceReference | None = None
 
 
 # grug#1397 backstop for a model that ignores `is_finding`: the candidate's
@@ -1400,7 +1401,7 @@ def _opencode_go_fallback_chain_config() -> "BackendConfig | None":
 
 # Free-model discovery. OpenCode Go publishes a price for every model, and the
 # free set changes often, so Elder reads the list (cached, `opencode_go_free`)
-# and tries the models priced exactly zero behind the configured ones. Opt-in:
+# and tries the listed free models before the configured paid ones. Opt-in:
 # nothing is fetched or added unless `GRUG_OPENCODE_GO_FREE_DISCOVERY` is true.
 # Knobs: `_TTL_SECONDS` (cache, default 2700), `_MAX_TIERS` (discovered tiers
 # per walk, default 2), `_HOURLY_CEILING` (calls per hour per pod to all free
@@ -1451,26 +1452,28 @@ def _opencode_go_free_gate_get() -> "opencode_go_free.FreeCallGate":
         return _opencode_go_free_gate
 
 
-def _opencode_go_discovered_chain_configs(
-    configured: "list[BackendConfig | None]",
-) -> "list[BackendConfig]":
-    """Chain tiers for the Go models priced zero right now, in list order with
-    the private-safe ones first, skipping any already in the chain, any
-    cooling after a 429, and all of them at the hourly ceiling. Empty when
-    discovery is off, the list is empty or unreachable."""
+def _opencode_go_chain_configs(
+    configured: list[BackendConfig | None],
+) -> list[BackendConfig | None]:
+    """Try configured free tiers, then discovered free tiers, then paid tiers."""
     if not _opencode_go_free_discovery_on():
-        return []
+        return configured
+    free, priced = _opencode_go_free_catalog_get().model_prices()
+    if priced is None or (not free and not priced):
+        return [tier for tier in configured if tier and not _opencode_go_model_is_free(tier.model)]
+    configured_free = [tier for tier in configured if tier and tier.model in free]
+    configured_paid = [tier for tier in configured if tier and tier.model in priced]
     limit = _env_number("GRUG_OPENCODE_GO_FREE_MAX_TIERS", 2, int)
     gate = _opencode_go_free_gate_get()
     if limit <= 0 or gate.ceiling_reached():
-        return []
-    have = {c.model for c in configured if c is not None}
-    found = [
-        m for m in _opencode_go_free_catalog_get().models()
-        if m not in have and m != _OPENCODE_GO_MODEL and not gate.cooling(m)
-    ]
+        return [*configured_free, *configured_paid]
+    have = {tier.model for tier in configured_free}
+    found = [m for m in free if m not in have and not gate.cooling(m)]
     found.sort(key=lambda m: m not in _OPENCODE_GO_PRIVATE_SAFE_MODELS)
-    return [_opencode_go_extra_model_config(m, _CLOUD_CHAIN_TIMEOUT_SECONDS) for m in found[:limit]]
+    discovered = [
+        _opencode_go_extra_model_config(m, _CLOUD_CHAIN_TIMEOUT_SECONDS) for m in found[:limit]
+    ]
+    return [*configured_free, *discovered, *configured_paid]
 
 
 @contextlib.contextmanager
@@ -2158,9 +2161,9 @@ def _free_tier_chain_config() -> "BackendConfig | None":
 
 
 def _cloud_chain_tiers() -> list[BackendConfig]:
-    """The ordered cloud chain: opencode Go (skipped while its usage-limit
-    breaker is open), an optional second free Go model, an optional paid Go
-    fallback model, OpenRouter `:free` (only if configured), Poolside
+    """The ordered cloud chain: OpenCode Go (free first with discovery on,
+    with paid tiers skipped while the usage-limit breaker is open),
+    OpenRouter `:free` (only if configured), Poolside
     laguna-s-2.1, then the spark-gateway's free provider pool (grug#1269),
     with the Cave after all of them. Poolside was dropped in
     grug#910 as unfunded; it answers again (2026-09-26) and has the best eval
@@ -2174,8 +2177,7 @@ def _cloud_chain_tiers() -> list[BackendConfig]:
         _opencode_go_fallback_chain_config(),
     ]
     candidates: list["BackendConfig | None"] = [
-        *go_tiers,
-        *_opencode_go_discovered_chain_configs(go_tiers),
+        *_opencode_go_chain_configs(go_tiers),
         _free_tier_chain_config(),
         _poolside_chain_config(),
         _free_pool_chain_config(),
@@ -2484,6 +2486,15 @@ _CAVE_FINDINGS_RESPONSE_FORMAT = {
                             "category": {"type": "string", "enum": sorted(CATEGORIES - {DEFAULT_CATEGORY})},
                             "outside_diff_reason": {
                                 "type": "string", "maxLength": MAX_FINDING_MESSAGE_CHARS,
+                            },
+                            "evidence_ref": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string", "maxLength": CAVE_MAX_PATH_CHARS},
+                                    "line": {"type": "integer", "minimum": 1},
+                                },
+                                "required": ["path", "line"],
+                                "additionalProperties": False,
                             },
                             "is_finding": {"type": "boolean"},
                         },
@@ -3005,6 +3016,15 @@ def _build_messages(
         learnings=learnings,
         guidelines=guidelines,
     )
+    if evidence.cross_file_contents:
+        system += (
+            "\n\nWhen unchanged cross-file context proves a finding, anchor the "
+            "finding's path and line on the changed diff line. Add one optional "
+            '`"evidence_ref": {"path": "src/caller.py", "line": 42}` field '
+            "using the exact path and original line number from the snippet. "
+            "For caller-not-updated, put the caller or test location in this field. "
+            "Describe the breakage in the message without repeating the citation."
+        )
     # The review prompt is redacted on EVERY backend, Cave included (#438):
     # a PR diff can carry a committed credential, and the Elder reviews code
     # structure, not the literal secret value, so masking does not cost
@@ -3393,6 +3413,18 @@ _MAX_FINDING_MESSAGE_CHARS = MAX_FINDING_MESSAGE_CHARS
 _MAX_SUGGESTION_CHARS = CAVE_MAX_SUGGESTION_CHARS
 
 
+def _coerce_evidence_ref(raw: object) -> EvidenceReference | None:
+    if not isinstance(raw, dict):
+        return None
+    path, line = raw.get("path"), raw.get("line")
+    if (
+        isinstance(path, str) and path and _redact_secrets(path) == path
+        and type(line) is int and line > 0
+    ):
+        return EvidenceReference(path, line)
+    return None
+
+
 def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
     """Validate one raw dict from the LLM into a `Finding`. Returns
     `(finding, "")` on success or `(None, reason)` on rejection so
@@ -3470,6 +3502,7 @@ def _coerce_finding(raw: Any) -> tuple[Optional[Finding], str]:
         path=path, line=line, rule=rule, severity=severity, message=message,  # type: ignore[arg-type]
         suggestion=suggestion, effort=effort, category=category,
         outside_diff_reason=outside_diff_reason, withdrawn=withdrawn,
+        evidence_ref=_coerce_evidence_ref(raw.get("evidence_ref")),
     ), ""
 
 
@@ -4807,6 +4840,12 @@ def _merge_review_findings(
             severity = finding.severity if incoming_rank > current_rank else current.severity
             preferred = finding if incoming_rank > current_rank else current
             other = current if preferred is finding else finding
+            explanation = (
+                finding
+                if incoming_rank == current_rank
+                and len(finding.message) > len(current.message)
+                else preferred
+            )
             merged[key] = replace(
                 current,
                 # Both sides are out here. A preferred message need not carry
@@ -4816,12 +4855,8 @@ def _merge_review_findings(
                 # Prefer the explanation from the model that assigned the
                 # stronger severity; use length only as a same-severity
                 # tiebreaker so the merged finding keeps the most evidence.
-                message=(
-                    finding.message
-                    if incoming_rank == current_rank
-                    and len(finding.message) > len(current.message)
-                    else preferred.message
-                ),
+                message=explanation.message,
+                evidence_ref=explanation.evidence_ref,
                 suggestion=preferred.suggestion or other.suggestion,
                 effort=preferred.effort or other.effort,
                 category=(
@@ -7321,9 +7356,9 @@ def _free_tier_found_nothing(tier: BackendConfig, outcome: _ArmOutcome) -> bool:
 
 # grug#1601: the narrow relaxation of the rule above. A free Go model answered
 # empty on a 33k-token diff where the paid primary found faults, so the default
-# stands: a free model's empty answer confirms nothing. On a small cohort, after
-# a paid or ranked model already answered empty, a free model that an eval
-# measured at a false-empty rate of 5 percent or less may be the second opinion.
+# stands: a free model's empty answer confirms nothing. On a small cohort, a
+# free model measured at a false-empty rate of 5 percent or less may confirm
+# an empty answer from a paid or ranked model.
 # Off unless GRUG_OPENCODE_GO_FREE_CONFIRM is set.
 _FREE_CONFIRM_DEFAULT_MAX_TOKENS = 10_000
 _CHARS_PER_TOKEN = 4
@@ -7469,9 +7504,10 @@ def _try_cloud_primary(
     failure, and on total failure it rides along as `low_confidence`
     (grug#1097)."""
     first_parse_fail: tuple[Backend, str | None, str] | None = None
-    # The first model whose answer was a short empty review. A second,
-    # DIFFERENT model answering empty too is agreement, and ends the chain.
+    # Only a trusted empty can anchor consensus. Keep a qualified free empty
+    # in case a trusted model answers later in the free-first walk.
     first_empty: tuple[Backend, str] | None = held_empty
+    confirming_free: tuple[tuple[Backend, str], _ArmOutcome] | None = None
     first_empty_outcome: _ArmOutcome | None = None
     last_error = ""
     for tier in _cloud_chain_tiers():
@@ -7489,7 +7525,14 @@ def _try_cloud_primary(
                     answer=_cloud_tier_success(outcome, hunks, pr_context),
                 )
             if first_empty is None:
-                first_empty = key
+                if not _empty_confirms_nothing(key):
+                    first_empty = key
+                    if confirming_free and _empty_answers_agree(key, confirming_free[0], pr_context):
+                        return _CloudPrimaryResult(
+                            answer=_cloud_tier_success(confirming_free[1], hunks, pr_context),
+                        )
+                elif confirming_free is None and _free_empty_may_confirm(key):
+                    confirming_free = (key, outcome)
             if first_empty_outcome is None and held_empty is None:
                 first_empty_outcome = outcome
             continue
@@ -7635,8 +7678,11 @@ def _walk_review_ladder(
             list(evidence.hunks), messages, variant, pr_tags, installation_id,
             pr_context, cancel_event, held_empty,
         )
-        if cloud_result.answer is not None:
-            return cloud_result.answer
+        answer = cloud_result.answer
+        if answer is not None:
+            if answer.kind == "reviewed" and answer.backend_used == Backend.OPENCODE_GO:
+                log.info("opencode_go_review_served", extra={"model": answer.model_name})
+            return answer
         low_confidence = low_confidence or cloud_result.low_confidence
         # Total cloud failure: fall through, unconditionally, to the exact
         # path every "cave" deployment runs - "if that fails, use my local
@@ -7884,11 +7930,30 @@ def _run_subscription_fallback(
                 error=f"{Backend.SUBSCRIPTION.value}: {resolved_model} is the author's family",
                 tier_served="subscription",
             )
-        if _is_degenerate_empty_review(findings, attempt.usage_metrics):
-            return _untrusted_empty_review(
-                Backend.SUBSCRIPTION, resolved_model, _served_models(model), span_context,
-                "subscription",
+        # grug#1601: the lane's empty answer gets the trust rule every other
+        # rung gets. A short empty (`_is_degenerate_empty_review`) is held at
+        # low confidence until a second, different model confirms it. The
+        # `elder_subscription_lane_empty` line is the measurement this rule is
+        # re-checked against.
+        if not findings:
+            usage = attempt.usage_metrics
+            degenerate = _is_degenerate_empty_review(findings, usage)
+            log.info(
+                "elder_subscription_lane_empty",
+                extra={
+                    "model": resolved_model,
+                    "input_tokens": usage.get("input_tokens"),
+                    "output_tokens": usage.get("output_tokens"),
+                    "diff_chars": _REVIEWED_DIFF_CHARS.get(),
+                    "trusted": not degenerate,
+                },
             )
+            if degenerate:
+                _record_degenerate_review(Backend.SUBSCRIPTION, resolved_model, usage)
+                return _untrusted_empty_review(
+                    Backend.SUBSCRIPTION, resolved_model, _served_models(model), span_context,
+                    "subscription",
+                )
         log.info(
             "elder_last_resort_tier_served",
             extra={
@@ -8331,6 +8396,7 @@ JUDGE_MAX_FINDINGS = 75
 # single judge request, not the persona's total bounded batch budget.
 _JUDGE_MAX_FINDINGS = JUDGE_BATCH_SIZE
 
+# The verify-only criterion adapts the MIT-licensed rubric credited in #1749.
 _JUDGE_SYSTEM_PROMPT = (
     "You are an adjudicator grading a code reviewer's findings to build a "
     "ground-truth dataset. For each numbered finding, decide whether it "

@@ -43,6 +43,7 @@ from cave_drawings import (
     export_document,
     fired_review_key,
     is_valid_repo,
+    learning_origin,
     matches_query,
     plan_import,
     preview_paths,
@@ -113,18 +114,19 @@ def _text(row: dict[str, Any], key: str) -> str:
 
 
 def _source(row: dict[str, Any], repo: str) -> dict[str, Any]:
-    """Provenance: the PR and review thread the learning was taught in."""
+    """The learning's origin and its pull request or review thread evidence."""
     pr = int(row.get("source_pr") or 0)
     comment_id = int(row.get("source_comment_id") or 0)
     thread_url = f"https://github.com/{repo}/pull/{pr}" if repo and pr else ""
     if thread_url and comment_id:
         thread_url += f"#discussion_r{comment_id}"
-    history = row.get("history") or []
-    imported = bool(history) and history[0].get("action") == "imported"
+    origin = learning_origin(row)
     return {
         "pr": pr, "comment_id": comment_id,
         "author": _text(row, "author"), "thread_url": thread_url,
-        "signal": "import" if imported else "maintainer-reply",
+        "signal": "import" if origin == "import" else "maintainer-reply",
+        "origin": origin,
+        "cited_prs": list(row.get("source_prs") or []),
         "reason": _text(row, "reason"),
         "finding_class": _text(row, "finding_class"),
         "finding_category": _text(row, "finding_category"),

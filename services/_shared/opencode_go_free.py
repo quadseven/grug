@@ -163,23 +163,33 @@ class FreeModelCatalog:
         return self._fetched_at is not None and now - self._fetched_at <= self._ttl
 
     def models(self) -> list[str]:
-        """Free model ids now: fresh cache, else a refresh, else the stale
-        list while it is young enough, else nothing."""
+        """Free model ids from the current usable catalog."""
+        free, _ = self.model_prices()
+        return free
+
+    def model_prices(self) -> tuple[list[str], frozenset[str] | None]:
+        """Free and priced ids from one snapshot, refreshing when due.
+
+        A missing usable catalog has no free ids and no priced set.
+        """
         now = self._clock()
         with self._lock:
             if self._fresh(now):
-                return list(self._free)
+                return list(self._free), self._priced
             if now < self.retry_not_before:
-                return list(self._free) if self._usable(now) else []
+                return self._cached_prices(now)
         if not self._fetching.acquire(blocking=False):
             with self._lock:
-                return list(self._free) if self._usable(now) else []
+                return self._cached_prices(now)
         try:
             self._refresh()
         finally:
             self._fetching.release()
         with self._lock:
-            return list(self._free) if self._usable(self._clock()) else []
+            return self._cached_prices(self._clock())
+
+    def _cached_prices(self, now: float) -> tuple[list[str], frozenset[str] | None]:
+        return (list(self._free), self._priced) if self._usable(now) else ([], None)
 
     def _refresh(self) -> None:
         try:

@@ -1,13 +1,17 @@
 """Tests for personas/code_reviewer/persona.py."""
 from __future__ import annotations
 
+import pytest
+
 from llm_client import (
     Backend,
     Finding as LlmFinding,
     FindingOrigin,
     LlmReviewResponse,
+    _coerce_finding,
 )
 from personas.code_reviewer.diff_parser import parse_diff
+from personas.code_reviewer.markings import build_review_result
 from personas.code_reviewer.persona import (
     CodeReviewEvaluation,
     Finding,
@@ -88,6 +92,44 @@ def test_explicit_cross_file_finding_is_advisory_and_requires_snippet_line() -> 
     assert "OUTSIDE DIFF" in finding.message
     assert out.conclusion == "success"
     assert out.dropped_hallucinations == 1
+
+
+@pytest.mark.parametrize(
+    ("evidence_path", "evidence_line", "expected_citation"),
+    [
+        ("src/caller.py", 42, "**Evidence:** `src/caller.py:42`"),
+        ("src/caller.py", 43, ""),
+        ("src/other.py", 42, ""),
+        ("src/caller.py", True, ""),
+    ],
+)
+def test_inline_finding_only_publishes_a_supplied_evidence_line(
+    evidence_path, evidence_line, expected_citation,
+) -> None:
+    finding, error = _coerce_finding({
+        "path": "src/x.py",
+        "line": 2,
+        "rule": "caller-not-updated",
+        "severity": "high",
+        "message": "The caller still uses the old argument shape.",
+        "evidence_ref": {"path": evidence_path, "line": evidence_line},
+    })
+    assert finding is not None, error
+    evaluation = evaluate_diff(
+        parse_diff(_DIFF),
+        LlmReviewResponse(kind="reviewed", findings=(finding,)),
+        cross_file_contents={"src/caller.py": "1: from src.x import parse\n42: parse(1)"},
+    )
+    review, _ = build_review_result(evaluation, head_sha="abc", event="COMMENT")
+
+    assert review is not None
+    (comment,) = review.comments
+    assert (comment.path, comment.line) == ("src/x.py", 2)
+    if expected_citation:
+        assert f"{finding.message}\n\n{expected_citation}" in comment.body
+    else:
+        assert "**Evidence:**" not in comment.body
+        assert evaluation.findings[0].evidence_ref is None
 
 
 def test_finding_outside_diff_lines_is_dropped() -> None:

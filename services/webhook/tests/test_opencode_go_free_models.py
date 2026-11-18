@@ -335,7 +335,7 @@ def _env(monkeypatch):
 
 
 def _listed(monkeypatch, *models: dict, enabled: bool = True) -> _Fetch:
-    fetch = _Fetch(_ok(*models))
+    fetch = _Fetch(_ok(*models, _model(lc._OPENCODE_GO_MODEL, 1, 1)))
     if enabled:
         monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
     monkeypatch.setattr(lc, "_opencode_go_free_models_fetch", fetch, raising=False)
@@ -352,11 +352,10 @@ def test_discovery_is_off_unless_asked_for_and_never_touches_the_network(monkeyp
     assert fetch.calls == 0
 
 
-def test_discovered_free_models_join_the_chain_after_the_configured_ones(monkeypatch) -> None:
+def test_configured_and_discovered_free_models_run_before_paid_go(monkeypatch) -> None:
     _listed(monkeypatch, _model("beam-free"), _model(_FREE), _model(_FREE_NO_SUFFIX))
     chain = _chain()
-    assert chain[:2] == [lc._OPENCODE_GO_MODEL, "beam-free"]
-    assert chain[2:4] == [_FREE, _FREE_NO_SUFFIX]
+    assert chain[:4] == ["beam-free", _FREE, _FREE_NO_SUFFIX, lc._OPENCODE_GO_MODEL]
     assert chain.count("beam-free") == 1
 
 
@@ -370,19 +369,26 @@ def test_a_priced_model_is_never_a_tier(monkeypatch) -> None:
     assert "cheap-one" not in chain and "sneaky-free" not in chain
 
 
-def test_an_empty_list_leaves_the_chain_as_it_was(monkeypatch) -> None:
-    before = _chain()
-    _listed(monkeypatch, _model("paid", 1, 1))
-    assert _chain() == before
+def test_an_empty_list_leaves_the_paid_chain_as_it_was(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "second-paid")
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
+    monkeypatch.setattr(lc, "_opencode_go_free_models_fetch", _Fetch(_ok()))
+    assert _chain() == [lc._OPENCODE_GO_MODEL, "second-paid", "poolside/laguna-s-2.1"]
 
 
-def test_a_dead_list_endpoint_leaves_the_chain_as_it_was(monkeypatch) -> None:
+def test_a_configured_model_delisted_without_a_free_suffix_is_skipped(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", _FREE_NO_SUFFIX)
+    _listed(monkeypatch, _model("beam-free"))
+    assert _chain() == ["beam-free", lc._OPENCODE_GO_MODEL, "poolside/laguna-s-2.1"]
+
+
+def test_a_dead_list_endpoint_preserves_paid_go(monkeypatch) -> None:
     before = _chain()
     monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
     monkeypatch.setattr(
         lc, "_opencode_go_free_models_fetch", _Fetch(httpx.ConnectError("down")), raising=False,
     )
-    assert _chain() == before
+    assert _chain() == [model for model in before if model != "beam-free"]
 
 
 def test_the_number_of_discovered_tiers_is_bounded(monkeypatch) -> None:

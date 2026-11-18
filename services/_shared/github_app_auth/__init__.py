@@ -313,6 +313,20 @@ def get_install_token(
             "GitHub returned a 200 without a usable installation token "
             f"(installation {installation_id}): {type(e).__name__}"
         ) from e
+    response_permissions = payload.get("permissions")
+    if not isinstance(response_permissions, dict) or not all(
+        isinstance(name, str) and isinstance(level, str)
+        for name, level in response_permissions.items()
+    ):
+        response_permissions = None
+    log.info(
+        "install_token_minted",
+        extra={
+            "installation_id": installation_id,
+            "purpose": purpose.value,
+            "permissions": response_permissions,
+        },
+    )
     # GitHub returns expires_at ISO; default 1hr from creation.
     _cache.put(key, token, ttl_seconds=55 * 60)
     return token
@@ -378,6 +392,15 @@ def _is_retryable_github_error(response: httpx.Response) -> bool:
     if status in _RATE_LIMIT_STATUS:
         return _is_secondary_rate_limit(response)
     return False
+
+
+def is_github_permission_denied(response: httpx.Response) -> bool:
+    """Identify a GitHub 403 without primary or secondary rate-limit signals."""
+    return (
+        response.status_code == 403
+        and response.headers.get("X-RateLimit-Remaining") != "0"
+        and not _is_secondary_rate_limit(response)
+    )
 
 
 def _retry_sleep_seconds(attempt: int, response: httpx.Response) -> float:

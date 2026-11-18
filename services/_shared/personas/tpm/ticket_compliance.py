@@ -28,7 +28,7 @@ _CLOSES_RE = re.compile(r"\b(?:closes|closed|close|fixes|fixed|fix|resolves|reso
 _BOX_RE = re.compile(r"^\s*[-*]\s*\[ \]\s+(.+?)\s*$")
 # Words too generic to be distinctive signal.
 #
-# Bug (found 2026-07-24, live audit of grug#730/PR#734): this list used to be
+# Bug (found 2026-07-24, live audit of grug issue #730/PR #734): this list used to be
 # a small hand-rolled set that MISSED ordinary English connectors like "but"
 # and "after" - so e.g. issue #730's unchecked criterion "Failure after model
 # completion but before publication is observable..." spuriously overlapped
@@ -154,7 +154,7 @@ def unaddressed_criteria(criteria: list[str], signals: set[str]) -> list[str]:
     never flagged (we can't judge it).
 
     Requires at least `_MIN_MATCH_TOKENS` overlapping tokens, not just one.
-    Found live (2026-07-24, grug#730/PR#734): a single shared word is weak
+    Found live (2026-07-24, grug issue #730/PR #734): a single shared word is weak
     evidence - two DIFFERENT criteria in the same issue can each contain
     one word that also happens to appear in the PR's prose for an
     unrelated reason (e.g. a criterion about failure-recovery matches on

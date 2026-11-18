@@ -163,8 +163,18 @@ def test_all_rungs_failing_with_no_rerun_left_still_fails_when_blocking(elder) -
     assert [(c.status, c.conclusion) for c in posted] == [("completed", "failure")]
 
 
-def test_all_rungs_failing_in_warn_mode_stays_neutral(elder) -> None:
+def test_all_rungs_failing_in_warn_mode_waits_for_the_rerun(elder) -> None:
+    """#818: WARN mode no longer publishes a neutral "could not review" while
+    the queue still has a re-run for this pass; the check stays pending."""
     _result, posted = elder(blocking=False, rerun_pending=True)
+
+    assert [(c.status, c.conclusion) for c in posted] == [("in_progress", None)]
+
+
+def test_all_rungs_failing_in_warn_mode_stays_neutral_on_the_last_delivery(
+    elder,
+) -> None:
+    _result, posted = elder(blocking=False, rerun_pending=False)
 
     assert [(c.status, c.conclusion) for c in posted] == [("completed", "neutral")]
 
@@ -198,7 +208,7 @@ def _run_review_job(monkeypatch, *, receive_count: int) -> MagicMock:
 
 
 @pytest.mark.parametrize(
-    "receive_count, pending", [(1, True), (2, True), (3, False), (5, False)],
+    "receive_count, pending", [(1, True), (2, True), (3, True), (4, False), (5, False)],
 )
 def test_the_automatic_rerun_is_bounded(monkeypatch, receive_count, pending) -> None:
     """The queue redelivers a raised job. The first deliveries leave the check

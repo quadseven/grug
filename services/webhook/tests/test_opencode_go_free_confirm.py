@@ -111,9 +111,9 @@ def _env(monkeypatch, tmp_path):
     )
     listing = {"object": "list", "data": [
         {"id": m, "type": "chat",
-         "cost": {"text": {"input": {"price": 0}, "output": {"price": 0}}},
+         "cost": {"text": {"input": {"price": price}, "output": {"price": price}}},
          "api": {"chat-completions": {"base_url": "https://example.invalid/v1"}}}
-        for m in (FREE_A, FREE_B)
+        for m, price in ((FREE_A, 0), (FREE_B, 0), (PAID, 1))
     ]}
     monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
     monkeypatch.setattr(
@@ -198,7 +198,7 @@ def test_flag_on_without_a_report_changes_nothing(monkeypatch) -> None:
     assert _low_confidence(out)
 
 
-def test_a_paid_empty_then_an_allowlisted_free_empty_is_a_clean_review(monkeypatch, caplog) -> None:
+def test_an_allowlisted_free_empty_and_a_paid_empty_are_a_clean_review(monkeypatch, caplog) -> None:
     _flag_on(monkeypatch)
     _allow(FREE_A)
     with caplog.at_level("INFO"):
@@ -207,7 +207,7 @@ def test_a_paid_empty_then_an_allowlisted_free_empty_is_a_clean_review(monkeypat
     assert out.findings == ()
     assert not out.error
     assert evaluate_diff((), out).conclusion == "success"
-    assert asked == [PAID, FREE_A]  # no further model was asked
+    assert asked == [FREE_A, FREE_B, PAID]
     assert out.model_name == FREE_A
     assert any(r.getMessage() == "llm_cloud_empty_consensus" for r in caplog.records)
 
@@ -217,7 +217,7 @@ def test_a_model_not_on_the_allowlist_never_confirms(monkeypatch) -> None:
     _allow(FREE_B)
     out, asked = _run(_EMPTY, {FREE_A: _EMPTY, FREE_B: _EMPTY})
     # FREE_A may not confirm and is passed over; FREE_B is listed, so it does.
-    assert asked == [PAID, FREE_A, FREE_B]
+    assert asked == [FREE_A, FREE_B, PAID]
     assert out.model_name == FREE_B
     _allow("some-other-free")
     out, _ = _run(_EMPTY, {FREE_A: _EMPTY, FREE_B: _EMPTY})
@@ -253,7 +253,7 @@ def test_the_cohort_limit_is_configurable(monkeypatch) -> None:
     assert not out.error  # a bad value falls back to the default
 
 
-def test_no_paid_empty_first_means_no_relaxation(monkeypatch) -> None:
+def test_no_paid_empty_means_no_relaxation(monkeypatch) -> None:
     _flag_on(monkeypatch)
     _allow(FREE_A, FREE_B)
     # The paid primary is down; two free models answer empty. Two free answers
@@ -268,7 +268,7 @@ def test_a_paid_answer_with_findings_is_never_overridden(monkeypatch) -> None:
     _allow(FREE_A)
     out, asked = _run(_FOUND, {FREE_A: _EMPTY})
     assert len(out.findings) == 1
-    assert asked == [PAID]
+    assert asked == [FREE_A, FREE_B, PAID]
 
 
 def test_a_free_models_findings_still_win_over_a_paid_skim(monkeypatch) -> None:
