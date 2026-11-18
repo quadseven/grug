@@ -23,14 +23,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from github_checks_client import CheckConclusion
+
 from personas.publish_check import PUBLISH_FAILED, publish_persona_check
-from personas.tpm.dor_checks import CheckResult, IssueFactsFetcher, run_all
-from personas.tpm.sibling_evidence import SiblingFetcher
 from personas.tpm.dor_checks import (
+    HARD_WRAPPED_BODY,
+    CheckResult,
+    IssueFactsFetcher,
     IssueFetcher,
     has_loom_footer,
     loom_footer_lane,
+    run_all,
 )
+from personas.tpm.sibling_evidence import SiblingFetcher
 from personas.tribe import CHECK_CHIEF
 
 
@@ -245,7 +249,10 @@ def _blocking_failures(
     three call sites from drifting (#550 stage-1 audit). `advisory_checks`
     lets org/repo config promote an advisory check (in-scope) to blocking.
     """
-    return [r for r in results if not r.passed and r.name not in advisory_checks]
+    return [
+        r for r in results
+        if not r.passed and r.name != HARD_WRAPPED_BODY and r.name not in advisory_checks
+    ]
 
 
 # DISPLAY ONLY - the key stays. `CheckResult.name` is load-bearing:
@@ -263,6 +270,7 @@ _CHECK_DISPLAY: dict[str, str] = {
     "in-scope": "in scope",
     "linked-issue-completeness": "ticket done",
     "linked-issue-epic": "which epic",
+    HARD_WRAPPED_BODY: "body wrapping",
 }
 
 
@@ -299,7 +307,7 @@ def _summary(
     never meant to be. `Hunt Plan ready - 5/6 checks (ticket done skipped)`
     tells the reader which row to distrust.
     """
-    blocking = _blocking_failures(results)
+    blocking = _blocking_failures(results, advisory_checks)
     skipped = _skipped(results)
     total = len(results)
     if not blocking:
@@ -339,10 +347,10 @@ def _summary(
             icon = "skipped"
         elif r.passed:
             icon = "pass"
-        elif r.name in advisory_checks:
-            icon = "warn"
-        else:
+        elif r in blocking:
             icon = "fail"
+        else:
+            icon = "warn"
         lines.append(f"| {check_display_name(r.name)} | {icon} | {r.detail} |")
     return title, "\n".join(lines)
 
@@ -358,7 +366,7 @@ def evaluate_pull_request(
     author_outsider: bool = False,
     advisory_checks: frozenset[str] = _ADVISORY_CHECKS,
 ) -> TpmEvaluation:
-    """Pure: run all 9 DoR rules over pr_body and return the rollup.
+    """Pure: run the DoR rules over pr_body and return the rollup.
 
     `chief_rule` decides first. A skip rule (a fleet Loom lane footer,
     explicit opt-out, or an agent marker from an author who is not a
@@ -384,10 +392,8 @@ def evaluate_pull_request(
     spec's purity attestation (attest_persona_purity.py) sees only the
     allowlisted `run_all` call.
 
-    `advisory_checks` decides which failed checks are advisory (warn, never
-    block). Defaults to `_ADVISORY_CHECKS` (issue-link, loom-footer,
-    in-scope); org/repo config can pass a smaller set to promote `in-scope`
-    to blocking alongside the existing strict mode.
+    Hard-wrapped prose is always advisory. For other checks, org/repo config
+    can pass a smaller `advisory_checks` set to promote `in-scope` to blocking.
     """
     rule = chief_rule(
         pr_body, author_trusted=author_trusted, author_outsider=author_outsider,
