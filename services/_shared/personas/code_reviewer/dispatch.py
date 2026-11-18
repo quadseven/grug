@@ -190,7 +190,9 @@ from personas.code_reviewer.outage_advisory import (
     ADVISORY_TITLE, advisory_summary, observe as _observe_outage,
 )
 from personas.code_reviewer.degraded_gate import (
-    degraded_conclusion, gate_sentence, lead_with_degraded_line,
+    alert_operator_could_not_review, could_not_review_sentence,
+    could_not_review_title, degraded_conclusion, gate_sentence,
+    lead_with_degraded_line,
 )
 from personas.code_reviewer.publish_retry import (
     DeliveryOutcome, PendingPublication, publication_key, queue_publication,
@@ -2420,11 +2422,15 @@ def dispatch_code_review(
     as this call is running.
 
     `rerun_pending` (grug#1494): the caller will run this review again if it
-    degrades to `all_failed` (every model rung failed), or to a partial or
-    low-confidence review with nothing blocking in it. On a blocking repo the
-    check then stays `in_progress` - pending, so the required check still
-    blocks the merge - instead of completing `failure` for a retry that is
-    already queued. Never set for the last scheduled attempt.
+    degrades to a reason the queue retries (`RETRIED_DEGRADATIONS`: every
+    model rung failed, unparseable output, a failed diff fetch), or to a
+    partial or low-confidence review with nothing blocking in it. The check
+    then stays `in_progress` - pending, so a required check still blocks the
+    merge - instead of completing for a retry that is already queued. The
+    retried reasons wait in WARN mode too (grug#818), so no author reads
+    "Grug could not review" before the retries run out; the partial and
+    low-confidence ones wait only on a blocking repo (`_hold_for_rerun`).
+    Never set for the last scheduled attempt.
     """
     # #1350: when this run began, so a clean verdict can tell Elder's own
     # earlier blocks on this head from one another run posts mid-flight.
@@ -2758,6 +2764,13 @@ def dispatch_code_review(
             reason = "fetch_or_parse_failed"
             check_summary = None
             verdict_summary = "Grug could not look — diff fetch/parse failed"
+            if rerun_pending:
+                # grug#818: the queue re-runs this reason, so a completed
+                # "could not review" now would be read before the retry lands.
+                return _publish_rerun_pending(
+                    installation_id, owner, repo_name, pull_number, head_sha,
+                    reason, blocking=blocking,
+                )
         degraded = _publish_degraded(
             installation_id, owner, repo_name, pull_number, head_sha,
             reason=reason, summary=check_summary, blocking=blocking,
@@ -3230,10 +3243,10 @@ def dispatch_code_review(
             head_sha=head_sha,
         )
 
-    if rerun_pending and blocking and _rerun_before_failing(evaluation):
+    if rerun_pending and _hold_for_rerun(evaluation, blocking):
         return _publish_rerun_pending(
             installation_id, owner, repo_name, pull_number, head_sha,
-            str(evaluation.degraded_reason),
+            str(evaluation.degraded_reason), blocking=blocking,
         )
 
     muted = (
@@ -3381,6 +3394,7 @@ def dispatch_code_review(
         )
         summary = append_neutral_reason(summary, why)
         title = neutral_check_title(title, why)
+    _alert_if_no_review(evaluation, f"{owner}/{repo_name}#{pull_number}")
     check_result = CheckRunResult(
         name=_CHECK_NAME,
         head_sha=head_sha,
@@ -5613,44 +5627,78 @@ def _async_deep_append_if_needed(
     )
 
 
-def _rerun_before_failing(evaluation: CodeReviewEvaluation) -> bool:
-    """Should a blocking repo's degraded review wait for the scheduled re-run
-    instead of publishing `failure` now?
+def _hold_for_rerun(evaluation: CodeReviewEvaluation, blocking: bool) -> bool:
+    """Should this degraded review leave the check pending for the scheduled
+    re-run instead of publishing now?
 
-    `all_failed` (#1494): no model answered. A partial review (a cohort
-    failed or was never walked) and a low-confidence review are degraded the
-    same way and fail closed the same way (#1212), so they get the same
-    bounded re-run - unless the pass already found a blocking problem. That
-    is a real verdict, which a full review would publish too, so it fails
-    now and nothing is re-run."""
+    grug#818: a reason the queue always re-runs (`RETRIED_DEGRADATIONS`:
+    every model failed, unparseable output) waits in BOTH modes. Publishing
+    it first put "Grug could not review" in front of the author - a neutral
+    in WARN mode, a failure in BLOCK mode - for a pass the very next delivery
+    usually repaired.
+
+    A partial review (a cohort failed or was never walked) and a
+    low-confidence review publish real findings, so they wait only where
+    their degraded check would fail closed (#1212, BLOCK mode), and only
+    when the pass found nothing blocking. A blocking finding is a real
+    verdict, which a full review would publish too, so it fails now and
+    nothing is re-run."""
     reason = evaluation.degraded_reason
-    if reason == "all_failed":
+    if reason in RETRIED_DEGRADATIONS:
         return True
     return (
-        reason in PUBLISHABLE_DEGRADATIONS
+        blocking
+        and reason in PUBLISHABLE_DEGRADATIONS
         and evaluation.conclusion != "failure"
     )
 
 
-def _rerun_pending_summary(reason: str) -> str:
+def _alert_if_no_review(evaluation: CodeReviewEvaluation, pr: str) -> None:
+    """Page an operator before a check saying no review happened goes out.
+
+    Only a blackout says that; a partial or low-confidence review published
+    findings, and `no_diff` had nothing to review (`is_blackout`)."""
+    if is_blackout(evaluation.degraded_reason):
+        alert_operator_could_not_review(
+            str(evaluation.degraded_reason), pr=pr, surface="dispatch",
+        )
+
+
+def _rerun_pending_summary(reason: str, *, blocking: bool) -> str:
     """What the pending check says about the pass that is being re-run."""
     if reason == "all_failed":
         what = f"Every model failed this pass (`{reason}`)."
+    elif reason in RETRIED_DEGRADATIONS:
+        what = f"This pass did not finish (`{reason}`)."
     else:
         what = (
             f"This pass was degraded (`{reason}`) and found nothing blocking, "
             "so it is not a full review yet."
         )
-    return (
-        f"{what} Elder re-runs the review automatically. Merge stays "
-        "blocked until a full review lands; if the re-runs also fail this "
-        "check fails. Comment `/grug improve` to re-run sooner."
+    merge = (
+        "Merge stays blocked until a full review lands; if the re-runs also "
+        "fail this check fails."
+        if blocking
+        else "This check is advisory, so merge is not blocked meanwhile."
     )
+    return (
+        f"{what} Elder re-runs the review automatically. {merge} "
+        "Comment `/grug improve` to re-run sooner."
+    )
+
+
+def _rerun_pending_title(reason: str) -> str:
+    """The pending check's title while a queued re-run retries."""
+    if reason == "all_failed":
+        return "Elder waiting on a model - re-run scheduled"
+    if reason in RETRIED_DEGRADATIONS:
+        return "Elder re-running - first pass did not finish"
+    return "Elder review degraded - re-run scheduled"
 
 
 def _publish_rerun_pending(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-    head_sha: str, reason: str,
+    head_sha: str, reason: str, *, blocking: bool,
 ) -> dict[str, str]:
     """Leave the Elder check pending while a queued re-run retries (grug#1494).
 
@@ -5669,12 +5717,8 @@ def _publish_rerun_pending(
                 CheckRunResult(
                     name=_CHECK_NAME, head_sha=head_sha, status="in_progress",
                     conclusion=None,
-                    title=(
-                        "Elder waiting on a model - re-run scheduled"
-                        if reason == "all_failed"
-                        else "Elder review degraded - re-run scheduled"
-                    ),
-                    summary=_rerun_pending_summary(reason),
+                    title=_rerun_pending_title(reason),
+                    summary=_rerun_pending_summary(reason, blocking=blocking),
                 ),
                 external_id=(
                     f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
@@ -5701,16 +5745,24 @@ def _publish_degraded(
     head_sha: str, *, reason: str, summary: str | None = None,
     blocking: bool = False,
 ) -> dict[str, str]:
-    """Post the "skipped" check-run when fetch/parse fails. Best-effort -
+    """Post the terminal "could not review" check-run when fetch/parse fails
+    (grug#818: one voice with the other no-review surfaces). Best-effort -
     a publish failure here is also swallowed since we can't do anything
     useful with it (would need its own degraded publish, etc).
 
     grug#1212: concludes `failure` when the repo's Elder is blocking (no
     review happened, and a neutral required check would pass), `neutral`
     in WARN mode; the summary leads with the degraded line either way."""
-    title = f"WARN Elder review skipped ({reason})"
+    pr = f"{owner}/{repo_name}#{pull_number}"
+    if reason == DIFF_TOO_LARGE:
+        # The author can act on this one (split the change); it is no fault
+        # of Grug's, so nobody is paged and the check says what to do.
+        title = "Grug could not review this pass - diff over GitHub's size limit"
+    else:
+        title = could_not_review_title(reason)
+        alert_operator_could_not_review(reason, pr=pr, surface="fetch_or_parse")
     summary = lead_with_degraded_line(summary or (
-        f"Elder could not run this pass: `{reason}`. " + gate_sentence(blocking)
+        could_not_review_sentence(reason) + " " + gate_sentence(blocking)
     ), reason)
     conclusion = degraded_conclusion(blocking)
     publish_failed = False

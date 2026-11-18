@@ -1073,6 +1073,33 @@ backends and since when. It is not an `Elder clear`, and nothing was reviewed.
 - Find advisories: check runs titled `Elder advisory: review backends down`.
   After the outage, re-run any PR that merged on one.
 
+## Grug could not review (`elder_could_not_review`)
+
+An author reads "Grug could not review this pass ... an operator has been
+alerted" only after the retries ran out. That sentence is the same on the
+board verdict, the board body, the check title and the check summary
+(grug#818); `elder_could_not_review` is the ERROR log the alert reads, logged
+before any of them is written. Its `reason` is the degraded reason and its
+`surface` is the writer: `dispatch` (no model produced a usable review),
+`fetch_or_parse` (GitHub would not serve the diff) or `fail_open` (the
+durable lane closed the check).
+
+How far the retries go first:
+
+- Every model failed, unparseable output, a failed diff fetch
+  (`RETRIED_DEGRADATIONS`), and a GitHub refusal while re-checking freshness:
+  the check stays pending in both WARN and BLOCK mode while the review queue
+  still has a re-run scheduled. The terminal check is published on delivery
+  `ALL_FAILED_AUTO_RERUN_DELIVERIES` (4), the last-but-one of the review
+  queue's `maxReceiveCount` (5), so one delivery is left for a consumer killed
+  mid-publish. A test fails if the two numbers drift apart.
+- A billing or key problem on one backend (401/402/403/404) pages on its own
+  as `llm_backend_unusable` (below) and falls through to the next backend; it
+  reaches the author only if every backend failed and every retry did too.
+
+To act: read `reason`, fix the backend or GitHub side, then comment
+`/grug improve` on each PR the log names.
+
 ## LLM backend unusable
 
 The `[grug] LLM backend unusable` monitor fires when a review backend answers
