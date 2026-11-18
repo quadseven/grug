@@ -10,6 +10,8 @@ import llm_client as lc
 import pytest
 from llm_client import Backend, Hunk, review_diff
 from review_evidence import assemble_evidence
+import model_availability as availability
+import review_ladder
 
 _FREE = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
@@ -37,11 +39,11 @@ def _clean(monkeypatch):
     monkeypatch.setattr(call_report, "_inflight_shown", False)
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     monkeypatch.setattr(
-        lc, "acquire_free_tier_slot", lambda *a, **k: type("Admit", (), {"admitted": True})(),
+        availability, "acquire_free_tier_slot", lambda *a, **k: type("Admit", (), {"admitted": True})(),
     )
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
@@ -69,7 +71,7 @@ def _hunk() -> Hunk:
 
 def _large_hunk() -> Hunk:
     """Past `_DEGENERATE_MIN_DIFF_CHARS`: a short empty answer is a skim."""
-    return Hunk(path="src/x.py", body="@@ -1 +1 @@\n+" + "y" * lc._DEGENERATE_MIN_DIFF_CHARS)
+    return Hunk(path="src/x.py", body="@@ -1 +1 @@\n+" + "y" * review_ladder._DEGENERATE_MIN_DIFF_CHARS)
 
 
 def test_outcomes_match_the_ledger() -> None:

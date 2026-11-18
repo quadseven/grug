@@ -27,7 +27,7 @@ wire 5xx). This version asserts AST *shape and reachability*:
           `degraded_fails_closed`, `mode == "blocking"` and
           `is_real_degradation(...)`, and sits BEFORE the neutral branch (so
           the neutral branch cannot shadow it); every `plan_publish` call
-          in `_review_pass` passes `degraded_fails_closed=True`.
+          in `dispatch_code_review` passes `degraded_fails_closed=True`.
     - blocking_failure_yields_failure_and_request_changes_per_dispatch
         → ("failure","REQUEST_CHANGES") is returned under a non-constant
           test referencing `conclusion`/`"failure"`.
@@ -35,12 +35,12 @@ wire 5xx). This version asserts AST *shape and reachability*:
         → exactly one `_gate`, returning 2-tuples; no dead
           (`if False`) branches anywhere in the gate or dispatch.
 
-  Publish-independence contract (`_review_pass`, reached through
-  `dispatch_code_review` with the original `blocking` flag):
+  Publish-independence contract (the staged pass `dispatch_code_review` calls):
     - check_run_and_review_publish_independently_per_dispatch
         → post_check_run + post_review each in their own try; the
-          check-run handler sets `check_publish_failed = True` (an Assign,
-          not a string) and does NOT early-return; the planned outcome is
+          check-run handler returns `_PostedCheck(failed=True)` and the
+          review handler a `_PostedReview` with `failed` or `rejected` set,
+          so the other surface still posts; the planned outcome is
           passed through `PublishOutcome.settled` with both publish-failed
           kwargs, and the persona result is read off that settled outcome.
     - dispatch_never_raises_wire_exception_degrades_to_neutral_per_dispatch
@@ -327,92 +327,13 @@ def _kwarg_value(call: ast.Call, name: str) -> ast.expr | None:
     return None
 
 
-def _outcome_field_names(f: ast.FunctionDef, outcome: str) -> tuple[str, str] | None:
-    """The `(conclusion, event)` Names bound from `<outcome>.conclusion` and
-    `<outcome>.event` by one tuple assignment, or None."""
-    for n in ast.walk(f):
-        if not (
-            isinstance(n, ast.Assign)
-            and len(n.targets) == 1
-            and isinstance(n.targets[0], ast.Tuple)
-            and isinstance(n.value, ast.Tuple)
-            and len(n.targets[0].elts) == 2
-            and len(n.value.elts) == 2
-            and all(isinstance(e, ast.Name) for e in n.targets[0].elts)
-        ):
-            continue
-        fields = [
-            e.attr for e in n.value.elts
-            if isinstance(e, ast.Attribute)
-            and isinstance(e.value, ast.Name) and e.value.id == outcome
-        ]
-        if fields == ["conclusion", "event"]:
-            return n.targets[0].elts[0].id, n.targets[0].elts[1].id  # type: ignore[attr-defined]
-    return None
-
-
-def _planned_outcome_name(f: ast.FunctionDef, ps_calls: list[ast.Call]) -> str | None:
-    for n in ast.walk(f):
-        if (
-            isinstance(n, ast.Assign)
-            and n.value in ps_calls
-            and len(n.targets) == 1
-            and isinstance(n.targets[0], ast.Name)
-        ):
-            return n.targets[0].id
-    return None
-
-
-def _check_ssot_flow(
-    f: ast.FunctionDef, path: Path, ps_calls: list[ast.Call],
-) -> list[str]:
-    """The PublishOutcome `plan_publish` returns must be bound to a Name whose
-    `.conclusion` / `.event` are unpacked into two Names, and THOSE names must
-    reach the two publish surfaces - conclusion -> CheckRunResult(conclusion=),
-    event -> FinishedPass(event=). Proves the no-drift "single source
-    of truth" property."""
-    outcome = _planned_outcome_name(f, ps_calls)
-    names = _outcome_field_names(f, outcome) if outcome else None
-    if names is None:
-        return [
-            f"FAIL: {path} - plan_publish result is not bound to an outcome "
-            "whose `.conclusion, .event` are unpacked into `(conclusion, event)`; "
-            "can't prove single-source-of-truth flow"
-        ]
-    conclusion_name, event_name = names
-    fails: list[str] = []
-    crr = _calls_named(f, "CheckRunResult")
-    if not any(
-        isinstance(_kwarg_value(c, "conclusion"), ast.Name)
-        and _kwarg_value(c, "conclusion").id == conclusion_name  # type: ignore[union-attr]
-        for c in crr
-    ):
-        fails.append(
-            f"FAIL: {path} - CheckRunResult(conclusion=) is not the `{conclusion_name}` "
-            "from plan_publish; check-run conclusion may drift from the gate"
-        )
-    # #1591: the review is rendered by the markings projection, so the event
-    # reaches it as `FinishedPass(event=)`; a direct build is still accepted.
-    brr = _calls_named(f, "FinishedPass") + _calls_named(f, "build_review_result")
-    if not any(
-        isinstance(_kwarg_value(c, "event"), ast.Name)
-        and _kwarg_value(c, "event").id == event_name  # type: ignore[union-attr]
-        for c in brr
-    ):
-        fails.append(
-            f"FAIL: {path} - FinishedPass(event=) is not the `{event_name}` "
-            "from plan_publish; review event may drift from the gate"
-        )
-    return fails
-
-
 def _check_mode_derivation(f: ast.FunctionDef, path: Path) -> list[str]:
     """Validate that `mode` is derived from the `blocking` flag and never
     reassigned to a constant."""
     fails: list[str] = []
     params = {a.arg for a in (f.args.args + f.args.kwonlyargs)}
     if "blocking" not in params:
-        fails.append(f"FAIL: {path} - {f.name} has no `blocking` param")
+        fails.append(f"FAIL: {path} — dispatch_code_review has no `blocking` param")
     mode_vals = _mode_values(f)
     if not mode_vals:
         fails.append(f"FAIL: {path} — `mode` is never assigned")
@@ -429,83 +350,164 @@ def _check_mode_derivation(f: ast.FunctionDef, path: Path) -> list[str]:
     return fails
 
 
-def _check_plan_publish_mode(
-    f: ast.FunctionDef, path: Path,
-) -> tuple[list[ast.Call], list[str]]:
-    """Validate that plan_publish is called and its `mode` argument is the
-    derived `mode` Name (not a literal). Returns (ps_calls, fails).
-    """
-    ps_calls = _calls_named(f, "plan_publish")
+# The dispatch pass is split into typed stages (#725). Each contract below is
+# checked on the stage that now owns it; the entry point must call every stage,
+# so a stage nothing reaches cannot attest the pass.
+STAGE_NAMES: tuple[str, ...] = (
+    "_start_review_run", "_plan_tier1_publication", "_post_tier1_check",
+    "_project_tier1", "_post_tier1_review", "_record_tier1_publication",
+    "_record_dispatch_outcome",
+)
+
+
+def _is_attr(node: ast.expr | None, base: str, attr: str) -> bool:
+    return (
+        isinstance(node, ast.Attribute) and node.attr == attr
+        and isinstance(node.value, ast.Name) and node.value.id == base
+    )
+
+
+def _check_mode_flow(start: ast.FunctionDef, path: Path) -> list[str]:
+    """`mode` is derived from `blocking` and is what the run carries."""
+    fails = _check_mode_derivation(start, path)
+    runs = _calls_named(start, "_ReviewRun")
+    if not any(
+        isinstance(_kwarg_value(c, "mode"), ast.Name)
+        and _kwarg_value(c, "mode").id == "mode"  # type: ignore[union-attr]
+        for c in runs
+    ):
+        fails.append(
+            f"FAIL: {path} - _ReviewRun is not built with the derived `mode`; "
+            "the gate would consume a different mode"
+        )
+    return fails
+
+
+def _check_plan_stage(plan: ast.FunctionDef, path: Path) -> list[str]:
+    """The gate consumes `run.mode`, fails closed, and its outcome is carried
+    on the publication that both surfaces read."""
     fails: list[str] = []
+    ps_calls = _calls_named(plan, "plan_publish")
     if not ps_calls:
-        fails.append(f"FAIL: {path} - plan_publish is never called in dispatch")
+        fails.append(f"FAIL: {path} - plan_publish is never called in the plan stage")
     for c in ps_calls:
-        mode_arg: ast.expr | None = None
-        for kw in c.keywords:
-            if kw.arg == "mode":
-                mode_arg = kw.value
-        if not (isinstance(mode_arg, ast.Name) and mode_arg.id == "mode"):
+        if not _is_attr(_kwarg_value(c, "mode"), "run", "mode"):
             fails.append(
-                f"FAIL: {path} - plan_publish called with a non-`mode` argument at "
+                f"FAIL: {path} - plan_publish called with a non-`run.mode` argument at "
                 f"line {c.lineno}; the gate must consume the derived mode"
             )
-    return ps_calls, fails
+        opt_in = _kwarg_value(c, "degraded_fails_closed")
+        if not (isinstance(opt_in, ast.Constant) and opt_in.value is True):
+            fails.append(
+                f"FAIL: {path} - plan_publish at line {c.lineno} does not pass "
+                "`degraded_fails_closed=True`; a degraded Elder review in BLOCK "
+                "mode would conclude neutral"
+            )
+    outcome = next(
+        (
+            n.targets[0].id for n in ast.walk(plan)
+            if isinstance(n, ast.Assign) and n.value in ps_calls
+            and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
+        ),
+        None,
+    )
+    published = _calls_named(plan, "_Tier1Publication")
+    carried = any(
+        isinstance(_kwarg_value(c, "outcome"), ast.Name)
+        and _kwarg_value(c, "outcome").id == outcome  # type: ignore[union-attr]
+        for c in published
+    )
+    read_conclusion = any(
+        _is_attr(n, outcome, "conclusion") for n in ast.walk(plan)
+    ) if outcome else False
+    if not (outcome and carried and read_conclusion):
+        fails.append(
+            f"FAIL: {path} - plan_publish result is not bound to an outcome that is "
+            "carried on `_Tier1Publication(outcome=)` with its `.conclusion` read; "
+            "can't prove single-source-of-truth flow"
+        )
+    return fails
 
 
-def _check_publish_handlers(
-    path: Path,
-    check_tries: list[ast.Try], review_tries: list[ast.Try],
+def _check_surface_flow(
+    check: ast.FunctionDef, project: ast.FunctionDef, path: Path,
 ) -> list[str]:
-    """Validate the try/except handlers around post_check_run and post_review.
-    Check-run handlers must: catch a wire exception, not early-return, and
-    record the failure via check_publish_failed = True. Review handlers must
-    catch a wire exception.
-    """
+    """Both surfaces read the planned `plan.conclusion` / `plan.event`."""
     fails: list[str] = []
-    for tnode in check_tries:
-        # handler types must be able to catch a wire 5xx
+    if not any(
+        _is_attr(_kwarg_value(c, "conclusion"), "plan", "conclusion")
+        for c in _calls_named(check, "CheckRunResult")
+    ):
+        fails.append(
+            f"FAIL: {path} - CheckRunResult(conclusion=) is not `plan.conclusion`; "
+            "check-run conclusion may drift from the gate"
+        )
+    finished = _calls_named(project, "FinishedPass")
+    for kwarg in ("conclusion", "event"):
+        if not any(_is_attr(_kwarg_value(c, kwarg), "plan", kwarg) for c in finished):
+            fails.append(
+                f"FAIL: {path} - FinishedPass({kwarg}=) is not `plan.{kwarg}`; "
+                "the review may drift from the gate"
+            )
+    return fails
+
+
+def _handler_returns_failed(
+    handler: ast.ExceptHandler, cls: str, flags: tuple[str, ...],
+) -> bool:
+    """The handler's only exit is `return <cls>(...)` that sets one of `flags`
+    to something other than a constant False."""
+    returns = [
+        n for stmt in handler.body for n in _walk_no_nested(stmt)
+        if isinstance(n, ast.Return)
+    ]
+    if len(returns) != 1:
+        return False
+    call = returns[0].value
+    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == cls):
+        return False
+    values = [_kwarg_value(call, flag) for flag in flags]
+    return any(
+        v is not None and not (isinstance(v, ast.Constant) and v.value is False)
+        for v in values
+    )
+
+
+def _check_publish_stage(
+    func: ast.FunctionDef, path: Path, *, callee: str, cls: str, label: str,
+    flags: tuple[str, ...],
+) -> list[str]:
+    """One publish surface: its wire call is in a try that catches a wire
+    exception and RECORDS the failure on the returned stage result, so the
+    other surface still posts and `settled` sees the failure."""
+    tries = _try_blocks_containing(func, callee)
+    if not tries:
+        return [f"FAIL: {path} - {callee} is not wrapped in its own try (independent surface)"]
+    fails: list[str] = []
+    for tnode in tries:
         for handler in tnode.handlers:
             names = _handler_exc_names(handler)
             if not (names & ALLOWED_WIRE_EXC):
                 fails.append(
-                    f"FAIL: {path} — check-run except catches {sorted(names) or 'nothing'}; "
+                    f"FAIL: {path} - {label} except catches {sorted(names) or 'nothing'}; "
                     f"must catch a wire exception {sorted(ALLOWED_WIRE_EXC)}"
                 )
-            # must NOT early-return (would skip the independent review post)
-            if any(
-                isinstance(n, ast.Return)
-                for stmt in handler.body for n in _walk_no_nested(stmt)
-            ):
+            if not _handler_returns_failed(handler, cls, flags):
                 fails.append(
-                    f"FAIL: {path} — check-run except returns early; a check-run "
-                    "failure would skip the independent review post"
-                )
-            # must RECORD the failure (Assign True, not a logged string)
-            if not _handler_assigns_true(handler, "check_publish_failed"):
-                fails.append(
-                    f"FAIL: {path} — check-run except does not set "
-                    "`check_publish_failed = True`"
-                )
-
-    for tnode in review_tries:
-        for handler in tnode.handlers:
-            names = _handler_exc_names(handler)
-            if not (names & ALLOWED_WIRE_EXC):
-                fails.append(
-                    f"FAIL: {path} — review except catches {sorted(names) or 'nothing'}; "
-                    f"must catch a wire exception"
+                    f"FAIL: {path} - {label} except does not return `{cls}` with {' or '.join(flags)} set; "
+                    "the failure must be recorded, not swallowed or raised"
                 )
     return fails
 
 
-def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
-    entry = _find_funcdef(tree, "dispatch_code_review")
-    if entry is None:
+def _check_entry_wrapper(tree: ast.AST, path: Path) -> list[str]:
+    """`dispatch_code_review` returns `_review_pass` inside a try whose
+    `finally` calls the approval-cleanup helper, so neither an unused helper
+    nor a removed `finally` can attest it."""
+    wrapper = _find_funcdef(tree, "dispatch_code_review")
+    if wrapper is None:
         return [f"FAIL: {path} - exactly one `dispatch_code_review` expected"]
-    # The entry point delegates the pass inside a try/finally for approval
-    # cleanup. Require a direct return and a `finally` that calls the cleanup
-    # helper, so neither an unused helper nor a removed `finally` can attest.
-    body = entry.body[1:] if ast.get_docstring(entry) is not None else entry.body
+    body = wrapper.body[1:] if ast.get_docstring(wrapper) is not None else wrapper.body
     match body:
         case [ast.Try(
             body=[ast.Return(value=ast.Call(func=ast.Name(id="_review_pass")) as call)],
@@ -514,69 +516,79 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
             blocking = _kwarg_value(call, "blocking")
             if not isinstance(blocking, ast.Name) or blocking.id != "blocking":
                 return [f"FAIL: {path} - dispatch_code_review must forward blocking to _review_pass"]
+            return []
         case _:
-            return [f"FAIL: {path} - dispatch_code_review must directly return _review_pass"]
+            return [
+                f"FAIL: {path} - dispatch_code_review must directly return _review_pass "
+                "inside a try whose finally withdraws other-commit approvals"
+            ]
 
-    f = _find_funcdef(tree, "_review_pass")
-    if f is None:
+
+def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
+    wrapper_fails = _check_entry_wrapper(tree, path)
+    if wrapper_fails:
+        return wrapper_fails
+    entry = _find_funcdef(tree, "_review_pass")
+    if entry is None:
         return [f"FAIL: {path} - exactly one `_review_pass` expected"]
+    stages: dict[str, ast.FunctionDef] = {}
     fails: list[str] = []
+    for name in STAGE_NAMES:
+        stage = _find_funcdef(tree, name)
+        if stage is None:
+            fails.append(f"FAIL: {path} - exactly one `{name}` expected")
+        elif not _calls_named(entry, name):
+            fails.append(f"FAIL: {path} - _review_pass never calls `{name}`")
+        else:
+            stages[name] = stage
+    if fails:
+        return fails
 
     # No dead-code guards anywhere (kills `... and False` around post_review etc).
-    dead = _dead_branch_tests(f)
-    if dead:
-        fails.append(
-            f"FAIL: {path} - {f.name} has dead-code branch test(s) at "
-            f"line(s) {dead}; a constant-false guard hides a skipped publish surface"
-        )
-
-    # mode derives from the blocking flag and is never reassigned to a constant.
-    fails.extend(_check_mode_derivation(f, path))
-
-    # the value handed to plan_publish must be the `mode` Name, not a literal.
-    ps_calls, mode_fails = _check_plan_publish_mode(f, path)
-    fails.extend(mode_fails)
-
-    # grug#1212: Elder opts into the fail-closed branch at every call.
-    for c in ps_calls:
-        opt_in = _kwarg_value(c, "degraded_fails_closed")
-        if not (isinstance(opt_in, ast.Constant) and opt_in.value is True):
+    for func in (entry, *stages.values()):
+        dead = _dead_branch_tests(func)
+        if dead:
             fails.append(
-                f"FAIL: {path} - plan_publish at line {c.lineno} does not pass "
-                "`degraded_fails_closed=True`; a degraded Elder review in BLOCK "
-                "mode would conclude neutral"
+                f"FAIL: {path} - {func.name} has dead-code branch test(s) at "
+                f"line(s) {dead}; a constant-false guard hides a skipped publish surface"
             )
 
-    # SSOT no-drift: the (conclusion, event) pair plan_publish returns must
-    # be the SAME values published - conclusion into CheckRunResult(conclusion=),
-    # event into FinishedPass(event=). Without this, a mutation could
-    # recompute `event` independently and the two surfaces would drift.
-    fails.extend(_check_ssot_flow(f, path, ps_calls))
+    fails.extend(_check_mode_flow(stages["_start_review_run"], path))
+    fails.extend(_check_plan_stage(stages["_plan_tier1_publication"], path))
+    fails.extend(_check_surface_flow(
+        stages["_post_tier1_check"], stages["_project_tier1"], path,
+    ))
+    fails.extend(_check_publish_stage(
+        stages["_post_tier1_check"], path,
+        callee="post_check_run", cls="_PostedCheck", label="check-run", flags=("failed",),
+    ))
+    fails.extend(_check_publish_stage(
+        stages["_post_tier1_review"], path,
+        callee="post_review", cls="_PostedReview", label="review",
+        flags=("failed", "rejected"),
+    ))
 
-    # check-run + review on independent surfaces.
-    check_tries = _try_blocks_containing(f, "post_check_run")
-    review_tries = _try_blocks_containing(f, "post_review")
-    if not check_tries:
-        fails.append(f"FAIL: {path} — post_check_run is not wrapped in try/except")
-    if not review_tries:
+    # never-raise: the diff-failure stage degrades instead of raising.
+    handler = _find_funcdef(tree, "_handle_diff_failure")
+    if handler is None or not _calls_named(handler, "_publish_degraded"):
         fails.append(
-            f"FAIL: {path} — post_review not wrapped in its own try (independent surface)"
-        )
-
-    fails.extend(_check_publish_handlers(path, check_tries, review_tries))
-
-    # never-raise: fetch/parse degrade fallback present.
-    if not _calls_named(f, "_publish_degraded"):
-        fails.append(
-            f"FAIL: {path} — no _publish_degraded fallback; fetch/parse errors must "
+            f"FAIL: {path} - no _publish_degraded fallback; fetch/parse errors must "
             "degrade to advisory-neutral, not raise"
         )
+    if not _calls_named(entry, "_handle_diff_failure"):
+        fails.append(f"FAIL: {path} - _review_pass never calls `_handle_diff_failure`")
 
     # result rollup consults BOTH independent publish surfaces, and the
     # persona result is read off the settled outcome.
-    fails.extend(_check_settled_outcome(f, path))
+    fails.extend(_check_settled_outcome(stages["_record_dispatch_outcome"], path))
+    if not any(
+        isinstance(n, ast.Attribute) and n.attr == "result"
+        and isinstance(n.value, ast.Name) and n.value.id == "outcome"
+        for n in ast.walk(entry)
+    ):
+        fails.append(f"FAIL: {path} - the dispatch response is not read off the settled outcome")
 
-    fails.extend(_check_capture(tree, f, path))
+    fails.extend(_check_capture(tree, stages["_record_tier1_publication"], path))
     return fails
 
 
@@ -620,12 +632,12 @@ def _check_capture(tree: ast.AST, f: ast.FunctionDef, path: Path) -> list[str]:
     capture_tries = _try_blocks_containing(f, "get_review_comments")
     capture_helper = _find_funcdef(tree, "_capture_review_comments")
     if capture_helper is not None:
-        # When the helper exists, the review pass MUST call it -
+        # When the helper exists, dispatch_code_review MUST call it -
         # otherwise the synchronous path silently drops comment capture.
         if not _calls_named(f, "_capture_review_comments"):
             fails.append(
                 f"FAIL: {path} - _capture_review_comments helper exists but is "
-                f"never called from {f.name}"
+                "never called from dispatch_code_review"
             )
         # When the helper exists, it MUST contain a guarded get_review_comments
         # call - capture_tries is only for inline capture in dispatch.

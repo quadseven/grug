@@ -147,7 +147,7 @@ def lane_work_findings(
         pr_title=pr_title, hunks=hunks,
     ))
     findings.extend(scan_weakened_verification(
-        changes, hunks, criteria=criteria, pr_title=pr_title,
+        changes, hunks, criteria=criteria, pr_title=pr_title, diff_text=diff_text,
     ))
     findings.extend(scan_sanitizers(changes, hunks))
     findings.extend(scan_fabricated_results(changes, hunks))

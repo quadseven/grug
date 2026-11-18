@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import llm_client as lc
 import pytest
-from llm_client import Backend, Hunk, LlmReviewResponse, review_diff
+from llm_client import Hunk, LlmReviewResponse, review_diff
 from personas.code_reviewer import dispatch as cr_dispatch
 from review_evidence import assemble_evidence
 
@@ -29,6 +29,8 @@ from tests.test_elder_degraded_fail_closed import (
     _payload,
     _pr_data,
 )
+import model_availability as availability
+import review_ladder
 
 
 @pytest.fixture(autouse=True)
@@ -36,8 +38,8 @@ def _owned_ladder(monkeypatch):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
     monkeypatch.delenv("GRUG_REVIEW_BACKEND_PRIORITY", raising=False)
@@ -95,25 +97,23 @@ def test_a_429_on_the_first_pass_is_retried_after_the_delay_and_finishes(monkeyp
 def test_a_rate_limited_model_is_not_marked_failed_on_the_chunk() -> None:
     """The ladder's skip set holds models that really failed. A 429 is only a
     wait, so it stays out of the set while a timeout stays in it."""
-    ladder = lc._ChunkLadder()
+    ladder = review_ladder._ChunkLadder(lambda _: None)
     seen: list[frozenset] = []
 
     def walk(outcomes):
-        def call():
-            seen.append(lc._LADDER_SKIP.get())
-            trail = lc._LADDER_TRAIL.get()
-            trail.extend(outcomes)
+        def call(chunk):
+            seen.append(chunk.skip)
+            chunk.trail.extend(outcomes)
             return LlmReviewResponse(kind="all_failed", error="x")
         return call
 
-    limited = lc._LadderAttempt(
+    limited = review_ladder._LadderAttempt(
         backend="poolside", model="m-limited", reason="http_429", retry_after=1.0,
     )
-    broken = lc._LadderAttempt(backend="cave", model="m-broken", reason="ReadTimeout")
-    with patch.object(lc, "_RETRY_SLEEP", lambda _s: None):
-        ladder.run(0, walk([limited, broken]))
-        ladder.run(0, walk([]))
-        ladder.run(1, walk([]))
+    broken = review_ladder._LadderAttempt(backend="cave", model="m-broken", reason="ReadTimeout")
+    ladder.run(0, walk([limited, broken]))
+    ladder.run(0, walk([]))
+    ladder.run(1, walk([]))
 
     assert seen[1] == frozenset({("cave", "m-broken")})
     assert seen[2] == frozenset(), "a later chunk starts with nothing skipped"

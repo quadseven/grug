@@ -21,6 +21,8 @@ import llm_client as lc
 import pytest
 from llm_client import Backend, Hunk, LlmReviewResponse, review_diff
 from review_evidence import assemble_evidence
+import model_availability as availability
+import provider_wire
 
 
 @pytest.fixture(autouse=True)
@@ -28,8 +30,8 @@ def _owned_ladder(monkeypatch):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda _s: None)
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
@@ -104,7 +106,7 @@ def test_a_call_is_clamped_to_the_time_left() -> None:
 
     deadline = time.monotonic() + 30.0
     with patch.object(httpx, "post", side_effect=respond):
-        lc._post_with_retries("http://x.test", {}, {}, 330.0, 1, 1, deadline)
+        provider_wire._post_with_retries("http://x.test", {}, {}, 330.0, 1, 1, deadline)
 
     assert len(sent) == 1
     assert sent[0] <= 30.0
@@ -112,7 +114,7 @@ def test_a_call_is_clamped_to_the_time_left() -> None:
 
 def test_a_call_is_not_sent_once_the_deadline_has_passed() -> None:
     with patch.object(httpx, "post") as post, pytest.raises(lc.ReviewDeadlineReached):
-        lc._post_with_retries(
+        provider_wire._post_with_retries(
             "http://x.test", {}, {}, 330.0, 1, 1, time.monotonic() + 1.0,
         )
     post.assert_not_called()
@@ -126,7 +128,7 @@ def test_no_deadline_keeps_the_configured_timeout() -> None:
         return httpx.Response(200, json={})
 
     with patch.object(httpx, "post", side_effect=respond):
-        lc._post_with_retries("http://x.test", {}, {}, 330.0, 1, 1)
+        provider_wire._post_with_retries("http://x.test", {}, {}, 330.0, 1, 1)
 
     assert sent == [330.0]
 
@@ -141,13 +143,13 @@ def test_a_deadline_cut_timeout_does_not_slow_bench_the_model() -> None:
         patch.object(httpx, "post", side_effect=respond),
         pytest.raises(lc.ReviewDeadlineReached) as cut,
     ):
-        lc._post_with_retries(
+        provider_wire._post_with_retries(
             "http://x.test", {}, {}, 45.0, 1, 1, time.monotonic() + 20.0,
         )
 
     for _ in range(10):
-        lc._note_model_timeout(Backend.POOLSIDE, lc._POOLSIDE_MODEL, cut.value)
-    assert lc._slow_bench_state == {}
+        availability._note_model_timeout(Backend.POOLSIDE, lc._POOLSIDE_MODEL, cut.value)
+    assert availability._slow_bench_state == {}
 
 
 def test_a_full_timeout_under_a_distant_deadline_is_still_a_timeout() -> None:
@@ -158,7 +160,7 @@ def test_a_full_timeout_under_a_distant_deadline_is_still_a_timeout() -> None:
         patch.object(httpx, "post", side_effect=respond),
         pytest.raises(httpx.ReadTimeout),
     ):
-        lc._post_with_retries(
+        provider_wire._post_with_retries(
             "http://x.test", {}, {}, 45.0, 1, 1, time.monotonic() + 600.0,
         )
 
@@ -240,7 +242,7 @@ def test_slow_rungs_leave_every_cohort_room_for_the_subscription_lane(monkeypatc
     Cohorts share what is left, and the lane keeps a reserve inside each share:
     every cohort below is served by the lane and none is starved."""
     monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
-    lc._subscription_daily_calls.clear()
+    availability._subscription_daily_calls.clear()
     clock = _Clock()
     monkeypatch.setattr(lc.time, "monotonic", clock)
     hunks = [_big_hunk(f"src/m{i}.py", f"C{i}C") for i in range(6)]
@@ -258,7 +260,7 @@ def test_slow_rungs_leave_every_cohort_room_for_the_subscription_lane(monkeypatc
     with patch.object(httpx, "post", side_effect=respond):
         out = review_diff(assemble_evidence(hunks), installation_id=2)
 
-    lc._subscription_daily_calls.clear()
+    availability._subscription_daily_calls.clear()
     assert out.kind == "reviewed"
     assert lane_calls == 6
     assert not out.error

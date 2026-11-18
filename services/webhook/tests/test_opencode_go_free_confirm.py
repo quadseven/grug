@@ -24,6 +24,8 @@ import pytest
 from llm_client import Backend, Hunk, review_diff
 from personas.code_reviewer.persona import evaluate_diff
 from review_evidence import assemble_evidence
+import model_availability as availability
+import review_ladder
 
 PAID = "deepseek-v4.1-flash"
 FREE_A = "alpha-free"
@@ -90,10 +92,10 @@ def test_a_missing_or_broken_report_file_loads_as_nothing(tmp_path: Path) -> Non
 def _env(monkeypatch, tmp_path):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_opencode_go_free_catalog", None, raising=False)
-    monkeypatch.setattr(lc, "_opencode_go_free_gate", None, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_free_catalog", None, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_free_gate", None, raising=False)
     monkeypatch.setattr(lc, "_spark_data_class_header", lambda: "public")
     monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/test/opencode-go")
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
@@ -117,7 +119,7 @@ def _env(monkeypatch, tmp_path):
     ]}
     monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
     monkeypatch.setattr(
-        lc, "_opencode_go_free_models_fetch", lambda: httpx.Response(200, json=listing),
+        availability, "_opencode_go_free_models_fetch", lambda: httpx.Response(200, json=listing),
         raising=False,
     )
     monkeypatch.setattr(og, "_today", lambda: TODAY, raising=False)
@@ -283,11 +285,10 @@ def test_the_pure_rule_needs_a_known_cohort_size(monkeypatch) -> None:
     _flag_on(monkeypatch)
     _allow(FREE_A)
     paid, free = (Backend.OPENCODE_GO, PAID), (Backend.OPENCODE_GO, FREE_A)
-    lc._opencode_go_free_catalog_get().models()
-    assert not lc._empty_answers_agree(paid, free, None)
-    with lc._reviewed_diff_scope([_hunk(9_000)]):
-        assert lc._empty_answers_agree(paid, free, None)
-        # Never the other way round: a free first answer is not a paid one.
-        assert not lc._empty_answers_agree(free, paid, None)
-        # Never a free model confirming a free model.
-        assert not lc._empty_answers_agree((Backend.OPENCODE_GO, FREE_B), free, None)
+    availability._opencode_go_free_catalog_get().models()
+    assert not review_ladder._empty_answers_agree(paid, free, None)
+    assert review_ladder._empty_answers_agree(paid, free, None, 9_000)
+    # Never the other way round: a free first answer is not a paid one.
+    assert not review_ladder._empty_answers_agree(free, paid, None, 9_000)
+    # Never a free model confirming a free model.
+    assert not review_ladder._empty_answers_agree((Backend.OPENCODE_GO, FREE_B), free, None, 9_000)

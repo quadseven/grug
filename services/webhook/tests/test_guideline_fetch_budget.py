@@ -16,6 +16,7 @@ import pytest
 from llm_client import Hunk, review_diff
 from repo_file_cache import RepoFileCache
 from review_evidence import assemble_evidence
+import model_availability as availability
 
 _REQUEST = httpx.Request("GET", "https://api.github.com/repos/o/r/contents/f")
 _PR_CONTEXT = {
@@ -55,8 +56,8 @@ def _completion(_url, **_kwargs) -> httpx.Response:
 def test_a_multi_cohort_review_reads_each_guideline_file_once(monkeypatch):
     for loader in ("_load_poolside_key", "_load_openrouter_key", "_load_opencode_go_key"):
         monkeypatch.setattr(lc, loader, lambda: "test-key")
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda _s: None)
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
