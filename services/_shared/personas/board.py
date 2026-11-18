@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import re
 
+from personas.code_reviewer.degraded_gate import COULD_NOT_REVIEW_VERDICT
+
 BOARD_MARKER = "<!-- grug-board -->"
 
 # Fixed render order. A persona missing from a given pass simply has no
@@ -161,7 +163,8 @@ _HEADER_END = "<!-- /grug-header -->"
 _VERDICT_BLOCK = "Grug say **WAIT**. Something here bite tribe later."
 _VERDICT_ADVISE = "Grug say **go**, but Grug leave few marks for hunter."
 _VERDICT_CLEAR = "Grug look hard. **Trail clear.**"
-_VERDICT_DEGRADED = "Grug eyes cloudy this pass - **read for self**."
+# grug#818: the one voice for "no review happened", shared with the check.
+_VERDICT_DEGRADED = COULD_NOT_REVIEW_VERDICT
 _VERDICT_PARTIAL = "Grug walk most of trail. **Some ground not walked.**"
 
 
@@ -173,7 +176,7 @@ def verdict_line(
 
     `degraded` means Elder saw NOTHING. `partial` means it walked most of the
     diff but not all of it - a different fact, and it used to borrow the
-    blackout sentence. "Grug eyes cloudy - read for self" on a pass that
+    blackout sentence. "Grug could not review this pass" on a pass that
     reviewed most cohorts and published real findings tells the author to
     ignore work that was actually done.
 

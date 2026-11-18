@@ -15,10 +15,30 @@ the policy lives in one place.
 
 `no_diff` is not a degraded review (there was nothing to look at) and a
 superseded head is not the head that merges; neither comes through here.
+
+grug#818: when Elder produced no review at all, four surfaces used to say so
+in four voices ("eyes cloudy - read for self", "Elder skipped - <reason>",
+"could not see the diff", "Review degraded - no usable findings"). They now
+share the words below, which say plainly that no review happened, that the
+fault is Grug's rather than the change's, and that an operator was alerted -
+and `alert_operator_could_not_review` is the alert that makes the last part
+true. The durable lane retries a transient failure before any of these
+surfaces is written (`review_lifecycle.ALL_FAILED_AUTO_RERUN_DELIVERIES`).
 """
 from __future__ import annotations
 
+import logging
+import os
 from typing import Literal
+
+log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.code_reviewer")
+
+# The board's verdict sentence for a pass with no review behind it. It is the
+# email subject when it creates the board, so it states the fact and the
+# operator page and leaves out any instruction to the author.
+COULD_NOT_REVIEW_VERDICT = (
+    "Grug could not review this pass. **An operator has been alerted.**"
+)
 
 DegradedConclusion = Literal["failure", "neutral"]
 
@@ -44,6 +64,34 @@ def degraded_lead_line(reason: str) -> str:
 def lead_with_degraded_line(summary: str, reason: str) -> str:
     """`summary` with the degraded lead line as its first line."""
     return f"{degraded_lead_line(reason)}\n\n{summary}"
+
+
+def could_not_review_title(reason: str) -> str:
+    """The check title for a pass with no review behind it."""
+    return f"Grug could not review this pass ({reason or 'unknown'}) - operator alerted"
+
+
+def could_not_review_sentence(reason: str) -> str:
+    """The sentence every no-review surface (check summary, board body) uses."""
+    return (
+        f"Grug could not review this pass (`{reason or 'unknown'}`). The fault "
+        "is in Grug, not in this change, and an operator has been alerted. "
+        "Nothing here is a verdict on the code."
+    )
+
+
+def alert_operator_could_not_review(reason: str, *, pr: str, surface: str) -> None:
+    """Page an operator: an author is about to read that Grug did not review.
+
+    `elder_could_not_review` is an ERROR token on purpose, the same contract
+    as `llm_backend_unusable`: every surface that writes the sentences above
+    calls this first, so "an operator has been alerted" is never a claim with
+    no alert behind it. `surface` names the writer, so the runbook can tell a
+    dispatch blackout from a durable-lane fail-open."""
+    log.error(
+        "elder_could_not_review",
+        extra={"reason": reason or "unknown", "pr": pr, "surface": surface},
+    )
 
 
 def gate_sentence(blocking: bool | None) -> str:

@@ -6,6 +6,9 @@ pin what `rerun._run_hot_review` did before its decisions moved into
 """
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 import review_lifecycle as rl
@@ -59,8 +62,11 @@ REVIEW = [
     ("publish failed: redrive", _res("publish_failed"), None,
      RD, "Elder review publication failed", ""),
     ("#770 review_rejected completes", _res("review_rejected"), None, C, "dispatched", ""),
-    ("ADR-0023 freshness outage fails open", _res("skipped", "freshness_check_failed"), None,
-     FO, "fail_open_freshness", ""),
+    ("ADR-0023 freshness outage fails open on the last delivery",
+     _res("skipped", "freshness_check_failed"), None, FO, "fail_open_freshness", ""),
+    ("#818 freshness outage with a re-run ahead redrives",
+     _res("skipped", "freshness_check_failed", True), None,
+     RD, "Elder review degraded: freshness_check_failed; re-run scheduled", ""),
     ("#1494 all_failed redrives", _res("skipped", "all_failed"), None,
      RD, "Elder review degraded: all_failed", ""),
     ("#1534 partial with a re-run scheduled redrives", _res("skipped", "partial_review", True),
@@ -112,11 +118,28 @@ def test_every_self_completing_skip_completes():
         assert rl.decide({}, None, ClaimState.HELD, _res("skipped", reason)).step is C
 
 
-@pytest.mark.parametrize(("delivery", "pending"), [(0, False), (1, True), (2, True), (3, False)])
+@pytest.mark.parametrize(("delivery", "pending"), [
+    (0, False), (1, True), (2, True), (3, True), (4, False), (5, False),
+])
 def test_rerun_pending_bounds_the_deferred_failure(delivery, pending):
-    """#1494, #1501: deliveries 1 and 2 leave a blocking check pending; from the
-    third the failure is published."""
+    """#1494, #818: deliveries 1 to 3 leave the check pending; from the fourth
+    (the queue's last-but-one) the failure is published."""
     assert rl.rerun_pending(delivery) is pending
+
+
+def test_the_rerun_bound_is_the_review_queues_own_dead_letter_limit():
+    """#818: retries run out when the queue's do, not two deliveries early.
+    The terminal publish takes the last-but-one delivery, so one is left for
+    a consumer killed mid-publish."""
+    main = Path(__file__).resolve().parents[3] / "infra" / "pulumi" / "__main__.py"
+    limit = re.search(
+        r"_rerun_dlq\.arn\.apply\(\s*lambda arn: json\.dumps\("
+        r'\{"deadLetterTargetArn": arn, "maxReceiveCount": (\d+)\}',
+        main.read_text(),
+    )
+    assert limit, "the review queue's redrive policy moved; re-point this test"
+    assert int(limit.group(1)) == rl.REVIEW_QUEUE_MAX_RECEIVES
+    assert rl.ALL_FAILED_AUTO_RERUN_DELIVERIES == rl.REVIEW_QUEUE_MAX_RECEIVES - 1
 
 
 def test_step_names_are_the_logged_values():
@@ -135,3 +158,19 @@ def test_review_result_reads_a_dispatch_result():
     got = ReviewResult.from_dispatch({"result": "skipped", "degraded_reason": None,
                                       "rerun_scheduled": 1})
     assert got == ReviewResult("skipped", "", True)
+
+
+@pytest.mark.parametrize(("reason", "ahead", "scheduled"), [
+    ("freshness_check_failed", True, True),
+    ("freshness_check_failed", False, False),
+    ("mystery", True, False),
+])
+def test_a_transient_fail_open_counts_as_rerun_scheduled_while_one_is_ahead(
+    reason, ahead, scheduled,
+):
+    """#818: a GitHub brownout is retried like a model outage before the
+    check fails open; an unknown skip is not."""
+    got = ReviewResult.from_dispatch(
+        {"result": "skipped", "degraded_reason": reason}, rerun_ahead=ahead,
+    )
+    assert got.rerun_scheduled is scheduled

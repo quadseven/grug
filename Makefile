@@ -173,7 +173,7 @@ review-latency:
 
 # Elder replay eval harness (#361 slice 2, #537). Replays Elder over the
 # committed review-ledger corpus and scores catch-rate vs noise per class -
-# NOT a per-PR gate; makes REAL backend calls (free OpenRouter/Poolside
+# NOT a per-PR gate; model replay makes REAL backend calls (free OpenRouter/Poolside
 # keys; Cave needs the tailnet) - set GRUG_BENCH_{OPENROUTER,
 # POOLSIDE}_KEY and/or GRUG_BENCH_CAVE_URL+MODEL. Mirrors sast-benchmark
 # above; this harness had no make target before, which is part of why the
@@ -181,10 +181,11 @@ review-latency:
 #   make elder-eval                # print report
 #   make elder-eval ARGS=--record  # write baseline.json
 #   make elder-eval ARGS=--check   # exit 1 on regression vs baseline
+#   make elder-eval ARGS='--verify-only INSTALLATION_ID'  # count captured findings
 # The pure corpus/scoring core is covered by `make webhook-test` (no LLM).
 elder-eval:
 	cd services/webhook && PYTHONPATH=../_shared uv run --python 3.13 --with httpx --with pyjwt --with cryptography \
-		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
+		--with boto3 --with pyyaml --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
 		--with 'datadog-lambda>=6.107,<7' python -m elder_eval $(ARGS)
 
 # Elder integer-column/datetime fixture (#1493). Replays the synthetic

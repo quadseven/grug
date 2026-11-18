@@ -149,6 +149,15 @@ def extract_criteria(issue_body: str) -> list[Criterion]:
     return out
 
 
+def is_live_criterion(text: str) -> bool:
+    """Whether a criterion is explicitly reserved for post-deploy review."""
+    value = text.lstrip()
+    while value.startswith(("*", "_")):
+        value = value[1:].lstrip()
+    value = value.casefold()
+    return value.startswith("live:") or value.startswith("live proof") or value.startswith("live (")
+
+
 def _clean(text: str) -> str:
     """One printable line with no live fence or mention."""
     flat = "".join(c for c in " ".join(text.split()) if c.isprintable())
@@ -299,6 +308,7 @@ def _with_delivered(
 def build_linked_issue_context(
     pr_body: str, *, fetch_issue: IssueDetailsFetcher, owner: str = "", repo: str = "",
     fetch_siblings: SiblingFetcher | None = None,
+    live_criteria_count: list[int] | None = None,
 ) -> str | None:
     """The block for this PR's linked issues, or None. Never raises."""
     criteria_by_issue: dict[int, list[Criterion]] = {}
@@ -325,6 +335,11 @@ def build_linked_issue_context(
             )
             continue
         criteria = extract_criteria(issue_body)
+        if criteria:
+            live_count = sum(is_live_criterion(text) for _, text in criteria)
+            if live_criteria_count is not None:
+                live_criteria_count.append(live_count)
+            criteria = [item for item in criteria if not is_live_criterion(item[1])]
         if criteria:
             criteria_by_issue[number] = _with_delivered(
                 number, criteria, issue_body, fetch_siblings,

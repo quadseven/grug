@@ -207,6 +207,66 @@ def test_the_analyzers_give_a_hostile_pr_nothing_to_obey_or_steal(bench):
     _assert_clean(bench, runs=2)
 
 
+@pytest.mark.skipif(
+    not os.getenv("GRUG_ANALYZER_SANDBOX"), reason="requires the Linux sandbox launcher",
+)
+def test_analyzer_child_cannot_access_parent_resources(bench, tmp_path):
+    if mount := os.getenv("ANALYZER_TEST_CREDENTIAL"):
+        credential = Path(mount)
+    else:
+        credential = tmp_path / "credential"
+        credential.write_text("synthetic-credential")
+    assert credential.read_text() == "synthetic-credential"
+    parent_env = Path(f"/proc/{os.getpid()}/environ")
+    readable_by_parent = [str(credential)]
+    if sys.platform == "linux":
+        with parent_env.open("rb"):
+            pass
+        readable_by_parent.append(str(parent_env))
+    targets = [("127.0.0.1", bench.port)]
+    if host := os.getenv("ANALYZER_TEST_NETWORK_HOST"):
+        targets.append((socket.gethostbyname(host), 8080))
+    for address in targets:
+        with socket.create_connection(address, timeout=2):
+            pass
+    assert bench.egress_attempts() == 1
+
+    engine = bench.bin / "ruff"
+    engine.write_text(f"""#!{sys.executable}
+import socket
+import sys
+
+accessible = []
+for path in {readable_by_parent!r}:
+    try:
+        open(path, 'rb').close()
+    except PermissionError:
+        continue
+    accessible.append(path)
+for address in {targets!r}:
+    try:
+        socket.create_connection(address, timeout=2).close()
+    except PermissionError:
+        continue
+    accessible.append(address)
+try:
+    first, second = socket.socketpair(type=socket.SOCK_DGRAM)
+except PermissionError:
+    pass
+else:
+    first.close()
+    second.close()
+    accessible.append('Unix datagram socket pair')
+if accessible:
+    print(f'Analyzer reached parent resources: {{accessible}}', file=sys.stderr)
+    sys.exit(2)
+print('[]')
+""")
+    engine.chmod(0o755)
+    assert ruff_hits({"app.py": "value = 1\n"}) == ()
+    assert bench.egress_attempts() == 0
+
+
 def test_the_base_ignore_list_is_the_only_one_the_engine_sees(bench, monkeypatch):
     """A PR that adds an ignore list where the base has none must not get it
     honored, and a repo's own base list still applies."""

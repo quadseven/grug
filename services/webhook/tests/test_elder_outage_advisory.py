@@ -306,7 +306,7 @@ _UP = LlmReviewResponse(kind="reviewed", backend_used=Backend.POOLSIDE)
 def test_publish_fails_closed_then_advisory_then_blocks_again(run):
     first = run(_DOWN)
     assert first.conclusion == "failure"
-    assert first.title.startswith("WARN")
+    assert first.title.startswith("Grug could not review this pass")
     later = run(_DOWN, advance_min=25)
     assert later.conclusion == "neutral"
     assert oa.ADVISORY_TITLE in later.title

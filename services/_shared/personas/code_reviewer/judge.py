@@ -43,6 +43,7 @@ from personas.code_reviewer.intent_filter import INTENT_MISMATCH
 from personas.code_reviewer.persona import CodeReviewEvaluation, Finding
 from personas.code_reviewer.quarantine import quarantined_evidence, switch_on
 from personas.code_reviewer.sast import EXPOSED_SECRET
+from personas.code_reviewer.verify_only import is_summary_only
 from ledger import VERIFIER_REVIEWER
 from redact import redact_secrets
 from review_evidence import ElderEvidence
@@ -299,8 +300,8 @@ def partition_findings(
 
     A finding is SUPPRESSED iff ALL hold: the judge graded it, called it
     not-real, with `confidence >= confidence_floor`, AND its severity is
-    low/medium. HIGH/CRITICAL always publish (a judge FP on a critical must
-    never hide it, #346). A finding with no verdict (judge outage,
+    low/medium. Verify-only asks stay in the summary, and high/critical
+    findings always publish (#346). A finding with no verdict (judge outage,
     hallucinated index, over budget) is KEPT - fail-open. Pure - no IO."""
     # First verdict per index wins (a misbehaving judge emitting two verdicts
     # for one finding must not get a second vote).
@@ -318,6 +319,7 @@ def partition_findings(
             and not v.is_real_bug
             and v.confidence >= confidence_floor
             and f.severity in _SUPPRESSIBLE_SEVERITIES
+            and not is_summary_only(f.message, f.severity)
         ):
             suppressed.append(f)
         else:

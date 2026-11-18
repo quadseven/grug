@@ -1,7 +1,7 @@
 """Static DoR checks for PR bodies.
 
 Ported from scripts/tpm.py with the bullet-count regex tightened per
-quadseven/grug#20: empty `- [ ]` placeholders no longer count toward the
+empty grug issue #20: empty `- [ ]` placeholders no longer count toward the
 >=3 minimum (security: an unfilled template should NOT pass). Text inside
 HTML comments counts for nothing either (#1330): a template's guidance and
 example bullets live in comments the rendered PR never shows.

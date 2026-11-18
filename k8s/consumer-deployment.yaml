@@ -335,10 +335,6 @@ spec:
             # NOTE: this engine covers 10 hand-written PYTHON rules only. It is
             # not general security coverage - see #859 before trusting it.
             - {name: GRUG_SAST_ENGINE, value: opengrep}
-            # Stable, writable, per-pod cache path for the engine
-            # (#865). Unset falls back to the scan dir: correct but
-            # re-extracts ~242M every scan.
-            - {name: GRUG_SAST_CACHE_DIR, value: /var/cache/grug-sast}
             # Lint evidence (#681, epic #707): ruff over changed Python files -
             # the consumer runs full Elder re-runs, so it needs the same engine
             # as the webhook. The ruff CLI ships in the image (same image as
@@ -376,10 +372,6 @@ spec:
             - {name: grug-pki, mountPath: /var/run/grug-pki, readOnly: true}
             - {name: aws-config, mountPath: /etc/grug-aws, readOnly: true}
             - {name: tmp, mountPath: /tmp}
-            # Opengrep's runtime cache (#865). Its own volume so the
-            # 242M extraction happens once per POD, outside both the
-            # scanned tree and tmp's 64Mi cap.
-            - {name: sast-cache, mountPath: /var/cache/grug-sast}
       volumes:
         - name: grug-pki
           secret:
@@ -389,8 +381,3 @@ spec:
             name: grug-aws-config
         - name: tmp
           emptyDir: {sizeLimit: 64Mi}
-        # 1Gi against >=52.9 GB allocatable on the smallest node grug
-        # can schedule on - capacity is not the constraint; opengrep
-        # extracts ~242M and needs headroom to rewrite it on upgrade.
-        - name: sast-cache
-          emptyDir: {sizeLimit: 1Gi}

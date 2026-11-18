@@ -1,7 +1,7 @@
-"""The read-only sandbox every Elder analyzer subprocess runs in (#1254).
+"""The sandbox every reviewer analyzer subprocess runs in (#1254, #1576).
 
 An analyzer is a parser, never a runner: it reads the changed files and
-reports what it sees. Three properties keep it that way, and every analyzer
+reports what it sees. Four properties keep it that way, and every analyzer
 (ruff in lint.py, the engines in analyzers.py, the scan in sast.py) goes through this module to
 get them:
 
@@ -17,12 +17,18 @@ get them:
 3. A SCRUBBED ENVIRONMENT. `sandbox_env` passes an allowlist, not the pod's
    environment: the GitHub App key, the database URL and every provider
    token stay out of the child process entirely.
+4. A KERNEL BOUNDARY. The runtime image routes every engine through Landlock
+   and seccomp before it sees any PR input. The executable can read its input
+   and runtime files, write to private scratch, and make no network connections.
 """
 from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import stat
+import subprocess
+import tempfile
 from collections.abc import Iterator
 
 # Only what a statically linked or bundled-interpreter binary needs to start.
@@ -66,6 +72,35 @@ def sandbox_env(home: str, extra: dict[str, str] | None = None) -> dict[str, str
     env["HOME"] = home
     env.update(extra or {})
     return env
+
+
+def run_analyzer(
+    argv: list[str], *, scan_root: str, env: dict[str, str], timeout: float,
+    rules_dir: str | None = None, cwd: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an engine, requiring the OS launcher in the image and in Kubernetes."""
+    launcher = os.getenv("GRUG_ANALYZER_SANDBOX")
+    if not launcher and os.getenv("KUBERNETES_SERVICE_HOST"):
+        launcher = "/usr/local/bin/grug-analyzer-sandbox"
+    if not launcher:
+        return subprocess.run(
+            argv, cwd=cwd, env=env, timeout=timeout, capture_output=True,
+            text=True, check=False,
+        )
+
+    engine = shutil.which(argv[0], path=env["PATH"])
+    if not engine:
+        raise FileNotFoundError(argv[0])
+    with tempfile.TemporaryDirectory(prefix="grug-analyzer-scratch-") as scratch:
+        child_env = dict(env, HOME=scratch, XDG_CACHE_HOME=scratch, TMPDIR=scratch)
+        command = [
+            launcher, scan_root, scratch, rules_dir or "-", os.path.abspath(engine), *argv[1:],
+        ]
+        return subprocess.run(
+            command, cwd=cwd, env=child_env, timeout=timeout,
+            stdin=subprocess.DEVNULL, close_fds=True, capture_output=True,
+            text=True, check=False,
+        )
 
 
 def _chmod_tree(root: str, file_mode: int, dir_mode: int) -> None:
