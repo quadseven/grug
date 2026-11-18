@@ -4048,7 +4048,7 @@ def test_only_the_size_limit_406_is_terminal(monkeypatch, error):
 
 # --- #1102: resolve Elder's own fixed threads after a synchronize review ---
 
-def _run_with_resolver(monkeypatch, action, resolver, *, llm=None):
+def _run_with_resolver(monkeypatch, action, resolver, *, llm=None, publish=None):
     llm = llm or LlmReviewResponse(
         kind="reviewed",
         findings=(LlmFinding(
@@ -4059,7 +4059,7 @@ def _run_with_resolver(monkeypatch, action, resolver, *, llm=None):
     )
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
-    monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **kw: {})
+    monkeypatch.setattr(cr_dispatch, "post_review", publish or (lambda *a, **kw: {}))
     monkeypatch.setattr(cr_dispatch, "resolve_fixed_threads", resolver)
 
     def get(url, **kw):
@@ -4088,6 +4088,50 @@ def test_synchronize_review_resolves_fixed_threads_with_review_findings(monkeypa
     assert [f.rule_name for f in kw["findings"]] == ["silent-failure"]
     assert kw["head_sha"]
     assert out["result"] == "pass"
+
+
+def test_review_body_reports_threads_actually_resolved(monkeypatch):
+    posted = []
+    updated = []
+
+    def publish(*args, result, **kwargs):
+        posted.append(result)
+        return {"id": 77}
+
+    def put(url, *, json, **kwargs):
+        updated.append((url, json["body"]))
+        return httpx.Response(200, request=httpx.Request("PUT", url))
+
+    monkeypatch.setattr(httpx, "put", put)
+    monkeypatch.setattr(cr_dispatch, "get_review_comments", lambda *a, **kw: [])
+    _run_with_resolver(
+        monkeypatch, "synchronize", lambda *a, **kw: 2, publish=publish,
+    )
+
+    [(url, body)] = updated
+    assert url.endswith("/pulls/7/reviews/77")
+    assert body.startswith(posted[0].body)
+    assert "Resolved 2 earlier Elder threads." in body
+
+
+def test_deep_findings_are_kept_in_the_thread_resolution_pass(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cr_dispatch, "review_is_staged", lambda hunks: False)
+    monkeypatch.setattr(
+        cr_dispatch, "decide_deep_escalation",
+        lambda *a: MagicMock(escalate=True, reasons=["test"], added_lines=5),
+    )
+    monkeypatch.setattr(
+        cr_dispatch, "review_reasoner_diff", lambda *a, **kw: _deep_llm_with_finding(),
+    )
+    monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
+
+    _run_with_resolver(
+        monkeypatch, "synchronize", lambda *a, **kw: calls.append(kw) or 0,
+    )
+
+    [call] = calls
+    assert {f.rule_name for f in call["findings"]} == {"silent-failure", "deep-bug"}
 
 
 def test_first_review_does_not_try_to_resolve_threads(monkeypatch):

@@ -56,7 +56,7 @@ from github_checks_client import (
 )
 from github_reviews_client import (  # noqa: F401 - InlineComment, ReviewResult re-exported
     InlineComment, ReviewEvent, ReviewResult, dismiss_review, get_review_comments,
-    list_reviews, post_review,
+    list_reviews, post_review, update_review_body,
 )
 from llm_client import (
     DeepEscalationDecision,
@@ -1120,11 +1120,11 @@ def _head_is_same_repo(pr: dict, repo: dict) -> bool:
 
 
 def _tidy_fixed_threads(
-    *, action: str, review_published: bool, evaluation: CodeReviewEvaluation,
+    *, action: str, review_published: bool, evaluation: CodeReviewEvaluation | None,
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, threads: list[dict] | None = None,
     pr_author: str | None = None, trusted_push: bool = False,
-) -> None:
+) -> int:
     """Resolve Elder's own fixed threads after a complete re-review (#1102),
     then edit each Elder finding in place to its current state (#1187).
 
@@ -1133,7 +1133,7 @@ def _tidy_fixed_threads(
     it did not look, and its silence must not read as "fixed". Living review
     reuses the listing taken before the resolver ran, so a thread the
     resolver just closed still reads as changed, and reads addressed; with
-    no listing it is skipped (the failure is already logged). Never raises.
+    no listing it is skipped (the failure is already logged).
     """
     # Any re-review of a PR that may already carry Elder threads. Production
     # reviews arrive through the durable queue as action="review"
@@ -1142,11 +1142,13 @@ def _tidy_fixed_threads(
     if (
         action not in _RE_REVIEW_ACTIONS
         or not review_published
+        or evaluation is None
         or evaluation.degraded_reason
     ):
-        return
+        return 0
+    resolved = 0
     try:
-        resolve_fixed_threads(
+        resolved = resolve_fixed_threads(
             installation_id, owner, repo_name, pull_number,
             head_sha=head_sha, findings=evaluation.findings, threads=threads,
             pr_author=pr_author,
@@ -1166,6 +1168,7 @@ def _tidy_fixed_threads(
                 head_sha, evaluation.findings, trusted_push=trusted_push,
             ),
         )
+    return resolved
 
 
 def _to_llm_hunks(hunks: tuple[DiffHunk, ...]) -> list[LlmHunk]:
@@ -3736,8 +3739,9 @@ def dispatch_code_review(
     # check. When tiered escalation fires, run the reasoner arm now and append
     # any new findings. Failures here never change `result` — the required
     # check already completed.
+    finished_evaluation = None
     try:
-        _async_deep_append_if_needed(
+        finished_evaluation = _async_deep_append_if_needed(
             installation_id=installation_id,
             owner=owner,
             repo_name=repo_name,
@@ -3777,17 +3781,41 @@ def dispatch_code_review(
             },
         )
 
-    # Close Elder's own threads the push fixed and this review does not
-    # re-raise (#1102). After the deep append so a deep-only re-raise has
-    # already posted its fresh thread.
-    _tidy_fixed_threads(
+    # Reconcile threads against the complete set of findings, including
+    # those re-raised by the deep append.
+    resolved_threads = _tidy_fixed_threads(
         action=action,
         review_published=not (review_publish_failed or review_publish_rejected),
-        evaluation=evaluation,
+        evaluation=finished_evaluation,
         installation_id=installation_id, owner=owner, repo_name=repo_name,
         pull_number=pull_number, head_sha=head_sha, threads=listed_threads,
         pr_author=author_login, trusted_push=_head_is_same_repo(pr, repo),
     )
+    if resolved_threads:
+        noun = "thread" if resolved_threads == 1 else "threads"
+        note = f"Resolved {resolved_threads} earlier Elder {noun}."
+        try:
+            if review_result is None:
+                with_install_token_retry(
+                    installation_id,
+                    lambda token: post_review(
+                        token, owner, repo_name, pull_number=pull_number,
+                        result=ReviewResult(head_sha, "COMMENT", note, ()),
+                    ),
+                )
+            elif isinstance(review_id, int):
+                with_install_token_retry(
+                    installation_id,
+                    lambda token: update_review_body(
+                        token, owner, repo_name, pull_number=pull_number,
+                        review_id=review_id, body=f"{review_result.body}\n\n{note}",
+                    ),
+                )
+        except Exception as e:  # noqa: BLE001 - the review is already complete
+            log.warning(
+                "elder_thread_resolution_note_failed",
+                extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
+            )
 
     # LLM-as-a-judge DD evals (#190) submit AFTER the review + check-run are
     # POSTed, so recording can't delay the developer seeing the review. The
@@ -5335,11 +5363,12 @@ def _async_deep_append_if_needed(
     deferred_approval: bool = False,
     security_pass_complete: bool,
     run_started_at: datetime,
-) -> None:
+) -> CodeReviewEvaluation | None:
     """Run reasoner after Tier-1 publish when tiered escalation fires (#646).
 
     Posts additional inline comments and a second completed check-run summary
-    that includes deep findings. Never raises to the caller.
+    that includes deep findings. Returns the evaluation for thread
+    reconciliation, or None if a planned pass could not finish.
 
     `deep_plan` is the escalation Tier-1 decided before it published, so
     Tier-1 knew a deep pass would follow. On such a head the deep append
@@ -5350,11 +5379,12 @@ def _async_deep_append_if_needed(
     """
     decision = deep_plan
     if (
-        decision is None
-        or check_publish_failed
+        check_publish_failed
         or (cancel_event is not None and cancel_event.is_set())
     ):
-        return
+        return None
+    if decision is None:
+        return evaluation
 
     log.info(
         "elder_async_deep_start",
@@ -5374,7 +5404,7 @@ def _async_deep_append_if_needed(
         snapshot_id=snapshot_id,
         head_sha=head_sha,
     ):
-        return
+        return None
 
     deep_llm = review_reasoner_diff(
         evidence,
@@ -5395,7 +5425,7 @@ def _async_deep_append_if_needed(
         if not is_blackout(deep_llm.kind):
             # `no_diff`: nothing for the reasoner to look at is not a
             # failure to look (BENIGN_DEGRADATIONS) - nothing to qualify.
-            return
+            return evaluation
         # grug#848: the reasoner did NOT run (transport or parse failure).
         # This used to `return` here, leaving Tier-1's already-published
         # `success` standing over a promise its own check-run text made
@@ -5433,7 +5463,7 @@ def _async_deep_append_if_needed(
             "elder_async_deep_skipped_cancelled",
             extra={"pr": f"{owner}/{repo_name}#{pull_number}"},
         )
-        return
+        return None
     if _deep_snapshot_is_stale(
         action=action,
         installation_id=installation_id,
@@ -5444,7 +5474,7 @@ def _async_deep_append_if_needed(
         head_sha=head_sha,
         when="post_infer",
     ):
-        return
+        return None
 
     # Dedupe against already-posted Tier-1 + prior-push comments AND drop
     # reasoner duplicates from the combined check summary.
@@ -5642,6 +5672,7 @@ def _async_deep_append_if_needed(
             "conclusion": conclusion,
         },
     )
+    return combined
 
 
 def _hold_for_rerun(evaluation: CodeReviewEvaluation, blocking: bool) -> bool:

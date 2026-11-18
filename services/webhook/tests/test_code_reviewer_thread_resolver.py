@@ -147,7 +147,7 @@ def test_refused_resolve_edits_root_comment_and_collapses_without_reply(run):
     """When the resolve call is refused, the root comment is edited to start
     with 'Fixed in <sha>' and collapsed, and no reply is posted."""
     gh = _GhForbiddenResolve([_with_node_id(_thread())])
-    assert run(gh) == 1
+    assert run(gh) == 0
     assert gh.resolved == []
     assert gh.replies == []
     assert gh.minimized == ["C1"]
@@ -203,6 +203,38 @@ def test_untouched_code_stays_open(run):
     gh = _Gh([_thread(outdated=False)])
     assert run(gh) == 0
     assert gh.resolved == [] and gh.replies == []
+
+
+def test_fixed_reply_resolves_an_unchanged_anchor_on_a_new_head(run):
+    gh = _Gh([_thread(outdated=False, comments=[
+        _comment(), _reply(author="pr-author"),
+    ])])
+    assert run(gh, pr_author="pr-author") == 1
+    assert gh.resolved == ["T1"]
+
+
+def test_same_head_never_resolves_a_thread_even_after_a_fix_reply(run):
+    gh = _Gh([_thread(comments=[
+        _comment(oid=HEAD), _reply(author="pr-author"),
+    ])])
+    assert run(gh, pr_author="pr-author") == 0
+    assert gh.resolved == []
+
+
+def test_reported_again_stays_open_even_after_a_fix_reply(run):
+    gh = _Gh([_thread(outdated=False, comments=[
+        _comment(), _reply(author="pr-author"),
+    ])])
+    assert run(gh, [_finding()], pr_author="pr-author") == 0
+    assert gh.resolved == []
+
+
+def test_human_thread_with_a_fix_reply_stays_open(run):
+    gh = _Gh([_thread(comments=[
+        _comment(author="human-reviewer"), _reply(author="pr-author"),
+    ])])
+    assert run(gh, pr_author="pr-author") == 0
+    assert gh.resolved == []
 
 
 def test_already_resolved_is_skipped(run):
@@ -367,7 +399,7 @@ def test_forbidden_resolve_falls_back_to_collapsing_the_comment(run):
     """The app cannot resolve threads without broader permission, but it can
     collapse its own comment as outdated. That is the fallback."""
     gh = _GhForbiddenResolve([_with_node_id(_thread())])
-    assert run(gh) == 1
+    assert run(gh) == 0
     assert gh.replies == []
     assert gh.resolved == []
     assert gh.minimized == ["C1"]

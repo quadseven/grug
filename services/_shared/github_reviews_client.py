@@ -158,6 +158,29 @@ def post_review(
     return resp.json()
 
 
+def update_review_body(
+    install_token: str,
+    owner: str,
+    repo: str,
+    *,
+    pull_number: int,
+    review_id: int,
+    body: str,
+) -> None:
+    """Update a submitted review's body while preserving its verdict and comments."""
+    resp = httpx.put(
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}/reviews/{review_id}",
+        json={"body": body},
+        headers={
+            "Authorization": f"Bearer {install_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+
+
 def list_reviews(
     install_token: str,
     owner: str,
