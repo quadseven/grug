@@ -51,6 +51,8 @@ def _is_subscription_cap_reached() -> bool:
 def _record_subscription_call() -> None:
     with _subscription_cap_lock:
         key = _subscription_today_key()
+        if key not in _subscription_daily_calls:
+            _subscription_daily_calls.clear()
         _subscription_daily_calls[key] = _subscription_daily_calls.get(key, 0) + 1
 
 
@@ -288,14 +290,16 @@ def _reserve_opencode_go_call(config: BackendConfig) -> None:
     cap = _opencode_go_daily_cap()
     if cap is None:
         return
-    try:
-        from adapters.pg_rate_limit_store import try_reserve_slot  # late: pg-backed
+    from adapters.pg_base import DatabaseUrlMissingError  # late: pg-backed
+    from adapters.pg_rate_limit_store import try_reserve_slot
+    from psycopg import OperationalError
 
+    try:
         # The minute window never binds first: it fills only as the day does.
         result = try_reserve_slot(
             name=_OPENCODE_GO_CAP_LIMITER, minute_limit=max(cap, 1), day_limit=cap,
         )
-    except Exception as e:  # noqa: BLE001 - fail CLOSED, see the comment above
+    except (DatabaseUrlMissingError, OperationalError) as e:
         log.warning("opencode_go_daily_cap_store_error", extra={"kind": type(e).__name__})
         raise OpencodeGoCircuitOpenError("opencode Go daily cap: store unavailable") from e
     if result.admitted:

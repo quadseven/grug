@@ -13,12 +13,13 @@ from unittest.mock import patch
 
 import httpx
 import llm_client as lc
+import model_availability as availability
+import psycopg
 import pytest
-from adapters.pg_rate_limit_store import ReservationResult
+import review_ladder
+from adapters.pg_rate_limit_store import ReservationResult, try_reserve_slot
 from llm_client import Backend, Hunk, review_diff
 from review_evidence import assemble_evidence
-import model_availability as availability
-import review_ladder
 
 _RESERVE = "adapters.pg_rate_limit_store.try_reserve_slot"
 _PAID = "deepseek-v4.1-flash"
@@ -144,14 +145,26 @@ def test_a_free_go_model_never_touches_the_cap(monkeypatch) -> None:
     assert counter.names == []
 
 
-def test_a_store_outage_refuses_paid_go_and_opens_no_hold() -> None:
+@pytest.mark.parametrize("reserve", [
+    pytest.param(psycopg.OperationalError("store down"), id="connection"),
+    pytest.param(try_reserve_slot, id="missing_url"),
+])
+def test_a_store_outage_refuses_paid_go_and_opens_no_hold(monkeypatch, reserve) -> None:
     """No counter means no bound, so a paid call does not go out; the hold
     stays shut so a store blip does not cost Go the rest of the day."""
     http = _Http({_PAID: _finding(), _FREE_GO: _finding()})
-    out = _review(http, RuntimeError("store down"))
+    monkeypatch.delenv("GRUG_DATABASE_URL", raising=False)
+    out = _review(http, reserve)
     assert out.kind == "reviewed"
     assert http.models == [_FREE_GO]
     assert availability._opencode_go_available()
+
+
+def test_go_store_programming_error_propagates_before_any_model_call() -> None:
+    http = _Http({_PAID: _finding(), _FREE_GO: _finding()})
+    with pytest.raises(NameError, match="reservation bug"):
+        _review(http, NameError("reservation bug"))
+    assert http.models == []
 
 
 def test_an_unset_cap_leaves_a_self_hosted_deployment_uncapped(monkeypatch) -> None:

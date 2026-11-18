@@ -5210,23 +5210,23 @@ def _run_review_arm(
         cancel_event=cancel_event,
         walk=walk,
     )
+    err = attempt.error_text or ""
     if attempt.error_kind == "config":
         return _ArmOutcome(
             backend=backend,
             kind="config_error",
-            error_text=attempt.error_text or "",
+            error_text=err,
         )
     if attempt.error_kind == "transport":
         return _ArmOutcome(
             backend=backend,
             kind="transport_error",
-            error_text=attempt.error_text or "",
+            error_text=err,
         )
     # Completed attempt: map to the arm's outcome. `raw_response` is never
     # None here - config/transport errors returned above.
     resp = attempt.raw_response
     assert resp is not None
-    err = attempt.error_text or ""
     model = attempt.model
     findings = attempt.findings
 

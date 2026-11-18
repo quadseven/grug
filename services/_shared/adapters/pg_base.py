@@ -75,10 +75,14 @@ CREATE INDEX IF NOT EXISTS grug_kv_ttl
 TTL_LIVE = "(ttl IS NULL OR ttl > EXTRACT(EPOCH FROM now()))"
 
 
+class DatabaseUrlMissingError(RuntimeError):
+    """The Postgres store has no configured connection URL."""
+
+
 def _database_url() -> str:
     url = os.environ.get("GRUG_DATABASE_URL", "")
     if not url:
-        raise RuntimeError(
+        raise DatabaseUrlMissingError(
             "GRUG_DATABASE_URL is not set - the Postgres store cannot start. "
             "(k8s injects it from the deployment secret; tests set it from "
             "the testcontainer.)"

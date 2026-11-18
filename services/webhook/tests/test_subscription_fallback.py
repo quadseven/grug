@@ -331,6 +331,18 @@ def test_subscription_daily_call_cap_stops_processing(monkeypatch) -> None:
     assert eval_result.tier_served == "subscription"
 
 
+def test_subscription_counter_retains_only_the_current_utc_day(monkeypatch) -> None:
+    monkeypatch.setattr(availability, "_subscription_today_key", lambda: "2026-01-01")
+    availability._record_subscription_call()
+    availability._record_subscription_call()
+    assert availability._subscription_calls_today() == 2
+
+    monkeypatch.setattr(availability, "_subscription_today_key", lambda: "2026-01-02")
+    assert availability._subscription_calls_today() == 0
+    availability._record_subscription_call()
+    assert availability._subscription_daily_calls == {"2026-01-02": 1}
+
+
 def test_subscription_quota_429_ends_degraded() -> None:
     """When subscription returns 429 quota exhaustion, review ends degraded with subscription_limit_reached."""
     recorder = _Recorder({
