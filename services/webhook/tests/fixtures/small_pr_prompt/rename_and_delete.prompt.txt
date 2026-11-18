@@ -1,0 +1,18 @@
+### src/util/clock.py
+```diff
+@@ -1,5 +1,5 @@
+ import time
+ 
+ 
+-def now():
+-    return time.time()
++def now_seconds():
++    return int(time.time())
+```
+
+### src/util/shim.py
+```diff
+@@ -0,0 +1,2 @@
++def noop():
++    return None
+```

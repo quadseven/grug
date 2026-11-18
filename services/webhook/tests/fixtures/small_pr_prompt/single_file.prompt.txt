@@ -1,0 +1,13 @@
+### src/billing/invoice.py
+```diff
+@@ -10,7 +10,9 @@ def total(lines):
+     subtotal = 0
+     for line in lines:
+-        subtotal += line.price
++        if line.quantity <= 0:
++            continue
++        subtotal += line.price * line.quantity
+     return subtotal
+ 
+ 
+```
