@@ -370,19 +370,16 @@ def test_a_priced_model_is_never_a_tier(monkeypatch) -> None:
 
 
 def test_an_empty_list_leaves_the_paid_chain_as_it_was(monkeypatch) -> None:
-    monkeypatch.delenv("GRUG_OPENCODE_GO_FALLBACK_MODEL")
-    before = _chain()
-    monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", _FREE_NO_SUFFIX)
+    monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "second-paid")
     monkeypatch.setenv("GRUG_OPENCODE_GO_FREE_DISCOVERY", "1")
     monkeypatch.setattr(lc, "_opencode_go_free_models_fetch", _Fetch(_ok()))
-    assert _chain() == before
+    assert _chain() == [lc._OPENCODE_GO_MODEL, "second-paid", "poolside/laguna-s-2.1"]
 
 
 def test_a_configured_model_delisted_without_a_free_suffix_is_skipped(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", _FREE_NO_SUFFIX)
-    before = _chain()
-    _listed(monkeypatch)
-    assert _chain() == [model for model in before if model != _FREE_NO_SUFFIX]
+    _listed(monkeypatch, _model("beam-free"))
+    assert _chain() == ["beam-free", lc._OPENCODE_GO_MODEL, "poolside/laguna-s-2.1"]
 
 
 def test_a_dead_list_endpoint_preserves_paid_go(monkeypatch) -> None:

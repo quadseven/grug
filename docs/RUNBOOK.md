@@ -1085,10 +1085,10 @@ entry that names no known backend or pool logs
 `grug_disabled_backends_unknown_entry` and disables nothing.
 
 With `GRUG_OPENCODE_GO_FREE_DISCOVERY` enabled, Elder tries live-listed free
-Go models before configured paid Go models. Configured models that disappear
-from the catalog are skipped. If the catalog returns no models, the default
-paid model stays available. `opencode_go_review_served` logs the model that
-served a review.
+Go models before configured paid Go models. A nonempty catalog excludes
+unlisted models. If the catalog is empty or unavailable, Elder keeps the
+configured Go models in order, skipping names that end in `-free`.
+`opencode_go_review_served` logs the model that served a review.
 
 `GRUG_OPENCODE_GO_DAILY_CAP` bounds paid OpenCode Go calls per UTC day across
 every pod, counted in `grug_kv`. At the cap grug logs

@@ -1458,11 +1458,8 @@ def _opencode_go_chain_configs(
     if not _opencode_go_free_discovery_on():
         return configured
     free, priced = _opencode_go_free_catalog_get().model_prices()
-    if priced is None:
+    if priced is None or (not free and not priced):
         return [tier for tier in configured if tier and not _opencode_go_model_is_free(tier.model)]
-    if not free and not priced:
-        # An empty inventory cannot confirm configured models. Keep the known paid default.
-        priced = frozenset({_OPENCODE_GO_DEFAULT_MODEL})
     configured_free = [tier for tier in configured if tier and tier.model in free]
     configured_paid = [tier for tier in configured if tier and tier.model in priced]
     limit = _env_number("GRUG_OPENCODE_GO_FREE_MAX_TIERS", 2, int)
