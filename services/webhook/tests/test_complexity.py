@@ -2,14 +2,40 @@
 
 from __future__ import annotations
 
-from personas.code_reviewer.diff_parser import DiffHunk
+import ast
+from pathlib import Path
+
+import pytest
 from personas.code_reviewer.complexity import (
     cognitive_complexity,
     cyclomatic_complexity,
     scan_complexity,
     scan_complexity_full,
 )
-import ast
+from personas.code_reviewer.diff_parser import DiffHunk
+
+
+@pytest.mark.parametrize(
+    ("module_path", "entrypoint"),
+    [
+        ("llm_client.py", "_review_diff_dispatch"),
+        ("personas/code_reviewer/dispatch.py", "dispatch_code_review"),
+    ],
+)
+def test_elder_dispatch_entrypoint_stays_within_complexity_caps(
+    module_path: str, entrypoint: str,
+) -> None:
+    shared = Path(__file__).resolve().parents[2] / "_shared"
+    module = ast.parse((shared / module_path).read_text(encoding="utf-8"))
+    function = next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == entrypoint
+    )
+    cyclomatic = cyclomatic_complexity(function)
+    cognitive = cognitive_complexity(function)
+    assert cyclomatic <= 15 and cognitive <= 25, (
+        f"{entrypoint}: cyclomatic {cyclomatic}/15, cognitive {cognitive}/25"
+    )
 
 
 def _func(src):
