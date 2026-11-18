@@ -11,13 +11,13 @@ with_install_token_retry + post_check_run at the seam boundary
 from __future__ import annotations
 
 import logging
-
+import textwrap
 from unittest.mock import patch
 
 import pytest
 
-import personas.publish_check as publish_check
-import personas.tpm.persona as persona
+from personas import publish_check
+from personas.tpm import persona
 from personas.tpm.dor_checks import CheckResult
 
 
@@ -176,6 +176,78 @@ def test_summary_no_skips_keeps_all_n_wording():
 
 
 # --- evaluate_pull_request (pure) ---
+
+_PROSE = (
+    "The release summary explains how the new queue handles each request when "
+    "a worker is busy and how the retry schedule gives the system time to "
+    "recover before it sends a final status update."
+)
+_WRAPPED_PROSE = textwrap.fill(_PROSE, width=72)
+
+
+@pytest.mark.parametrize("plan", [_GOOD_BODY, _BODY_MISSING_SCOPE_FENCE])
+def test_evaluate_reports_first_hard_wrapped_paragraph_without_changing_conclusion(plan):
+    body = plan + f"\n## Notes\n\n{_WRAPPED_PROSE}\n\n{_WRAPPED_PROSE}\n"
+    evaluation = persona.evaluate_pull_request(body)
+    findings = [r for r in evaluation.results if r.name == "hard-wrapped-body"]
+
+    assert len(findings) == 1
+    assert not findings[0].passed
+    assert f"line {len(plan.splitlines()) + 4}" in findings[0].detail
+    assert "Write one paragraph per line" in findings[0].detail
+    assert evaluation.conclusion == persona.evaluate_pull_request(plan).conclusion
+    _, summary = persona._summary(list(evaluation.results))
+    assert "| body wrapping | warn |" in summary
+
+
+def test_evaluate_reports_hard_wrapping_within_a_list_item():
+    item = textwrap.fill(_PROSE, width=72, initial_indent="- ", subsequent_indent="  ")
+    prefix = _GOOD_BODY + "\n## Notes\n\n<!--\nExample notes\n-->\n\n"
+
+    evaluation = persona.evaluate_pull_request(prefix + item)
+    findings = [r for r in evaluation.results if r.name == "hard-wrapped-body"]
+
+    assert len(findings) == 1
+    assert f"line {len(prefix.splitlines()) + 1}" in findings[0].detail
+
+
+@pytest.mark.parametrize(("widths", "warns"), [((60, 80), True), ((59, 80), False), ((60, 81), False)])
+def test_evaluate_respects_hard_wrapping_width(widths, warns):
+    prose = "\n".join(("Word " * 17)[:width - 1] + "x" for width in widths)
+    evaluation = persona.evaluate_pull_request(_GOOD_BODY + "\n## Notes\n\n" + prose)
+
+    assert any(r.name == "hard-wrapped-body" for r in evaluation.results) is warns
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        f"{_PROSE}\n\n{_PROSE}",
+        _WRAPPED_PROSE.replace("\n", "\n\n"),
+        textwrap.indent(_WRAPPED_PROSE, "- "),
+        f"```text\n{_WRAPPED_PROSE}\n```",
+        f"~~~~text\n{_WRAPPED_PROSE}\n~~~\n{_WRAPPED_PROSE}\n~~~~",
+        f"```text\n{_WRAPPED_PROSE}",
+        textwrap.indent(_WRAPPED_PROSE, "    "),
+        "    - " + _WRAPPED_PROSE.replace("\n", "\n    "),
+        textwrap.indent(_WRAPPED_PROSE, "> "),
+        f"> {_WRAPPED_PROSE}",
+        textwrap.indent(_WRAPPED_PROSE, "### "),
+        f"{_WRAPPED_PROSE}\n===",
+        f"<!--\n{_WRAPPED_PROSE}\n-->",
+        "label | value\n--- | ---\n" + "\n".join(f"{line} | value" for line in _WRAPPED_PROSE.splitlines()),
+    ],
+    ids=[
+        "one-line-paragraphs", "separate-short-paragraphs", "separate-list-items",
+        "fenced-code", "longer-fence", "unclosed-fence", "indented-code", "indented-code-with-list-marker", "quotes",
+        "lazy-quote", "atx-headings", "setext-heading", "html-comment", "table",
+    ],
+)
+def test_evaluate_ignores_prose_without_wrapping_and_non_prose(notes):
+    body = _GOOD_BODY + f"\n## Notes\n\n{notes}\n"
+
+    assert all(r.name != "hard-wrapped-body" for r in persona.evaluate_pull_request(body).results)
+
 
 def test_evaluate_pull_request_passes_on_good_body():
     evaluation = persona.evaluate_pull_request(_GOOD_BODY)

@@ -658,6 +658,82 @@ def check_linked_issue_in_epic(
     )
 
 
+HARD_WRAPPED_BODY = "hard-wrapped-body"
+
+_BODY_LIST_PREFIX = r"[ \t]*(?:[-+*]|\d{1,9}[.)])[ \t]+"
+_BODY_LIST_ITEM_PAT = re.compile(_BODY_LIST_PREFIX)
+# Match fences before comments so comment delimiters in examples stay literal.
+# A closing fence must use the same marker and be at least as long as its opener.
+_BODY_MARKUP_PAT = re.compile(
+    rf"^(?:{_BODY_LIST_PREFIX}|[ \t]*)"
+    r"(?!`{3,}[^`\n]+`)"
+    r"(?P<fence>(?P<marker>[`~])(?P=marker){2,})[^\n]*\n"
+    r".*?(?:^[ \t]*(?P=fence)(?P=marker)*[ \t]*$|\Z)"
+    r"|(?P<inline_code>(?<!`)(?P<ticks>`+)(?!`)[^\n]*?(?<!`)(?P=ticks)(?!`))"
+    r"|<!--.*?(?:-->|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+_BODY_HEADING_OR_RULE_PAT = re.compile(
+    r"#{1,6}(?:\s|$)|(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$",
+)
+_BODY_SETEXT_PAT = re.compile(r"=+|-+")
+_BODY_TABLE_DELIMITER_PAT = re.compile(r"(?=.*\|)\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?")
+
+
+def _hard_wrapped_body_finding(body: str) -> CheckResult | None:
+    """Report the first wrapped prose paragraph or list item, by source line."""
+    prose = _BODY_MARKUP_PAT.sub(
+        lambda match: match["inline_code"] or "\n" * match[0].count("\n"),
+        "\n".join(body.splitlines()),
+    )
+    lines = [*prose.split("\n"), ""]
+    paragraph_start = list_indent = 0
+    has_wrap = previous_in_range = in_quote_or_table = False
+
+    for number, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        indent = len(raw[:len(raw) - len(raw.lstrip())].expandtabs(4))
+        if line and not paragraph_start and indent >= list_indent + 4:
+            continue
+        item = _BODY_LIST_ITEM_PAT.match(raw) if indent < list_indent + 4 else None
+        if item:
+            line = raw[item.end():].strip()
+        setext = _BODY_SETEXT_PAT.fullmatch(line)
+        heading_or_rule = _BODY_HEADING_OR_RULE_PAT.match(line)
+        quote = line.startswith(">")
+        table = (
+            "|" in line and number < len(lines)
+            and _BODY_TABLE_DELIMITER_PAT.fullmatch(lines[number].strip())
+        )
+        if not line or item or setext or quote or table or heading_or_rule:
+            # Wait for the end of a paragraph in case it is a Setext heading.
+            if has_wrap and not (setext and indent >= list_indent):
+                return CheckResult(
+                    HARD_WRAPPED_BODY, False,
+                    f"Hard-wrapped prose starts at line {paragraph_start}. "
+                    "Write one paragraph per line.",
+                )
+            paragraph_start = 0
+            has_wrap = previous_in_range = False
+            in_quote_or_table = bool(table or (quote and line.lstrip("> ").strip()))
+            if line and indent < list_indent:
+                list_indent = 0
+            if item:
+                list_indent = len(item[0].expandtabs(4))
+            if not item or not line or heading_or_rule or setext or quote or table:
+                continue
+        elif in_quote_or_table:
+            continue
+        elif not paragraph_start and indent < list_indent:
+            list_indent = 0
+
+        paragraph_start = paragraph_start or number
+        in_range = 60 <= len(line) <= 80
+        has_wrap |= previous_in_range and in_range
+        previous_in_range = in_range
+    return None
+
+
 _PURE_CHECKS = (
     check_why,
     check_acceptance,
@@ -689,11 +765,8 @@ def run_all(
     `fetch_changed_files` to `check_in_scope`. When either IO fetcher is
     None, its check fails open (pass, marked `skipped`).
 
-    The first 5 checks are pure (body -> CheckResult); the last 3 need IO
-    through their injected fetchers.
+    The prose wrapping advisory is included only when there is a finding.
     """
-    # The first 5 checks are pure (body -> CheckResult); the last 3 need IO
-    # through their injected fetchers.
     results = [check(body) for check in _PURE_CHECKS]
     results.append(check_linked_issue_completeness(
         body, fetch_issue=fetch_issue, fetch_siblings=fetch_siblings,
@@ -702,4 +775,6 @@ def run_all(
     results.append(
         check_in_scope(body, fetch_issue=fetch_issue, fetch_changed_files=fetch_changed_files)
     )
+    if wrapping := _hard_wrapped_body_finding(body):
+        results.append(wrapping)
     return results
