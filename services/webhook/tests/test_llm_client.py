@@ -17,6 +17,9 @@ from llm_client import Backend, Finding, Hunk, LlmReviewResponse, review_diff
 from personas.code_reviewer.persona import evaluate_diff
 from review_pipeline import ReviewCohort, ReviewPlan
 from review_evidence import assemble_evidence
+import model_availability as availability
+import provider_wire
+import review_ladder
 
 
 @pytest.fixture(autouse=True)
@@ -33,13 +36,13 @@ def _patch_keys(monkeypatch):
     # Retired names stand in as chain tiers here; test_opencode_go_return.py
     # covers the real data-terms gate.
     monkeypatch.setattr(
-        lc, "_OPENCODE_GO_PRIVATE_SAFE_MODELS",
-        lc._OPENCODE_GO_PRIVATE_SAFE_MODELS
+        availability, "_OPENCODE_GO_PRIVATE_SAFE_MODELS",
+        availability._OPENCODE_GO_PRIVATE_SAFE_MODELS
         | {"space-bunny-free", "longcat-2.5-preview-free", "mimo-v2.5", "gpt-5.6-luna"},
     )
-    monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_blocked_until", 0.0, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.delenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", raising=False)
     monkeypatch.delenv("GRUG_CLOUD_FREE_TIER_MODEL", raising=False)
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
@@ -69,7 +72,7 @@ def _hunk(path="src/x.py", body="@@ -1 +1 @@\n-foo\n+bar") -> Hunk:
 def _large_hunk(path="src/x.py") -> Hunk:
     """A diff past `_DEGENERATE_MIN_DIFF_CHARS`, where a short empty answer
     is still untrusted (grug#1642)."""
-    return Hunk(path=path, body="@@ -1 +1 @@\n+" + "y" * lc._DEGENERATE_MIN_DIFF_CHARS)
+    return Hunk(path=path, body="@@ -1 +1 @@\n+" + "y" * review_ladder._DEGENERATE_MIN_DIFF_CHARS)
 
 
 def _one_ladder_walk(hunks: list[Hunk], installation_id: int) -> LlmReviewResponse:
@@ -1699,11 +1702,11 @@ def test_call_backend_raises_ratelimit_timeout_before_any_http_call(monkeypatch)
             minute_count=20, day_count=5, minute_limit=20, day_limit=1000,
         )
 
-    monkeypatch.setattr(lc, "acquire_free_tier_slot", fake_acquire)
+    monkeypatch.setattr(availability, "acquire_free_tier_slot", fake_acquire)
     free_config = replace(lc._BACKEND_CONFIGS[Backend.OPENROUTER], model="meta-llama/x:free")
 
     with patch.object(httpx, "post") as mock_post:
-        with pytest.raises(lc.RateLimitTimeoutError) as exc_info:
+        with pytest.raises(availability.RateLimitTimeoutError) as exc_info:
             lc._call_backend(free_config, [])
     mock_post.assert_not_called()
     assert isinstance(exc_info.value, httpx.RequestError)
@@ -1736,7 +1739,7 @@ def test_openrouter_free_tier_limiter_exhaustion_never_reads_as_clean_review(mon
             minute_count=20, day_count=5, minute_limit=20, day_limit=1000,
         )
 
-    monkeypatch.setattr(lc, "acquire_free_tier_slot", fake_acquire)
+    monkeypatch.setattr(availability, "acquire_free_tier_slot", fake_acquire)
 
     def respond(url, **kwargs):
         model = (kwargs.get("json") or {}).get("model", "")
@@ -2656,29 +2659,18 @@ def test_judge_findings_stays_off_the_review_seam(monkeypatch) -> None:
 
     monkeypatch.setattr(lc, "_run_llm_attempt", _seam_must_not_run)
     monkeypatch.setattr(lc, "_call_llm_attempt", _seam_must_not_run)
-    config = lc._BACKEND_CONFIGS[lc.select_backend(1)]
-    trail: list = []
-    trail_token = lc._LADDER_TRAIL.set(trail)
-    skip_token = lc._LADDER_SKIP.set(
-        frozenset({(config.backend.value, config.model)}),
-    )
     findings_repr = [{"rule_name": "r", "file": "x.py", "line": 2, "message": "m"}]
-    try:
-        with patch.object(
-            httpx, "post", side_effect=httpx.ReadTimeout("judge backend down"),
-        ) as mock_post:
-            out = lc.judge_findings(
-                findings_repr,
-                assemble_evidence([_hunk()]),
-                installation_id=1,
-            )
-    finally:
-        lc._LADDER_SKIP.reset(skip_token)
-        lc._LADDER_TRAIL.reset(trail_token)
+    with patch.object(
+        httpx, "post", side_effect=httpx.ReadTimeout("judge backend down"),
+    ) as mock_post:
+        out = lc.judge_findings(
+            findings_repr,
+            assemble_evidence([_hunk()]),
+            installation_id=1,
+        )
 
     assert out == ()
-    mock_post.assert_called()  # the ladder skip set did not apply
-    assert trail == []  # the failure was not recorded against the chunk
+    mock_post.assert_called()
     assert span_names == [lc._LLMOBS_JUDGE_NAME]
     assert lc._LLMOBS_JUDGE_NAME == "elder_judge"
     assert annotate_calls[0]["metadata"]["judge"] is True
@@ -4419,7 +4411,7 @@ def _admit_free_tier(monkeypatch) -> None:
             minute_count=1, day_count=1, minute_limit=20, day_limit=1000,
         )
 
-    monkeypatch.setattr(lc, "acquire_free_tier_slot", fake_acquire)
+    monkeypatch.setattr(availability, "acquire_free_tier_slot", fake_acquire)
 
 
 def test_cloud_chain_tries_free_tier_when_opencode_go_fails_and_free_tier_configured(
@@ -4741,7 +4733,7 @@ def test_responses_envelope_picks_the_message_block_not_reasoning() -> None:
             {"type": "message", "content": [{"type": "output_text", "text": '{"findings": []}'}]},
         ],
     }
-    out = lc._responses_envelope_to_chat(body)
+    out = provider_wire.responses_envelope_to_chat(body)
     assert out["choices"][0]["message"]["content"] == '{"findings": []}'
     assert out["model"] == "gpt-5.6-luna"
 
@@ -4754,14 +4746,14 @@ def test_responses_incomplete_maps_to_length_finish_reason() -> None:
         "status": "incomplete",
         "output": [{"type": "message", "content": [{"type": "output_text", "text": "{"}]}],
     }
-    assert lc._responses_envelope_to_chat(body)["choices"][0]["finish_reason"] == "length"
+    assert provider_wire.responses_envelope_to_chat(body)["choices"][0]["finish_reason"] == "length"
 
 
 def test_responses_envelope_without_text_degrades_to_none() -> None:
     """Unexpected shapes degrade to content=None, which _parse_response
     already diagnoses precisely (grug#881) rather than raising."""
     body = {"model": "m", "status": "completed", "output": [{"type": "reasoning"}]}
-    assert lc._responses_envelope_to_chat(body)["choices"][0]["message"]["content"] is None
+    assert provider_wire.responses_envelope_to_chat(body)["choices"][0]["message"]["content"] is None
 
 
 def test_parse_response_normalises_a_responses_envelope() -> None:
@@ -4934,7 +4926,7 @@ _INVALID_KEY_401 = {"error": {"code": 401, "message": "User not found."}}
     (429, {"error": {"code": 429, "message": "Rate limit exceeded: free-models-per-day"}}),
 ])
 def test_openrouter_free_tier_refusals_classify_as_rate_limited(status, body) -> None:
-    text = lc._backend_error_message(httpx.Response(status, json=body))
+    text = availability._backend_error_message(httpx.Response(status, json=body))
     assert lc.classify_backend_failure(
         backend_value="openrouter", status=status, error_message=text,
     ) == "rate_limited"
@@ -4949,7 +4941,7 @@ def test_openrouter_free_tier_refusals_classify_as_rate_limited(status, body) ->
     ("poolside", 402, {"error": {"message": "out of credits"}}),
 ])
 def test_genuine_config_failures_stay_unusable(backend_value, status, body) -> None:
-    text = lc._backend_error_message(httpx.Response(status, json=body))
+    text = availability._backend_error_message(httpx.Response(status, json=body))
     assert lc.classify_backend_failure(
         backend_value=backend_value, status=status, error_message=text,
     ) == "unusable"
@@ -5256,28 +5248,28 @@ def test_opencode_go_usage_limit_opens_breaker_and_skips_go_until_retry_after(
 
     urls = [c.args[0] for c in post.call_args_list]
     assert sum("opencode.ai" in u for u in urls) == 1
-    assert not lc._opencode_go_available()
-    assert lc._opencode_go_available(now=lc.time.time() + 105_420)
+    assert not availability._opencode_go_available()
+    assert availability._opencode_go_available(now=lc.time.time() + 105_420)
 
 
 def test_ordinary_opencode_go_429_does_not_open_breaker() -> None:
-    lc._note_opencode_go_response(
+    availability._note_opencode_go_response(
         httpx.Response(429, json={"error": {"message": "slow down"}}),
     )
-    assert lc._opencode_go_available()
+    assert availability._opencode_go_available()
 
 
 def test_breaker_caps_an_absurd_retry_after() -> None:
-    lc._note_opencode_go_response(_go_limit_429("99999999"))
-    assert lc._opencode_go_available(
-        now=lc.time.time() + lc._OPENCODE_GO_MAX_BLOCK_SECONDS + 1,
+    availability._note_opencode_go_response(_go_limit_429("99999999"))
+    assert availability._opencode_go_available(
+        now=lc.time.time() + availability._OPENCODE_GO_MAX_BLOCK_SECONDS + 1,
     )
 
 
 def test_open_breaker_drops_go_from_interactive_order(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/x")
     assert Backend.OPENCODE_GO in lc._interactive_backend_order(1)
-    lc._note_opencode_go_response(_go_limit_429())
+    availability._note_opencode_go_response(_go_limit_429())
     assert Backend.OPENCODE_GO not in lc._interactive_backend_order(1)
 
 
@@ -5315,16 +5307,14 @@ def test_degenerate_empty_review_falls_through_to_the_next_tier(monkeypatch) -> 
 
 
 def test_small_empty_review_is_not_degenerate() -> None:
-    assert not lc._is_degenerate_empty_review((), {"input_tokens": 900, "output_tokens": 7})
-    assert not lc._is_degenerate_empty_review((), {"input_tokens": 15_000, "output_tokens": 300})
-    assert not lc._is_degenerate_empty_review((), {})
-    assert lc._is_degenerate_empty_review((), {"input_tokens": 15_000, "output_tokens": 7})
+    assert not review_ladder._is_degenerate_empty_review((), {"input_tokens": 900, "output_tokens": 7})
+    assert not review_ladder._is_degenerate_empty_review((), {"input_tokens": 15_000, "output_tokens": 300})
+    assert not review_ladder._is_degenerate_empty_review((), {})
+    assert review_ladder._is_degenerate_empty_review((), {"input_tokens": 15_000, "output_tokens": 7})
     # grug#1642: inside a review the diff's size decides, not the prompt's.
     usage = {"input_tokens": 23_000, "output_tokens": 7}
-    with lc._reviewed_diff_scope([_hunk()]):
-        assert not lc._is_degenerate_empty_review((), usage)
-    with lc._reviewed_diff_scope([_large_hunk()]):
-        assert lc._is_degenerate_empty_review((), usage)
+    assert not review_ladder._is_degenerate_empty_review((), usage, len(_hunk().body))
+    assert review_ladder._is_degenerate_empty_review((), usage, len(_large_hunk().body))
 
 
 def test_judge_truncated_at_output_cap_is_a_failure_not_a_verdict() -> None:
@@ -5530,8 +5520,8 @@ def test_usage_limit_breaker_never_blocks_the_free_models(monkeypatch) -> None:
     against it, so an open breaker must not take them off the chain - that
     would turn one paid refusal into hours with no OpenCode Go review."""
     monkeypatch.setenv("GRUG_OPENCODE_GO_SECOND_MODEL", "longcat-2.5-preview-free")
-    monkeypatch.setattr(lc, "_opencode_go_blocked_until", lc.time.time() + 3600)
-    assert not lc._opencode_go_available()
+    monkeypatch.setattr(availability, "_opencode_go_blocked_until", lc.time.time() + 3600)
+    assert not availability._opencode_go_available()
 
     models = [t.model for t in lc._cloud_chain_tiers()]
     assert models[:2] == ["space-bunny-free", "longcat-2.5-preview-free"]
@@ -5625,7 +5615,7 @@ def test_three_client_errors_bench_the_model(monkeypatch, caplog, status) -> Non
     )
     # The provider breaker (grug#1225) stops calls after the first 401/402;
     # this test isolates the per-model bench underneath it.
-    monkeypatch.setattr(lc, "_note_provider_response", lambda *_: None)
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
     cfg = _go_cfg()
     with caplog.at_level("WARNING"):
         for _ in range(2):
@@ -5633,7 +5623,7 @@ def test_three_client_errors_bench_the_model(monkeypatch, caplog, status) -> Non
         assert "space-bunny-free" in _free_models()
         _call(cfg, _err(status))
     assert "space-bunny-free" not in _free_models()
-    assert lc._model_is_benched("opencode-go", "space-bunny-free")
+    assert availability._model_is_benched("opencode-go", "space-bunny-free")
     rec = [r for r in caplog.records if r.getMessage() == "llm_model_benched"]
     assert len(rec) == 1
     assert (rec[0].backend, rec[0].model, rec[0].status) == (
@@ -5653,7 +5643,7 @@ def test_bench_lasts_an_hour_then_doubles_up_to_twelve(monkeypatch) -> None:
     for _ in range(6):
         for _ in range(3):
             _call(cfg, _err(404))
-        entry = lc._bench_state[("opencode-go", "space-bunny-free")]
+        entry = availability._bench_state[("opencode-go", "space-bunny-free")]
         durations.append(entry.benched_until - clock[0])
         clock[0] = entry.benched_until + 1
     assert durations == [3600.0, 7200.0, 14400.0, 28800.0, 43200.0, 43200.0]
@@ -5666,17 +5656,17 @@ def test_failures_outside_the_window_do_not_accumulate(monkeypatch) -> None:
     for _ in range(3):
         _call(cfg, _err(404))
         clock[0] += 400  # third lands 800s after the first
-    assert not lc._model_is_benched("opencode-go", "space-bunny-free")
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
 
 
 def test_a_success_unbenches_immediately(monkeypatch) -> None:
     cfg = _go_cfg()
     for _ in range(3):
         _call(cfg, _err(404))
-    assert lc._model_is_benched("opencode-go", "space-bunny-free")
+    assert availability._model_is_benched("opencode-go", "space-bunny-free")
     # A direct call (judge, a probe) that succeeds clears the bench.
     _call(cfg, _usage_response('{"findings": []}', 500, 20))
-    assert not lc._model_is_benched("opencode-go", "space-bunny-free")
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
     assert "space-bunny-free" in _free_models()
 
 
@@ -5687,7 +5677,7 @@ def test_failures_before_a_success_do_not_carry_over() -> None:
     _call(cfg, _usage_response('{"findings": []}', 500, 20))
     for _ in range(2):
         _call(cfg, _err(404))
-    assert not lc._model_is_benched("opencode-go", "space-bunny-free")
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
 
 
 @pytest.mark.parametrize("resp", [
@@ -5708,14 +5698,14 @@ def test_failures_before_a_success_do_not_carry_over() -> None:
 def test_outages_limits_and_request_errors_never_bench(monkeypatch, resp) -> None:
     # Spent-limit refusals trip the provider breaker (grug#1225), which would
     # refuse the repeat calls this test needs; the bench is what it checks.
-    monkeypatch.setattr(lc, "_note_provider_response", lambda *_: None)
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
     # A 429 also cools the model in the free-call gate, which would refuse the
     # repeats; the gate has its own tests.
-    monkeypatch.setattr(lc, "_opencode_go_free_slot", lambda _c: contextlib.nullcontext())
+    monkeypatch.setattr(availability, "_opencode_go_free_slot", lambda _c: contextlib.nullcontext())
     cfg = lc.replace(_go_cfg(), retry_attempts=1)
     for _ in range(5):
         _call(cfg, resp)
-    assert not lc._model_is_benched("opencode-go", "space-bunny-free")
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
 
 
 def test_transport_errors_never_bench() -> None:
@@ -5724,7 +5714,7 @@ def test_transport_errors_never_bench() -> None:
         with patch.object(httpx, "post", side_effect=httpx.ConnectError("down")):
             with pytest.raises(httpx.RequestError):
                 lc._call_backend(cfg, [{"role": "user", "content": "hi"}])
-    assert not lc._model_is_benched("opencode-go", "space-bunny-free")
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
 
 
 def test_the_bench_is_per_model(monkeypatch) -> None:
@@ -5781,7 +5771,7 @@ def test_fallback_tier_sits_after_the_free_go_tiers_before_openrouter(monkeypatc
 def test_fallback_tier_follows_the_usage_limit_breaker(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
     assert "deepseek-v4.1-flash" in _free_models()
-    monkeypatch.setattr(lc, "_opencode_go_blocked_until", lc.time.time() + 3600)
+    monkeypatch.setattr(availability, "_opencode_go_blocked_until", lc.time.time() + 3600)
     models = _free_models()
     assert "deepseek-v4.1-flash" not in models
     assert "space-bunny-free" in models  # free primary still runs
@@ -5844,7 +5834,7 @@ def test_bench_metric_failure_never_escapes(monkeypatch) -> None:
         raise RuntimeError("statsd down")
 
     monkeypatch.setattr(observability, "emit_count", boom)
-    lc._announce_model_benched("opencode-go", "m", 404, 3600.0)  # must not raise
+    availability._announce_model_benched("opencode-go", "m", 404, 3600.0)  # must not raise
 
 
 def test_primary_reasoning_model_gets_the_longer_chain_timeout(monkeypatch) -> None:
@@ -5889,8 +5879,8 @@ def test_three_timeouts_slow_bench_the_model(monkeypatch, caplog) -> None:
     cfg = _go_cfg()
     with caplog.at_level("WARNING"):
         _timeout(cfg, 3)
-    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
-    assert not lc._model_is_benched(_GO, "space-bunny-free")
+    assert availability._model_is_slow_benched(_GO, "space-bunny-free")
+    assert not availability._model_is_benched(_GO, "space-bunny-free")
     assert "space-bunny-free" not in _free_models()
     rec = [r for r in caplog.records if r.getMessage() == "llm_model_slow_benched"]
     assert len(rec) == 1
@@ -5904,7 +5894,7 @@ def test_three_timeouts_slow_bench_the_model(monkeypatch, caplog) -> None:
 def test_two_timeouts_do_not_slow_bench(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
     _timeout(_go_cfg(), 2)
-    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert not availability._model_is_slow_benched(_GO, "space-bunny-free")
     assert "space-bunny-free" in _free_models()
 
 
@@ -5912,15 +5902,15 @@ def test_timeouts_outside_the_window_do_not_add_up(monkeypatch) -> None:
     clock = _slow_clock(monkeypatch)
     cfg = _go_cfg()
     _timeout(cfg, 2)
-    clock[0] += lc._SLOW_BENCH_WINDOW_SECONDS + 1
+    clock[0] += availability._SLOW_BENCH_WINDOW_SECONDS + 1
     _timeout(cfg, 1)
-    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert not availability._model_is_slow_benched(_GO, "space-bunny-free")
 
 
 @pytest.mark.parametrize("kind", [httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout])
 def test_every_timeout_kind_counts(monkeypatch, kind) -> None:
     _timeout(_go_cfg(), 3, kind=kind)
-    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert availability._model_is_slow_benched(_GO, "space-bunny-free")
 
 
 def test_non_timeout_transport_errors_do_not_count(monkeypatch) -> None:
@@ -5930,15 +5920,15 @@ def test_non_timeout_transport_errors_do_not_count(monkeypatch) -> None:
             lc._run_llm_attempt(
                 backend=cfg.backend, config=cfg, messages=_MSG, variant="v1", pr_tags={},
             )
-    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert not availability._model_is_slow_benched(_GO, "space-bunny-free")
 
 
 def test_slow_bench_expires(monkeypatch) -> None:
     clock = _slow_clock(monkeypatch)
     _timeout(_go_cfg(), 3)
-    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
-    clock[0] += lc._SLOW_BENCH_BASE_SECONDS + 1
-    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert availability._model_is_slow_benched(_GO, "space-bunny-free")
+    clock[0] += availability._SLOW_BENCH_BASE_SECONDS + 1
+    assert not availability._model_is_slow_benched(_GO, "space-bunny-free")
 
 
 def test_slow_benched_tier_is_skipped_and_leaves_the_worst_case(monkeypatch) -> None:
@@ -5956,15 +5946,15 @@ def test_a_success_clears_the_slow_bench_and_the_backoff(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_OPENCODE_GO_FALLBACK_MODEL", "deepseek-v4.1-flash")
     cfg = _go_cfg()
     _timeout(cfg, 3)
-    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert availability._model_is_slow_benched(_GO, "space-bunny-free")
     _call(cfg, httpx.Response(200, json=_openai_json_response('{"findings": []}')))
-    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
-    assert (_GO, "space-bunny-free") not in lc._slow_bench_state
+    assert not availability._model_is_slow_benched(_GO, "space-bunny-free")
+    assert (_GO, "space-bunny-free") not in availability._slow_bench_state
     assert "space-bunny-free" in _free_models()
     # Backoff reset: the next trip is the base length again.
     clock[0] += 10
     _timeout(cfg, 3)
-    assert lc._slow_bench_state[(_GO, "space-bunny-free")].benched_until == clock[0] + 600.0
+    assert availability._slow_bench_state[(_GO, "space-bunny-free")].benched_until == clock[0] + 600.0
 
 
 def test_slow_bench_doubles_up_to_an_hour(monkeypatch) -> None:
@@ -5974,7 +5964,7 @@ def test_slow_bench_doubles_up_to_an_hour(monkeypatch) -> None:
     lengths = []
     for _ in range(6):
         _timeout(cfg, 3)
-        entry = lc._slow_bench_state[(_GO, "space-bunny-free")]
+        entry = availability._slow_bench_state[(_GO, "space-bunny-free")]
         lengths.append(entry.benched_until - clock[0])
         clock[0] += lengths[-1] + 1
     assert lengths == [600.0, 1200.0, 2400.0, 3600.0, 3600.0, 3600.0]
@@ -5982,10 +5972,10 @@ def test_slow_bench_doubles_up_to_an_hour(monkeypatch) -> None:
 
 def test_a_timeout_never_feeds_the_client_error_bench(monkeypatch) -> None:
     _timeout(_go_cfg(), 6)
-    assert (_GO, "space-bunny-free") not in lc._bench_state or not lc._model_is_benched(
+    assert (_GO, "space-bunny-free") not in availability._bench_state or not availability._model_is_benched(
         _GO, "space-bunny-free"
     )
-    assert not lc._bench_state.get((_GO, "space-bunny-free"), lc._BenchEntry()).failures
+    assert not availability._bench_state.get((_GO, "space-bunny-free"), availability._BenchEntry()).failures
 
 
 def test_a_client_error_never_feeds_the_slow_bench(monkeypatch) -> None:
@@ -5993,20 +5983,20 @@ def test_a_client_error_never_feeds_the_slow_bench(monkeypatch) -> None:
     for _ in range(2):
         _call(cfg, _err(404))
     _timeout(cfg, 2)
-    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
-    assert not lc._model_is_benched(_GO, "space-bunny-free")
+    assert not availability._model_is_slow_benched(_GO, "space-bunny-free")
+    assert not availability._model_is_benched(_GO, "space-bunny-free")
     for _ in range(3):
         _call(cfg, _err(404))
-    assert not lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert not availability._model_is_slow_benched(_GO, "space-bunny-free")
 
 
 def test_the_cave_is_never_slow_benched(monkeypatch) -> None:
     for arm in (Backend.CAVE, Backend.CAVE_REASONER):
         cave = lc._cave_review_config(arm)
-        assert cave is not None and cave.backend not in lc._BENCH_CLOUD_BACKENDS
+        assert cave is not None and cave.backend not in availability._BENCH_CLOUD_BACKENDS
         _timeout(cave, 5)
-        assert not lc._model_is_slow_benched(cave.backend.value, cave.model)
-    assert lc._slow_bench_state == {}
+        assert not availability._model_is_slow_benched(cave.backend.value, cave.model)
+    assert availability._slow_bench_state == {}
 
 
 def test_every_cloud_tier_slow_benched_still_leaves_one(monkeypatch) -> None:
@@ -6015,7 +6005,7 @@ def test_every_cloud_tier_slow_benched_still_leaves_one(monkeypatch) -> None:
     assert len(tiers) >= 2
     for tier in tiers:
         _timeout(tier, 3)
-        assert lc._model_is_slow_benched(tier.backend.value, tier.model)
+        assert availability._model_is_slow_benched(tier.backend.value, tier.model)
     assert len(lc._cloud_chain_tiers()) == 1
 
 
@@ -6023,7 +6013,7 @@ def test_a_lone_tier_stays_even_when_slow_benched(monkeypatch) -> None:
     monkeypatch.setattr(lc, "_poolside_chain_config", lambda: None)
     assert _free_models() == ["space-bunny-free"]
     _timeout(_go_cfg(), 3)
-    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert availability._model_is_slow_benched(_GO, "space-bunny-free")
     assert _free_models() == ["space-bunny-free"]
 
 
@@ -6044,9 +6034,9 @@ def test_slow_bench_metric_failure_never_escapes(monkeypatch) -> None:
         raise RuntimeError("statsd down")
 
     monkeypatch.setattr(observability, "emit_count", boom)
-    lc._announce_model_slow_benched(_GO, "m", 600.0)  # must not raise
+    availability._announce_model_slow_benched(_GO, "m", 600.0)  # must not raise
     _timeout(_go_cfg(), 3)  # the tripping path must not raise either
-    assert lc._model_is_slow_benched(_GO, "space-bunny-free")
+    assert availability._model_is_slow_benched(_GO, "space-bunny-free")
 
 
 def test_a_slow_primary_is_skipped_on_the_next_review(monkeypatch) -> None:

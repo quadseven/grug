@@ -20,6 +20,7 @@ from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer import persona as cr_persona
 from personas.tpm.dor_checks import loom_footer_model
 from review_evidence import assemble_evidence
+import model_availability as availability
 
 _CLAUDE = "claude-haiku-4.5"
 _LAGUNA = "poolside/laguna-s-2.1"
@@ -37,8 +38,8 @@ def _tier(backend: Backend, model: str) -> BackendConfig:
 @pytest.fixture(autouse=True)
 def _setup_env(monkeypatch):
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
     monkeypatch.delenv("GRUG_CAVE_GATEWAY_URL", raising=False)
@@ -50,10 +51,10 @@ def _setup_env(monkeypatch):
         ],
     )
     monkeypatch.setattr(
-        lc, "_OPENCODE_GO_PRIVATE_SAFE_MODELS", lc._OPENCODE_GO_PRIVATE_SAFE_MODELS | {_CLAUDE},
+        availability, "_OPENCODE_GO_PRIVATE_SAFE_MODELS", availability._OPENCODE_GO_PRIVATE_SAFE_MODELS | {_CLAUDE},
     )
     monkeypatch.setattr(lc, "_free_provider_fallback_configs", list)
-    monkeypatch.setattr(lc, "_subscription_fallback_config", lambda: None)
+    monkeypatch.setattr(lc, "_subscription_fallback_config", lambda *_: None)
 
 
 def _hunk() -> Hunk:

@@ -10,7 +10,7 @@ Elder reviews. Every sample is invented for this set; none comes from a real
 repository, and every value in it is a placeholder.
 
 Each case is padded with documentation hunks to a total diff just past
-`llm_client._DEGENERATE_MIN_DIFF_CHARS` (8,000 characters), the size where a
+`review_ladder._DEGENERATE_MIN_DIFF_CHARS` (8,000 characters), the size where a
 short empty answer first counts as untrusted. A bare 1,000-character diff is
 not the regime the relaxation applies to, so measuring one would flatter the
 model. The documentation hunks hold only prose and cannot carry a defect.

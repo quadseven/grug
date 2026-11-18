@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import free_confirm_corpus as corpus
+import model_availability as availability
+from review_ladder import ReviewWalk
 
 log = logging.getLogger("grug.elder_eval.free_confirm")
 
@@ -172,7 +174,7 @@ def ask_model(
     hunks = diff_to_hunks(corpus.diff_for(case))
     messages = lc._build_messages(assemble_evidence(hunks), _PROMPT_VARIANT)
     tier = lc._opencode_go_extra_model_config(model, lc._CLOUD_CHAIN_TIMEOUT_SECONDS)
-    gate = lc._opencode_go_free_gate_get()
+    gate = availability._opencode_go_free_gate_get()
     detail = ""
     for attempt in range(1, ATTEMPTS + 1):
         wait = max(gate.cooldown_until(model) - time.time(), 0.0)
@@ -188,13 +190,13 @@ def ask_model(
             sleep(wait)
         # A failed call benches a model for a while; a measurement must not
         # read that bench as an answer.
-        for state in (getattr(lc, "_bench_state", None), getattr(lc, "_slow_bench_state", None)):
+        for state in (getattr(availability, "_bench_state", None), getattr(availability, "_slow_bench_state", None)):
             if isinstance(state, dict):
                 state.clear()
-        with lc._reviewed_diff_scope(hunks):
-            outcome = lc._run_review_arm(
-                lc.Backend.OPENCODE_GO, messages, _PROMPT_VARIANT, {}, None, config_override=tier,
-            )
+        outcome = lc._run_review_arm(
+            lc.Backend.OPENCODE_GO, messages, _PROMPT_VARIANT, {}, None, config_override=tier,
+            walk=ReviewWalk(diff_chars=sum(len(hunk.body) for hunk in hunks)),
+        )
         paths = _finding_paths(outcome)
         if paths is not None:
             return CaseResult(case.case_id, case.defective, label_answer(case, paths))
@@ -210,9 +212,8 @@ def ask_model(
 
 
 def current_free_models() -> list[str]:
-    import llm_client as lc
 
-    return lc._opencode_go_free_catalog_get().models()
+    return availability._opencode_go_free_catalog_get().models()
 
 
 def _load_state(path: Path | None, models: list[str]) -> dict[str, list[CaseResult]]:

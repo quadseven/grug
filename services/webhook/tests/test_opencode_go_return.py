@@ -17,6 +17,8 @@ import pytest
 from adapters.pg_rate_limit_store import ReservationResult
 from llm_client import Backend, Hunk, review_diff
 from review_evidence import assemble_evidence
+import model_availability as availability
+import review_ladder
 
 _RESERVE = "adapters.pg_rate_limit_store.try_reserve_slot"
 _PAID = "deepseek-v4.1-flash"
@@ -37,9 +39,9 @@ def _env(monkeypatch):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
-    monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_blocked_until", 0.0, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
@@ -123,13 +125,13 @@ def test_at_the_daily_cap_no_paid_call_is_made_and_the_free_tier_answers(caplog)
 
 
 def test_the_cap_holds_every_pod_off_until_the_next_utc_day() -> None:
-    with patch.object(lc.shared_benches, "publish") as publish:
+    with patch.object(availability.shared_benches, "publish") as publish:
         _review(_Http({_FREE_GO: _finding()}), _Counter(used=2))
     publish.assert_called_once_with(
-        "go", Backend.OPENCODE_GO.value, "", lc._next_utc_midnight(),
+        "go", Backend.OPENCODE_GO.value, "", availability._next_utc_midnight(),
     )
-    assert not lc._opencode_go_available()
-    assert lc._opencode_go_available(now=lc._next_utc_midnight() + 1)
+    assert not availability._opencode_go_available()
+    assert availability._opencode_go_available(now=availability._next_utc_midnight() + 1)
     assert [t.model for t in lc._cloud_chain_tiers()] == [_FREE_GO, lc._POOLSIDE_MODEL]
 
 
@@ -149,7 +151,7 @@ def test_a_store_outage_refuses_paid_go_and_opens_no_hold() -> None:
     out = _review(http, RuntimeError("store down"))
     assert out.kind == "reviewed"
     assert http.models == [_FREE_GO]
-    assert lc._opencode_go_available()
+    assert availability._opencode_go_available()
 
 
 def test_an_unset_cap_leaves_a_self_hosted_deployment_uncapped(monkeypatch) -> None:
@@ -173,7 +175,7 @@ def test_a_spent_allowance_falls_to_the_next_backend_with_no_failed_review() -> 
     assert out.backend_used == Backend.OPENCODE_GO
     assert len(out.findings) == 1
     assert http.models == [_PAID, _FREE_GO]
-    assert not lc._opencode_go_available()
+    assert not availability._opencode_go_available()
 
 
 def test_every_backend_dead_does_not_pass_the_review() -> None:
@@ -206,7 +208,7 @@ def test_a_free_go_empty_answer_cannot_agree_with_the_paid_model() -> None:
             "usage": {"prompt_tokens": 15_000, "completion_tokens": 7},
         })
     # A diff past the small-diff bound, where an empty answer is a skim (grug#1642).
-    large = "@@ -1 +1 @@\n+" + "y" * lc._DEGENERATE_MIN_DIFF_CHARS
+    large = "@@ -1 +1 @@\n+" + "y" * review_ladder._DEGENERATE_MIN_DIFF_CHARS
     out = _review(_Http({_PAID: empty(), _FREE_GO: empty()}), _Counter(), body=large)
     assert (out.error or "").startswith(lc._LOW_CONFIDENCE_PREFIX)
 
@@ -256,7 +258,7 @@ def test_every_shipped_go_model_has_verified_data_terms() -> None:
         *_shipped("GRUG_OPENCODE_GO_FALLBACK_MODEL").values(),
         lc._OPENCODE_GO_DEFAULT_MODEL,
     }
-    assert shipped <= lc._OPENCODE_GO_PRIVATE_SAFE_MODELS
+    assert shipped <= availability._OPENCODE_GO_PRIVATE_SAFE_MODELS
 
 
 _PRIVATE = {"repo": "o/r", "pr_number": 1, "repo_private": True}

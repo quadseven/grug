@@ -29,11 +29,13 @@ from llm_client import (
     BackendConfig,
     Hunk,
     review_diff,
-    route_elder_model_call,
 )
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer import persona as cr_persona
 from review_evidence import assemble_evidence
+import model_availability as availability
+import provider_wire
+import review_ladder
 
 _CAVE_URL = "http://cave.test/v1/chat/completions"
 _FREE_GATEWAY_URL = "http://cave.test/free/v1/chat/completions"
@@ -45,25 +47,26 @@ _SUBSCRIPTION_URL = "http://cave.test/subscription/v1/chat/completions"
 @pytest.fixture(autouse=True)
 def _setup_env(monkeypatch):
     """Set up clean fallback environment."""
-    lc._subscription_daily_calls.clear()
+    availability._subscription_daily_calls.clear()
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
-    monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_blocked_until", 0.0, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     monkeypatch.setattr(
-        lc, "acquire_free_tier_slot",
+        availability, "acquire_free_tier_slot",
         lambda *a, **k: type("Admit", (), {"admitted": True})(),
     )
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cave")
     monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
     monkeypatch.setenv("GRUG_SUBSCRIPTION_DAILY_CAP", "50")
     monkeypatch.setenv("GRUG_CLOUD_FREE_POOL", "true")
     yield
-    lc._subscription_daily_calls.clear()
+    availability._subscription_daily_calls.clear()
 
 
 def _finding_body(file_path: str = "src/x.py", line: int = 1) -> str:
@@ -231,7 +234,7 @@ def test_order_is_fixed_never_reordered_by_load_or_latency() -> None:
 
     evidence = assemble_evidence([_hunk()])
     with patch.object(httpx, "post", side_effect=mock_post):
-        resp = route_elder_model_call(evidence, installation_id=1)
+        resp = review_diff(evidence, installation_id=1)
 
     assert resp.kind == "reviewed"
     assert resp.tier_served == "subscription"
@@ -290,7 +293,7 @@ def test_subscription_refuses_pay_per_token_api_key(monkeypatch) -> None:
 def test_subscription_daily_call_cap_stops_processing(monkeypatch) -> None:
     """AC: configured daily call cap stops processing and review ends degraded with that reason."""
     monkeypatch.setenv("GRUG_SUBSCRIPTION_DAILY_CAP", "2")
-    lc._subscription_daily_calls.clear()
+    availability._subscription_daily_calls.clear()
 
     recorder = _Recorder({
         _CAVE_URL: httpx.ConnectTimeout("cave down"),
@@ -305,13 +308,13 @@ def test_subscription_daily_call_cap_stops_processing(monkeypatch) -> None:
     with patch.object(httpx, "post", side_effect=recorder):
         resp1 = review_diff(evidence, installation_id=1)
     assert resp1.kind == "reviewed"
-    assert lc._subscription_calls_today() == 1
+    assert availability._subscription_calls_today() == 1
 
     # Second call succeeds and increments count to 2 (cap reached)
     with patch.object(httpx, "post", side_effect=recorder):
         resp2 = review_diff(evidence, installation_id=1)
     assert resp2.kind == "reviewed"
-    assert lc._subscription_calls_today() == 2
+    assert availability._subscription_calls_today() == 2
 
     # Third call hits daily cap: stops processing, ends degraded
     with patch.object(httpx, "post", side_effect=recorder):
@@ -442,26 +445,19 @@ def test_the_lane_bearer_comes_from_ssm_when_a_path_is_set(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
     monkeypatch.setattr(lc, "get_subscription_lane_token", lambda: "lane-token")
     cfg = lc._subscription_fallback_config()
-    assert lc._merged_headers(cfg, cfg.key_loader())["Authorization"] == "Bearer lane-token"
+    assert provider_wire._merged_headers(cfg, cfg.key_loader())["Authorization"] == "Bearer lane-token"
 
 
 def test_the_author_family_reaches_the_lane_only_inside_a_gated_walk(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", _SUBSCRIPTION_URL)
     cfg = lc._subscription_fallback_config()
-    assert "X-Review-Author-Family" not in lc._merged_headers(cfg, "k")
-    token = lc._FAMILY_GATE.set(("gpt", False))
-    try:
-        assert lc._merged_headers(cfg, "k")["X-Review-Author-Family"] == "gpt"
-    finally:
-        lc._FAMILY_GATE.reset(token)
+    assert "X-Review-Author-Family" not in provider_wire._merged_headers(cfg, "k")
+    cfg = lc._subscription_fallback_config(author_family="gpt")
+    assert provider_wire._merged_headers(cfg, "k")["X-Review-Author-Family"] == "gpt"
 
 
-def test_a_lane_named_for_no_family_is_not_gated_off_a_reviewed_family(monkeypatch) -> None:
-    token = lc._FAMILY_GATE.set(("gpt", False))
-    try:
-        assert not lc._family_gated("subscription-lane")
-    finally:
-        lc._FAMILY_GATE.reset(token)
+def test_a_lane_named_for_no_family_is_not_gated_off_a_reviewed_family() -> None:
+    assert not review_ladder.ReviewWalk(author_family="gpt").family_gated("subscription-lane")
 
 
 def test_the_egress_policy_opens_the_lane_the_manifests_name() -> None:
@@ -616,7 +612,7 @@ def test_a_garbled_cave_answer_still_reaches_the_subscription_lane() -> None:
         _SUBSCRIPTION_URL: _finding_body(),
     })
     with patch.object(httpx, "post", side_effect=recorder):
-        resp = route_elder_model_call(assemble_evidence([_hunk()]), installation_id=1)
+        resp = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert resp.kind == "reviewed"
     assert resp.backend_used == Backend.SUBSCRIPTION
@@ -635,7 +631,7 @@ def test_every_tier_garbled_or_down_stays_a_parse_failure() -> None:
         _SUBSCRIPTION_URL: httpx.ConnectTimeout("lane down"),
     })
     with patch.object(httpx, "post", side_effect=recorder):
-        resp = route_elder_model_call(assemble_evidence([_hunk()]), installation_id=1)
+        resp = review_diff(assemble_evidence([_hunk()]), installation_id=1)
 
     assert resp.kind == "parse_failed"
     assert resp.backend_used == Backend.CAVE
@@ -651,7 +647,7 @@ def test_a_cancelled_review_after_a_garbled_cave_answer_asks_no_one_else() -> No
 
     recorder = _Recorder({_CAVE_URL: garble_and_cancel})
     with patch.object(httpx, "post", side_effect=recorder):
-        resp = route_elder_model_call(
+        resp = review_diff(
             assemble_evidence([_hunk()]), installation_id=1, cancel_event=cancel,
         )
 
@@ -681,7 +677,9 @@ def _walk_to_free_pool(free_answer: str, cave: object = _GARBLED, lane: object =
         _SUBSCRIPTION_URL: lane or httpx.ConnectTimeout("lane down"),
     })
     with patch.object(httpx, "post", side_effect=recorder):
-        return route_elder_model_call(assemble_evidence([_hunk()]), installation_id=1)
+        return lc._review_cave_primary(
+            assemble_evidence([_hunk()]), 1, "caveman", None, "", review_ladder.ReviewWalk(),
+        )
 
 
 @pytest.mark.parametrize("empty", [_EMPTY_SHORT, _EMPTY_LONG])
@@ -733,7 +731,7 @@ def _cave_answer(model: str, completion_tokens: int) -> str:
         ("free-pool", 900),
         ("an-unlisted-model", 900),
         ("", 900),
-        (lc._CAVE_REVIEW_CODER_DEFAULT_MODEL, 6),
+        (review_ladder._CAVE_REVIEW_CODER_DEFAULT_MODEL, 6),
     ],
 )
 def test_an_untrusted_cave_empty_walks_on_to_the_lane(model, tokens) -> None:
@@ -755,10 +753,10 @@ def test_an_untrusted_cave_empty_with_nothing_after_it_is_low_confidence() -> No
 
 
 def test_the_cave_trusts_an_empty_only_from_its_own_models() -> None:
-    assert {lc._CAVE_REVIEW_CODER_DEFAULT_MODEL, lc._CAVE_REVIEW_REASONER_DEFAULT_MODEL} <= (
-        lc._TRUSTED_EMPTY_CAVE_MODELS
+    assert {review_ladder._CAVE_REVIEW_CODER_DEFAULT_MODEL, review_ladder._CAVE_REVIEW_REASONER_DEFAULT_MODEL} <= (
+        review_ladder._TRUSTED_EMPTY_CAVE_MODELS
     )
-    assert not lc._cave_empty_is_trusted(
+    assert not review_ladder._cave_empty_is_trusted(
         lc._ArmOutcome(backend=Backend.CAVE, kind="success", model="gemma4:31b"),
     )
 
@@ -777,7 +775,7 @@ def test_a_long_free_pool_empty_in_the_cloud_chain_is_not_a_clean_pass(monkeypat
         "subscription": httpx.ConnectTimeout("lane down"),
     })
     with patch.object(httpx, "post", side_effect=recorder):
-        resp = lc._walk_review_ladder(assemble_evidence([_hunk()]), 1, "caveman", None)
+        resp = lc._review_diff_dispatch(assemble_evidence([_hunk()]), 1, "caveman", None)
 
     assert resp.error.startswith(lc._LOW_CONFIDENCE_PREFIX)
     assert cr_persona.evaluate_diff((), resp).degraded_reason == "low_confidence_review"
@@ -785,7 +783,7 @@ def test_a_long_free_pool_empty_in_the_cloud_chain_is_not_a_clean_pass(monkeypat
 
 def test_a_listed_resident_empty_of_real_length_stays_a_clean_review() -> None:
     resp = _walk_to_free_pool(
-        _EMPTY_SHORT, cave=_cave_answer(lc._CAVE_REVIEW_CODER_DEFAULT_MODEL, 900),
+        _EMPTY_SHORT, cave=_cave_answer(review_ladder._CAVE_REVIEW_CODER_DEFAULT_MODEL, 900),
     )
 
     assert resp.backend_used == Backend.CAVE
@@ -809,9 +807,9 @@ def test_a_token_capped_cave_empty_keeps_its_truncation_error() -> None:
 def test_the_trusted_empty_list_comes_from_the_environment(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_CAVE_TRUSTED_EMPTY_MODELS", " resident-a , resident-b ")
     outcome = lc._ArmOutcome(backend=Backend.CAVE, kind="success", model="resident-b")
-    assert lc._cave_empty_is_trusted(outcome)
-    assert not lc._cave_empty_is_trusted(
-        lc._ArmOutcome(backend=Backend.CAVE, kind="success", model=lc._CAVE_REVIEW_CODER_DEFAULT_MODEL),
+    assert review_ladder._cave_empty_is_trusted(outcome)
+    assert not review_ladder._cave_empty_is_trusted(
+        lc._ArmOutcome(backend=Backend.CAVE, kind="success", model=review_ladder._CAVE_REVIEW_CODER_DEFAULT_MODEL),
     )
 
 
@@ -829,15 +827,17 @@ def test_the_workloads_ship_the_model_the_sparks_serve() -> None:
 _PUBLIC_PR = {"repo": "quadseven/grug", "pr_number": 7, "repo_private": False}
 
 
-def _lane_first(monkeypatch, responses: dict[str, object], *, pr=_PUBLIC_PR, gate=None):
+_LANE_DIFF = _hunk().body + "\n+" + "x" * 9_000
+
+
+def _lane_first(monkeypatch, responses: dict[str, object], *, pr=_PUBLIC_PR, author_family=None):
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "subscription")
     recorder = _Recorder(responses)
-    token = lc._FAMILY_GATE.set(gate)
-    try:
-        with patch.object(httpx, "post", side_effect=recorder), lc._spark_job_scope(pr):
-            resp = lc._walk_review_ladder(assemble_evidence([_hunk()]), 1, "caveman", None)
-    finally:
-        lc._FAMILY_GATE.reset(token)
+    evidence = assemble_evidence(
+        [Hunk(path=_hunk().path, body=_LANE_DIFF)], pr_context=dict(pr, author_family=author_family),
+    )
+    with patch.object(httpx, "post", side_effect=recorder), lc._spark_job_scope(pr):
+        resp = lc._review_diff_dispatch(evidence, 1, "caveman", None)
     return resp, recorder
 
 
@@ -884,7 +884,7 @@ def test_a_short_lane_empty_logs_low_confidence(monkeypatch, caplog) -> None:
     [event] = [r for r in caplog.records if r.message == "elder_subscription_lane_empty"]
     assert event.levelno == logging.INFO
     assert (event.model, event.input_tokens, event.output_tokens) == ("gpt-6-luna", 30_000, 9)
-    assert event.diff_chars is None
+    assert event.diff_chars == len(_LANE_DIFF)
     assert event.trusted is False
     [warning] = [r for r in caplog.records if r.message == "llm_review_degenerate_empty"]
     assert warning.backend == Backend.SUBSCRIPTION.value
@@ -928,12 +928,12 @@ def test_the_lane_hears_the_data_class(monkeypatch) -> None:
 
 
 def test_a_lane_answer_from_the_authors_family_is_a_miss(monkeypatch) -> None:
-    monkeypatch.setattr(lc, "model_family", lambda model: "openai" if "gpt" in model else "other")
+    monkeypatch.setattr(review_ladder, "model_family", lambda model: "openai" if "gpt" in model else "other")
     resp, _ = _lane_first(
         monkeypatch,
         {"subscription": _lane_answer(json.loads(_finding_body())["choices"][0]["message"]["content"]),
          "opencode": _finding_body()},
-        gate=("openai", False),
+        author_family="openai",
     )
 
     assert resp.backend_used == Backend.OPENCODE_GO

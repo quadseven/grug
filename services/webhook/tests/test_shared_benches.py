@@ -10,6 +10,7 @@ import llm_client as lc
 import pytest
 import shared_benches
 from llm_client import Backend, BackendConfig
+import model_availability as availability
 
 _MODEL = "laguna-s-2.1"
 _REAL_ENSURE_THREAD = shared_benches._ensure_thread
@@ -54,10 +55,10 @@ def table(monkeypatch):
     monkeypatch.setattr(shared_benches, "_ensure_thread", lambda: None)
     monkeypatch.setattr(shared_benches, "_snapshot", {})
     shared_benches._queue.clear()
-    monkeypatch.setattr(lc, "_bench_state", {})
-    monkeypatch.setattr(lc, "_slow_bench_state", {})
-    monkeypatch.setattr(lc, "_provider_blocked_until", {})
-    monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0)
+    monkeypatch.setattr(availability, "_bench_state", {})
+    monkeypatch.setattr(availability, "_slow_bench_state", {})
+    monkeypatch.setattr(availability, "_provider_blocked_until", {})
+    monkeypatch.setattr(availability, "_opencode_go_blocked_until", 0.0)
     yield t
     shared_benches._queue.clear()
 
@@ -65,10 +66,10 @@ def table(monkeypatch):
 def _other_pod(monkeypatch) -> None:
     """A different process, or this one after a restart: no local state, and
     a snapshot read fresh from the table."""
-    monkeypatch.setattr(lc, "_bench_state", {})
-    monkeypatch.setattr(lc, "_slow_bench_state", {})
-    monkeypatch.setattr(lc, "_provider_blocked_until", {})
-    monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0)
+    monkeypatch.setattr(availability, "_bench_state", {})
+    monkeypatch.setattr(availability, "_slow_bench_state", {})
+    monkeypatch.setattr(availability, "_provider_blocked_until", {})
+    monkeypatch.setattr(availability, "_opencode_go_blocked_until", 0.0)
     monkeypatch.setattr(shared_benches, "_snapshot", {})
     shared_benches.sync()
 
@@ -81,8 +82,8 @@ def _resp(status: int, body: dict | None = None, headers: dict | None = None) ->
 
 
 def _bench_poolside() -> None:
-    for _ in range(lc._BENCH_FAILURE_THRESHOLD):
-        lc._note_model_response(_POOLSIDE, _resp(404))
+    for _ in range(availability._BENCH_FAILURE_THRESHOLD):
+        availability._note_model_response(_POOLSIDE, _resp(404))
 
 
 def test_a_model_benched_in_one_pod_is_skipped_by_another_and_after_a_restart(table, monkeypatch):
@@ -91,9 +92,9 @@ def test_a_model_benched_in_one_pod_is_skipped_by_another_and_after_a_restart(ta
     assert "bench#poolside#laguna-s-2.1" in table.rows
 
     _other_pod(monkeypatch)
-    assert lc._bench_state == {}, "the other pod starts with no local bench"
-    assert lc._model_is_benched("poolside", _MODEL)
-    assert not lc._tier_is_usable(_POOLSIDE, [])
+    assert availability._bench_state == {}, "the other pod starts with no local bench"
+    assert availability._model_is_benched("poolside", _MODEL)
+    assert not availability._tier_is_usable(_POOLSIDE, [])
 
 
 def test_a_success_clears_the_shared_bench_for_pods_that_did_not_open_it(table, monkeypatch):
@@ -101,32 +102,32 @@ def test_a_success_clears_the_shared_bench_for_pods_that_did_not_open_it(table, 
     shared_benches.sync()
     _other_pod(monkeypatch)
 
-    lc._note_model_response(_POOLSIDE, _resp(200, {"choices": []}))
+    availability._note_model_response(_POOLSIDE, _resp(200, {"choices": []}))
     shared_benches.sync()
     assert table.rows == {}
     _other_pod(monkeypatch)
-    assert not lc._model_is_benched("poolside", _MODEL)
+    assert not availability._model_is_benched("poolside", _MODEL)
 
 
 def test_a_slow_bench_is_shared(table, monkeypatch):
     timeout = httpx.ReadTimeout("slow", request=httpx.Request("POST", _POOLSIDE.url))
-    for _ in range(lc._SLOW_BENCH_FAILURE_THRESHOLD):
-        lc._note_model_timeout(Backend.POOLSIDE, _MODEL, timeout)
+    for _ in range(availability._SLOW_BENCH_FAILURE_THRESHOLD):
+        availability._note_model_timeout(Backend.POOLSIDE, _MODEL, timeout)
     shared_benches.sync()
 
     _other_pod(monkeypatch)
-    assert lc._model_is_slow_benched("poolside", _MODEL)
-    assert lc._slow_bench_expiry(_POOLSIDE) > 0
+    assert availability._model_is_slow_benched("poolside", _MODEL)
+    assert availability._slow_bench_expiry(_POOLSIDE) > 0
 
 
 def test_a_provider_breaker_is_shared(table, monkeypatch):
-    lc._note_provider_response(_POOLSIDE, _resp(401, {"error": {"message": "bad key"}}))
+    availability._note_provider_response(_POOLSIDE, _resp(401, {"error": {"message": "bad key"}}))
     shared_benches.sync()
 
     _other_pod(monkeypatch)
-    assert not lc._provider_available(Backend.POOLSIDE, _MODEL)
+    assert not availability._provider_available(Backend.POOLSIDE, _MODEL)
     with pytest.raises(lc.BackendDisabledError):
-        lc._refuse_unusable_backend(_POOLSIDE)
+        availability._refuse_unusable_backend(_POOLSIDE, public=False)
 
 
 def test_the_opencode_go_usage_breaker_is_shared(table, monkeypatch):
@@ -138,24 +139,24 @@ def test_the_opencode_go_usage_breaker_is_shared(table, monkeypatch):
         429, {"error": {"type": "GoUsageLimitError", "message": "usage limit"}},
         headers={"retry-after": "7200"},
     )
-    lc._note_opencode_go_response(limit)
+    availability._note_opencode_go_response(limit)
     shared_benches.sync()
 
     _other_pod(monkeypatch)
-    assert not lc._opencode_go_available()
+    assert not availability._opencode_go_available()
     with pytest.raises(lc.OpencodeGoCircuitOpenError):
-        lc._refuse_unusable_backend(go)
+        availability._refuse_unusable_backend(go, public=False)
 
 
 def test_a_store_that_is_down_never_breaks_or_blocks_a_review(table, monkeypatch):
     table.down = True
     _bench_poolside()  # publishing never raises
-    assert lc._model_is_benched("poolside", _MODEL), "the local bench still holds"
+    assert availability._model_is_benched("poolside", _MODEL), "the local bench still holds"
     shared_benches.sync()  # logged, never raised
 
     calls = []
     monkeypatch.setattr(shared_benches, "_read_live", lambda: calls.append(1) or [])
-    assert lc._tier_is_usable(
+    assert availability._tier_is_usable(
         BackendConfig(backend=Backend.OPENROUTER, url="u", model="m:free", key_loader=lambda: "k"),
         [],
     )
@@ -175,7 +176,7 @@ def test_a_clear_made_while_the_store_is_down_is_applied_when_it_is_back(table, 
     shared_benches.sync()
     _other_pod(monkeypatch)
     table.down = True
-    lc._note_model_response(_POOLSIDE, _resp(200, {"choices": []}))
+    availability._note_model_response(_POOLSIDE, _resp(200, {"choices": []}))
     shared_benches.sync()
     table.down = False
     shared_benches.sync()

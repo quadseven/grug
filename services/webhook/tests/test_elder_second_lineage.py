@@ -18,6 +18,7 @@ from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer.judge import RefuteOutcome
 from review_evidence import assemble_evidence
+import model_availability as availability
 
 _AUTH_DIFF = """diff --git a/src/auth/session.py b/src/auth/session.py
 --- a/src/auth/session.py
@@ -208,13 +209,14 @@ def test_a_reply_on_the_author_family_is_not_a_second_lineage():
 
 
 def _lane_headers(monkeypatch, *, primary, author=None):
-    from llm_client import _subscription_fallback_config, _merged_headers
+    from llm_client import _subscription_fallback_config
+    from provider_wire import _merged_headers
 
     monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", "http://lane.test/v1/chat/completions")
     seen: list = []
 
-    def _tier(messages, variant, pr_tags, hunks, pr_context, installation_id):
-        seen.append(_merged_headers(_subscription_fallback_config(), "k"))
+    def _tier(messages, variant, pr_tags, hunks, pr_context, installation_id, *, walk):
+        seen.append(_merged_headers(_subscription_fallback_config(walk.author_family), "k"))
         return LlmReviewResponse(kind="reviewed")
 
     monkeypatch.setattr(llm_client, "_run_subscription_fallback", _tier)
@@ -259,8 +261,8 @@ def test_a_diff_too_big_for_one_call_never_reaches_the_lane(monkeypatch):
 
 
 def test_half_the_daily_cap_stays_for_the_last_resort(monkeypatch):
-    monkeypatch.setattr(llm_client, "_subscription_daily_cap", lambda: 10)
-    monkeypatch.setattr(llm_client, "_subscription_calls_today", lambda: 5)
+    monkeypatch.setattr(availability, "_subscription_daily_cap", lambda: 10)
+    monkeypatch.setattr(availability, "_subscription_calls_today", lambda: 5)
     monkeypatch.setattr(
         llm_client, "_run_subscription_fallback",
         lambda *a: (_ for _ in ()).throw(AssertionError("no call")),
@@ -367,8 +369,8 @@ def test_second_pass_rows_never_become_eval_cases():
 def test_the_lane_is_told_which_family_to_avoid(monkeypatch):
     seen: list = []
 
-    def _tier(messages, variant, pr_tags, hunks, pr_context, installation_id):
-        seen.append(llm_client._review_author_family())
+    def _tier(messages, variant, pr_tags, hunks, pr_context, installation_id, *, walk):
+        seen.append(walk.author_family)
         return LlmReviewResponse(kind="reviewed")
 
     monkeypatch.setattr(llm_client, "_run_subscription_fallback", _tier)
@@ -377,11 +379,10 @@ def test_the_lane_is_told_which_family_to_avoid(monkeypatch):
     llm_client.review_second_lineage(evidence, 1, ("gpt-6-luna",))
 
     assert seen == ["gpt"]
-    assert llm_client._review_author_family() is None
 
 
 def test_no_subscription_lane_is_a_failed_second_pass_not_paid_spend(monkeypatch):
-    monkeypatch.setattr(llm_client, "_subscription_fallback_config", lambda: None)
+    monkeypatch.setattr(llm_client, "_subscription_fallback_config", lambda *_: None)
     monkeypatch.setattr(
         llm_client, "_call_backend",
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no other backend")),

@@ -23,6 +23,7 @@ from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer.persona import CodeReviewEvaluation, evaluate_diff
 from review_pipeline import ReviewCoverage
 from review_evidence import assemble_evidence
+import model_availability as availability
 
 
 @pytest.fixture(autouse=True)
@@ -31,8 +32,8 @@ def _owned_ladder(monkeypatch):
     monkeypatch.setattr(lc, "_load_poolside_key", lambda: "test-pool-key")
     monkeypatch.setattr(lc, "_load_openrouter_key", lambda: "test-or-key")
     monkeypatch.setattr(lc, "_load_opencode_go_key", lambda: "test-ocg-key")
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda _s: None)
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
     monkeypatch.setenv("GRUG_REVIEW_DEPTH", "fast")

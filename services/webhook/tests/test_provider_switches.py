@@ -16,6 +16,8 @@ import llm_client as lc
 import pytest
 from llm_client import Backend, Hunk, review_diff
 from review_evidence import assemble_evidence
+import model_availability as availability
+import review_ladder
 
 _GO_URL = "opencode.ai"
 _OR_URL = "openrouter.ai"
@@ -33,17 +35,17 @@ def _env(monkeypatch):
     # Retired names stand in as chain tiers here; test_opencode_go_return.py
     # covers the real data-terms gate.
     monkeypatch.setattr(
-        lc, "_OPENCODE_GO_PRIVATE_SAFE_MODELS",
-        lc._OPENCODE_GO_PRIVATE_SAFE_MODELS
+        availability, "_OPENCODE_GO_PRIVATE_SAFE_MODELS",
+        availability._OPENCODE_GO_PRIVATE_SAFE_MODELS
         | {"space-bunny-free", "longcat-2.5-preview-free", "mimo-v2.5"},
     )
-    monkeypatch.setattr(lc, "_opencode_go_blocked_until", 0.0, raising=False)
-    monkeypatch.setattr(lc, "_bench_state", {}, raising=False)
-    monkeypatch.setattr(lc, "_slow_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_opencode_go_blocked_until", 0.0, raising=False)
+    monkeypatch.setattr(availability, "_bench_state", {}, raising=False)
+    monkeypatch.setattr(availability, "_slow_bench_state", {}, raising=False)
     monkeypatch.setattr(lc, "_RETRY_SLEEP", lambda s: None)
     # The OpenRouter :free limiter talks to Postgres; admit every call here.
     monkeypatch.setattr(
-        lc, "acquire_free_tier_slot",
+        availability, "acquire_free_tier_slot",
         lambda *a, **k: type("Admit", (), {"admitted": True})(),
     )
     monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", "http://cave.test")
@@ -75,7 +77,7 @@ def _hunk() -> Hunk:
 
 def _large_hunk() -> Hunk:
     """Past `_DEGENERATE_MIN_DIFF_CHARS`: a short empty answer is a skim (grug#1642)."""
-    return Hunk(path="src/x.py", body="@@ -1 +1 @@\n+" + "y" * lc._DEGENERATE_MIN_DIFF_CHARS)
+    return Hunk(path="src/x.py", body="@@ -1 +1 @@\n+" + "y" * review_ladder._DEGENERATE_MIN_DIFF_CHARS)
 
 
 class _Recorder:
@@ -163,8 +165,8 @@ def test_the_shipped_chain_leads_with_go_then_the_free_cloud_tiers(monkeypatch) 
         (Backend.OPENCODE_GO, "deepseek-v4.1-flash"),
         (Backend.OPENCODE_GO, "beam-free"),
     ]
-    assert not lc._backend_enabled(Backend.OPENROUTER, "anthropic/claude-opus-4.7")
-    assert lc._backend_enabled(Backend.OPENROUTER, _FREE)
+    assert not availability._backend_enabled(Backend.OPENROUTER, "anthropic/claude-opus-4.7")
+    assert availability._backend_enabled(Backend.OPENROUTER, _FREE)
 
 
 def test_the_shipped_deep_escalation_is_a_mode_the_client_accepts(monkeypatch, caplog) -> None:
@@ -265,8 +267,8 @@ def test_the_free_vote_rule_is_symmetric() -> None:
     poolside = (Backend.POOLSIDE, lc._POOLSIDE_MODEL)
     go = (Backend.OPENCODE_GO, "deepseek-v4.1-flash")
     for a, b in ((free, poolside), (poolside, free), (pool, poolside), (poolside, pool)):
-        assert not lc._empty_answers_agree(a, b, None), (a, b)
-    assert lc._empty_answers_agree(poolside, go, None)
+        assert not review_ladder._empty_answers_agree(a, b, None), (a, b)
+    assert review_ladder._empty_answers_agree(poolside, go, None)
 
 
 def test_cloud_review_never_calls_a_disabled_backend(monkeypatch) -> None:
@@ -343,16 +345,16 @@ def test_call_backend_refuses_a_disabled_backend_without_a_request(monkeypatch) 
 
 
 def test_a_typo_in_the_switch_is_logged(monkeypatch, caplog) -> None:
-    monkeypatch.setattr(lc, "_warned_disabled_entries", set())
+    monkeypatch.setattr(availability, "_warned_disabled_entries", set())
     monkeypatch.setenv("GRUG_DISABLED_BACKENDS", "opencode_go,openrouter:cheap")
     with caplog.at_level("WARNING"):
-        lc._backend_enabled(Backend.OPENCODE_GO, "m")
+        availability._backend_enabled(Backend.OPENCODE_GO, "m")
     warned = sorted(
         r.entry for r in caplog.records
         if r.getMessage() == "grug_disabled_backends_unknown_entry"
     )
     assert warned == ["opencode_go", "openrouter:cheap"]
-    assert lc._backend_enabled(Backend.OPENCODE_GO, "m")
+    assert availability._backend_enabled(Backend.OPENCODE_GO, "m")
 
 
 # --- the provider breaker ---------------------------------------------------
@@ -394,7 +396,7 @@ def test_a_spent_paid_limit_blocks_only_the_paid_pool() -> None:
         with pytest.raises(lc.BackendDisabledError):
             lc._call_backend(_or("anthropic/claude-haiku-4.5"), _MESSAGES)
     assert post.call_count == 1
-    assert lc._provider_available(Backend.OPENROUTER, _FREE)
+    assert availability._provider_available(Backend.OPENROUTER, _FREE)
     assert lc._usable_saas_fallback_backends() == (Backend.POOLSIDE,)
     assert lc.select_backend(1) == Backend.POOLSIDE
 
@@ -402,7 +404,7 @@ def test_a_spent_paid_limit_blocks_only_the_paid_pool() -> None:
 def test_a_402_trips_the_breaker() -> None:
     with patch.object(httpx, "post", return_value=_err(402, "Insufficient credits")):
         lc._call_backend(_or("anthropic/claude-haiku-4.5"), _MESSAGES)
-    assert not lc._provider_available(Backend.OPENROUTER, "anthropic/claude-haiku-4.5")
+    assert not availability._provider_available(Backend.OPENROUTER, "anthropic/claude-haiku-4.5")
 
 
 def test_the_free_per_day_cap_blocks_the_free_tier_and_is_not_retried() -> None:
@@ -417,7 +419,7 @@ def test_the_free_per_day_cap_blocks_the_free_tier_and_is_not_retried() -> None:
     assert [t.backend for t in lc._cloud_chain_tiers()] == [
         Backend.OPENCODE_GO, Backend.OPENCODE_GO, Backend.OPENCODE_GO, Backend.POOLSIDE,
     ]
-    assert lc._provider_available(Backend.OPENROUTER, "anthropic/claude-haiku-4.5")
+    assert availability._provider_available(Backend.OPENROUTER, "anthropic/claude-haiku-4.5")
 
 
 @pytest.mark.parametrize("resp", [
@@ -434,7 +436,7 @@ def test_overload_and_other_errors_never_trip_the_breaker(resp) -> None:
     with patch.object(httpx, "post", return_value=resp):
         lc._call_backend(_or(_FREE), _MESSAGES)
         lc._call_backend(_or(_FREE), _MESSAGES)
-    assert lc._provider_available(Backend.OPENROUTER, _FREE)
+    assert availability._provider_available(Backend.OPENROUTER, _FREE)
 
 
 def test_a_plain_429_is_still_retried() -> None:
@@ -449,11 +451,11 @@ def test_the_breaker_honours_retry_after_then_closes(monkeypatch) -> None:
     monkeypatch.setattr(lc.time, "time", lambda: clock[0])
     with patch.object(httpx, "post", return_value=_err(401, "bad key", {"retry-after": "120"})):
         lc._call_backend(_or(_FREE), _MESSAGES)
-    assert not lc._provider_available(Backend.OPENROUTER, _FREE)
+    assert not availability._provider_available(Backend.OPENROUTER, _FREE)
     clock[0] += 119
-    assert not lc._provider_available(Backend.OPENROUTER, _FREE)
+    assert not availability._provider_available(Backend.OPENROUTER, _FREE)
     clock[0] += 2
-    assert lc._provider_available(Backend.OPENROUTER, _FREE)
+    assert availability._provider_available(Backend.OPENROUTER, _FREE)
 
 
 def test_without_retry_after_the_breaker_holds_an_hour(monkeypatch) -> None:
@@ -462,9 +464,9 @@ def test_without_retry_after_the_breaker_holds_an_hour(monkeypatch) -> None:
     with patch.object(httpx, "post", return_value=_err(401, "bad key")):
         lc._call_backend(_go(lc._OPENCODE_GO_MODEL), _MESSAGES)
     clock[0] += 3599
-    assert not lc._provider_available(Backend.OPENCODE_GO, lc._OPENCODE_GO_MODEL)
+    assert not availability._provider_available(Backend.OPENCODE_GO, lc._OPENCODE_GO_MODEL)
     clock[0] += 2
-    assert lc._provider_available(Backend.OPENCODE_GO, lc._OPENCODE_GO_MODEL)
+    assert availability._provider_available(Backend.OPENCODE_GO, lc._OPENCODE_GO_MODEL)
 
 
 def test_the_cave_never_trips_the_breaker() -> None:
@@ -508,7 +510,7 @@ def test_a_poolside_usage_limit_429_takes_poolside_out_of_the_chain_without_a_re
     ) as post:
         assert lc._call_backend(cfg, _MESSAGES).status_code == 429
     assert post.call_count == 1
-    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert not availability._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
     assert Backend.POOLSIDE not in [t.backend for t in lc._cloud_chain_tiers()]
 
 
@@ -520,11 +522,11 @@ def _poolside_call(resp: httpx.Response) -> None:
 
 def _note_poolside(resp: httpx.Response) -> None:
     """An answer that arrives after the hold opened, from a call in flight."""
-    lc._note_provider_response(lc._BACKEND_CONFIGS[Backend.POOLSIDE], resp)
+    availability._note_provider_response(lc._BACKEND_CONFIGS[Backend.POOLSIDE], resp)
 
 
 def _poolside_held_seconds(now: float) -> float:
-    return lc._provider_blocked_until[("poolside", "paid")] - now
+    return availability._provider_blocked_until[("poolside", "paid")] - now
 
 
 def test_repeated_limit_refusals_hold_poolside_two_then_four_up_to_thirty(monkeypatch) -> None:
@@ -533,13 +535,13 @@ def test_repeated_limit_refusals_hold_poolside_two_then_four_up_to_thirty(monkey
     now = {"t": 1_000_000.0}
     monkeypatch.setattr(lc.time, "time", lambda: now["t"])
     published = []
-    monkeypatch.setattr(lc.shared_benches, "publish", lambda *a: published.append(a))
+    monkeypatch.setattr(availability.shared_benches, "publish", lambda *a: published.append(a))
     limited = _err(429, "usage limit exceeded")
     seen = []
     for _ in range(6):
         _poolside_call(limited)
         seen.append(_poolside_held_seconds(now["t"]) / 60)
-        assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL, now["t"] + 1)
+        assert not availability._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL, now["t"] + 1)
         now["t"] += _poolside_held_seconds(now["t"]) + 1
     assert seen == [2, 4, 8, 16, 30, 30]
     assert ("provider", "poolside", "paid", pytest.approx(1_000_000.0 + 120)) in published
@@ -551,11 +553,11 @@ def test_repeated_limit_refusals_skip_poolside_then_it_is_asked_again(monkeypatc
     now = {"t": 1_000_000.0}
     monkeypatch.setattr(lc.time, "time", lambda: now["t"])
     _poolside_call(_err(429, "usage limit exceeded"))
-    assert not lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert not availability._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
     assert Backend.POOLSIDE not in lc._usable_saas_fallback_backends()
     assert Backend.POOLSIDE not in [t.backend for t in lc._cloud_chain_tiers()]
-    now["t"] += lc._LIMIT_HOLD_BASE_SECONDS + 1
-    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    now["t"] += availability._LIMIT_HOLD_BASE_SECONDS + 1
+    assert availability._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
     assert Backend.POOLSIDE in [t.backend for t in lc._cloud_chain_tiers()]
 
 
@@ -583,10 +585,10 @@ def test_the_first_success_clears_the_hold_and_the_escalation(monkeypatch) -> No
     now = 1_000_000.0
     monkeypatch.setattr(lc.time, "time", lambda: now)
     _poolside_call(_err(429, "usage limit exceeded"))
-    assert lc._limit_hold_error()
+    assert availability._limit_hold_error()
     _note_poolside(_ok())
-    assert lc._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
-    assert lc._limit_hold_error() == ""
+    assert availability._provider_available(Backend.POOLSIDE, lc._POOLSIDE_MODEL)
+    assert availability._limit_hold_error() == ""
     _poolside_call(_err(429, "usage limit exceeded"))
     assert _poolside_held_seconds(now) == 120.0
 
@@ -617,7 +619,7 @@ def test_opencode_go_monthly_usage_limit_still_trips_the_breaker() -> None:
     body = {"error": {"type": "GoUsageLimitError", "message": "Go usage limit exceeded"}}
     with patch.object(httpx, "post", return_value=httpx.Response(429, json=body)):
         lc._call_backend(_go("longcat-2.5-preview-free"), _MESSAGES)
-    assert not lc._provider_available(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
+    assert not availability._provider_available(Backend.OPENCODE_GO, "longcat-2.5-preview-free")
 
 
 def test_a_secret_candidate_survives_the_shipped_switches(monkeypatch) -> None:
