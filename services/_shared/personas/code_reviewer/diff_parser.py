@@ -425,7 +425,7 @@ def added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
     lineno = hunk.new_start
     for raw in hunk.body.splitlines():
-        if raw.startswith("@@") or raw.startswith(chr(92)):
+        if raw.startswith(("@@", chr(92))):
             continue  # header / no-newline marker - no new-side advance
         if raw.startswith("+"):
             out.append((lineno, raw[1:]))
@@ -705,4 +705,23 @@ def file_changes(unified_diff: str) -> tuple[FileChange, ...]:
         removed = sum(1 for line in body if line.startswith("-"))
         path = old if status == "removed" else new
         out.append(FileChange(path, status, previous, similarity, added, removed))
+    return tuple(out)
+
+
+def deleted_file_hunks(unified_diff: str) -> tuple[DiffHunk, ...]:
+    """Whole-file deletion evidence, with no line anchors on the new side."""
+    out: list[DiffHunk] = []
+    for block in re.split(r"(?m)^(?=diff --git )", unified_diff):
+        lines = block.splitlines()
+        paths = _DIFF_GIT_RE.match(lines[0]) if lines else None
+        if not paths:
+            continue
+        status, _, _, _, start = _block_header(lines[1:], *paths.groups())
+        body = lines[start + 1:]
+        header = _HUNK_HEADER_RE.match(body[0]) if body else None
+        if not header or status != "removed" or header[2] != "0" or header[3] != "0":
+            continue
+        removed = [line for line in body[1:] if not line.startswith("\\ No newline")]
+        if len(removed) == int(header[1] or 1) and all(line.startswith("-") for line in removed):
+            out.append(DiffHunk(paths[1], 1, frozenset(), "\n".join(body)))
     return tuple(out)

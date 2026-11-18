@@ -12,12 +12,13 @@ Recorded shapes, from lane pull requests Elder passed as test edits:
   minted the role's token), one adding a test that asserts the layer
   stays gone.
 
-Two rules, each one finding per file, anchored on a new-side line:
+Two rules, each one finding per file:
 
 - `weakened-test`: a test file whose diff deletes test functions (the
   `def` and at least one assertion go, and no test of that name or a close
   rename comes back; a counterpart in another file of the same diff counts
-  only under the rule in `moved_tests`) or flips an assertion's polarity (`assertTrue` and
+  only under the rule in `moved_tests`), drops assertions from a surviving
+  test, or flips an assertion's polarity (`assertTrue` and
   `assertFalse`, `In` and `NotIn`, `assert x` and `assert not x`, `True`
   and `False` as the expected value). High when `DELETED_HIGH` or more
   deleted tests in a file are not mentioned by the title or the linked
@@ -35,6 +36,9 @@ Two rules, each one finding per file, anchored on a new-side line:
   replacement. That is a behavior the ticket changes on purpose, with its
   new contract pinned in place of the old: in one week of merged work the
   rule's findings were declined 14 times out of 19, nearly all this shape.
+  A removed assertion that refers to a Python definition deleted by the
+  same diff is excused. A removed test is excused only when all its lost
+  assertions qualify.
 - `removed-verification-layer` (high): a CI workflow loses a line of a
   security or verification layer (a deny-list, leak or secret scan,
   signature or attestation check, a code scanner) that the diff does not
@@ -51,12 +55,13 @@ Pure: file changes, hunks and PR text in; findings out.
 
 from __future__ import annotations
 
+import ast
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from personas.code_reviewer.criteria_coverage import LinkedCriterion
-from personas.code_reviewer.diff_parser import DiffHunk, FileChange
+from personas.code_reviewer.diff_parser import DiffHunk, FileChange, deleted_file_hunks
 from personas.code_reviewer.moved_tests import (
     ASSERT_RE,
     CLASS_RE,
@@ -143,6 +148,7 @@ _REMOVAL_RE = re.compile(
 )
 
 _DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
+_CONSTANT_RE = re.compile(r"^([A-Z][A-Z_0-9]*)\s*(?::[^=]+)?=(?!=)")
 
 _CI_PATH_RE = re.compile(
     r"(?:^|/)\.github/workflows/[^/]+\.ya?ml$|(?:^|/)action\.ya?ml$"
@@ -185,13 +191,13 @@ def _incomplete(line: str) -> bool:
 @dataclass
 class _Deleted:
     name: str
-    asserts: int = 0
     # Every assertion line the test loses, and their whitespace-normalized
     # forms: what a copy elsewhere in the diff must match (#1496).
     total: int = 0
     mock: int = 0
     is_async: bool = False
     norm: set[str] = field(default_factory=set)
+    lost: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -208,6 +214,7 @@ class _TestFile:
     # removed test name -> the test added in its place in the same change run
     replaced_by: dict[str, str] = field(default_factory=dict)
     flips: list[str] = field(default_factory=list)
+    lost_assertions: list[str] = field(default_factory=list)
     hunks: list[DiffHunk] = field(default_factory=list)
 
 
@@ -283,6 +290,8 @@ class _HunkWalk:
     run_added: list[str] = field(default_factory=list)
     added_pol: dict[str, set[int]] = field(default_factory=dict)
     removed_pol: list[tuple[str, str, int]] = field(default_factory=list)
+    run_lost_assertions: list[str] = field(default_factory=list)
+    run_has_added_assertion: bool = False
 
     def close_run(self) -> None:
         """Pair the tests a change run removed with those it added, in order."""
@@ -292,6 +301,10 @@ class _HunkWalk:
             self.tf.replaced_by[old] = new
         self.run_removed.clear()
         self.run_added.clear()
+        if not self.run_has_added_assertion:
+            self.tf.lost_assertions.extend(self.run_lost_assertions)
+        self.run_lost_assertions.clear()
+        self.run_has_added_assertion = False
 
     def added_line(self, text: str) -> None:
         self.tf.reader.feed(text, added=True)
@@ -299,6 +312,7 @@ class _HunkWalk:
         if d and d.group(1).startswith("test"):
             self.run_added.append(d.group(1))
         if _ASSERT_RE.search(text):
+            self.run_has_added_assertion = True
             p = _polarity(text)
             if p:
                 self.added_pol.setdefault(p[0], set()).add(p[1])
@@ -324,15 +338,17 @@ class _HunkWalk:
             self.run_removed.append(self.current.name)
 
     def _removed_assert(self, text: str) -> None:
+        shown = text.strip()
         if self.current is not None:
             self.current.total += 1
             self.current.mock += bool(MOCK_ASSERT_RE.search(text))
             self.current.norm.add(normal(text))
-        if self.current is not None and text.strip() not in self.tf.added:
-            self.current.asserts += 1
+        if shown not in self.tf.added:
+            lost = self.current.lost if self.current is not None else self.run_lost_assertions
+            lost.append(shown)
         p = _polarity(text)
         if p:
-            self.removed_pol.append((text.strip(), p[0], p[1]))
+            self.removed_pol.append((shown, p[0], p[1]))
 
     def finish(self) -> None:
         self.close_run()
@@ -371,7 +387,7 @@ def _renamed(old: str, new: str | None) -> bool:
 def _deleted_tests(tf: _TestFile) -> list[_Deleted]:
     return [
         d for j, d in enumerate(tf.removed)
-        if d.asserts
+        if d.lost
         and j not in tf.moved
         and d.name not in tf.added_defs
         and not _renamed(d.name, tf.replaced_by.get(d.name))
@@ -407,6 +423,66 @@ def _removed_code_stems(by_file: dict[str, list[DiffHunk]]) -> frozenset[str]:
                 if raw.startswith("-") and len(raw) <= _MAX_LINE:
                     stems.update(_stem(w) for w in re.findall(r"[a-z0-9]+", raw[1:].lower()))
     return frozenset(stems)
+
+
+def _hunk_definitions(hunk: DiffHunk) -> tuple[set[str], list[str]]:
+    """Names a hunk keeps or adds, and names it deletes from a complete hunk."""
+    lines = hunk.body.splitlines()[1:]
+    complete = not any(_incomplete(raw) for raw in lines)
+    surviving: set[str] = set()
+    removed: list[str] = []
+    for raw in lines:
+        if len(raw) > _MAX_LINE:
+            continue
+        code = raw[1:]
+        definition = _DEF_RE.match(code) or _CLASS_RE.match(code) or _CONSTANT_RE.match(code)
+        if not definition:
+            continue
+        if raw.startswith((" ", "+")):
+            surviving.add(definition[1])
+        elif complete and raw.startswith("-"):
+            removed.append(definition[1])
+    return surviving, removed
+
+
+def _removed_symbols(by_file: dict[str, list[DiffHunk]]) -> dict[str, str]:
+    """Definitions deleted from production Python, excluding ones reintroduced."""
+    removed: dict[str, str] = {}
+    surviving: set[str] = set()
+    for path, hunks in by_file.items():
+        if is_test_file(path) or not path.endswith(".py"):
+            continue
+        module = path.rsplit("/", 1)[-1].removesuffix(".py")
+        for hunk in hunks:
+            kept, deleted = _hunk_definitions(hunk)
+            surviving |= kept
+            removed.update(dict.fromkeys(deleted, module))
+    return {name: module for name, module in removed.items() if name not in surviving}
+
+
+def _covers_removed_symbol(assertion: str, removed: dict[str, str]) -> bool:
+    if not removed:
+        return False
+    try:
+        nodes = ast.walk(ast.parse(assertion))
+    except SyntaxError:
+        return False
+    return any(
+        (isinstance(node, ast.Name) and node.id in removed)
+        or (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and removed.get(node.attr) == node.value.id
+        )
+        for node in nodes
+    )
+
+
+def _retired_test_file(tf: _TestFile, removed: dict[str, str]) -> bool:
+    return bool(tf.removed) and not tf.incomplete and not tf.lost_assertions and all(
+        d.lost and all(_covers_removed_symbol(a, removed) for a in d.lost)
+        for d in tf.removed
+    )
 
 
 def _goes_with_guard(name: str, removed_stems: frozenset[str]) -> bool:
@@ -480,14 +556,18 @@ def _unasked(flips: list[str], ticket: _Ticket) -> list[str]:
     return [f for f in flips if not _flip_asked(f, ticket.lower)]
 
 
-def _change_parts(tf: _TestFile, deleted: list[_Deleted]) -> list[str]:
+def _change_parts(tf: _TestFile, deleted: list[_Deleted], lost: list[str]) -> list[str]:
     """What the diff does to the file's tests, as message clauses."""
     parts = []
     if deleted:
-        gone = sum(d.asserts for d in deleted)
+        gone = sum(len(d.lost) for d in deleted)
         parts.append(
             f"deletes {len(deleted)} test(s) ({_named_list([d.name for d in deleted])}) "
             f"with {gone} assertion(s) the diff does not add back"
+        )
+    if lost:
+        parts.append(
+            f"drops {len(lost)} assertion(s) ({_named_list(lost)})"
         )
     if tf.flips:
         parts.append(
@@ -524,16 +604,23 @@ def _why(*, high: bool, unnamed: bool, guarded: list[str] = ()) -> str:
 
 def _test_file_finding(
     tf: _TestFile, hunks: tuple[DiffHunk, ...], ticket: _Ticket, unasked_flips: int,
-    removed_stems: frozenset[str] = frozenset(),
+    removed_stems: frozenset[str], removed_symbols: dict[str, str],
 ) -> Finding | None:
     """The `weakened-test` finding for one test file, or None."""
     deleted = [
-        d for d in _deleted_tests(tf) if not _replaced_for_ticket(tf, d, ticket.stems)
+        d for d in _deleted_tests(tf)
+        if not _replaced_for_ticket(tf, d, ticket.stems)
+        and not all(_covers_removed_symbol(a, removed_symbols) for a in d.lost)
+    ]
+    flipped = set(tf.flips)
+    lost = [
+        a for a in tf.lost_assertions
+        if a not in flipped and not _covers_removed_symbol(a, removed_symbols)
     ]
     # A lone flip with nothing deleted most often follows a behavior the
     # ticket changed on purpose: on the lane corpus it was as common in
     # good work as in damaging work, so it is left to the model.
-    if not deleted and unasked_flips < 2:
+    if not deleted and not lost and unasked_flips < 2:
         return None
     unnamed = [d for d in deleted if not _mentioned(d.name, ticket.stems)]
     guarded = [] if ticket.removal else [
@@ -543,15 +630,18 @@ def _test_file_finding(
         bool(_unasked(tf.flips, ticket)) and unasked_flips >= FLIPS_HIGH
     )
     anchor = _anchor(tf.hunks, hunks)
-    if anchor is None:
-        return None
+    file, line = anchor or (tf.path, tf.hunks[0].new_start)
+    why = _why(high=high, unnamed=bool(unnamed), guarded=guarded) if deleted or tf.flips else (
+        "The diff gives no evidence that the assertions lost their target."
+    )
     return Finding(
-        file=anchor[0], line=anchor[1],
+        file=file, line=line,
         severity="high" if high else "medium",
         rule_name=RULE_TEST,
+        outside_diff_reason=None if anchor else "the test diff only removes lines",
         message=(
-            f"In `{tf.path}`, this diff " + " and ".join(_change_parts(tf, deleted))
-            + ". " + _why(high=high, unnamed=bool(unnamed), guarded=guarded)
+            f"In `{tf.path}`, this diff " + " and ".join(_change_parts(tf, deleted, lost))
+            + ". " + why
             + " Restore the tests that pinned behavior the ticket did not "
             "change, or name the change in the ticket."
         ),
@@ -580,14 +670,14 @@ def _removed_file_findings(
 
 def _test_findings(
     files: list[_TestFile], removed_files: list[str], hunks: tuple[DiffHunk, ...],
-    ticket: str, removed_stems: frozenset[str] = frozenset(),
+    ticket: str, removed_stems: frozenset[str], removed_symbols: dict[str, str],
 ) -> list[Finding]:
     asked = _Ticket.of(ticket)
     complete = [tf for tf in files if not tf.incomplete]
     unasked_flips = sum(len(_unasked(tf.flips, asked)) for tf in complete)
     findings = [
         f for f in (
-            _test_file_finding(tf, hunks, asked, unasked_flips, removed_stems)
+            _test_file_finding(tf, hunks, asked, unasked_flips, removed_stems, removed_symbols)
             for tf in complete
         )
         if f is not None
@@ -686,6 +776,7 @@ def scan_weakened_verification(
     *,
     criteria: tuple[LinkedCriterion, ...] | Callable[[], tuple[LinkedCriterion, ...]],
     pr_title: str | Callable[[], str],
+    diff_text: str = "",
 ) -> tuple[Finding, ...]:
     """`weakened-test` and `removed-verification-layer` findings, or none
     when the diff is past `MAX_DIFF_LINES` (not evaluated).
@@ -701,20 +792,33 @@ def scan_weakened_verification(
         by_file.setdefault(hunk.file_path, []).append(hunk)
     budget = [MAX_DIFF_LINES]
     tests: list[_TestFile] = []
+    deleted_paths = dict.fromkeys(c.path for c in changes if c.status == "removed")
+    removed_files = dict.fromkeys(path for path in deleted_paths if is_test_file(path))
+    deleted = {
+        h.file_path: [h] for h in deleted_file_hunks(diff_text) if h.file_path in deleted_paths
+    } if deleted_paths else {}
+    removed_symbols = _removed_symbols(by_file | deleted)
     for path, own in by_file.items():
         if is_test_file(path):
             tf = _read_test_file(path, own, budget)
             if tf is None:
                 return ()
             tests.append(tf)
+    deleted_budget = [MAX_DIFF_LINES]
+    for path in tuple(removed_files):
+        if path not in deleted:
+            continue
+        tf = _read_test_file(path, deleted[path], deleted_budget)
+        if tf is not None and _retired_test_file(tf, removed_symbols):
+            del removed_files[path]
     mark_moved(tests)
-    removed_files = [
-        c.path for c in changes if c.status == "removed" and is_test_file(c.path)
-    ]
     layer = _layer_findings(by_file, hunks, ticket, budget)
     if layer is None:
         return ()
     return tuple(
-        _test_findings(tests, removed_files, hunks, ticket, _removed_code_stems(by_file))
+        _test_findings(
+            tests, list(removed_files), hunks, ticket,
+            _removed_code_stems(by_file), removed_symbols,
+        )
         + layer
     )

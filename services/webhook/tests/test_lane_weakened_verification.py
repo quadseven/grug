@@ -224,6 +224,100 @@ def test_two_deleted_tests_the_ticket_does_not_name_are_high():
     assert "deletes 2 test(s)" in f.message
 
 
+_RETIRED_FALLBACK = _diff("service/gear.py", ("", [
+    " def current_gear():",
+    "     return []",
+    "-",
+    "-def fallback_gear():",
+    "-    return ['spare']",
+]))
+
+
+def test_deleting_a_function_and_the_test_that_calls_it_is_not_weakened():
+    tests = _diff("tests/test_gear.py", ("", [
+        " from service import gear",
+        "-",
+        "-def test_uses_the_spare():",
+        "-    assert gear.fallback_gear() == ['spare']",
+        " ",
+        " def test_current_gear():",
+        "-    assert not gear.current_gear()",
+        "+    assert gear.current_gear() == []",
+    ]))
+    assert _scan(_RETIRED_FALLBACK + tests) == ()
+
+
+@pytest.mark.parametrize("production, expected", [
+    ("", ("weakened-test",)),
+    (_RETIRED_FALLBACK, ()),
+])
+def test_dropping_an_assertion_is_weakened_when_its_function_stays(production, expected):
+    tests = _diff("tests/test_gear.py", ("", [
+        " def test_gear_sources():",
+        "     assert gear.current_gear() == []",
+        "-    assert gear.fallback_gear() == ['spare']",
+    ]))
+    assert tuple(f.rule_name for f in _scan(production + tests)) == expected
+
+
+def test_dropping_a_check_for_a_retired_branch_selector_is_not_weakened():
+    production = _diff("service/gear.py", ("", [
+        "-FALLBACK_SOURCE = 'spare'",
+        " ",
+        " def select_gear(source):",
+        "-    if source == FALLBACK_SOURCE:",
+        "-        return ['spare']",
+        "     return []",
+    ]))
+    tests = _diff("tests/test_gear.py", ("", [
+        " def test_gear_sources():",
+        "-    assert gear.select_gear(gear.FALLBACK_SOURCE) == ['spare']",
+        "     assert gear.select_gear('current') == []",
+    ]))
+    assert _scan(production + tests) == ()
+
+
+@pytest.mark.parametrize("assertion", [
+    "assert stock.fallback_gear() == ['spare']",
+    "assert gear.current_gear() == []",
+])
+def test_deleting_a_mixed_test_still_flags_checks_for_code_that_stays(assertion):
+    tests = _diff("tests/test_gear.py", ("", [
+        "-def test_gear_sources():",
+        "-    assert gear.fallback_gear() == ['spare']",
+        f"-    {assertion}",
+        " ",
+        " def test_local_gear():",
+        "     assert gear.local_gear()",
+    ]))
+    (finding,) = _scan(_RETIRED_FALLBACK + tests)
+    assert finding.rule_name == "weakened-test"
+
+
+def test_deleting_a_test_file_for_retired_code_is_not_weakened():
+    tests = (
+        "diff --git a/tests/test_fallback.py b/tests/test_fallback.py\n"
+        "deleted file mode 100644\n"
+        "--- a/tests/test_fallback.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,4 +0,0 @@\n"
+        "-from service.gear import fallback_gear\n"
+        "-\n"
+        "-def test_uses_the_spare():\n"
+        "-    assert fallback_gear() == ['spare']\n"
+    )
+    unrelated = _diff("service/other.py", ("", ["+enabled = True"]))
+
+    def weakened(diff):
+        return [f.rule_name for f in lane_work_findings(
+            diff_text=diff, hunks=parse_diff(diff), file_contents={}, base_line_counts={},
+            boxes=(), pr_title=_TITLE, pr_body="",
+        ) if f.rule_name == "weakened-test"]
+
+    assert weakened(_RETIRED_FALLBACK + tests + unrelated) == []
+    assert weakened(tests + unrelated) == ["weakened-test"]
+
+
 def test_a_deleted_test_the_ticket_names_is_medium():
     title = "Learn outcomes post a comment instead of never posting one"
     (f,) = _scan(_DELETED, title=title)
