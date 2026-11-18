@@ -393,4 +393,4 @@ def _thread(*, outdated=False):
 
 def test_a_fixed_finding_releases_a_thread_on_a_line_the_fix_never_touched():
     assert carry_forward.select_carried([_thread()], ()) == ()
-    assert thread_resolver.select_fixed_threads([_thread()], ())[0] == ["T1"]
+    assert thread_resolver.select_fixed_threads([_thread()], (), head_sha="def")[0] == ["T1"]
