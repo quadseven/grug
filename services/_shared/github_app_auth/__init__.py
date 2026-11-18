@@ -380,6 +380,15 @@ def _is_retryable_github_error(response: httpx.Response) -> bool:
     return False
 
 
+def is_github_permission_denied(response: httpx.Response) -> bool:
+    """Identify a GitHub 403 without primary or secondary rate-limit signals."""
+    return (
+        response.status_code == 403
+        and response.headers.get("X-RateLimit-Remaining") != "0"
+        and not _is_secondary_rate_limit(response)
+    )
+
+
 def _retry_sleep_seconds(attempt: int, response: httpx.Response) -> float:
     """Exponential backoff + jitter, but a server-supplied `Retry-After`
     wins when it asks for longer - GitHub's guidance for its own

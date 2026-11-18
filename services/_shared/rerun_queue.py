@@ -7,10 +7,10 @@ consumer, and the stable FIFO group and dedup identities. boto3 stays in
 the producers' adapters: an encoder returns an `EncodedJob` whose
 `message_kwargs()` feed `send_message` directly.
 
-Wire compatibility. The API and webhook pods deploy at different times,
-so the body each encoder writes is byte-identical to version 1 as it was
-hand-built before this module existed (same keys, same order, a rerun job
-still carries no `kind`). `test_rerun_queue_protocol.py` pins it. Bumping
+Wire compatibility. The API and webhook pods deploy at different times.
+With the original inputs, encoders still write byte-identical version 1
+bodies (same keys, same order, a rerun job carries no `kind`).
+`test_rerun_queue_protocol.py` pins those bodies. Bumping
 `SCHEMA_VERSION` therefore needs the consumer to understand the new
 version BEFORE any producer writes it.
 
@@ -122,13 +122,16 @@ def encode_rerun(
     comment_id: int = 0,
     queued_at: float = 0.0,
     hold_started_at: float = 0.0,
+    requested_head_sha: str = "",
 ) -> EncodedJob:
     """An explicit persona rerun. Dedup on `(install, repo, pr, persona)`
     with no head sha: a rerun always targets the PR's current head, so two
     clicks are the same job. A command (`comment_id`), a `dedup_key` or a
     deferral (`not_before`) each get their own hashed dedup id, because the
     plain id may still sit inside SQS's 5-minute window and a collapsed
-    send would lose the job. The caller stamps `queued_at` for a command."""
+    send would lose the job. The caller stamps `queued_at` for a command.
+    The optional queued head addresses a failure check if Elder cannot read
+    the PR."""
     job: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "install_id": install_id,
@@ -142,6 +145,8 @@ def encode_rerun(
         if hold_started_at:
             job["hold_started_at"] = float(hold_started_at)
         dedup_key = dedup_key or f"cmd{int(comment_id)}"
+    if requested_head_sha:
+        job["requested_head_sha"] = requested_head_sha
     plain = f"{install_id}:{repo}:{pr_number}:{persona}"
     if not_before > 0:
         job["not_before"] = float(not_before)

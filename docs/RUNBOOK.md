@@ -200,31 +200,26 @@ regression.
 
 ### Elder: "Grug cannot read this pull request: 403 from GitHub"
 
-Elder's own read of `GET repos/<owner>/<repo>/pulls/<n>` was denied. The job
-posts one failing check-run with that title on the queued head and ends with
-status `pr_read_forbidden`, with no redrive. The structured log event is
-`elder_pr_read_forbidden` (fields: `install_id`, `repo`, `pr`, `head_sha`).
-This is a GitHub access problem, not a model outage: model failures carry
-`eyes clouded` titles instead. The handling lives in
-`services/webhook/rerun.py::_run_hot_review` (the 403 branch around the
-`_fetch_current_pr` call) and is pinned by
-`test_hot_review_pr_read_403_completes_check_without_redrive` in
-`services/webhook/tests/test_rerun.py`.
+Elder logs `elder_pr_read_forbidden` when GitHub denies its initial
+`GET /repos/<owner>/<repo>/pulls/<n>` after one token refresh. The event includes
+`install_id`, `repo`, `pr`, `head_sha`, `status`, and `github_request_id`.
+The job ends as `pr_read_forbidden` without calling a model. When the job
+has a queued head, Elder posts a failing check on that commit. If that
+check fails to publish, the queue retries the job. Jobs without a queued
+head record the denial in the log.
 
-Because other calls on the same repo can still succeed (models reached,
-other passes ran), the denial is specific to this read. Check in order:
+The original incident's specific cause is unconfirmed. Ask the owner of
+the installation identified by `install_id` to open its GitHub App
+configuration, confirm the affected repository is selected, and accept any
+pending **Pull requests** permission grant. See [App permissions](app-permissions.md).
 
-1. App installation coverage: in the installation's settings on GitHub,
-   confirm the repository is selected (or "All repositories" is on). A
-   private repo added after install is not covered by a "selected
-   repositories" installation.
-2. App permissions: `pull_requests` must be granted (see
-   `docs/app-permissions.md`). A permission change waits for the owner to
-   accept the new permissions on the installation; until then reads fail 403.
-3. Repository rules or an organization SAML/IP allow list that blocks the
-   App's installation token.
-
-Operator step once fixed: re-run Elder on the pull request (`/grug improve`).
+If the settings already grant access, reproduce the same GET from the
+consumer's network using `get_install_token(install_id, force_refresh=True)`
+with the default review purpose. Record the response status, GitHub request
+ID, and `X-Accepted-GitHub-Permissions` header in the private incident record.
+Use those details to check the token grant and the organization's IP policy
+with the installation owner. After the GET returns 200, comment
+`/grug improve` on the affected PR.
 
 ## Missed-delivery replay (#407)
 
