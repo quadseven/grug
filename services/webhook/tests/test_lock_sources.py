@@ -379,3 +379,35 @@ def test_non_lock_files_are_ignored():
         reviewed=frozenset({"src/app.py"}),
     )
     assert (check.findings, check.note, check.unreviewed) == ((), "", ())
+
+
+def test_more_lock_files_than_one_fetch_takes_are_all_read():
+    """infra PR 7173 changed 25 uv.lock files; the fetcher refuses more than 20
+    paths in one call, so the whole batch failed and every lock read as
+    "could not be read at head". The check reads them in batches instead."""
+    from personas.code_reviewer.lock_sources import FETCH_BATCH
+
+    paths = [f"stack{i}/uv.lock" for i in range(FETCH_BATCH + 5)]
+    calls = []
+
+    def fetch(batch, ref):
+        calls.append(len(batch))
+        if len(batch) > FETCH_BATCH:
+            raise RuntimeError("over the fetch cap")
+        text = _ROOT_UV + (_IDNA_37 if ref == "HEAD" else _IDNA_36)
+        return {p: text for p in batch}
+
+    diff = "".join(_diff(p, ["x"]) for p in paths)
+    check = lock_source_check(
+        parse_diff(diff), fetch=fetch, head_sha="HEAD", base_sha="BASE",
+        reviewed=frozenset(paths),
+    )
+    assert check.findings == ()
+    assert max(calls) <= FETCH_BATCH
+
+
+def test_the_lock_batch_fits_the_fetchers_cap():
+    from personas import review_publish
+    from personas.code_reviewer.lock_sources import FETCH_BATCH
+
+    assert FETCH_BATCH <= review_publish._MAX_CONTEXT_FILES
