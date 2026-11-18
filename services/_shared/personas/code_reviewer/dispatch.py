@@ -1812,6 +1812,7 @@ def _attach_linked_issue_context(
         ))
         _note_deferred_lint(pr_context, fetch_issue, owner=owner, repo_name=repo_name)
         _note_open_merge_holds(pr_context, fetch_issue, owner=owner, repo_name=repo_name)
+        live_criteria_count: list[int] = []
         linked = build_linked_issue_context(
             str(pr_context.get("body") or ""),
             fetch_issue=fetch_issue,
@@ -1821,7 +1822,13 @@ def _attach_linked_issue_context(
                 installation_id=installation_id, owner=owner, repo=repo_name,
                 pr_number=int(pr_context.get("pr_number") or 0),
             ),
+            live_criteria_count=live_criteria_count,
         )
+        if sum(live_criteria_count):
+            pr_context["linked_issue_live_criteria_count"] = sum(live_criteria_count)
+            pr_context["linked_issue_numbers"] = linked_issue_numbers(
+                str(pr_context.get("body") or ""), owner=owner, repo=repo_name,
+            )
         if linked:
             pr_context["linked_issue_context"] = linked
     except Exception as e:  # noqa: BLE001 - additive; never break the review
@@ -1850,17 +1857,24 @@ def _pinned_issues(
     ))
 
 
-def _linked_issue_summary_note(linked_context: str) -> str:
+def _linked_issue_summary_note(
+    linked_context: str, live_count: int = 0, linked_numbers: tuple[int, ...] = (),
+) -> str:
     """Summarize which linked issue criteria were included in the review."""
     criteria = rendered_criteria(linked_context)
-    if not criteria:
+    if not criteria and not live_count:
         return ""
-    issue_numbers = list(dict.fromkeys(issue for issue, _, _ in criteria))
-    return (
+    issue_numbers = list(dict.fromkeys(
+        linked_numbers or [issue for issue, _, _ in criteria],
+    ))
+    summary = (
         "\n\nLinked issue criteria read: "
         + ", ".join(f"#{number}" for number in issue_numbers)
-        + f" ({len(criteria)} criteria)."
+        + f" ({len(criteria)} criteria"
     )
+    if live_count:
+        summary += f"; {live_count} live criteria left for after deploy"
+    return summary + ")."
 
 
 def _pr_labels(pr: dict[str, Any]) -> frozenset[str]:
@@ -3334,6 +3348,8 @@ def dispatch_code_review(
     summary += lock_check.note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
+        int(pr_context.get("linked_issue_live_criteria_count") or 0),
+        tuple(pr_context.get("linked_issue_numbers") or ()),
     )
     summary += installation_permission_summary_note(installation_id)
     conclusion, title, summary, listed_threads, carried_blocking = _carry_into_check(
@@ -5482,6 +5498,8 @@ def _async_deep_append_if_needed(
     summary += config_note
     summary += _linked_issue_summary_note(
         str(pr_context.get("linked_issue_context") or ""),
+        int(pr_context.get("linked_issue_live_criteria_count") or 0),
+        tuple(pr_context.get("linked_issue_numbers") or ()),
     )
     title = f"{ADVISORY_TITLE if outage.advisory else title} (deep append)"
     # The author-facing distinction #848 asks for: "the reasoner ran and

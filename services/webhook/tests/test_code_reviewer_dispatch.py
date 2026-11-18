@@ -451,6 +451,14 @@ def test_intent_paragraph_is_first_and_sensitive_is_explicit():
     assert "acceptance criteria were checked" in paragraph
 
 
+def test_linked_issue_summary_reports_live_criteria_left_for_after_deploy():
+    note = cr_dispatch._linked_issue_summary_note(
+        "### LINKED ISSUE ACCEPTANCE CRITERIA\n#904 criterion 1 [open]: ordinary",
+        live_count=2,
+    )
+    assert "#904 (1 criteria; 2 live criteria left for after deploy)." in note
+
+
 def test_pr_labels_normalises_and_skips_malformed():
     """#1174: label parsing lifted out of dispatch_code_review."""
     pr = {"labels": [{"name": " Class:Sensitive "}, "bare-string", {"name": None}]}
