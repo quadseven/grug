@@ -425,6 +425,26 @@ def _removed_code_stems(by_file: dict[str, list[DiffHunk]]) -> frozenset[str]:
     return frozenset(stems)
 
 
+def _hunk_definitions(hunk: DiffHunk) -> tuple[set[str], list[str]]:
+    """Names a hunk keeps or adds, and names it deletes from a complete hunk."""
+    lines = hunk.body.splitlines()[1:]
+    complete = not any(_incomplete(raw) for raw in lines)
+    surviving: set[str] = set()
+    removed: list[str] = []
+    for raw in lines:
+        if len(raw) > _MAX_LINE:
+            continue
+        code = raw[1:]
+        definition = _DEF_RE.match(code) or _CLASS_RE.match(code) or _CONSTANT_RE.match(code)
+        if not definition:
+            continue
+        if raw.startswith((" ", "+")):
+            surviving.add(definition[1])
+        elif complete and raw.startswith("-"):
+            removed.append(definition[1])
+    return surviving, removed
+
+
 def _removed_symbols(by_file: dict[str, list[DiffHunk]]) -> dict[str, str]:
     """Definitions deleted from production Python, excluding ones reintroduced."""
     removed: dict[str, str] = {}
@@ -434,18 +454,9 @@ def _removed_symbols(by_file: dict[str, list[DiffHunk]]) -> dict[str, str]:
             continue
         module = path.rsplit("/", 1)[-1].removesuffix(".py")
         for hunk in hunks:
-            lines = hunk.body.splitlines()[1:]
-            complete = not any(_incomplete(raw) for raw in lines)
-            for raw in lines:
-                if len(raw) > _MAX_LINE:
-                    continue
-                code = raw[1:]
-                definition = _DEF_RE.match(code) or _CLASS_RE.match(code) or _CONSTANT_RE.match(code)
-                if definition:
-                    if raw.startswith((" ", "+")):
-                        surviving.add(definition[1])
-                    elif complete and raw.startswith("-"):
-                        removed[definition[1]] = module
+            kept, deleted = _hunk_definitions(hunk)
+            surviving |= kept
+            removed.update(dict.fromkeys(deleted, module))
     return {name: module for name, module in removed.items() if name not in surviving}
 
 
