@@ -423,9 +423,8 @@ def _launcher_fails(argv, **kw):
 def launcher_env(monkeypatch):
     from personas.code_reviewer import analyzer_sandbox as sb
     monkeypatch.setenv("GRUG_ANALYZER_SANDBOX", "/launcher")
-    sb.reset_sandbox_state()
+    monkeypatch.setattr(sb, "_state", None)
     yield sb
-    sb.reset_sandbox_state()
 
 
 def test_run_analyzer_raises_sandbox_unavailable_when_landlock_is_off(launcher_env):
@@ -493,7 +492,6 @@ def test_probe_needs_nothing_without_a_launcher(monkeypatch):
     from personas.code_reviewer import analyzer_sandbox as sb
     monkeypatch.delenv("GRUG_ANALYZER_SANDBOX", raising=False)
     monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
-    sb.reset_sandbox_state()
+    monkeypatch.setattr(sb, "_state", None)
     st = sb.sandbox_state()
     assert (st.required, st.available) == (False, True)
-    sb.reset_sandbox_state()

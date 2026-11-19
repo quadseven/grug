@@ -166,13 +166,6 @@ def sandbox_state(*, refresh: bool = False) -> SandboxState:
         return _state
 
 
-def reset_sandbox_state() -> None:
-    """Test hook: forget the cached probe."""
-    global _state
-    with _state_lock:
-        _state = None
-
-
 def sandbox_env(home: str, extra: dict[str, str] | None = None) -> dict[str, str]:
     """The whole environment of an analyzer subprocess.
 
