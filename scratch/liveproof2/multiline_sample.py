@@ -11,12 +11,20 @@ def read_settings(path):
     return settings
 
 
-def read_many(paths):
-    """Load several JSON settings files."""
-    results = []
-    for path in paths:
-        handle = open(path)
-        raw = handle.read()
-        parsed = json.loads(raw)
-        results.append(parsed)
-    return results
+def average_score(scores):
+    """Return the mean of the scores, or 0.0 when there are none."""
+    total = 0
+    for score in scores:
+        total += score
+    mean = total / len(scores)
+    return mean
+
+
+def first_even(numbers):
+    """Return the first even number, or None."""
+    found = None
+    for number in numbers:
+        if number % 2 == 1:
+            found = number
+            break
+    return found
