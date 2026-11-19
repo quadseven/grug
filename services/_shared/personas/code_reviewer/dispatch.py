@@ -187,7 +187,8 @@ from personas.code_reviewer.elder_review import review_freshness_id_from_pr
 from personas.code_reviewer import carry_forward, carry_verdict, hunt_link, living_review
 from personas.hunt_recorder import PrRef, now as hunt_now
 from personas.code_reviewer.outage_advisory import (
-    ADVISORY_TITLE, advisory_summary, observe as _observe_outage,
+    ADVISORY_TITLE, advisory_summary, classify as _classify_outage,
+    observe as _observe_outage,
 )
 from personas.code_reviewer.degraded_gate import (
     alert_operator_could_not_review, could_not_review_sentence,
@@ -6136,19 +6137,22 @@ def _hold_for_rerun(evaluation: CodeReviewEvaluation, blocking: bool) -> bool:
     usually repaired.
 
     A partial review (a cohort failed or was never walked) and a
-    low-confidence review publish real findings, so they wait only where
-    their degraded check would fail closed (#1212, BLOCK mode), and only
-    when the pass found nothing blocking. A blocking finding is a real
-    verdict, which a full review would publish too, so it fails now and
-    nothing is re-run."""
+    low-confidence review publish real findings, and wait only when the
+    pass found nothing blocking: a blocking finding is a real verdict,
+    which a full review would publish too, so it fails now and nothing is
+    re-run. On a blocking repo they always wait (#1212: their degraded
+    check would fail closed). In WARN mode they wait only when a failing
+    backend caused them (`outage_advisory.classify` says `outage`), the
+    transient case a re-run can repair; a partial review of a diff too big
+    for the budget is not transient, so it publishes at once, as before.
+    Either way the degraded notice goes out once, on the last scheduled
+    delivery, never ahead of a re-run that is still owed (grug#818)."""
     reason = evaluation.degraded_reason
     if reason in RETRIED_DEGRADATIONS:
         return True
-    return (
-        blocking
-        and reason in PUBLISHABLE_DEGRADATIONS
-        and evaluation.conclusion != "failure"
-    )
+    if reason not in PUBLISHABLE_DEGRADATIONS or evaluation.conclusion == "failure":
+        return False
+    return blocking or _classify_outage(reason, evaluation.coverage) == "outage"
 
 
 def _alert_if_no_review(evaluation: CodeReviewEvaluation, pr: str) -> None:
