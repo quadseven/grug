@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import boto3
 import psycopg
@@ -69,6 +69,23 @@ _PG_CONNECT_TIMEOUT_S = 2
 class ReadinessReport:
     ready: bool
     deps: dict  # dependency name -> reachable bool
+    # Informational state that never gates readiness: a pod whose analyzer
+    # sandbox cannot start still serves everything else (#1576).
+    advisory: dict = field(default_factory=dict)
+
+
+def _sandbox_advisory() -> dict:
+    """Analyzer-sandbox state for /readyz. Never raises, never gates."""
+    try:
+        from personas.code_reviewer.analyzer_sandbox import sandbox_state
+
+        st = sandbox_state()
+        return {"analyzer_sandbox": {
+            "required": st.required, "available": st.available, "detail": st.detail,
+        }}
+    except Exception as e:  # noqa: BLE001 - advisory only
+        log.warning("analyzer_sandbox_probe_failed", extra={"err": str(e)})
+        return {}
 
 
 def _check_ssm_auth() -> None:
@@ -136,7 +153,8 @@ def check_readiness(*, now=time.monotonic) -> ReadinessReport:
                 extra={"dependency": name, "err": str(e)},
             )
             deps[name] = False
-    report = ReadinessReport(ready=all(deps.values()), deps=deps)
+    report = ReadinessReport(
+        ready=all(deps.values()), deps=deps, advisory=_sandbox_advisory())
     _cache["at"] = t
     _cache["report"] = report
     return report

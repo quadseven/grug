@@ -99,6 +99,7 @@ def readyz(response: Response) -> dict[str, object]:
         "status": "ready" if rep.ready else "not_ready",
         "service": "grug-api",
         "deps": rep.deps,
+        "advisory": rep.advisory,
     }
 
 

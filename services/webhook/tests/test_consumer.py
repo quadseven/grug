@@ -1576,3 +1576,16 @@ def test_terminal_failure_ignores_a_body_the_protocol_rejects(monkeypatch):
         spec, _dlq_message(5, schema_version=9), RuntimeError("x"),
     )
     assert called == []
+
+
+def test_startup_check_probes_the_analyzer_sandbox_without_failing(monkeypatch):
+    import readiness
+    from personas.code_reviewer import analyzer_sandbox as sb
+    monkeypatch.setattr(
+        readiness, "check_readiness",
+        lambda: readiness.ReadinessReport(ready=True, deps={"ssm_auth": True, "postgres": True}),
+    )
+    calls = []
+    monkeypatch.setattr(sb, "sandbox_state", lambda: calls.append(1) or sb.SandboxState(True, False, "x"))
+    consumer._startup_check()  # an unavailable sandbox must not stop the consumer
+    assert calls

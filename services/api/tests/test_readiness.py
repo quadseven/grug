@@ -166,3 +166,16 @@ def test_readiness_probe_never_decrypts(monkeypatch):
 
     assert seen["WithDecryption"] is False, "readiness probe must not bill a KMS request"
     assert seen["Name"] == "/grug/github-app-id"
+
+
+def test_sandbox_state_is_advisory_and_never_gates_readiness(monkeypatch):
+    from personas.code_reviewer import analyzer_sandbox as sb
+    monkeypatch.setattr(readiness, "_check_ssm_auth", _ok)
+    monkeypatch.setattr(readiness, "_check_postgres", _ok)
+    monkeypatch.setattr(
+        sb, "sandbox_state",
+        lambda: sb.SandboxState(True, False, "landlock_create_ruleset: Operation not supported"),
+    )
+    rep = check_readiness()
+    assert rep.ready is True
+    assert rep.advisory["analyzer_sandbox"]["available"] is False

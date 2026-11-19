@@ -24,12 +24,18 @@ get them:
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
+import threading
 from collections.abc import Iterator
+from dataclasses import dataclass
+
+log = logging.getLogger("grug.code_reviewer.analyzer_sandbox")
 
 # Only what a statically linked or bundled-interpreter binary needs to start.
 # PATH finds the binary; the locale keys stop opengrep's bundled Python from
@@ -60,6 +66,113 @@ class AnalyzerSkip(Exception):
     skip and the review goes on."""
 
 
+# The reason an analyzer skip carries when the kernel boundary cannot start.
+SANDBOX_UNAVAILABLE = "sandbox unavailable"
+
+# What the launcher prints (and exits 2 with) when it cannot install a kernel
+# restriction. Landlock calls are named landlock_*; the other two are the
+# no-new-privs prctl and the seccomp filter load.
+_LAUNCHER_FAILURES = ("landlock_", "PR_SET_NO_NEW_PRIVS", "could not install analyzer seccomp")
+
+
+class SandboxUnavailable(AnalyzerSkip):
+    """The launcher could not install Landlock or seccomp on this kernel.
+
+    Fail closed on purpose (#1576): the analyzer is NOT run without the
+    boundary. It is an `AnalyzerSkip`, so the runner records a skip, but the
+    reason names the sandbox instead of a bare "error"."""
+
+
+def _launcher_failure(proc: subprocess.CompletedProcess[str]) -> str | None:
+    """The launcher's own failure line, or None when the engine ran (or failed
+    for its own reasons, which are not the sandbox's)."""
+    if proc.returncode != 2:
+        return None
+    for line in (proc.stderr or "").splitlines():
+        if line.startswith(_LAUNCHER_FAILURES):
+            return line.strip()[:200]
+    return None
+
+
+def _launcher_path() -> str | None:
+    launcher = os.getenv("GRUG_ANALYZER_SANDBOX")
+    if not launcher and os.getenv("KUBERNETES_SERVICE_HOST"):
+        launcher = "/usr/local/bin/grug-analyzer-sandbox"
+    return launcher or None
+
+
+@dataclass(frozen=True)
+class SandboxState:
+    """Whether the kernel boundary works on this host.
+
+    `required` is False where no launcher is configured (source test runs):
+    nothing to probe, and `available` is then True."""
+    required: bool
+    available: bool
+    detail: str = ""
+
+
+_state_lock = threading.Lock()
+_state: SandboxState | None = None
+
+
+def probe_sandbox() -> SandboxState:
+    """Start the launcher on a harmless binary and report whether it worked.
+
+    Never raises. A kernel property does not change while the process lives,
+    so callers use `sandbox_state()`, which caches this."""
+    launcher = _launcher_path()
+    if not launcher:
+        return SandboxState(required=False, available=True, detail="no launcher configured")
+    probe_bin = shutil.which("true") or sys.executable
+    try:
+        with tempfile.TemporaryDirectory(prefix="grug-sandbox-probe-") as tmp:
+            scan, scratch = os.path.join(tmp, "scan"), os.path.join(tmp, "scratch")
+            os.makedirs(scan)
+            os.makedirs(scratch)
+            args = [] if probe_bin != sys.executable else ["-c", "pass"]
+            proc = subprocess.run(
+                [launcher, scan, scratch, "-", os.path.abspath(probe_bin), *args],
+                env={"PATH": os.environ.get("PATH", _DEFAULT_PATH)},
+                stdin=subprocess.DEVNULL, close_fds=True, capture_output=True,
+                text=True, check=False, timeout=15,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return SandboxState(True, False, f"launcher did not run: {type(exc).__name__}")
+    if proc.returncode == 0:
+        return SandboxState(required=True, available=True, detail="ok")
+    detail = _launcher_failure(proc) or (
+        f"probe exited {proc.returncode}: " + (proc.stderr or "").strip()[:150])
+    return SandboxState(required=True, available=False, detail=detail)
+
+
+def sandbox_state(*, refresh: bool = False) -> SandboxState:
+    """The cached probe result. The first call logs one line: INFO when the
+    boundary works, ERROR when it cannot start (every analyzer will then be
+    skipped, so this must not go unnoticed)."""
+    global _state
+    with _state_lock:
+        if _state is None or refresh:
+            _state = probe_sandbox()
+            if _state.required and not _state.available:
+                log.error(
+                    "analyzer_sandbox_unavailable: EVERY analyzer (ruff, opengrep) "
+                    "will be skipped on this host until the kernel supports the "
+                    "sandbox",
+                    extra={"detail": _state.detail},
+                )
+            elif _state.required:
+                log.info("analyzer_sandbox_ready")
+        return _state
+
+
+def reset_sandbox_state() -> None:
+    """Test hook: forget the cached probe."""
+    global _state
+    with _state_lock:
+        _state = None
+
+
 def sandbox_env(home: str, extra: dict[str, str] | None = None) -> dict[str, str]:
     """The whole environment of an analyzer subprocess.
 
@@ -79,9 +192,7 @@ def run_analyzer(
     rules_dir: str | None = None, cwd: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an engine, requiring the OS launcher in the image and in Kubernetes."""
-    launcher = os.getenv("GRUG_ANALYZER_SANDBOX")
-    if not launcher and os.getenv("KUBERNETES_SERVICE_HOST"):
-        launcher = "/usr/local/bin/grug-analyzer-sandbox"
+    launcher = _launcher_path()
     if not launcher:
         return subprocess.run(
             argv, cwd=cwd, env=env, timeout=timeout, capture_output=True,
@@ -96,11 +207,16 @@ def run_analyzer(
         command = [
             launcher, scan_root, scratch, rules_dir or "-", os.path.abspath(engine), *argv[1:],
         ]
-        return subprocess.run(
+        proc = subprocess.run(
             command, cwd=cwd, env=child_env, timeout=timeout,
             stdin=subprocess.DEVNULL, close_fds=True, capture_output=True,
             text=True, check=False,
         )
+    failure = _launcher_failure(proc)
+    if failure:
+        log.warning("analyzer_sandbox_launch_failed", extra={"detail": failure})
+        raise SandboxUnavailable(SANDBOX_UNAVAILABLE)
+    return proc
 
 
 def _chmod_tree(root: str, file_mode: int, dir_mode: int) -> None:

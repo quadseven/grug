@@ -29,7 +29,7 @@ from typing import Optional
 from llm_client import _cave_judge_config, FindingJudgement, Hunk, JudgeFindingRepr, PrContext, judge_findings
 from review_evidence import assemble_evidence, without_author_text
 
-from .analyzer_sandbox import read_only_tree, run_analyzer, sandbox_env, without_engine_config
+from .analyzer_sandbox import SandboxUnavailable, read_only_tree, run_analyzer, sandbox_env, without_engine_config
 from .complexity import _changed_by_file
 from .diff_parser import added_lines, DiffHunk
 from .persona import Finding
@@ -295,6 +295,10 @@ def scan_opengrep(
             # make the scanner unusable - but never stay silent about reduced
             # coverage.
             _log_unscanned_files(data, tmp_prefix, set(kept_files))
+    except SandboxUnavailable:
+        # Fail closed (#1576): no scan without the kernel boundary.
+        log.warning("sast_opengrep_sandbox_unavailable")
+        return ()
     except FileNotFoundError:
         log.warning("sast_opengrep_binary_missing")
         return ()
