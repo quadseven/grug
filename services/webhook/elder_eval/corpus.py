@@ -17,9 +17,9 @@ import json
 import logging
 import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 # Deliberate private import: the eval must bridge onto Elder's REAL closed
 # taxonomy, not a copy that drifts (same rationale as the SAST runner
@@ -30,6 +30,7 @@ from ledger import TELEMETRY_REVIEWERS, LedgerRow, parse_row
 log = logging.getLogger("grug.elder_eval")
 
 _NORM_RE = re.compile(r"[^a-z0-9]+")
+_REPO_REF_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 def normalize_class(label: str) -> str:
@@ -138,6 +139,10 @@ class EvalCase:
     runner skips replaying it and `scoring.score` reports it separately
     from `errored_cases`, so a stable, already-diagnosed corpus problem
     stops being re-flagged as if it were new.
+
+    `clean_control`: an explicitly selected reviewed PR with no escape.
+    Known accepted classes remain catch targets; emissions in other classes
+    count as noise.
     """
 
     repo: str
@@ -150,6 +155,7 @@ class EvalCase:
     anchor_fix_commit: str | None = None
     unresolvable_reason: str | None = None
     fixture: EvalFixture | None = None
+    clean_control: bool = False
 
     @property
     def case_id(self) -> str:
@@ -160,11 +166,16 @@ class EvalCase:
     @property
     def scorable(self) -> bool:
         """Worth an LLM call: contributes to catch or noise denominators."""
-        return bool(self.fixture or self.expected_classes or self.fp_only_classes)
+        return bool(
+            self.fixture or self.expected_classes or self.fp_only_classes
+            or self.clean_control
+        )
 
     @property
     def clean(self) -> bool:
-        return self.fixture is not None and not self.expected_classes
+        return not self.expected_classes and (
+            self.clean_control or self.fixture is not None
+        )
 
     @property
     def cross_file_contents(self) -> dict[str, str] | None:
@@ -222,8 +233,55 @@ def _case_anchor(rows: list[LedgerRow]) -> tuple[str | None, str | None]:
     return head_sha, (fix_commit if head_sha is None else None)
 
 
-def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
-    """Group ledger rows into per-(repo, pr) EvalCases, (repo, pr)-sorted.
+def parse_control_refs(text: str) -> tuple[tuple[str, int], ...]:
+    """Parse a JSONL list of clean PR controls as ``(repo, pr)`` pairs.
+
+    Each non-empty line is an object with a non-empty ``repo`` string and a
+    positive integer ``pr``. Duplicate pairs are collapsed in first-seen
+    order. Invalid rows fail with their line number so a typo cannot silently
+    remove a control from the replay denominator.
+    """
+    controls: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for line_number, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"clean-control JSONL line {line_number} is not valid JSON"
+            ) from exc
+        if not isinstance(value, dict):
+            raise TypeError(
+                f"clean-control JSONL line {line_number} must be an object"
+            )
+        repo = value.get("repo")
+        pr = value.get("pr")
+        if (
+            not isinstance(repo, str) or not _REPO_REF_RE.fullmatch(repo.strip())
+            or not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0
+        ):
+            raise ValueError(
+                f"clean-control JSONL line {line_number} needs a repo and a "
+                "positive integer pr"
+            )
+        pair = (repo.strip(), pr)
+        if pair not in seen:
+            seen.add(pair)
+            controls.append(pair)
+    return tuple(controls)
+
+
+def build_cases(
+    rows: Iterable[LedgerRow], *,
+    clean_controls: Iterable[tuple[str, int]] = (),
+) -> tuple[EvalCase, ...]:
+    """Group ledger rows and clean controls into sorted per-PR eval cases.
+
+    A control may also have ledger rows: accepted classes stay catch targets
+    and false-positive classes stay noise targets. A control without rows is
+    still scorable, so the replay can measure unexpected findings on it.
 
     Rows with NO pr number are dropped here, and that is a real distinction
     rather than a tidy-up. `LedgerRow.pr` became optional in #764 so that
@@ -264,14 +322,27 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
             dropped,
         )
 
+    control_keys = set(clean_controls)
     cases: list[EvalCase] = []
-    for repo, pr in sorted(grouped):
+    for repo, pr in sorted(set(grouped) | control_keys):
+        key = (repo, pr)
+        if key not in grouped:
+            cases.append(EvalCase(
+                repo=repo,
+                pr=pr,
+                expected_classes={},
+                fp_only_classes=frozenset(),
+                out_of_taxonomy={},
+                unknown_verdicts={},
+                clean_control=True,
+            ))
+            continue
         expected: dict[str, frozenset[str]] = {}
         out_of_taxonomy: Counter[str] = Counter()
         unknown_verdicts: Counter[str] = Counter()
         fp_elder: set[str] = set()
         accepted_elder: set[str] = set()
-        for r in grouped[(repo, pr)]:
+        for r in grouped[key]:
             norm = normalize_class(r.finding_class)
             elder = expected_elder_classes(norm)
             if r.accepted:
@@ -290,7 +361,7 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
                 # must not vanish - a mislabeled corpus that yields zero
                 # expected cells needs to say WHY.
                 unknown_verdicts[r.verdict] += 1
-        anchor_head_sha, anchor_fix_commit = _case_anchor(grouped[(repo, pr)])
+        anchor_head_sha, anchor_fix_commit = _case_anchor(grouped[key])
         cases.append(
             EvalCase(
                 repo=repo,
@@ -303,7 +374,8 @@ def build_cases(rows: Iterable[LedgerRow]) -> tuple[EvalCase, ...]:
                 anchor_fix_commit=anchor_fix_commit,
                 out_of_taxonomy=dict(out_of_taxonomy),
                 unknown_verdicts=dict(unknown_verdicts),
-                unresolvable_reason=_KNOWN_UNRESOLVABLE_CASES.get((repo, pr)),
+                unresolvable_reason=_KNOWN_UNRESOLVABLE_CASES.get(key),
+                clean_control=key in control_keys,
             )
         )
     return tuple(cases)

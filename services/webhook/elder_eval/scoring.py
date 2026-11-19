@@ -23,8 +23,8 @@ Metrics:
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
 
 from .corpus import EvalCase
 
@@ -228,9 +228,22 @@ def score(
             expected_cells[ledger_cls] += 1
             if emitted_classes & elder_set:
                 caught_cells[ledger_cls] += 1
+        expected_elder_classes = {
+            elder_class
+            for elder_classes in case.expected_classes.values()
+            for elder_class in elder_classes
+        }
         for elder_cls, n in replay.emitted.items():
             total_emitted += n
-            if case.clean or elder_cls in case.fp_only_classes:
+            clean_fixture = case.fixture is not None and not case.expected_classes
+            unexpected_control_class = (
+                case.clean_control and elder_cls not in expected_elder_classes
+            )
+            if (
+                clean_fixture
+                or elder_cls in case.fp_only_classes
+                or unexpected_control_class
+            ):
                 noise += n
 
     per_class = {
