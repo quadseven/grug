@@ -91,7 +91,7 @@ from personas.code_reviewer.verify_only import is_summary_only
 from .corpus import (
     build_cases,
     load_fixture_cases,
-    parse_clean_controls,
+    parse_control_refs,
     rows_from_store,
 )
 from .gate import (
@@ -354,7 +354,7 @@ def _load_corpus(args):
         else parse_jsonl(Path(args.jsonl).read_text())
     )
     controls = (
-        parse_clean_controls(Path(args.clean_controls_jsonl).read_text())
+        parse_control_refs(Path(args.clean_controls_jsonl).read_text())
         if args.clean_controls_jsonl else ()
     )
     all_cases = build_cases(rows, clean_controls=controls)

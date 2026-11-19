@@ -233,7 +233,7 @@ def _case_anchor(rows: list[LedgerRow]) -> tuple[str | None, str | None]:
     return head_sha, (fix_commit if head_sha is None else None)
 
 
-def parse_clean_controls(text: str) -> tuple[tuple[str, int], ...]:
+def parse_control_refs(text: str) -> tuple[tuple[str, int], ...]:
     """Parse a JSONL list of clean PR controls as ``(repo, pr)`` pairs.
 
     Each non-empty line is an object with a non-empty ``repo`` string and a

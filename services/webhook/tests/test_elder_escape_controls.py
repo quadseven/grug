@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from elder_eval import __main__ as cli
-from elder_eval.corpus import build_cases, parse_clean_controls
+from elder_eval.corpus import build_cases, parse_control_refs
 from elder_eval.scoring import CaseReplay, score
 from ledger import LedgerRow
 
@@ -12,7 +12,7 @@ _REPO = "example/project"
 
 
 def test_clean_controls_are_replayable_and_all_emissions_count_as_noise():
-    controls = parse_clean_controls('{"repo":"example/project","pr":17}\n')
+    controls = parse_control_refs('{"repo":"example/project","pr":17}\n')
     (case,) = build_cases([], clean_controls=controls)
 
     assert (case.repo, case.pr) == (_REPO, 17)
@@ -37,7 +37,7 @@ def test_clean_controls_are_replayable_and_all_emissions_count_as_noise():
 
 def test_clean_control_input_rejects_malformed_rows():
     with pytest.raises(ValueError, match="line 1"):
-        parse_clean_controls('{"repo":"example/project","pr":"bad"}\n')
+        parse_control_refs('{"repo":"example/project","pr":"bad"}\n')
 
 
 def test_replay_cli_loads_clean_control_jsonl(tmp_path):
