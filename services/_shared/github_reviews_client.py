@@ -83,6 +83,31 @@ class InlineComment:
             raise ValueError("InlineComment.path must be non-empty")
 
 
+@dataclass(frozen=True, kw_only=True)
+class SpanComment(InlineComment):
+    """An inline comment over several lines (#1759): `start_line` is the
+    first, `line` the last, both on the RIGHT side.
+
+    A separate class so `InlineComment`, and the one-line payload `asdict()`
+    builds from it, stay exactly as before. Both new fields are required and
+    never None, so `asdict()` cannot emit the null `start_line` GitHub reads
+    as a malformed anchor. `infra/scripts/attest_github_reviews_client.py`
+    pins this shape."""
+
+    start_line: int
+    start_side: Literal["RIGHT"] = "RIGHT"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not 1 <= self.start_line < self.line:
+            raise ValueError(
+                f"SpanComment.start_line must be >= 1 and before line "
+                f"(got {self.start_line} .. {self.line})"
+            )
+        if self.side != "RIGHT":
+            raise ValueError("SpanComment must anchor the RIGHT side")
+
+
 @dataclass(frozen=True)
 class ReviewResult:
     """A complete PR review payload — top-level body + inline comments.
@@ -99,7 +124,7 @@ class ReviewResult:
     commit_id: str
     event: ReviewEvent
     body: str
-    comments: tuple[InlineComment, ...]
+    comments: tuple[InlineComment | SpanComment, ...]
 
     def __post_init__(self) -> None:
         if self.event not in _VALID_EVENTS:
