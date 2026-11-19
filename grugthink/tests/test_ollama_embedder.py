@@ -70,7 +70,7 @@ class TestOllamaEmbedderTimeout:
 
 
 class TestOllamaEmbedderPriorityAndKeepAlive:
-    """quadseven/infra#1768/#1770/#1773 - live incident 2026-07-13: embedding
+    """Gateway priority tickets - live incident 2026-07-13: embedding
     calls sent no priority header (defaulted to batch) and no keep_alive, so
     they both queued behind unrelated chat generations on the shared gateway
     target AND paid a repeated cold-load tax. Both fixed at the request
