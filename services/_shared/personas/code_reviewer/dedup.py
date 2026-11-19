@@ -123,6 +123,11 @@ def prior_keys_from_comments(comments: list[dict]) -> set[str]:
             # dedup (the caller only catches httpx errors).
             continue
         keys.add(finding_key(path, line_int, rule))
+        # A multi-line suggestion (#1759) anchors a span and GitHub reports
+        # its LAST line as `line`; the finding sits anywhere inside it.
+        start = c.get("start_line") or c.get("original_start_line")
+        if isinstance(start, int) and 0 < line_int - start < 6:
+            keys.update(finding_key(path, n, rule) for n in range(start, line_int))
         if rule == "high-complexity":
             body = c.get("body", "") or ""
             function_match = (
