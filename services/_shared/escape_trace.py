@@ -111,6 +111,9 @@ class EscapeTrace:
     touching_findings: tuple[FindingRef, ...] = ()
     # Why nothing was traced, when escaped_pr is None.
     reason: str = ""
+    # Paths changed by both the escaped and correcting PRs. Empty means the
+    # trace has no shared-file evidence for classifying review visibility.
+    shared_files: tuple[str, ...] = ()
 
     @property
     def traced(self) -> bool:
@@ -199,4 +202,5 @@ def trace_escape(
         chain=tuple(chain),
         reverts_root=(len(chain) % 2 == 1) if kind in _REVERT_KINDS else None,
         touching_findings=touching,
+        shared_files=tuple(sorted(shared)),
     )
