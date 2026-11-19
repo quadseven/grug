@@ -17,7 +17,8 @@
 
 .PHONY: test webhook-test api-test pg-test pulumi-preview pulumi-up \
         tear-down rebuild smoke docker-build-webhook sast-benchmark \
-        review-latency elder-eval elder-eval-column scripts-test chief-check
+        sast-candidate-counts review-latency elder-eval elder-eval-column \
+        scripts-test chief-check
 
 # Admin seed values — the row (re)installed after a tear-down so the
 # allowlist gate works on the first PR after rebuild. NO DEFAULTS on
@@ -162,6 +163,13 @@ sast-benchmark:
 	cd services/webhook && PYTHONPATH=../_shared uv run --python 3.13 --with httpx --with pyjwt --with cryptography \
 		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
 		--with 'datadog-lambda>=6.107,<7' python -m sast_benchmark $(ARGS)
+
+# Count planted SAST fixtures by language before exploitability judging.
+# Requires opengrep on PATH; this reports candidates, not Guard findings.
+sast-candidate-counts:
+	cd services/webhook && PYTHONPATH=../_shared uv run --python 3.13 --with httpx --with pyjwt --with cryptography \
+		--with boto3 --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
+		--with 'datadog-lambda>=6.107,<7' python sast_candidate_counts.py
 
 # Elder review latency harness (#648). Live long-prefill concurrency sweep;
 # pure core is covered by webhook unit tests. Requires GRUG_BENCH_CAVE_URL+MODEL.

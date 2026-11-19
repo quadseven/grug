@@ -1307,7 +1307,7 @@ def test_review_llm_timeout_invalid_value_falls_back_to_default(monkeypatch) -> 
 def test_cave_calls_are_tagged_interactive_priority(monkeypatch) -> None:
     """Grug's own review ensemble (coder + reasoner arms) carries
     X-Spark-Priority: interactive so the spark-gateway priority queue
-    (quadseven/infra#1768) lets it jump ahead of Hermes's long agentic turns
+    (a gateway infra ticket) lets it jump ahead of Hermes's long agentic turns
     on the same shared, single-generation-slot Ollama target - the exact
     2026-07-12 incident this header exists to prevent. Deep depth so BOTH
     arms fire (see test_deep_review_consults_both_arms_and_merges_findings)
