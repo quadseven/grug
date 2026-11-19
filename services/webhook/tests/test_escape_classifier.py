@@ -4,7 +4,7 @@ from escape_classifier import (
     EscapeClass,
     ReviewRecord,
     ReviewSource,
-    classify_escape,
+    classify_review_outcome,
 )
 from escape_trace import EscapeTrace, FindingRef
 
@@ -42,21 +42,29 @@ def _finding(*, pr: int = 10, path: str = PATH, verdict: str = "") -> FindingRef
 
 def test_untraced_or_without_shared_paths_has_no_class():
     assert (
-        classify_escape(_trace(escaped_pr=None), findings=(), review_history=()) is None
+        classify_review_outcome(
+            _trace(escaped_pr=None), findings=(), review_history=()
+        )
+        is None
     )
     assert (
-        classify_escape(_trace(shared_files=()), findings=(), review_history=()) is None
+        classify_review_outcome(
+            _trace(shared_files=()), findings=(), review_history=()
+        )
+        is None
     )
 
 
 def test_no_review_of_escaped_pr_is_not_reviewed():
-    result = classify_escape(_trace(), findings=(), review_history=(_review(pr=11),))
+    result = classify_review_outcome(
+        _trace(), findings=(), review_history=(_review(pr=11),)
+    )
 
     assert result is EscapeClass.NOT_REVIEWED
 
 
 def test_review_that_did_not_see_a_shared_file_is_not_seen():
-    result = classify_escape(
+    result = classify_review_outcome(
         _trace(),
         findings=(),
         review_history=(_review(seen_paths=("README.md",)),),
@@ -66,13 +74,13 @@ def test_review_that_did_not_see_a_shared_file_is_not_seen():
 
 
 def test_elder_saw_shared_file_without_a_relevant_finding():
-    result = classify_escape(_trace(), findings=(), review_history=(_review(),))
+    result = classify_review_outcome(_trace(), findings=(), review_history=(_review(),))
 
     assert result is EscapeClass.SEEN_NOT_FLAGGED
 
 
 def test_dismissed_finding_is_flagged_dismissed():
-    result = classify_escape(
+    result = classify_review_outcome(
         _trace(),
         findings=(_finding(verdict="dismissed"),),
         review_history=(_review(),),
@@ -82,7 +90,7 @@ def test_dismissed_finding_is_flagged_dismissed():
 
 
 def test_rule_suppressed_finding_is_flagged_suppressed():
-    result = classify_escape(
+    result = classify_review_outcome(
         _trace(),
         findings=(_finding(verdict="suppressed-by-rule"),),
         review_history=(_review(),),
@@ -92,7 +100,7 @@ def test_rule_suppressed_finding_is_flagged_suppressed():
 
 
 def test_unclassified_finding_disposition_has_no_class():
-    result = classify_escape(
+    result = classify_review_outcome(
         _trace(),
         findings=(_finding(verdict="fixed"),),
         review_history=(_review(),),
@@ -102,7 +110,7 @@ def test_unclassified_finding_disposition_has_no_class():
 
 
 def test_deterministic_lane_that_saw_the_file_without_finding_is_a_miss():
-    result = classify_escape(
+    result = classify_review_outcome(
         _trace(),
         findings=(),
         review_history=(_review(source=ReviewSource.DETERMINISTIC_LANE),),
@@ -112,7 +120,7 @@ def test_deterministic_lane_that_saw_the_file_without_finding_is_a_miss():
 
 
 def test_unrelated_findings_and_reviews_do_not_change_the_class():
-    result = classify_escape(
+    result = classify_review_outcome(
         _trace(),
         findings=(_finding(pr=11), _finding(path="README.md")),
         review_history=(_review(pr=11),),

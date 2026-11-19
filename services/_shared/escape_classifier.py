@@ -40,7 +40,61 @@ def _verdict(value: str) -> str:
     return value.strip().casefold().replace("_", "-")
 
 
-def classify_escape(
+def _finding_disposition(
+    findings: Sequence[FindingRef],
+) -> tuple[bool, EscapeClass | None]:
+    verdicts = frozenset(_verdict(finding.verdict) for finding in findings)
+    classes = {
+        "dismissed": EscapeClass.FLAGGED_DISMISSED,
+        "suppressed-by-rule": EscapeClass.FLAGGED_SUPPRESSED_BY_RULE,
+    }
+    if not verdicts:
+        return True, None
+    if len(verdicts) != 1:
+        return False, None
+    verdict = next(iter(verdicts))
+    if verdict not in classes:
+        return False, None
+    return True, classes[verdict]
+
+
+def _seen_by_source(
+    reviews: Sequence[ReviewRecord], shared_files: frozenset[str],
+) -> dict[ReviewSource, frozenset[str]]:
+    seen = {source: set() for source in ReviewSource}
+    for record in reviews:
+        seen[record.source].update(set(record.seen_paths) & shared_files)
+    return {source: frozenset(paths) for source, paths in seen.items()}
+
+
+def _classify_reviewed_paths(
+    shared_files: frozenset[str],
+    findings: Sequence[FindingRef],
+    reviews: Sequence[ReviewRecord],
+) -> EscapeClass | None:
+    valid_disposition, disposition = _finding_disposition(findings)
+    if not valid_disposition:
+        return None
+    if disposition is not None:
+        return disposition
+
+    seen_by_source = _seen_by_source(reviews, shared_files)
+    seen_paths = frozenset().union(*seen_by_source.values())
+    seen_paths |= frozenset(finding.path for finding in findings)
+    if not seen_paths:
+        return EscapeClass.NOT_SEEN if reviews else EscapeClass.NOT_REVIEWED
+
+    deterministic_findings = frozenset(
+        finding.path
+        for finding in findings
+        if finding.reviewer.strip().casefold() == ReviewSource.DETERMINISTIC_LANE.value
+    )
+    if seen_by_source[ReviewSource.DETERMINISTIC_LANE] - deterministic_findings:
+        return EscapeClass.DETERMINISTIC_LANE_MISS
+    return EscapeClass.SEEN_NOT_FLAGGED
+
+
+def classify_review_outcome(
     trace: EscapeTrace,
     *,
     findings: Sequence[FindingRef],
@@ -64,47 +118,8 @@ def classify_escape(
         for finding in findings
         if finding.pr == escaped_pr and finding.path in shared_files
     )
-    verdicts = tuple(_verdict(finding.verdict) for finding in relevant_findings)
-    dispositions = {"dismissed", "suppressed-by-rule"}
-    if any(verdict not in dispositions for verdict in verdicts):
-        return None
-    if len(set(verdicts)) > 1:
-        return None
-
     if not reviews and not relevant_findings:
         return EscapeClass.NOT_REVIEWED
-
-    if "dismissed" in verdicts:
-        return EscapeClass.FLAGGED_DISMISSED
-
-    if "suppressed-by-rule" in verdicts:
-        return EscapeClass.FLAGGED_SUPPRESSED_BY_RULE
-
-    # Multiple runs of a source accumulate coverage.
-    seen_by_source = {
-        source: frozenset().union(
-            *(
-                frozenset(record.seen_paths) & shared_files
-                for record in reviews
-                if record.source is source
-            )
-        )
-        for source in ReviewSource
-    }
-
-    seen_paths = frozenset().union(*seen_by_source.values())
     # A finding itself proves that a review saw its path, even if an older
     # review snapshot did not retain its file list.
-    seen_paths |= frozenset(finding.path for finding in relevant_findings)
-    if not seen_paths:
-        return EscapeClass.NOT_SEEN if reviews else EscapeClass.NOT_REVIEWED
-
-    deterministic_findings = frozenset(
-        finding.path
-        for finding in relevant_findings
-        if finding.reviewer.strip().casefold() == ReviewSource.DETERMINISTIC_LANE.value
-    )
-    if seen_by_source[ReviewSource.DETERMINISTIC_LANE] - deterministic_findings:
-        return EscapeClass.DETERMINISTIC_LANE_MISS
-
-    return EscapeClass.SEEN_NOT_FLAGGED
+    return _classify_reviewed_paths(shared_files, relevant_findings, reviews)
