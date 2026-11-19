@@ -5659,6 +5659,41 @@ def test_failures_outside_the_window_do_not_accumulate(monkeypatch) -> None:
     assert not availability._model_is_benched("opencode-go", "space-bunny-free")
 
 
+_RESPONSE_FORMAT_MESSAGE = "Structured response_format is not enabled for model 'space-bunny-free'"
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_a_response_format_rejection_benches_the_model_on_the_first_call(monkeypatch, status) -> None:
+    # grug#1745: a model that rejects response_format will reject every review,
+    # so one refusal is enough; counting three more costs a call per review.
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    clock = [1000.0]
+    monkeypatch.setattr(lc.time, "time", lambda: clock[0])
+    cfg = _go_cfg()
+    assert "space-bunny-free" in _free_models()
+    _call(cfg, _err(status, _RESPONSE_FORMAT_MESSAGE))
+    assert availability._model_is_benched("opencode-go", "space-bunny-free")
+    assert "space-bunny-free" not in _free_models(), "the chain moves on to the next tier"
+    entry = availability._bench_state[("opencode-go", "space-bunny-free")]
+    assert entry.benched_until - clock[0] == availability._BENCH_BASE_SECONDS
+
+
+def test_a_response_format_bench_ends_when_it_expires(monkeypatch) -> None:
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    clock = [1000.0]
+    monkeypatch.setattr(lc.time, "time", lambda: clock[0])
+    _call(_go_cfg(), _err(400, _RESPONSE_FORMAT_MESSAGE))
+    clock[0] += availability._BENCH_BASE_SECONDS + 1
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
+    assert "space-bunny-free" in _free_models()
+
+
+def test_other_client_errors_still_wait_for_three_failures(monkeypatch) -> None:
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    _call(_go_cfg(), _err(400, "invalid temperature"))
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
+
+
 def test_a_success_unbenches_immediately(monkeypatch) -> None:
     cfg = _go_cfg()
     for _ in range(3):
