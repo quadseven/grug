@@ -158,3 +158,10 @@ def test_no_shared_files_means_no_findings():
     f = FindingRef(pr=10, path="a.py")
     t = trace_escape(fix, REPO, _sources([old, fix], findings={10: [f]}))
     assert t.traced and t.touching_findings == ()
+
+
+def test_ordinary_prose_without_a_pull_reference_does_not_link():
+    body = "This reverts the cache change. A regression in latency, see the dashboard. Fixes #"
+    fix = _pr(34, body=body, commit_messages=("Tidy up\n\nRegression-of: the parser",))
+    t = trace_escape(fix, REPO, _sources([_pr(10), fix]))
+    assert not t.traced and t.link is None
