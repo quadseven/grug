@@ -594,7 +594,7 @@ def test_epic_check_passes_for_a_ticket_with_a_native_parent():
     "- Part of #1",
     "Parent #1",
     "## Parent\n#1",
-    "Part of quadseven/infra#1",
+    "Part of quadseven/infra#1",  # leak-guard-allow: example of the cross-repo link shape the parser reads
 ])
 def test_epic_check_passes_for_a_body_link_the_hunt_collector_reads(body):
     r = check_linked_issue_in_epic("fixes #5", fetch_issue_facts=_fetcher(i5=_facts(5, body=body)))
