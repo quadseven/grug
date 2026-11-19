@@ -74,7 +74,7 @@ from llm_client import (
     review_cohort_char_budget,
     review_diff,
 )
-from personas.code_reviewer.diff_parser import parse_diff
+from personas.code_reviewer.diff_parser import fit_hunks_to_cohorts, parse_diff
 from personas.code_reviewer.finding_funnel import publish_funnel
 from personas.code_reviewer.judge import (
     falsification_verifier_enabled,
@@ -184,8 +184,16 @@ def _published_findings(
 
 
 def diff_to_hunks(diff_text: str) -> list[Hunk]:
-    """Unified diff -> Elder's Hunk units, via the production diff parser."""
-    return [Hunk(path=h.file_path, body=h.body) for h in parse_diff(diff_text)]
+    """Unified diff -> Elder's Hunk units, via the production diff parser.
+
+    Hunks bigger than one cohort go through the SAME preparation step live
+    Elder runs (`fit_hunks_to_cohorts`, #1747): split into line-anchored
+    pieces within the bounds, otherwise kept whole so `run_case` refuses the
+    case instead of scoring a partial read."""
+    fitted, _split, _oversized = fit_hunks_to_cohorts(
+        parse_diff(diff_text), review_cohort_char_budget(), drop_oversized=False,
+    )
+    return [Hunk(path=h.file_path, body=h.body) for h in fitted]
 
 
 def bounded_hunks(
