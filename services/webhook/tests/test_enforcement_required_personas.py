@@ -39,6 +39,18 @@ from personas.tribe import (
     LEGACY_CHECK_ELDER,
 )
 
+APP_ID = 424242
+
+
+@pytest.fixture(autouse=True)
+def _app_id():
+    """The App's own id, as enforcement reads it from the App configuration."""
+    # The pin pass is covered in test_enforcement_pin.py; here it is stubbed so
+    # these tests keep asserting the one PUT they were written for.
+    with patch("enforcement.pin_grug_checks"), patch("enforcement._grug_app_id", return_value=APP_ID):
+        yield
+
+
 ELDER_BLOCK = {"code_reviewer_enabled": True, "code_reviewer_blocking": True}
 ELDER_WARN = {"code_reviewer_enabled": True, "code_reviewer_blocking": False}
 ELDER_OFF = {"code_reviewer_enabled": False, "code_reviewer_blocking": True}
@@ -122,6 +134,7 @@ def test_create_requires_elder_only_when_blocking(cfg, expected):
 
     mock_create.assert_called_once_with(
         "tok", "o", "r", GRUG_TPM_RULESET_NAME, expected,
+        integration_id=APP_ID,
     )
 
 

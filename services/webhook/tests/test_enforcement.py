@@ -23,6 +23,15 @@ from personas.tribe import CHECK_ELDER
 
 
 @pytest.fixture(autouse=True)
+def _app_id():
+    """The App's own id, as enforcement reads it from the App configuration."""
+    # The pin pass is covered in test_enforcement_pin.py; here it is stubbed so
+    # these tests keep asserting the one PUT they were written for.
+    with patch("enforcement.pin_grug_checks"), patch("enforcement._grug_app_id", return_value=424242):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _default_repo_config():
     """ensure_enforcement reads the repo's persona modes (grug#1202) to pick
     the ruleset's required contexts. These lifecycle tests predate that and
@@ -54,6 +63,7 @@ def test_ensure_creates_ruleset_when_none():
     mock_create.assert_called_once_with(
         "tok", "myorg", "myrepo", GRUG_TPM_RULESET_NAME,
         [GRUG_DOR_CHECK_NAME, CHECK_ELDER],
+        integration_id=424242,
     )
     mock_set.assert_called_once_with(100, 200, 42)
 

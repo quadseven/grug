@@ -72,6 +72,68 @@ def required_persona_checks(cfg: Mapping[str, Any]) -> list[str]:
     return out
 
 
+def _grug_app_id() -> int:
+    """This App's own numeric id, read the way the rest of the code reads it.
+    Required checks named "Grug - ..." are pinned to it so a same-named check
+    from any other App or workflow cannot satisfy the rule."""
+    from github_app_auth import get_app_id  # type: ignore
+    return int(get_app_id())
+
+
+def _is_grug_check(check: dict) -> bool:
+    name = _canonical(check)
+    return isinstance(name, str) and name.startswith("Grug - ")
+
+
+def pin_grug_checks(
+    install_token: str,
+    owner: str,
+    repo: str,
+    ruleset_id: int,
+) -> bool:
+    """Pin every required "Grug - ..." check on a Grug-managed ruleset to this
+    App's integration_id. An entry with no integration_id, or one naming a
+    different App, is rewritten; a Grug entry that already carries the right id
+    is left alone, and so is every non-Grug check and every other rule. Returns
+    True if it PUT an update."""
+    app_id = _grug_app_id()
+    ruleset = get_ruleset(install_token, owner, repo, ruleset_id)
+    new_rules: list[dict] = []
+    changed = False
+    for rule in ruleset.get("rules", []):
+        if rule.get("type") != "required_status_checks":
+            new_rules.append(rule)
+            continue
+        checks = rule.get("parameters", {}).get("required_status_checks", [])
+        fixed: list[dict] = []
+        seen: set[str] = set()
+        rule_changed = False
+        for c in checks:
+            if _is_grug_check(c):
+                if c.get("integration_id") != app_id:
+                    c = {**c, "integration_id": app_id}
+                    rule_changed = True
+                name = _canonical(c)
+                if name in seen:
+                    rule_changed = True  # the pin made it a duplicate
+                    continue
+                seen.add(name)
+            fixed.append(c)
+        if rule_changed:
+            changed = True
+            new_rules.append(_with_checks(rule, fixed))
+        else:
+            new_rules.append(rule)
+    if not changed:
+        return False
+    update_ruleset(install_token, owner, repo, ruleset_id, new_rules)
+    log.info(
+        "enforcement_grug_checks_pinned",
+        extra={"owner": owner, "repo": repo, "ruleset_id": ruleset_id},
+    )
+    return True
+
+
 def _with_checks(rule: dict, checks: list[dict]) -> dict:
     """Copy of a required_status_checks rule with its contexts replaced and
     every other parameter kept. A null integration_id is dropped from each
@@ -160,7 +222,8 @@ def reconcile_persona_contexts(
         host = new_rules[chief_rule]
         checks = list(host.get("parameters", {}).get("required_status_checks", []))
         new_rules[chief_rule] = _with_checks(
-            host, checks + [{"context": c} for c in missing],
+            host,
+            checks + [{"context": c, "integration_id": _grug_app_id()} for c in missing],
         )
         changed = True
     if not changed:
@@ -408,6 +471,7 @@ def ensure_enforcement(
         install_token, owner, repo,
         GRUG_TPM_RULESET_NAME,
         [GRUG_DOR_CHECK_NAME, *required_persona_checks(get_repo_config(install_id, repo_id))],
+        integration_id=_grug_app_id(),
     )
     ruleset_id = result["id"]
 
@@ -456,6 +520,14 @@ def _heal_managed_ruleset(
     except Exception as e:  # noqa: BLE001 - self-heal never blocks the existing-state return
         log.warning(
             "enforcement_persona_contexts_reconcile_failed",
+            extra={**ids, "kind": type(e).__name__, "detail": str(e)[:200]},
+        )
+    try:
+        # Last, so it also pins whatever the steps above added or renamed.
+        pin_grug_checks(install_token, owner, repo, ruleset_id)
+    except Exception as e:  # noqa: BLE001 - self-heal never blocks the existing-state return
+        log.warning(
+            "enforcement_pin_grug_checks_failed",
             extra={**ids, "kind": type(e).__name__, "detail": str(e)[:200]},
         )
 
