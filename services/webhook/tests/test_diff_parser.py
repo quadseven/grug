@@ -1,6 +1,8 @@
 """Tests for personas/code_reviewer/diff_parser.py."""
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from personas.code_reviewer.diff_parser import DiffHunk, DiffParseError, added_lines, parse_diff
@@ -784,3 +786,101 @@ def test_file_header_after_a_spent_hunk_still_ends_it_without_a_git_line() -> No
     hunks = parse_diff(diff)
     assert hunks[0].body == "@@ -1 +1 @@\n-x\n+y"
     assert hunks[0].new_lines == frozenset({1})
+
+
+# --- oversized-hunk compression (#1747) -------------------------------------
+
+from personas.code_reviewer.diff_parser import (  # noqa: E402
+    added_lines as _added_lines,
+    parse_diff as _parse_diff,
+    split_large_hunks,
+)
+
+
+def _big_hunk(path="big.py", added=300, with_edit=False):
+    rows = ["@@ -1,2 +1,%d @@" % (added + 2), " ctx-a"]
+    if with_edit:
+        rows += ["-old-line", "+new-line"]
+    rows += [f"+row {i:04d} {'x' * 20}" for i in range(added)]
+    rows += [" ctx-z"]
+    return _parse_diff(
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n" + "\n".join(rows) + "\n"
+    )[0]
+
+
+class TestSplitLargeHunks:
+    def test_pieces_cover_every_added_line_exactly_once(self):
+        hunk = _big_hunk(with_edit=True)
+        budget = len(hunk.body) // 3 + 200
+        out, split = split_large_hunks((hunk,), budget)
+        assert split == ("big.py",) and 2 <= len(out) <= 3
+        assert all(len(p.body) <= budget for p in out)
+        got = [ln for p in out for ln in _added_lines(p)]
+        assert got == _added_lines(hunk)
+        union = set().union(*(p.new_lines for p in out))
+        assert union == hunk.new_lines
+        assert sum(len(p.new_lines) for p in out) == len(hunk.new_lines)
+
+    def test_piece_headers_are_consistent_with_their_bodies(self):
+        hunk = _big_hunk()
+        out, _ = split_large_hunks((hunk,), len(hunk.body) // 2 + 300)
+        for p in out:
+            lines = p.body.splitlines()
+            m = re.match(r"@@ -(\d+),(\d+) \+(\d+),(\d+) @@", lines[0])
+            body = lines[1:]
+            assert int(m.group(2)) == sum(1 for x in body if x[:1] in (" ", "-"))
+            assert int(m.group(4)) == sum(1 for x in body if x[:1] in (" ", "+"))
+            assert int(m.group(3)) == p.new_start
+        # The pieces survive a round trip through the parser.
+        text = "diff --git a/big.py b/big.py\n--- a/big.py\n+++ b/big.py\n" + "\n".join(
+            p.body for p in out) + "\n"
+        assert [p.new_lines for p in _parse_diff(text)] == [p.new_lines for p in out]
+
+    def test_context_overlap_is_never_counted_as_added(self):
+        pad = "p" * 18
+        rows = [f" c{i} {pad}" for i in range(1, 4)]
+        rows += [f"-r1 {pad}"]
+        rows += [f"+a{i} {pad}" for i in range(4, 10)]
+        rows += [f" c10 {pad}", f" c11 {pad}", f" c12 {pad}"]
+        hunk = DiffHunk(
+            file_path="a.py", new_start=1, new_lines=frozenset(range(4, 10)),
+            body="@@ -1,7 +1,12 @@\n" + "\n".join(rows),
+        )
+        out, _ = split_large_hunks((hunk,), 64 + 6 * 24)
+        assert len(out) >= 2
+        assert set().union(*(p.new_lines for p in out)) == set(range(4, 10))
+        assert sum(len(p.new_lines) for p in out) == 6
+        # A later piece repeats trailing context lines, never added ones.
+        assert any(" c" in p.body.splitlines()[1] for p in out[1:])
+
+    def test_small_hunks_pass_through_untouched(self):
+        hunk = _big_hunk(added=3)
+        assert split_large_hunks((hunk,), 10_000) == ((hunk,), ())
+
+    def test_hunk_needing_too_many_pieces_stays_whole_to_be_named(self):
+        # Beyond the piece cap the hunk is returned unchanged, so
+        # split_oversized_hunks drops and NAMES it: never silently cut.
+        hunk = _big_hunk(added=2_000)
+        budget = len(hunk.body) // 10
+        out, split = split_large_hunks((hunk,), budget)
+        assert out == (hunk,) and split == ()
+        kept, oversized = split_oversized_hunks(out, budget)
+        assert kept == () and oversized == ("big.py",)
+
+    def test_total_piece_budget_is_shared_across_hunks(self):
+        hunks = tuple(_big_hunk(f"f{i}.py") for i in range(4))
+        budget = len(hunks[0].body) // 3 + 200
+        out, split = split_large_hunks(hunks, budget)
+        assert len(split) < 4  # later hunks stay whole, to be named
+        assert out[-1] == hunks[-1]
+
+    def test_a_single_line_over_budget_is_not_split(self):
+        hunk = DiffHunk(
+            file_path="min.js", new_start=1, new_lines=frozenset({1}),
+            body="@@ -0,0 +1 @@\n+" + "x" * 5_000,
+        )
+        assert split_large_hunks((hunk,), 1_000) == ((hunk,), ())
+
+    def test_zero_budget_is_a_no_op(self):
+        hunks = (_big_hunk(),)
+        assert split_large_hunks(hunks, 0) == (hunks, ())

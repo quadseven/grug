@@ -413,6 +413,120 @@ def split_oversized_hunks(
     return tuple(kept), tuple(oversized)
 
 
+# Compression of a hunk bigger than one cohort (#1747). Bounds keep one
+# huge file from starving the rest of the diff of the 10-cohort backstop:
+# a hunk is split only when its pieces fit `_MAX_SPLIT_PIECES`, and all
+# splits in one diff share `_MAX_SPLIT_PIECES_TOTAL`. Anything beyond that
+# is left whole for `split_oversized_hunks` to drop and NAME, as before.
+_MAX_SPLIT_PIECES = 3
+_MAX_SPLIT_PIECES_TOTAL = 6
+_SPLIT_HEADER_RESERVE = 64
+_SPLIT_OVERLAP_LINES = 3
+
+
+def _split_one_hunk(
+    hunk: DiffHunk, max_chars: int, max_pieces: int,
+) -> tuple[DiffHunk, ...] | None:
+    """Cut `hunk` at line boundaries into pieces of at most `max_chars`
+    with recomputed headers; `None` when it cannot be done within
+    `max_pieces` (or one line alone exceeds the budget).
+
+    Every line lands in exactly one piece, so every added line stays
+    anchored: `new_lines` of the pieces partition the original's. Up to
+    `_SPLIT_OVERLAP_LINES` trailing CONTEXT lines of a piece are repeated
+    at the head of the next one (context only, never counted as added)."""
+    lines = hunk.body.splitlines()
+    m = _OLD_SIDE_RE.match(lines[0]) if lines else None
+    if m is None:
+        return None
+    body = lines[1:]
+    old_at = [int(m.group(1))]
+    new_at = [hunk.new_start]
+    for raw in body:
+        o, n = old_at[-1], new_at[-1]
+        if raw.startswith("\\"):
+            pass
+        elif raw.startswith("+"):
+            n += 1
+        elif raw.startswith("-"):
+            o += 1
+        else:
+            o += 1
+            n += 1
+        old_at.append(o)
+        new_at.append(n)
+
+    def is_context(raw: str) -> bool:
+        return not raw.startswith(("+", "-", "\\"))
+
+    pieces: list[DiffHunk] = []
+    start = 0
+    while start < len(body):
+        if len(pieces) >= max_pieces:
+            return None
+        head = start
+        if pieces:
+            while (
+                head > 0 and start - head < _SPLIT_OVERLAP_LINES
+                and is_context(body[head - 1])
+            ):
+                head -= 1
+        size = _SPLIT_HEADER_RESERVE + sum(len(x) + 1 for x in body[head:start])
+        end = start
+        while end < len(body):
+            cost = len(body[end]) + 1
+            if size + cost > max_chars and not body[end].startswith("\\"):
+                break
+            size += cost
+            end += 1
+        if end == start:
+            return None
+        chunk = body[head:end]
+        old_n = sum(1 for x in chunk if x.startswith("-") or is_context(x))
+        new_n = sum(1 for x in chunk if x.startswith("+") or is_context(x))
+        old_start = old_at[head] - (1 if old_n == 0 else 0)
+        new_start = max(new_at[head] - (1 if new_n == 0 else 0), 1)
+        header = f"@@ -{old_start},{old_n} +{new_start},{new_n} @@"
+        added = frozenset(
+            new_at[i] for i in range(start, end) if body[i].startswith("+")
+        )
+        pieces.append(DiffHunk(
+            file_path=hunk.file_path, new_start=new_at[head],
+            new_lines=added, body="\n".join([header, *chunk]),
+        ))
+        start = end
+    return tuple(pieces) if pieces and all(len(p.body) <= max_chars for p in pieces) else None
+
+
+def split_large_hunks(
+    hunks: tuple[DiffHunk, ...], max_hunk_chars: int,
+) -> tuple[tuple[DiffHunk, ...], tuple[str, ...]]:
+    """Compress hunks over `max_hunk_chars` into line-anchored pieces
+    (#1747), returning (hunks, split_paths).
+
+    Run BEFORE `split_oversized_hunks`: a hunk that splits within the
+    bounds above is read in full, in place and in order; one that does
+    not is returned unchanged so `split_oversized_hunks` drops it and the
+    path is named as not read. Nothing is ever truncated. A non-positive
+    budget is a no-op. Pure."""
+    if max_hunk_chars <= 0:
+        return hunks, ()
+    out: list[DiffHunk] = []
+    split_paths: dict[str, None] = {}
+    spare = _MAX_SPLIT_PIECES_TOTAL
+    for h in hunks:
+        pieces = None
+        if len(h.body) > max_hunk_chars:
+            pieces = _split_one_hunk(h, max_hunk_chars, min(_MAX_SPLIT_PIECES, spare))
+        if pieces is None:
+            out.append(h)
+            continue
+        spare -= len(pieces)
+        split_paths[h.file_path] = None
+        out.extend(pieces)
+    return tuple(out), tuple(split_paths)
+
+
 def added_lines(hunk: DiffHunk) -> list[tuple[int, str]]:
     """New-side (lineno, text) for each ADDED line in a hunk.
 

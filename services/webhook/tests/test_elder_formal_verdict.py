@@ -434,7 +434,7 @@ def test_unreviewed_path_never_approves_and_is_named(monkeypatch, kind, blocking
     if kind == "excluded":
         path, body = "data/rows.csv", "+a,b\n"
     elif kind == "oversized":
-        path, body = "src/huge.py", "".join(f"+v{i} = {i}\n" for i in range(400))
+        path, body = "src/huge.py", "".join(f"+v{i} = {i}\n" for i in range(2000))
         monkeypatch.setattr(cr_dispatch, "review_cohort_char_budget", lambda: 2000)
     else:
         path, body = "docs/guide.md", "+words\n"
@@ -450,6 +450,23 @@ def test_unreviewed_path_never_approves_and_is_named(monkeypatch, kind, blocking
     assert f"`{path}`" in summary.split("Elder does not approve this head", 1)[1]
 
 
+def test_hunk_that_splits_into_a_few_pieces_is_read_and_the_note_says_so(monkeypatch):
+    """#1747: a hunk over one cohort that fits a few pieces is read in full
+    (so it is not an unreviewed path) and the summary records the
+    compression. A hunk that needs far more pieces is still dropped, named
+    and never approved (the oversized case above)."""
+    body = "".join(f"+v{i} = {i}\n" for i in range(400))
+    monkeypatch.setattr(cr_dispatch, "review_cohort_char_budget", lambda: 2000)
+    checks: list = []
+    _run(
+        monkeypatch, _clean(), blocking=True,
+        diff=_with_file("src/huge.py", body), checks=checks,
+    )
+    summary = checks[-1].summary
+    assert "Compressed: the change to `src/huge.py`" in summary
+    assert "Elder does not approve this head" not in summary
+
+
 def test_unreviewed_path_still_requests_changes_on_a_block(monkeypatch):
     _ignore_docs(monkeypatch)
     posted, _ = _run(
@@ -460,7 +477,7 @@ def test_unreviewed_path_still_requests_changes_on_a_block(monkeypatch):
 
 
 _HEAD2 = "feed5678beef"
-_HUGE = "".join(f"+v{i} = {i}\n" for i in range(400))
+_HUGE = "".join(f"+v{i} = {i}\n" for i in range(2000))
 _OTHER = """diff --git a/src/y.py b/src/y.py
 --- a/src/y.py
 +++ b/src/y.py
