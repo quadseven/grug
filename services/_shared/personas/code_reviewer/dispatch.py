@@ -89,7 +89,7 @@ from personas.code_reviewer.dedup import (
 from personas.code_reviewer.diff_parser import (
     added_lines,
     DiffHunk, DiffParseError, file_changes, is_tree_copy_candidate, new_file_blob_ids,
-    parse_diff, split_duplicate_hunks, split_large_hunks, split_oversized_hunks,
+    fit_hunks_to_cohorts, parse_diff, split_duplicate_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
 )
 from personas.code_reviewer.lock_sources import (
@@ -2968,10 +2968,10 @@ def _prepare_review_diff(
     # normally. Measured live: one 1,004,156-char generated
     # `.json` hunk cost four unrelated healthy cohorts.
     cohort_budget = review_cohort_char_budget()
-    # #1747: compress first. A hunk that splits into a few line-anchored
-    # pieces is read in full; only what still does not fit is dropped and
-    # named below, so the author sees exactly what was compressed or unread.
-    hunks, split_paths = split_large_hunks(hunks, cohort_budget)
+    # #1747: one shared step (also used by the replay harness) splits what
+    # can be split into line-anchored pieces and names what still cannot
+    # be read, so the author sees exactly what was compressed or unread.
+    hunks, split_paths, oversized_paths = fit_hunks_to_cohorts(hunks, cohort_budget)
     if split_paths:
         config_note += (
             "\n\nCompressed: the change to "
@@ -2980,7 +2980,6 @@ def _prepare_review_diff(
             + " was larger than one review pass, so Elder split it at line"
             " boundaries and read every line in separate pieces."
         )
-    hunks, oversized_paths = split_oversized_hunks(hunks, cohort_budget)
     if oversized_paths:
         log.warning(
             "code_review_hunks_oversized",

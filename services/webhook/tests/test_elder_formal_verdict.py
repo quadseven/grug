@@ -565,3 +565,19 @@ def _evaluation(conclusion, degraded_reason=None) -> CodeReviewEvaluation:
 )
 def test_verdict_event(evaluation, kwargs, event):
     assert verdict_event(evaluation, **kwargs) == event
+
+
+def test_a_40000_line_file_is_named_and_never_approved_live(monkeypatch):
+    """#1747: at the default cohort budget a 40,000 line added file needs
+    about 30 pieces, over the bound, so live Elder drops it, names it and
+    does not approve. Same bound as the replay harness."""
+    body = "".join(f"+v{i} = {i}\n" for i in range(40_000))
+    checks: list = []
+    posted, _ = _run(
+        monkeypatch, _clean(), blocking=True,
+        diff=_with_file("src/huge.py", body), checks=checks,
+    )
+    assert "APPROVE" not in [r.event for r in posted]
+    summary = checks[-1].summary
+    assert "Compressed: the change to `src/huge.py`" not in summary
+    assert "`src/huge.py`" in summary.split("Elder does not approve this head", 1)[1]

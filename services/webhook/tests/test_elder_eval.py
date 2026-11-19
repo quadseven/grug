@@ -2261,3 +2261,69 @@ def test_report_prints_the_models_that_answered(capsys):
 
     cli._print_report("cave", _one_case_report(served_models=["tag-a"]))
     assert "model(s) that actually answered: tag-ax1" in capsys.readouterr().out
+
+
+# --- #1747: the replay prepares oversized hunks the way production does ------
+
+
+def _added_file_diff(path: str, lines: int) -> str:
+    rows = "".join(f"+value_{i:06d} = {i}\n" for i in range(lines))
+    return (
+        f"diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n"
+        f"+++ b/{path}\n@@ -0,0 +1,{lines} @@\n{rows}"
+    )
+
+
+def test_replay_uses_the_same_hunk_preparation_as_production():
+    """One shared function (`fit_hunks_to_cohorts`), not two copies: the
+    harness's hunks are exactly what live dispatch would plan."""
+    from elder_eval import runner
+    from personas.code_reviewer.diff_parser import fit_hunks_to_cohorts, parse_diff
+
+    diff = _added_file_diff("big.py", 4_000)
+    fitted, split, oversized = fit_hunks_to_cohorts(
+        parse_diff(diff), runner.review_cohort_char_budget(), drop_oversized=False,
+    )
+    assert split == ("big.py",) and oversized == ()
+    assert [h.body for h in runner.diff_to_hunks(diff)] == [h.body for h in fitted]
+
+
+def test_replay_reads_every_line_of_a_hunk_that_fits_the_bound(monkeypatch):
+    """A 4,000 line added file (about 3 cohorts) is split, every cohort is
+    sent to the model, and every added line reaches a prompt."""
+    from elder_eval import runner
+    from sast_benchmark.backends import BenchBackend
+
+    prompts = []
+
+    def fake_post(backend, messages):
+        prompts.append(messages[-1]["content"])
+        return _bench_response([_finding("big.py")])
+
+    monkeypatch.setattr(runner, "_post", fake_post)
+    (case,) = build_cases([_row(4, "correctness")])
+    backend = BenchBackend(name="fake", url="http://invalid", model="m", api_key="")
+    replay = runner.run_case(backend, case, _added_file_diff("big.py", 4_000))
+
+    assert replay.errored is False and replay.staged is True
+    assert 2 <= len(prompts) <= 3
+    joined = "\n".join(prompts)
+    assert all(f"value_{i:06d} = {i}" in joined for i in range(4_000))
+
+
+def test_replay_of_a_40000_line_file_is_refused_not_partly_read(monkeypatch):
+    """#1747 criterion 1 as written (40,000 lines, about 30 pieces) is NOT
+    met within the bound of 3 pieces per hunk: the case errors with no
+    model call rather than scoring a partial read. Raising the bound is a
+    cost decision for the owner (about 30 model calls per replay)."""
+    from elder_eval import runner
+    from sast_benchmark.backends import BenchBackend
+
+    calls = []
+    monkeypatch.setattr(runner, "_post", lambda b, m: calls.append(m))
+    (case,) = build_cases([_row(5, "correctness")])
+    backend = BenchBackend(name="fake", url="http://invalid", model="m", api_key="")
+    replay = runner.run_case(backend, case, _added_file_diff("huge.py", 40_000))
+
+    assert calls == []
+    assert replay.errored is True
