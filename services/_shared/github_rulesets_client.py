@@ -186,8 +186,12 @@ def create_ruleset(
     repo: str,
     name: str,
     status_check_contexts: list[str],
+    integration_id: int | None = None,
 ) -> dict:
-    """Create a ruleset requiring status checks on the default branch."""
+    """Create a ruleset requiring status checks on the default branch.
+
+    With `integration_id`, every required check is pinned to that GitHub App,
+    so a same-named check from any other App or workflow cannot satisfy it."""
     body = {
         "name": name,
         "target": "branch",
@@ -208,9 +212,12 @@ def create_ruleset(
                     # matches no possible input", 422), which broke every
                     # enforcement "fix". integration_id is optional; sending
                     # just {context} requires the check by name regardless of
-                    # which app reports it.
+                    # which app reports it. A caller that wants the check
+                    # pinned passes a real (non-null) integration_id.
                     "required_status_checks": [
                         {"context": ctx}
+                        if integration_id is None
+                        else {"context": ctx, "integration_id": integration_id}
                         for ctx in status_check_contexts
                     ],
                 },
