@@ -29,6 +29,16 @@ block that would have replaced a C++ line with the sentence describing the
 fix. Document formats (markdown, rst, plain text) are exempt from the word
 count, since a fix there is prose by nature; the sign-off is refused anywhere.
 
+Multi-line spans (#1759). `checked_span_suggestion` extends the gate to a
+bounded local rewrite: the finding's suggestion holds two to six lines and
+replaces the Python statement that contains the anchored line. GitHub anchors
+such a comment with `start_line` and `line` on the same side, and every line
+between them must be visible in ONE diff hunk with no deleted line between two
+of them, so the span is checked against the PR diff (`diff_right_side`). A
+span that leaves the hunk, crosses a deleted line, is longer than six lines or
+sits in a file the gate cannot parse gets no block: the finding renders as
+prose, never as a malformed suggestion.
+
 Pure: no I/O, no logging. A None answer means "render the fix as prose",
 which is what every finding did before this module existed.
 """
@@ -39,8 +49,10 @@ import io
 import keyword
 import re
 import tokenize
+from dataclasses import dataclass
 from typing import Any
 
+from personas.code_reviewer.diff_parser import DiffParseError, parse_diff
 from personas.code_reviewer.persona import Finding
 
 _PYTHON_SUFFIXES = (".py", ".pyi")
@@ -253,3 +265,159 @@ def _leaves_open(line: str) -> bool:
         # cannot encode (UnicodeEncodeError); the parse check decides those.
         return False
     return False
+
+
+# --- multi-line spans (#1759) ------------------------------------------------
+
+# Both the replaced span and the replacement stay this short: a rewrite longer
+# than a handful of lines is a refactor, which stays prose.
+MAX_SPAN_LINES = 6
+
+_HUNK_START = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)")
+
+
+@dataclass(frozen=True, slots=True)
+class HunkView:
+    """The right (new) side of one hunk, as GitHub lets a comment anchor to it.
+
+    `visible` is every new-side line the hunk shows, added or context.
+    `cuts` holds each visible line that a deleted line follows, so a span that
+    would run from that line to the next crosses the deletion."""
+
+    visible: frozenset[int]
+    cuts: frozenset[int]
+
+    def holds(self, start: int, end: int) -> bool:
+        """True when start..end are all visible with no deletion between."""
+        if not all(n in self.visible for n in range(start, end + 1)):
+            return False
+        return not any(n in self.cuts for n in range(start, end))
+
+
+@dataclass(frozen=True, slots=True)
+class SpanSuggestion:
+    """A checked multi-line replacement of `start_line`..`end_line` (1-based,
+    inclusive, new side). `text` is the exact block content."""
+
+    start_line: int
+    end_line: int
+    text: str
+
+
+def diff_right_side(diff_text: str) -> dict[str, tuple[HunkView, ...]]:
+    """`{path: hunk views}` for the unified diff. Empty for no diff or one
+    the parser refuses, which leaves every multi-line fix as prose."""
+    try:
+        hunks = parse_diff(diff_text)
+    except DiffParseError:
+        return {}
+    out: dict[str, list[HunkView]] = {}
+    for hunk in hunks:
+        view = _hunk_view(hunk.body)
+        if view is not None:
+            out.setdefault(hunk.file_path, []).append(view)
+    return {path: tuple(views) for path, views in out.items()}
+
+
+def _hunk_view(body: str) -> HunkView | None:
+    rows = body.split("\n")
+    header = _HUNK_START.match(rows[0]) if rows else None
+    if header is None:
+        return None
+    cursor = int(header.group(1))
+    visible: set[int] = set()
+    cuts: set[int] = set()
+    for raw in rows[1:]:
+        if raw.startswith("\\"):
+            continue
+        if raw.startswith("-"):
+            if cursor - 1 in visible:
+                cuts.add(cursor - 1)
+            continue
+        # Added, context, or an empty context line some tools trim.
+        visible.add(cursor)
+        cursor += 1
+    return HunkView(frozenset(visible), frozenset(cuts))
+
+
+def checked_span_suggestion(
+    finding: Finding,
+    file_text: str,
+    hunks: tuple[HunkView, ...],
+) -> SpanSuggestion | None:
+    """The multi-line replacement for the statement holding the finding's
+    line, or None when no such fix survives the checks.
+
+    Only a Python file is offered one: the span is the innermost statement
+    containing `finding.line`, and the gate needs it to be exact. The span
+    must fit one hunk of `hunks`, hold at most `MAX_SPAN_LINES` lines, and
+    the replacement must be two to `MAX_SPAN_LINES` lines that change the
+    span and leave the file parsing."""
+    if finding.suggestion is None or not finding.file.endswith(_PYTHON_SUFFIXES):
+        return None
+    replacement = _lines_of(finding.suggestion)
+    if replacement is None or not 2 <= len(replacement) <= MAX_SPAN_LINES:
+        return None
+    lines = file_text.splitlines()
+    span = _statement_span(file_text, finding.line)
+    if span is None or span[1] > len(lines):
+        return None
+    start, end = span
+    if end - start + 1 > MAX_SPAN_LINES:
+        return None
+    if not any(view.holds(start, end) for view in hunks):
+        return None
+    original = lines[start - 1:end]
+    replacement = _indented_like(replacement, original[0])
+    if [r.rstrip() for r in replacement] == [o.rstrip() for o in original]:
+        return None
+    if original[-1].rstrip().endswith("\\"):
+        return None
+    text = "\n".join(replacement)
+    if _leaves_open(text) and not _leaves_open("\n".join(original)):
+        return None
+    if _SIGN_OFF in text.lower():
+        return None
+    try:
+        ast.parse("\n".join(lines))
+        ast.parse("\n".join(lines[: start - 1] + replacement + lines[end:]))
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    return SpanSuggestion(start, end, text)
+
+
+def _lines_of(suggestion: str) -> list[str] | None:
+    """The suggestion split into lines, or None for a blank one, one that
+    carries a fence, or one with a bare carriage return. Leading indentation
+    is kept: GitHub commits the block verbatim."""
+    text = suggestion.replace("\r\n", "\n").strip("\n")
+    if not text.strip() or "\r" in text or "```" in text:
+        return None
+    return text.split("\n")
+
+
+def _indented_like(replacement: list[str], first_original: str) -> list[str]:
+    """Give a replacement written without indentation the indentation of the
+    first replaced line. One that already starts indented is left verbatim."""
+    if replacement[0][:1] in (" ", "\t"):
+        return replacement
+    indent = first_original[: len(first_original) - len(first_original.lstrip())]
+    return [indent + r if r.strip() else r for r in replacement]
+
+
+def _statement_span(file_text: str, line: int) -> tuple[int, int] | None:
+    """(first, last) line of the innermost statement containing `line`."""
+    try:
+        tree = ast.parse(file_text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    best: tuple[int, int] | None = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        first, last = node.lineno, node.end_lineno
+        if last is None or not first <= line <= last:
+            continue
+        if best is None or last - first < best[1] - best[0]:
+            best = (first, last)
+    return best

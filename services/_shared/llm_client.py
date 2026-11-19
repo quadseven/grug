@@ -38,6 +38,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import threading
 import time
@@ -1987,12 +1988,96 @@ def _build_messages(
     ]
 
 
+# grug#1811: the subscription lane sits behind a relay with ordered failover.
+# When its first host flaps, every call for the next several seconds fails
+# fast (502/503/504, a refused or reset connection) and then succeeds again.
+# Riding that window out costs two short waits; falling to the next backend
+# costs a degraded review. Retries are for a fast gateway-class failure only:
+# never a 429 or other 4xx, never a call that ran long (a slow full read
+# timeout), and never when the review's budget cannot hold the wait plus a call.
+_FLAP_RETRY_DELAYS_SECONDS = (5.0, 8.0)
+_FLAP_JITTER_FRACTION = 0.1
+_FLAP_FAST_FAILURE_SECONDS = 30.0
+_FLAP_STATUSES = frozenset({502, 503, 504})
+_FLAP_EXCEPTIONS = (
+    httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,
+)
+
+
+def _FLAP_SLEEP(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _flap_trigger(resp: httpx.Response | None, exc: BaseException | None, elapsed: float) -> str:
+    """Why this attempt counts as a gateway flap, or "" when it does not."""
+    if resp is not None:
+        return f"http_{resp.status_code}" if resp.status_code in _FLAP_STATUSES else ""
+    if isinstance(exc, _FLAP_EXCEPTIONS) and elapsed < _FLAP_FAST_FAILURE_SECONDS:
+        return type(exc).__name__
+    return ""
+
+
+def _call_subscription_riding_flaps(
+    config: BackendConfig, messages: list[dict[str, str]],
+    cancel_event: threading.Event | None, deadline: float | None,
+) -> httpx.Response:
+    public = _spark_data_class_header() == "public"
+    attempt = 0
+    while True:
+        started = time.monotonic()
+        resp: httpx.Response | None = None
+        error: Exception | None = None
+        try:
+            resp = provider_wire.call(
+                config, messages, cancel_event, deadline=deadline, public=public,
+                sleep=_RETRY_SLEEP,
+            )
+        except httpx.RequestError as e:
+            error = e
+        trigger = _flap_trigger(resp, error, time.monotonic() - started)
+        if attempt > 0:
+            log.warning("llm_subscription_flap_retry", extra={
+                "backend": config.backend.value, "attempt": attempt,
+                "outcome": (
+                    "recovered" if resp is not None and resp.status_code < 400
+                    else trigger
+                    or (f"http_{resp.status_code}" if resp is not None else type(error).__name__)
+                ),
+            })
+        if not trigger or attempt >= len(_FLAP_RETRY_DELAYS_SECONDS):
+            if error is not None:
+                raise error
+            assert resp is not None
+            return resp
+        wait = _FLAP_RETRY_DELAYS_SECONDS[attempt] * (
+            1 + random.uniform(-_FLAP_JITTER_FRACTION, _FLAP_JITTER_FRACTION)
+        )
+        if deadline is not None and (
+            deadline - time.monotonic() < wait + provider_wire._DEADLINE_CALL_FLOOR_SECONDS
+        ):
+            log.warning("llm_subscription_flap_retry", extra={
+                "backend": config.backend.value, "attempt": attempt + 1,
+                "outcome": "skipped_budget", "trigger": trigger,
+            })
+            if error is not None:
+                raise error
+            assert resp is not None
+            return resp
+        _FLAP_SLEEP(wait)
+        if cancel_event is not None and cancel_event.is_set():
+            raise httpx.RequestError("cancelled before retry")
+        attempt += 1
+
+
 def _call_backend(
     config: BackendConfig, messages: list[dict[str, str]],
     cancel_event: threading.Event | None = None,
 ) -> httpx.Response:
+    deadline = _call_deadline(config.backend)
+    if config.backend == Backend.SUBSCRIPTION:
+        return _call_subscription_riding_flaps(config, messages, cancel_event, deadline)
     return provider_wire.call(
-        config, messages, cancel_event, deadline=_call_deadline(config.backend),
+        config, messages, cancel_event, deadline=deadline,
         public=_spark_data_class_header() == "public", sleep=_RETRY_SLEEP,
     )
 
