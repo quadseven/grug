@@ -500,10 +500,37 @@ def _check_publish_stage(
     return fails
 
 
-def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
-    entry = _find_funcdef(tree, "dispatch_code_review")
-    if entry is None:
+def _check_entry_wrapper(tree: ast.AST, path: Path) -> list[str]:
+    """`dispatch_code_review` returns `_review_pass` inside a try whose
+    `finally` calls the approval-cleanup helper, so neither an unused helper
+    nor a removed `finally` can attest it."""
+    wrapper = _find_funcdef(tree, "dispatch_code_review")
+    if wrapper is None:
         return [f"FAIL: {path} - exactly one `dispatch_code_review` expected"]
+    body = wrapper.body[1:] if ast.get_docstring(wrapper) is not None else wrapper.body
+    match body:
+        case [ast.Try(
+            body=[ast.Return(value=ast.Call(func=ast.Name(id="_review_pass")) as call)],
+            finalbody=[ast.Expr(value=ast.Call(func=ast.Name(id="_withdraw_other_commit_approvals")))],
+        )]:
+            blocking = _kwarg_value(call, "blocking")
+            if not isinstance(blocking, ast.Name) or blocking.id != "blocking":
+                return [f"FAIL: {path} - dispatch_code_review must forward blocking to _review_pass"]
+            return []
+        case _:
+            return [
+                f"FAIL: {path} - dispatch_code_review must directly return _review_pass "
+                "inside a try whose finally withdraws other-commit approvals"
+            ]
+
+
+def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
+    wrapper_fails = _check_entry_wrapper(tree, path)
+    if wrapper_fails:
+        return wrapper_fails
+    entry = _find_funcdef(tree, "_review_pass")
+    if entry is None:
+        return [f"FAIL: {path} - exactly one `_review_pass` expected"]
     stages: dict[str, ast.FunctionDef] = {}
     fails: list[str] = []
     for name in STAGE_NAMES:
@@ -511,7 +538,7 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
         if stage is None:
             fails.append(f"FAIL: {path} - exactly one `{name}` expected")
         elif not _calls_named(entry, name):
-            fails.append(f"FAIL: {path} - dispatch_code_review never calls `{name}`")
+            fails.append(f"FAIL: {path} - _review_pass never calls `{name}`")
         else:
             stages[name] = stage
     if fails:
@@ -541,15 +568,7 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
         flags=("failed", "rejected"),
     ))
 
-    # never-raise: the diff-failure stage degrades instead of raising.
-    handler = _find_funcdef(tree, "_handle_diff_failure")
-    if handler is None or not _calls_named(handler, "_publish_degraded"):
-        fails.append(
-            f"FAIL: {path} - no _publish_degraded fallback; fetch/parse errors must "
-            "degrade to advisory-neutral, not raise"
-        )
-    if not _calls_named(entry, "_handle_diff_failure"):
-        fails.append(f"FAIL: {path} - dispatch_code_review never calls `_handle_diff_failure`")
+    fails.extend(_check_diff_failure(tree, entry, path))
 
     # result rollup consults BOTH independent publish surfaces, and the
     # persona result is read off the settled outcome.
@@ -562,6 +581,22 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
         fails.append(f"FAIL: {path} - the dispatch response is not read off the settled outcome")
 
     fails.extend(_check_capture(tree, stages["_record_tier1_publication"], path))
+    return fails
+
+
+def _check_diff_failure(
+    tree: ast.AST, entry: ast.FunctionDef, path: Path,
+) -> list[str]:
+    """Dispatch calls the diff-failure stage, which publishes a degraded result."""
+    fails: list[str] = []
+    handler = _find_funcdef(tree, "_handle_diff_failure")
+    if handler is None or not _calls_named(handler, "_publish_degraded"):
+        fails.append(
+            f"FAIL: {path} - no _publish_degraded fallback; fetch/parse errors must "
+            "degrade to advisory-neutral, not raise"
+        )
+    if not _calls_named(entry, "_handle_diff_failure"):
+        fails.append(f"FAIL: {path} - _review_pass never calls `_handle_diff_failure`")
     return fails
 
 

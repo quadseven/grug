@@ -31,6 +31,21 @@ state is the verdict (`personas.review_publish.verdict_event`):
   or superseded. A degraded run never approves: fail closed. A degraded run
   with a blocking finding still posts `COMMENT`, as ADR-0023 decided.
 
+**No approval over unreviewed code** (#1781). A changed path no model read
+leaves the head unvouched: data, generated or vendored files
+(`split_reviewable_hunks`), hunks too big for any cohort, and paths
+`.grug.yaml` `ignore`s. The run posts `COMMENT`, or `REQUEST_CHANGES` when a
+blocking finding stands, and the summary names the paths. The rule holds on
+Tier-1, on the deep append, and at the deferred `APPROVE`. Lock files are
+left to the lock check, which already refuses to vouch for one it did not
+read. Proven byte-identical copies and 100% moves (#813, #772) count as
+reviewed, since their content is already at head. Such a run also keeps
+the Living Hunt baseline where it was and stores no patch-id, so the next
+push reviews the skipped path again instead of a delta that omits it, and
+no carried verdict can vouch for it. A repository that
+`ignore`s paths, or a pull request that changes a CSV or a vendored file,
+therefore gets no `APPROVE`; the check conclusion is unchanged.
+
 **An unfinished security pass never approves** (#1780). When the diff touches
 a sensitive path and the code-only security pass (grug#1569) failed, timed
 out, or was skipped by a cancel, the run cannot vouch for the head: it posts
@@ -57,10 +72,29 @@ never requests changes, so a backend outage cannot block a merge this way.
 
 **Withdrawals.** The newest Elder verdict is the standing one:
 
-- A run that approves dismisses Elder's own older `REQUEST_CHANGES` (as
-  #1581 did for a `success` check, now in either mode).
-- A re-review that posts `COMMENT` dismisses Elder's own older `APPROVE`, so
-  a degraded run cannot leave an approval standing.
+- A run that approves dismisses Elder's own `REQUEST_CHANGES` on the head
+  it approves from runs that started earlier (as #1581 did for a `success`
+  check, now in either mode). It never dismisses a block on another commit
+  (#1781): that block may be a newer run's verdict on a newer push, and on
+  an older commit Elder's newer `APPROVE` already replaces it as Elder's
+  standing review state on GitHub.
+- A re-review (`synchronize`, `reopened`, `review`, `rerun`) withdraws
+  Elder's own earlier `APPROVE`s on the pull request before any early exit
+  (stale input, `skip_prs`, carried verdict, degraded, re-run pending), so a
+  run that cannot vouch for the head leaves no approval behind (#1781). A
+  clean finish approves the head again. A re-review that posts `COMMENT`
+  withdraws them once more at the end.
+- **Never approve a head that is not current** (#1781). Right before Tier-1
+  posts `APPROVE`, and right before the deferred `APPROVE`, Elder reads the
+  pull request's head from GitHub. If a push moved it past the reviewed
+  commit, or the lookup fails, the run posts no approval. Withdrawing
+  approvals stands down when the head has moved: an approval on the new head
+  belongs to a newer run.
+- However a review run ends (approved, skipped by `skip_prs`, carried,
+  stale, degraded, re-run pending, a deep append that failed or was
+  cancelled, or an exception), Elder withdraws its approvals on commits
+  other than the reviewed head, so a late approval from an older run cannot
+  survive (#1781). This runs in a `finally` around the whole pass.
 - **An escalated head is approved only by the deep pass.** Tier-1 decides
   before it publishes whether a deep pass will follow on the head. If one
   will, Tier-1 does not approve: an `APPROVE` standing while the reasoner is
@@ -87,11 +121,13 @@ marker (`<!-- grug:elder-run started=... -->`) naming when its run started:
   after this one. A review with no marker never counts as later.
 - A blocking deep pass never stands down for an earlier-started run's
   approval. It posts `REQUEST_CHANGES` and dismisses Elder's approvals from
-  earlier-started runs, on this head and earlier commits. An approval with
+  earlier-started runs, on this head and earlier commits, unless the head
+  has moved past this run (#1781). An approval with
   no marker cannot prove its run, so a block dismisses it too.
 - Right before posting a deferred `APPROVE`, the deep append re-checks the
-  head. If the latest Elder check is not its own and started after this run
-  started, or a later-started run has posted a verdict, or either lookup
+  head. If the pull request's head is no longer the reviewed commit, the
+  latest Elder check is not its own and started after this run
+  started, or a later-started run has posted a verdict, or any lookup
   fails, it does not approve.
 - A later-posted Elder check (#1344) still decides the check surface and
   refuses approvals, but it no longer silences a block.
@@ -102,7 +138,9 @@ request the Grug app opened gets `COMMENT`.
 ## Consequences
 
 - Gates can require Grug's `APPROVED` state on the head commit. A gate must
-  match the review's `commit_id` to the head: between a push and the next
-  review an older approval can still be standing where the ruleset does not
-  dismiss stale reviews on push.
+  match the review's `commit_id` to the head: between a push and the start
+  of the next review an older approval can still be standing where the
+  ruleset does not dismiss stale reviews on push.
+- A carried verdict (#1648) on a new head keeps its check but gets no
+  `APPROVE`, since the re-review withdrew the old one before carrying.
 - A pull request with nothing to review (`no_diff`) gets no approval.

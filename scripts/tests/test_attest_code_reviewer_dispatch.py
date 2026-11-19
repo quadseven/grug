@@ -37,6 +37,13 @@ def test_dispatch_attestation_accepts_the_staged_pass():
         ("        return _PostedReview(failed=not permanent, rejected=permanent)", "        return _PostedReview()", "review except"),
         ("        review_publish_failed=review.failed,\n", "", "review_publish_failed"),
         ("    check = _post_tier1_check(run, plan)\n", "", "never calls `_post_tier1_check`"),
+        ("return _review_pass(", "return _other_pass(", "return _review_pass"),
+        (
+            "    finally:\n        _withdraw_other_commit_approvals(payload)\n",
+            "    finally:\n        pass\n",
+            "finally withdraws",
+        ),
+        ("payload, blocking=blocking, cancel_event=cancel_event,\n            rerun_pending", "payload, blocking=False, cancel_event=cancel_event,\n            rerun_pending", "forward blocking"),
     ],
 )
 def test_dispatch_attestation_rejects_a_broken_stage(original, replacement, expected):

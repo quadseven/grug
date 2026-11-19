@@ -258,8 +258,12 @@ def test_an_unchecked_lock_dropped_by_the_ignore_filter_concludes_neutral(monkey
     original = cr_dispatch._apply_repo_config
 
     def _ignore_yarn(hunks, *a, **k):
-        kept, config, note = original(hunks, *a, **k)
-        return tuple(h for h in kept if not h.file_path.endswith("yarn.lock")), config, note
+        kept, config, note, ignored = original(hunks, *a, **k)
+        dropped = tuple(h.file_path for h in kept if h.file_path.endswith("yarn.lock"))
+        return (
+            tuple(h for h in kept if not h.file_path.endswith("yarn.lock")),
+            config, note, ignored + dropped,
+        )
 
     monkeypatch.setattr(cr_dispatch, "_apply_repo_config", _ignore_yarn)
     full = _added("web/yarn.lock", ['  resolved "https://registry.yarnpkg.com/x.tgz"']) + _added(

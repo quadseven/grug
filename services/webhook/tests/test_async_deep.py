@@ -304,6 +304,7 @@ def _run_escalated_review(
     posted_reviews: list | None = None,
     on_reasoner=None,
     tier1=None,
+    diff: str = _DIFF,
 ) -> list[dict]:
     """Drive one escalated tiered review (clean Tier-1, `deep` from the
     reasoner) in blocking mode (unless told otherwise) and return every
@@ -351,7 +352,7 @@ def _run_escalated_review(
         )
     with patch("adapters.install_store.put_elder_last_reviewed", lambda **k: None), \
          patch("adapters.install_store.get_elder_last_reviewed", return_value=None), \
-         patch("httpx.get", return_value=_diff_response()):
+         patch("httpx.get", return_value=_diff_response(diff)):
         cr_dispatch.dispatch_code_review(_payload(), blocking=blocking)
     return posted_checks
 
@@ -626,7 +627,8 @@ def _elder_review(rid, *, state, commit="abcd1234efgh", submitted_at=None):
 
 
 def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True,
-                       checks_on_head=None, posted=None, tier1=None):
+                       checks_on_head=None, posted=None, tier1=None,
+                       diff=_DIFF):
     """An escalated review that records every posted review, every
     dismissal, and the reviews already posted when the reasoner started.
 
@@ -645,6 +647,7 @@ def _run_with_verdicts(monkeypatch, *, deep, reviews_on_pr=(), blocking=True,
         monkeypatch, deep=deep, posted_reviews=reviews, blocking=blocking,
         on_reasoner=lambda: before_deep.extend(r.event for r in reviews),
         tier1=tier1,
+        diff=diff,
         checks_on_head=(
             [_elder_run(1, started_at="2999-01-01T00:00:00Z")]
             if checks_on_head is None else checks_on_head
@@ -690,10 +693,12 @@ def test_deep_blocking_finding_requests_changes_with_no_approval(monkeypatch, bl
 
 def test_deferred_approval_withdraws_elders_older_block(monkeypatch):
     """The clean deep pass is the approving run, so it withdraws Elder's own
-    block on an earlier commit, as a clean Tier-1 would."""
-    block = _elder_review(5, state="CHANGES_REQUESTED", commit="old0000")
+    block on this head from an earlier-started run, as a clean Tier-1 would.
+    A block on another commit stays (#1781): it may come from a newer push."""
+    block = _marked(5, state="CHANGES_REQUESTED", started="2000-01-01T00:00:00+00:00")
+    other = _elder_review(6, state="CHANGES_REQUESTED", commit="old0000")
     events, dismissed, _ = _run_with_verdicts(
-        monkeypatch, deep=_RAN_CLEAN, reviews_on_pr=[block],
+        monkeypatch, deep=_RAN_CLEAN, reviews_on_pr=[block, other],
     )
     assert events[-1] == "APPROVE"
     assert dismissed == [5]
@@ -830,8 +835,77 @@ def test_deferred_approval_refuses_an_unfinished_security_pass(monkeypatch):
         installation_id=11, owner="myorg", repo_name="myrepo", pull_number=7,
         head_sha="abcd1234efgh",
         run_started_at=datetime.fromisoformat("2000-01-01T00:00:00+00:00"),
-        own_check_ids=frozenset(), security_pass_complete=False,
+        own_check_ids=frozenset(), vouched=False,
     )
     assert posted == []
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_deferred_approval_stands_down_after_a_push(monkeypatch, blocking):
+    """#1781: a push lands while the deep pass runs and a newer run blocks
+    the new head. The older run's clean deep pass posts no approval on the
+    old head and dismisses neither the newer block nor anything else."""
+    monkeypatch.setattr(cr_dispatch, "_pr_head_state", lambda *a, **k: "moved")
+    newer_block = _marked(8, state="CHANGES_REQUESTED", commit="new9999",
+                          started="2999-01-01T00:00:00+00:00")
+    events, dismissed, _ = _run_with_verdicts(
+        monkeypatch, deep=_RAN_CLEAN, reviews_on_pr=[newer_block], blocking=blocking,
+    )
+    assert "APPROVE" not in events
+    assert dismissed == []
+
+
+def test_unconfirmed_head_never_gets_the_deferred_approval(monkeypatch):
+    monkeypatch.setattr(cr_dispatch, "_pr_head_state", lambda *a, **k: "unknown")
+    events, _, _ = _run_with_verdicts(monkeypatch, deep=_RAN_CLEAN)
+    assert "APPROVE" not in events
+
+
+@pytest.mark.parametrize("deep", [_DEEP_DOWN, _RAN_CLEAN], ids=["failed", "clean"])
+def test_deep_append_end_withdraws_a_late_approval_on_an_earlier_commit(
+    monkeypatch, deep,
+):
+    """#1781: an older run's approval on an earlier commit landed while this
+    run's deep pass ran. However the deep append ends, it is withdrawn, and
+    this run's own approval on its head (clean case) stays."""
+    late = _marked(7, state="APPROVED", commit="old0000",
+                   started="2000-01-01T00:00:00+00:00")
+    events, dismissed, _ = _run_with_verdicts(
+        monkeypatch, deep=deep, reviews_on_pr=[late],
+    )
+    assert dismissed == [7]
+    assert ("APPROVE" in events) == (deep is _RAN_CLEAN)
+
+
+_DIFF_WITH_IGNORED = _DIFF + """diff --git a/docs/guide.md b/docs/guide.md
+--- a/docs/guide.md
++++ b/docs/guide.md
+@@ -1,1 +1,2 @@
+ context
++words
+"""
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_deep_append_never_approves_over_an_unreviewed_path(monkeypatch, blocking):
+    """#1781: `.grug.yaml` ignores a changed path, so neither pass read it.
+    The clean deep pass posts no approval and its summary names the path."""
+    from personas.code_reviewer.repo_config import parse_repo_config
+
+    config = parse_repo_config("ignore:\n  - 'docs/**'\n")
+    monkeypatch.setattr(cr_dispatch, "_load_pr_repo_config", lambda *a, **k: config)
+    checks: list = []
+    monkeypatch.setattr(cr_dispatch, "get_app_id", lambda: _APP_ID)
+    monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **k: [])
+    monkeypatch.setattr(cr_dispatch, "dismiss_review", lambda *a, **kw: {})
+    reviews: list = []
+    checks = _run_escalated_review(
+        monkeypatch, deep=_RAN_CLEAN, blocking=blocking, posted_reviews=reviews,
+        diff=_DIFF_WITH_IGNORED,
+        checks_on_head=[_elder_run(1, started_at="2999-01-01T00:00:00Z")],
+    )
+    assert "APPROVE" not in [r.event for r in reviews]
+    deep = _deep_checks(checks)
+    assert deep and "`docs/guide.md`" in deep[-1]["summary"]
 
 

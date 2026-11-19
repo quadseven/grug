@@ -54,11 +54,11 @@ def _payload(action: str = "opened") -> dict:
     }
 
 
-def _diff_response():
+def _diff_response(diff: str = _DIFF):
     r = MagicMock(spec=httpx.Response)
     r.status_code = 200
     r.raise_for_status = MagicMock()
-    r.text = _DIFF
+    r.text = diff
     return r
 
 
@@ -93,21 +93,36 @@ def _review(rid, *, state, commit="old0000", submitted_at=None):
 
 
 def _run(monkeypatch, llm, *, blocking, action="opened", threads=(),
-         carried=(), reviews=(), author="alice"):
-    """Drive one Tier-1 review; return (posted reviews, dismissed ids)."""
+         carried=(), reviews=(), author="alice", head_state="current",
+         rerun_pending=False, diff=_DIFF, checks=None, head=_HEAD):
+    """Drive one Tier-1 review; return (posted reviews, dismissed ids).
+    `checks`, when given, collects every posted check-run.
+
+    `head_state` is what GitHub says about the head when Elder checks it
+    (#1781): "moved" models a push that landed after the run started."""
     posted: list[ReviewResult] = []
     dismissed: list[int] = []
+    monkeypatch.setattr(cr_dispatch, "_pr_head_state", lambda *a, **k: head_state)
     monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
-    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        cr_dispatch, "post_check_run",
+        lambda *a, **kw: (checks.append(a[3]) if checks is not None else None) or {},
+    )
     monkeypatch.setattr(
         cr_dispatch, "post_review",
         lambda *a, result, **kw: posted.append(result) or {"id": 500 + len(posted)},
     )
     monkeypatch.setattr(cr_dispatch, "list_reviews", lambda *a, **kw: list(reviews))
-    monkeypatch.setattr(
-        cr_dispatch, "dismiss_review",
-        lambda *a, **kw: dismissed.append(kw["review_id"]) or {},
-    )
+
+    def _dismiss(*a, review_id, **kw):
+        # As on GitHub: a dismissed review lists as DISMISSED afterward.
+        dismissed.append(review_id)
+        for review in reviews:
+            if review["id"] == review_id:
+                review["state"] = "DISMISSED"
+        return {}
+
+    monkeypatch.setattr(cr_dispatch, "dismiss_review", _dismiss)
     monkeypatch.setattr(
         cr_dispatch.carry_forward, "list_threads",
         lambda *a, **kw: None if threads is None else list(threads),
@@ -117,8 +132,11 @@ def _run(monkeypatch, llm, *, blocking, action="opened", threads=(),
     )
     payload = _payload(action)
     payload["pull_request"]["user"]["login"] = author
-    with patch("httpx.get", return_value=_diff_response()):
-        cr_dispatch.dispatch_code_review(payload, blocking=blocking)
+    payload["pull_request"]["head"]["sha"] = head
+    with patch("httpx.get", return_value=_diff_response(diff)):
+        cr_dispatch.dispatch_code_review(
+            payload, blocking=blocking, rerun_pending=rerun_pending,
+        )
     return posted, dismissed
 
 
@@ -256,12 +274,250 @@ def test_degraded_rereview_withdraws_elders_older_approval(monkeypatch):
     assert dismissed == [1]
 
 
-def test_clean_rereview_keeps_elders_older_approval(monkeypatch):
+def test_rereview_withdraws_elders_approval_on_an_earlier_commit(monkeypatch):
+    """#1781: the approval vouched for an older commit. A clean finish
+    approves the new head again."""
     reviews = [_review(1, state="APPROVED", commit="old0000")]
-    _, dismissed = _run(
+    posted, dismissed = _run(
         monkeypatch, _clean(), blocking=True, action="synchronize", reviews=reviews,
     )
+    assert dismissed == [1]
+    assert [r.event for r in posted] == ["APPROVE"]
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_degraded_rerun_pending_withdraws_elders_older_approval(monkeypatch, blocking):
+    """#1781: a run that exits early to wait for its re-run cannot vouch
+    for the head either, so the earlier approval is withdrawn first."""
+    reviews = [_review(1, state="APPROVED", commit="old0000")]
+    monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **kw: {})
+    _, dismissed = _run(
+        monkeypatch, LlmReviewResponse(kind="all_failed", error="poolside: timeout"),
+        blocking=blocking, action="synchronize", reviews=reviews, rerun_pending=True,
+    )
+    assert dismissed == [1]
+
+
+def test_stale_rereview_withdraws_elders_older_approval(monkeypatch):
+    """A queued re-review whose input went stale exits before any model
+    call, after withdrawing the approval it can no longer stand behind."""
+    reviews = [_review(1, state="APPROVED", commit="old0000")]
+    monkeypatch.setattr(
+        cr_dispatch, "_review_snapshot_freshness_failure",
+        lambda **kw: {"persona": "code_reviewer", "result": "stale"},
+    )
+    posted, dismissed = _run(
+        monkeypatch, _clean(), blocking=True, action="review", reviews=reviews,
+    )
+    assert posted == []
+    assert dismissed == [1]
+
+
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_push_after_the_run_started_leaves_the_newer_block_and_no_approval(
+    monkeypatch, blocking,
+):
+    """#1781: run A reviews the old head; a push lands and run B blocks the
+    new head. A finishes clean: it must not approve the old head, and must
+    not dismiss B's block or any approval on the new head."""
+    newer_block = _review(1, state="CHANGES_REQUESTED", commit="new9999")
+    newer_block["body"] += "\n" + run_marker(datetime(2999, 1, 1, tzinfo=timezone.utc))
+    posted, dismissed = _run(
+        monkeypatch, _clean(), blocking=blocking, action="synchronize",
+        reviews=[newer_block, _review(2, state="APPROVED", commit="new9999")],
+        head_state="moved",
+    )
+    assert "APPROVE" not in [r.event for r in posted]
     assert dismissed == []
+
+
+def test_unconfirmed_head_never_approves(monkeypatch):
+    """Fail closed: the head lookup failed, so the approval is not posted."""
+    posted, _ = _run(monkeypatch, _clean(), blocking=True, head_state="unknown")
+    assert "APPROVE" not in [r.event for r in posted]
+
+
+def test_approving_run_never_dismisses_a_block_on_another_commit(monkeypatch):
+    """Only a same-head block from an earlier-started run is withdrawn; a
+    block on another commit may belong to a newer push (#1781)."""
+    reviews = [_review(1, state="CHANGES_REQUESTED", commit="other00")]
+    posted, dismissed = _run(
+        monkeypatch, _clean(), blocking=True, action="synchronize", reviews=reviews,
+    )
+    assert [r.event for r in posted] == ["APPROVE"]
+    assert dismissed == []
+
+
+# --- #1781: every exit withdraws approvals on other commits -----------------
+
+
+def _old_approval() -> list[dict]:
+    return [_review(1, state="APPROVED", commit="old0000")]
+
+
+def test_config_skip_exit_withdraws_an_approval_on_another_commit(monkeypatch):
+    monkeypatch.setattr(cr_dispatch, "pr_skip_rule", lambda *a, **k: "skip_prs: bots")
+    reviews = _old_approval()
+    posted, dismissed = _run(monkeypatch, _clean(), blocking=True, reviews=reviews)
+    assert posted == []
+    assert dismissed == [1]
+
+
+def test_carried_verdict_exit_withdraws_an_approval_on_another_commit(monkeypatch):
+    monkeypatch.setattr(
+        cr_dispatch.carry_verdict, "carry_if_unchanged",
+        lambda *a, **k: {"persona": "code_reviewer", "result": "pass"},
+    )
+    posted, dismissed = _run(
+        monkeypatch, _clean(), blocking=True, reviews=_old_approval(),
+    )
+    assert posted == []
+    assert dismissed == [1]
+
+
+def test_degraded_fetch_exit_withdraws_an_approval_on_another_commit(monkeypatch):
+    def _down(*a, **k):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(cr_dispatch, "fetch_pr_diff", _down)
+    posted, dismissed = _run(
+        monkeypatch, _clean(), blocking=True, reviews=_old_approval(),
+    )
+    assert "APPROVE" not in [r.event for r in posted]
+    assert dismissed == [1]
+
+
+def test_exception_exit_withdraws_an_approval_on_another_commit(monkeypatch):
+    def _boom(*a, **k):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(cr_dispatch, "parse_diff", _boom)
+    reviews = _old_approval()
+    with pytest.raises(RuntimeError):
+        _run(monkeypatch, _clean(), blocking=True, reviews=reviews)
+    assert reviews[0]["state"] == "DISMISSED"
+
+
+def test_first_review_exit_keeps_this_heads_approval(monkeypatch):
+    """The final withdrawal touches other commits only: the approval this
+    run just posted on its head stands."""
+    reviews = _old_approval() + [_review(2, state="APPROVED", commit=_HEAD)]
+    posted, dismissed = _run(monkeypatch, _clean(), blocking=True, reviews=reviews)
+    assert [r.event for r in posted] == ["APPROVE"]
+    assert dismissed == [1]
+
+
+# --- #1781: no approval over unreviewed code ---------------------------------
+
+
+def _with_file(path: str, body: str = "+x = 1\n") -> str:
+    lines = body.count("\n")
+    return _DIFF + (
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+        f"@@ -1,1 +1,{lines + 1} @@\n context\n{body}"
+    )
+
+
+def _ignore_docs(monkeypatch):
+    from personas.code_reviewer.repo_config import parse_repo_config
+
+    config = parse_repo_config("ignore:\n  - 'docs/**'\n")
+    monkeypatch.setattr(cr_dispatch, "_load_pr_repo_config", lambda *a, **k: config)
+
+
+@pytest.mark.parametrize("kind", ["excluded", "oversized", "ignored"])
+@pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
+def test_unreviewed_path_never_approves_and_is_named(monkeypatch, kind, blocking):
+    """Elder approves only code it read. A changed path dropped before the
+    model saw it (data or generated, too big for any cohort, or ignored by
+    `.grug.yaml`) leaves the head unvouched, and the summary names it."""
+    if kind == "excluded":
+        path, body = "data/rows.csv", "+a,b\n"
+    elif kind == "oversized":
+        path, body = "src/huge.py", "".join(f"+v{i} = {i}\n" for i in range(400))
+        monkeypatch.setattr(cr_dispatch, "review_cohort_char_budget", lambda: 2000)
+    else:
+        path, body = "docs/guide.md", "+words\n"
+        _ignore_docs(monkeypatch)
+    checks: list = []
+    posted, _ = _run(
+        monkeypatch, _clean(), blocking=blocking, diff=_with_file(path, body),
+        checks=checks,
+    )
+    assert "APPROVE" not in [r.event for r in posted]
+    summary = checks[-1].summary
+    assert "Elder does not approve this head" in summary
+    assert f"`{path}`" in summary.split("Elder does not approve this head", 1)[1]
+
+
+def test_unreviewed_path_still_requests_changes_on_a_block(monkeypatch):
+    _ignore_docs(monkeypatch)
+    posted, _ = _run(
+        monkeypatch, _with("high"), blocking=True,
+        diff=_with_file("docs/guide.md", "+words\n"),
+    )
+    assert [r.event for r in posted][-1] == "REQUEST_CHANGES"
+
+
+_HEAD2 = "feed5678beef"
+_HUGE = "".join(f"+v{i} = {i}\n" for i in range(400))
+_OTHER = """diff --git a/src/y.py b/src/y.py
+--- a/src/y.py
++++ b/src/y.py
+@@ -1,1 +1,2 @@
+ context
++y = 2
+"""
+
+
+def test_unreviewed_path_is_not_skipped_by_the_next_delta_review(monkeypatch):
+    """#1781: push 1 carries a file too big to review, so it gets no
+    approval. Push 2 touches only another file. The Living Hunt baseline
+    must not have moved past push 1, or push 2's delta would skip the big
+    file and approve code nobody read."""
+    import adapters.install_store as store
+
+    baseline: dict = {}
+    monkeypatch.setattr(store, "get_elder_last_reviewed", lambda **k: baseline.get("head"))
+    monkeypatch.setattr(
+        store, "put_elder_last_reviewed", lambda **k: baseline.update(head=k["head_sha"]),
+    )
+    monkeypatch.setattr(cr_dispatch, "review_cohort_char_budget", lambda: 2000)
+    full_pr = _with_file("src/huge.py", _HUGE) + _OTHER
+    heads = iter((_HEAD, _HEAD2))
+    current = {}
+
+    def _snapshot(*a, **k):
+        return ("id", current["head"], "open", False)
+
+    monkeypatch.setattr(cr_dispatch, "_fetch_current_review_snapshot", _snapshot)
+    monkeypatch.setattr(
+        cr_dispatch, "fetch_pr_diff_with_scope", lambda *a, **k: (_OTHER, True, False),
+    )
+
+    current["head"] = next(heads)
+    first, _ = _run(
+        monkeypatch, _clean(), blocking=True, diff=_with_file("src/huge.py", _HUGE),
+    )
+    current["head"] = next(heads)
+    second, _ = _run(
+        monkeypatch, _clean(), blocking=True, action="synchronize", diff=full_pr,
+        head=_HEAD2,
+    )
+
+    assert "APPROVE" not in [r.event for r in first]
+    assert "APPROVE" not in [r.event for r in second]
+
+
+def test_lock_files_are_left_to_the_lock_check():
+    """A lock file the model skipped is the lock check's to vouch for
+    (`lock_check.unreviewed`), so it is not counted twice; every other
+    dropped path is named once, in diff order."""
+    assert cr_dispatch._unreviewed_paths(
+        excluded=("uv.lock", "data/rows.csv"),
+        oversized=("src/huge.py", "data/rows.csv"),
+        ignored=("docs/guide.md",),
+    ) == ("data/rows.csv", "src/huge.py", "docs/guide.md")
 
 
 # --- the pure verdict rule ----------------------------------------------------

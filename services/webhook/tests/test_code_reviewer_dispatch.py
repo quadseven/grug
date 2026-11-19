@@ -4314,22 +4314,23 @@ def _run_dismiss(monkeypatch, llm, *, reviews, blocking=True, threads=(),
 
 
 def test_clean_rereview_dismisses_only_elders_own_stale_block(monkeypatch):
-    """A clean re-review withdraws Elder's REQUEST_CHANGES on an earlier
-    commit. GitHub keeps that block until it is dismissed; a COMMENT review
-    does not replace it. Guard's block, a human's, an untagged one and a
-    block on the current head are all left alone."""
+    """A clean re-review withdraws Elder's earlier REQUEST_CHANGES on the
+    head it approves. Guard's block, a human's, an untagged one and a block
+    on another commit (#1781: it may come from a newer push, and Elder's
+    newer APPROVE already replaces it as Elder's standing state) are left
+    alone."""
     llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
     reviews = [
-        _review(1),                                                  # stale Elder block
+        _review(1, commit=_HEAD, submitted_at=_BEFORE_RUN),          # stale Elder block
         _review(2, body="<!-- grug:review persona=guard -->"),       # Guard's block
         _review(3, login="a-human"),                                 # a human
         _review(7, login="other-app[bot]"),                          # another bot quoting the tag
         _review(4, body="Grug Elder gaze upon your PR"),             # pre-tag review
-        _review(5, commit="abcd1234efgh"),                           # current head
+        _review(5),                                                  # another commit
         _review(6, state="COMMENTED"),                               # not a block
     ]
     listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
-    assert listed == [7]
+    assert listed == [7, 7, 7]  # #1781: approvals at start and end, plus the block
     assert dismissed == [1]
 
 
@@ -4367,12 +4368,16 @@ def test_same_head_blocks_of_other_authors_are_kept(monkeypatch):
     assert dismissed == []
 
 
-def test_earlier_commit_block_is_dismissed_even_if_submitted_after_run_start(monkeypatch):
-    """#1350: the earlier-commit rule does not depend on timing."""
+def test_block_on_another_commit_is_never_dismissed(monkeypatch):
+    """#1781: an approving run withdraws only same-head blocks. A block on
+    another commit may be a newer run's verdict on a newer push."""
     llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
-    reviews = [_review(1, commit="old0000", submitted_at=_AFTER_RUN)]
+    reviews = [
+        _review(1, commit="old0000", submitted_at=_AFTER_RUN),
+        _review(2, commit="old0000", submitted_at=_BEFORE_RUN),
+    ]
     _, dismissed = _run_dismiss(monkeypatch, llm, reviews=reviews)
-    assert dismissed == [1]
+    assert dismissed == []
 
 
 def test_carried_open_finding_keeps_the_block(monkeypatch):
@@ -4382,7 +4387,7 @@ def test_carried_open_finding_keeps_the_block(monkeypatch):
     listed, dismissed = _run_dismiss(
         monkeypatch, llm, reviews=[_review(1)], carried_conclusion="failure",
     )
-    assert listed == []
+    assert listed == [7, 7]  # #1781: only the approval withdrawals, start and end
     assert dismissed == []
 
 
@@ -4405,7 +4410,7 @@ def test_failing_review_keeps_the_block(monkeypatch):
         backend_used=Backend.POOLSIDE,
     )
     listed, dismissed = _run_dismiss(monkeypatch, llm, reviews=[_review(1)])
-    assert listed == []
+    assert listed == [7, 7]  # #1781: only the approval withdrawals, start and end
     assert dismissed == []
 
 
@@ -4459,7 +4464,7 @@ def test_advisory_findings_with_a_green_check_still_dismiss(monkeypatch):
         _, dismissed = _run_dismiss(
             monkeypatch, llm, reviews=reviews, action=action, check_run=_check,
         )
-        assert dismissed == [1, 2], action
+        assert dismissed == [1], action  # #1781: 2 sits on another commit
     assert recorded["conclusion"] == "success"
 
 
@@ -4476,7 +4481,7 @@ def test_failing_improve_rerun_keeps_the_block(monkeypatch):
     listed, dismissed = _run_dismiss(
         monkeypatch, llm, reviews=reviews, action="rerun",
     )
-    assert listed == []
+    assert listed == [7, 7]  # #1781: only the approval withdrawals, start and end
     assert dismissed == []
 
 
@@ -4489,7 +4494,7 @@ def test_advisory_clean_review_approves_and_withdraws_the_block(monkeypatch):
     listed, dismissed = _run_dismiss(
         monkeypatch, llm, reviews=reviews, action="synchronize", blocking=False,
     )
-    assert listed == [7]
+    assert listed == [7, 7, 7]  # #1781: approvals at start and end, plus the block
     assert dismissed == [1]
 
 
@@ -4517,7 +4522,7 @@ def test_clean_improve_rerun_never_touches_a_human_block(monkeypatch):
     listed, dismissed = _run_dismiss(
         monkeypatch, llm, reviews=reviews, action="rerun",
     )
-    assert listed == [7]
+    assert listed == [7, 7, 7]  # #1781: approvals at start and end, plus the block
     assert dismissed == []
 
 
@@ -4525,8 +4530,8 @@ def test_dismissal_message_links_the_clean_check_run(monkeypatch):
     llm = LlmReviewResponse(kind="reviewed", findings=(), backend_used=Backend.POOLSIDE)
     messages: list[str] = []
     _, dismissed = _run_dismiss(
-        monkeypatch, llm, reviews=[_review(1)], action="rerun",
-        messages=messages,
+        monkeypatch, llm, reviews=[_review(1, commit=_HEAD, submitted_at=_BEFORE_RUN)],
+        action="rerun", messages=messages,
         check_run=lambda *a, **kw: {"id": 424242, "html_url": _CLEAN_CHECK_URL},
     )
     assert dismissed == [1]
