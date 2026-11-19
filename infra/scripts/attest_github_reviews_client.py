@@ -9,6 +9,7 @@ Proves NECESSARY conditions for these bools (via AST static analysis):
   - `request_uses_install_token_bearer_auth_per_elder_persona`
   - `review_result_is_frozen_dataclass_no_mutation_per_elder_persona`
   - `inline_comment_is_frozen_dataclass_no_mutation_per_elder_persona`
+  - `span_comment_adds_only_required_start_fields_never_null` (#1759)
   - `post_review_does_not_swallow_401_per_elder_persona`
 
 Sufficiency requires runtime testing — this is the static half. The
@@ -187,6 +188,48 @@ EXPECTED_REVIEW_FIELDS: frozenset[str] = frozenset(
 EXPECTED_INLINE_COMMENT_FIELDS: frozenset[str] = frozenset(
     ("path", "line", "body", "side")
 )
+# A multi-line comment (#1759) is its own class, so the one-line shape above
+# is untouched. GitHub reads a null `start_line` as a malformed anchor, so the
+# two extra keys must never be able to be None: `asdict()` then has nothing to
+# omit and no manual marshalling is needed.
+EXPECTED_SPAN_COMMENT_FIELDS: frozenset[str] = frozenset(
+    EXPECTED_INLINE_COMMENT_FIELDS | {"start_line", "start_side"}
+)
+
+
+def _span_comment_failures(path: Path, tree: ast.Module) -> list[str]:
+    """SpanComment must be a frozen InlineComment subclass whose own fields
+    are exactly start_line (a required int) and start_side (RIGHT, defaulted,
+    never None)."""
+    cls = _find_frozen_dataclass(tree, "SpanComment")
+    if cls is None:
+        return [f"{path}: SpanComment is not a frozen dataclass"]
+    out: list[str] = []
+    if not any(isinstance(b, ast.Name) and b.id == "InlineComment" for b in cls.bases):
+        out.append(f"{path}: SpanComment must subclass InlineComment")
+    own = {
+        n.target.id: n for n in cls.body
+        if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
+    }
+    if set(own) != {"start_line", "start_side"}:
+        out.append(
+            f"{path}: SpanComment must add exactly ['start_line', 'start_side'] "
+            f"to InlineComment (got {sorted(own)}), so its asdict() keys are "
+            f"{sorted(EXPECTED_SPAN_COMMENT_FIELDS)}"
+        )
+        return out
+    line = own["start_line"]
+    if not (isinstance(line.annotation, ast.Name) and line.annotation.id == "int"
+            and line.value is None):
+        out.append(f"{path}: SpanComment.start_line must be a required `int` (no default, never None)")
+    side = own["start_side"]
+    if "None" in ast.dump(side.annotation) or (
+        isinstance(side.value, ast.Constant) and side.value.value is None
+    ):
+        out.append(f"{path}: SpanComment.start_side must never be None: GitHub rejects a null start_side")
+    elif not (isinstance(side.value, ast.Constant) and side.value.value == "RIGHT"):
+        out.append(f"{path}: SpanComment.start_side must default to 'RIGHT'")
+    return out
 
 
 def _dataclass_field_names(class_def: ast.ClassDef) -> frozenset[str]:
@@ -280,6 +323,10 @@ def _check(path: Path) -> list[str]:
                 f"{sorted(EXPECTED_INLINE_COMMENT_FIELDS)} for asdict() to "
                 f"produce GH's comments[] shape (got {sorted(fields)})"
             )
+
+    # A multi-line comment is a separate, attested shape; the null-free rule
+    # lives in its field definitions, not in marshalling code.
+    failures.extend(_span_comment_failures(path, tree))
 
     # `httpx.post` must pass `json=asdict(result)` — the URL+auth check
     # alone doesn't prove the payload shape. A regression that swapped

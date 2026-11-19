@@ -18,7 +18,7 @@ from personas.code_reviewer.suggestion import (
     checked_span_suggestion,
     diff_right_side,
 )
-from github_reviews_client import InlineComment, ReviewResult
+from github_reviews_client import InlineComment, ReviewResult, SpanComment
 
 PATH = "app/pick.py"
 
@@ -97,6 +97,7 @@ def test_two_line_rewrite_in_one_hunk_anchors_the_span():
     assert (span.start_line, span.end_line) == (4, 5)
 
     c = _comment(f)
+    assert isinstance(c, SpanComment)
     assert (c.start_line, c.line) == (4, 5)
     assert (c.start_side, c.side) == ("RIGHT", "RIGHT")
     assert "```suggestion\n    if options is None:\n        return []\n```" in c.body
@@ -136,7 +137,7 @@ def test_span_leaving_the_hunk_falls_back_to_prose():
     f = _finding(10, "    result = combine(a, b, c)\n    log(result)")
     assert _span(f, diff) is None
     c = _comment(f, diff)
-    assert c.start_line is None
+    assert not isinstance(c, SpanComment)
     assert "```suggestion" not in c.body
     assert "log(result)" in c.body  # still shown, as fenced prose
 
@@ -253,13 +254,13 @@ def test_fence_and_mention_stay_inert_inside_the_block():
 def test_single_line_suggestion_is_unchanged_by_the_span_path():
     f = _finding(6, "    return best(options, default)")
     c = _comment(f)
-    assert c.start_line is None and c.line == 6
+    assert not isinstance(c, SpanComment) and c.line == 6
     assert "```suggestion\n    return best(options, default)\n```" in c.body
 
 
 def test_no_diff_keeps_every_multi_line_fix_as_prose():
     c = _comment(_finding(4, "    if x:\n        return 1"), diff="")
-    assert c.start_line is None
+    assert not isinstance(c, SpanComment)
     assert "```suggestion" not in c.body
 
 
@@ -280,28 +281,43 @@ def test_wire_payload_carries_start_keys_only_for_a_span(monkeypatch):
     result = ReviewResult(
         commit_id="a" * 40, event="COMMENT", body="b",
         comments=(
-            InlineComment(path=PATH, line=5, body="x", start_line=4),
+            SpanComment(path=PATH, line=5, body="x", start_line=4),
             InlineComment(path=PATH, line=6, body="y"),
         ),
     )
     client.post_review("t", "o", "r", pull_number=1, result=result)
     span, plain = sent["json"]["comments"]
-    assert (span["start_line"], span["start_side"], span["side"]) == (4, "RIGHT", "RIGHT")
-    assert "start_line" not in plain and "start_side" not in plain
+    assert span == {
+        "path": PATH, "line": 5, "body": "x", "side": "RIGHT",
+        "start_line": 4, "start_side": "RIGHT",
+    }
+    # byte-identical to the one-line shape before multi-line support
+    assert plain == {"path": PATH, "line": 6, "body": "y", "side": "RIGHT"}
     json.dumps(sent["json"])
 
 
-@pytest.mark.parametrize(("start", "line", "side", "start_side"), [
-    (5, 5, "RIGHT", None),
-    (0, 5, "RIGHT", None),
-    (3, 5, "RIGHT", "LEFT"),
+def test_pending_publication_round_trips_both_comment_shapes():
+    from dataclasses import asdict
+    rows = [asdict(c) for c in (
+        SpanComment(path=PATH, line=5, body="x", start_line=4),
+        InlineComment(path=PATH, line=6, body="y"),
+    )]
+    from personas.code_reviewer import publish_retry as pr
+    rebuilt = tuple(
+        (SpanComment if "start_line" in c else InlineComment)(**c) for c in rows
+    )
+    assert isinstance(rebuilt[0], SpanComment) and type(rebuilt[1]) is InlineComment
+    assert pr.SpanComment is SpanComment
+
+
+@pytest.mark.parametrize(("start", "line", "side"), [
+    (5, 5, "RIGHT"),
+    (0, 5, "RIGHT"),
+    (3, 5, "LEFT"),
 ])
-def test_inline_comment_rejects_a_malformed_span(start, line, side, start_side):
+def test_span_comment_rejects_a_malformed_span(start, line, side):
     with pytest.raises(ValueError):
-        InlineComment(
-            path=PATH, line=line, body="x", side=side,
-            start_line=start, start_side=start_side,
-        )
+        SpanComment(path=PATH, line=line, body="x", side=side, start_line=start)
 
 
 def test_dedup_treats_every_line_of_a_span_as_commented():

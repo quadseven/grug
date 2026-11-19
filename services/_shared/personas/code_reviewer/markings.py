@@ -26,7 +26,7 @@ from typing import Any, Literal
 from model_family import ReviewFamilies
 from code_review_prompt import RULES
 from github_checks_client import CheckConclusion
-from github_reviews_client import InlineComment, ReviewEvent, ReviewResult
+from github_reviews_client import InlineComment, ReviewEvent, ReviewResult, SpanComment
 from llm_client import PrContext
 from review_types import EFFORTS, SEVERITIES
 from personas.review_publish import (
@@ -1484,9 +1484,8 @@ def _checked_inline_comment(
             path=f.file, line=f.line,
             body=_checked_comment_body(f, file_text, precedent_note),
         )
-    return InlineComment(
-        path=f.file, line=span.end_line,
-        start_line=span.start_line, start_side="RIGHT",
+    return SpanComment(
+        path=f.file, line=span.end_line, start_line=span.start_line,
         body=_inline_comment_body(f, precedent_note, span=span),
     )
 

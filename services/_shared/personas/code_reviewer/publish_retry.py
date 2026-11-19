@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
 from adapters import pg_publish_retry_store as store
-from github_reviews_client import InlineComment, ReviewResult, review_payload
+from github_reviews_client import InlineComment, ReviewResult, SpanComment
 from llm_client import Backend, FindingOrigin
 
 from personas.code_reviewer.persona import Finding
@@ -70,7 +70,7 @@ def publication_key(
             "installation_id": installation_id,
             "repo": f"{owner}/{repo_name}",
             "pull_number": pull_number,
-            "review": review_payload(result),
+            "review": asdict(result),
         },
         sort_keys=True,
     )
@@ -126,7 +126,10 @@ class PendingPublication:
             commit_id=raw_result["commit_id"],
             event=raw_result["event"],
             body=raw_result["body"],
-            comments=tuple(InlineComment(**c) for c in raw_result["comments"]),
+            comments=tuple(
+                (SpanComment if "start_line" in c else InlineComment)(**c)
+                for c in raw_result["comments"]
+            ),
         )
         return cls(
             key=record["key"],
