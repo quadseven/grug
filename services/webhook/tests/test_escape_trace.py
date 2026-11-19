@@ -14,6 +14,7 @@ from escape_trace import (
 )
 
 REPO = "acme/widgets"
+OTHER_REPO = "elsewhere/gadgets"
 SHA = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0"
 
 
@@ -88,7 +89,7 @@ def test_correcting_pr_with_no_link_traces_to_nothing():
 
 
 def test_ref_to_another_repo_is_ignored():
-    fix = _pr(31, body="Reverts other/repo#10")
+    fix = _pr(31, body=f"Reverts {OTHER_REPO}#10")
     t = trace_escape(fix, REPO, _sources([_pr(10), fix]))
     assert not t.traced
 

@@ -13,7 +13,7 @@ choose the fetchers and tests need no network.
 Link evidence, strongest first, so the first one that resolves to a merged
 earlier PR in the same repo wins:
 
-- `revert-body`: "Reverts #N" (also `owner/repo#N` and a pull URL), the line
+- `revert-body`: "Reverts #N" (also a repo-qualified reference and a pull URL), the line
   GitHub's Revert button writes.
 - `regression-body`: "Fixes regression from #N", "regression introduced in
   #N", "regression caused by #N".
@@ -42,7 +42,7 @@ REGRESSION_TRAILER = "regression-trailer"
 LINK_KINDS = (REVERT_BODY, REGRESSION_BODY, REVERT_TRAILER, REGRESSION_TRAILER)
 _REVERT_KINDS = frozenset({REVERT_BODY, REVERT_TRAILER})
 
-# A pull reference: "#12", "owner/repo#12" or a pull request URL.
+# A pull reference: "#12", a repo-qualified number or a pull request URL.
 _REF = (
     r"(?:https?://github\.com/(?P<urepo>[\w.-]+/[\w.-]+)/pull/"
     r"|(?P<rrepo>[\w.-]+/[\w.-]+)#|#)(?P<num>\d+)"
