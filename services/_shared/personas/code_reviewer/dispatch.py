@@ -381,7 +381,7 @@ def _review_snapshot_freshness_failure(
     # That discard is not a lone wasted pass. It re-enqueues against the SAME
     # sha, `elder_in_progress_check_skipped: already_in_progress` declines to
     # post the check-run because one is still open, and the check sits
-    # `pending` forever. Live on quadseven/infra#2133 (2026-08-01): Elder
+    # `pending` forever. Live on an infra ticket (2026-08-01): Elder
     # passed at 03:00:27, the author edited the body to satisfy Chief's own
     # DoR gate at 03:08, and a docs-only PR went back to pending for 25
     # minutes. Satisfying one grug check should not stall another.
