@@ -484,7 +484,7 @@ def _finding(
     fix: object = None,
 ) -> Finding:
     severity = _severity_for(code)
-    if code == "S608" and file_contents and _s608_is_constant(file_contents.get(path, ""), row):
+    if code == "S608" and file_contents and _s608_is_constant(file_contents.get(path, ""), row, path, file_contents):
         severity = "medium"
     if code == "S105" and file_contents and _s105_is_sql(file_contents.get(path, ""), row):
         severity = "medium"
@@ -539,18 +539,37 @@ def _s105_is_sql(source: str, row: int) -> bool:
     )
 
 
-def _s608_is_constant(source: str, row: int) -> bool:
+def _s608_is_constant(
+    source: str, row: int, path: str = "",
+    file_contents: dict[str, str] | None = None,
+) -> bool:
     """True when an expression ruff flagged on `row` is constant SQL by the
     rules of `_literal_sql`. This function only gathers the module-level
-    assignments those rules may resolve names through, and picks the
-    candidate expressions on `row`. Repository code is parsed, never
-    evaluated."""
+    assignments those rules may resolve names through (including one hop
+    through `from module import NAME`), and picks the candidate expressions
+    on `row`. Repository code is parsed, never evaluated."""
+    tree = _parse(source)
+    if tree is None:
+        return False
+    constants = _module_constants(tree)
+    constants.update(_imported_constants(tree, path, file_contents or {}))
+    for name in _rebound_names(tree):
+        constants.pop(name, None)
+    candidates = _s608_candidates(tree, row)
+    return any(_literal_sql(candidate, constants) for candidate in candidates)
+
+
+def _parse(source: str) -> ast.Module | None:
     try:
-        tree = ast.parse(source)
+        return ast.parse(source)
     except (SyntaxError, ValueError):
         # ValueError: text ast.parse cannot encode (a lone surrogate raises
         # UnicodeEncodeError). Unknown SQL keeps the high severity.
-        return False
+        return None
+
+
+def _module_constants(tree: ast.Module) -> dict[str, ast.expr]:
+    """Module-level assignments of `tree`, minus names bound more than once."""
     constants: dict[str, ast.expr] = {}
     for node in tree.body:
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -560,12 +579,52 @@ def _s608_is_constant(source: str, row: int) -> bool:
                 for target in targets:
                     if isinstance(target, ast.Name):
                         constants[target.id] = value
-
     for name in _rebound_names(tree):
         constants.pop(name, None)
+    return constants
 
-    candidates = _s608_candidates(tree, row)
-    return any(_literal_sql(candidate, constants) for candidate in candidates)
+
+def _module_candidates(path: str, level: int, module: str | None) -> list[str]:
+    """Paths the imported module may have in the scanned files: under each
+    package root above the flagged file (absolute import) or relative to
+    its directory (relative import)."""
+    parts = path.split("/")[:-1]
+    rel = (module or "").replace(".", "/")
+    if level:
+        base = parts[: len(parts) - (level - 1)] if level - 1 <= len(parts) else None
+        roots = [base] if base is not None else []
+    else:
+        roots = [parts[:i] for i in range(len(parts) + 1)]
+    found: list[str] = []
+    for root in roots:
+        stem = "/".join([*root, rel] if rel else root)
+        found += [f"{stem}.py", f"{stem}/__init__.py"]
+    return found
+
+
+def _imported_constants(
+    tree: ast.Module, path: str, file_contents: dict[str, str]
+) -> dict[str, ast.expr]:
+    """Names bound by `from <module> import NAME` whose module source is in
+    `file_contents` and defines NAME as constant SQL there. One hop only: the
+    value is replaced by a literal placeholder, since its own names mean
+    nothing in the importing file. Star imports and missing sources yield
+    nothing, so the finding stays high."""
+    resolved: dict[str, ast.expr] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        source = next((file_contents[c] for c in _module_candidates(path, node.level, node.module)
+                       if c in file_contents), None)
+        other = _parse(source) if source is not None else None
+        if other is None:
+            continue
+        theirs = _module_constants(other)
+        for alias in node.names:
+            value = theirs.get(alias.name)
+            if value is not None and _literal_sql(value, theirs):
+                resolved[alias.asname or alias.name] = ast.Constant(value="")
+    return resolved
 
 
 def _binding_names(node: ast.AST) -> list[str]:
