@@ -1,24 +1,28 @@
-"""Throwaway fixture: a reply helper with swapped arguments."""
+"""Throwaway fixture: small helpers with defects that need several lines to fix."""
 
 
-def send_message(sender, recipient, body):
-    """Return a message record."""
-    return {"from": sender, "to": recipient, "body": body}
+def sort_pair(first, second):
+    """Return the two values in ascending order."""
+    if first > second:
+        temp = first
+        first = second
+        second = first
+    return first, second
 
 
-def reply(original, text):
-    """Build a reply: it must go from the original recipient back to the original sender."""
-    return send_message(
-        sender=original["from"],
-        recipient=original["to"],
-        body=text,
-    )
+def find_index(items, target):
+    """Return the position of target in items, or -1."""
+    index = 0
+    while index < len(items):
+        if items[index] == target:
+            return index
+    return -1
 
 
-def clamp_range(low, high, value):
-    """Clamp value into the inclusive range low..high."""
-    if value < high:
-        value = high
-    if value > low:
-        value = low
-    return value
+def total_price(prices, tax_rate):
+    """Return the sum of prices with tax added to each price."""
+    total = 0
+    for price in prices:
+        taxed = price * tax_rate
+        total = total + taxed
+    return total
