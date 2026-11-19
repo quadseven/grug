@@ -85,7 +85,8 @@ _TEST_CRITERION_RE = re.compile(
 )
 _DOC_CRITERION_RE = re.compile(
     r"\b(?:readme|docs?|document(?:s|ed|ation|ing)?|changelog|adr"
-    r"|runbooks?|guide|guidance|playbooks?|docstrings?)\b",
+    r"|runbooks?|guide|guidance|playbooks?|docstrings?"
+    r"|written\s+decision|decision\s+records?|records?\s+the\s+decision)\b",
     re.IGNORECASE,
 )
 # A criterion that names a prose file by path ("`skills/x/SKILL.md` carries
