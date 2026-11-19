@@ -1457,7 +1457,7 @@ def test_intent_only_edit_does_not_discard_a_review_of_the_same_commit(monkeypat
     `already_in_progress` then declines to post a check-run, leaving the check
     `pending` forever.
 
-    Live on quadseven/infra#2133 (2026-08-01): Elder passed at 03:00:27, the
+    Live on an infra ticket (2026-08-01): Elder passed at 03:00:27, the
     author edited the body to satisfy Chief's DoR gate at 03:08, and the check
     went back to pending for 25 minutes on a docs-only diff.
     """
@@ -3595,7 +3595,7 @@ def test_degraded_review_does_not_claim_clear():
 def test_no_board_for_a_degradation_that_will_be_retried():
     """A retried degradation is not news YET.
 
-    On quadseven/infra#2157 the LLM half was cancelled mid-flight
+    On an infra ticket the LLM half was cancelled mid-flight
     (`all_failed`), the deterministic complexity scanner still produced one
     finding, and Elder created the board on the strength of it - mailing
     "Grug eyes cloudy this pass - read for self" plus a cyclomatic nitpick on

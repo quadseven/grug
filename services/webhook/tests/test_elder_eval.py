@@ -298,7 +298,7 @@ def test_build_cases_anchor_conflict_keeps_first_seen_and_does_not_crash():
 
 
 def test_build_cases_stamps_known_unresolvable_reason():
-    """#895: quadseven/zippie#165's PR and anchor commit are both gone from
+    """#895: one known case's PR and anchor commit are both gone from
     GitHub for good (repo recreated after the finding was recorded) -
     `build_cases` must stamp a reason so the runner never re-attempts a
     doomed fetch and the report can tell this apart from a fresh error."""
@@ -589,8 +589,8 @@ def test_score_unresolvable_case_excluded_and_reported_separately_from_errored()
     }
     report = score(cases, replays)
     assert report.errored_cases == ()
-    assert set(report.unresolvable_cases) == {"quadseven/zippie#165"}
-    assert "e3a58c73" in report.unresolvable_cases["quadseven/zippie#165"]
+    assert set(report.unresolvable_cases) == {"quadseven/zippie#165"}  # leak-guard-allow: case id shape under test
+    assert "e3a58c73" in report.unresolvable_cases["quadseven/zippie#165"]  # leak-guard-allow: case id shape under test
     assert report.cases_scored == 1
     assert not report.all_errored
 
