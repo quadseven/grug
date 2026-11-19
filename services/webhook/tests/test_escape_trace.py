@@ -150,6 +150,7 @@ def test_findings_on_shared_files_are_attached():
     miss = FindingRef(pr=10, path="a.py", finding_class="style", verdict="fixed")
     t = trace_escape(fix, REPO, _sources([old, fix], findings={10: [hit, miss]}))
     assert t.touching_findings == (hit,)
+    assert t.shared_files == ("b.py",)
 
 
 def test_no_shared_files_means_no_findings():
@@ -157,7 +158,7 @@ def test_no_shared_files_means_no_findings():
     fix = _pr(20, body="Reverts #10", files=("z.py",))
     f = FindingRef(pr=10, path="a.py")
     t = trace_escape(fix, REPO, _sources([old, fix], findings={10: [f]}))
-    assert t.traced and t.touching_findings == ()
+    assert t.traced and t.touching_findings == () and t.shared_files == ()
 
 
 def test_ordinary_prose_without_a_pull_reference_does_not_link():
