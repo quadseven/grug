@@ -311,3 +311,16 @@ def test_dedup_treats_every_line_of_a_span_as_commented():
     ])
     assert dedup.finding_key(PATH, 4, "null-deref") in keys
     assert dedup.finding_key(PATH, 5, "null-deref") in keys
+
+
+def test_three_line_replacement_of_a_three_line_span_parses_applied():
+    text = "def f(x):\n    y = g(\n        x,\n    )\n    return y\n"
+    diff = _diff(
+        "@@ -0,0 +1,5 @@\n+def f(x):\n+    y = g(\n+        x,\n+    )\n+    return y"
+    )
+    new = "    y = g(\n        x,\n        strict=True)"
+    f = _finding(3, new)
+    span = _span(f, diff, text)
+    assert (span.start_line, span.end_line) == (2, 4)
+    lines = text.splitlines()
+    ast.parse("\n".join(lines[:1] + new.split("\n") + lines[4:]))
