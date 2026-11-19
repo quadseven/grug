@@ -40,7 +40,13 @@ from personas.code_reviewer.precedent import (
     ClassPrecision, finding_is_muted, mute_note,
 )
 from personas import board
-from personas.code_reviewer.suggestion import checked_suggestion
+from personas.code_reviewer.suggestion import (
+    HunkView,
+    SpanSuggestion,
+    checked_span_suggestion,
+    checked_suggestion,
+    diff_right_side,
+)
 from personas.code_reviewer.docstrings import find_docstring_targets
 from personas.code_reviewer.test_generation import find_test_targets
 from personas.code_reviewer.line_refs import repair_where_refs
@@ -903,6 +909,7 @@ def _provenance_block(f: Finding) -> str:
 
 def _inline_comment_body(
     f: Finding, precedent_note: str = "", *, committable: bool = True,
+    span: SpanSuggestion | None = None,
 ) -> str:
     """Format one finding as a structured Marking (#553 / #617 / Markings v2).
 
@@ -921,7 +928,11 @@ def _inline_comment_body(
     LAST (dedup.parse_rule reads the last marker in the body).
 
     `committable=False` renders any suggestion as fenced prose: dispatch
-    passes it when `checked_suggestion` (#1149) could not verify the fix."""
+    passes it when `checked_suggestion` (#1149) could not verify the fix.
+
+    `span` (#1759) is a multi-line replacement `checked_span_suggestion`
+    verified; it renders as one block over its lines. The text sits inside a
+    fence, which renders no mention, and must stay byte-exact to commit."""
     cat = _category_for_finding(f)
     # CR-dense header: severity chip | category | rule | effort chip
     chip = (
@@ -954,7 +965,13 @@ def _inline_comment_body(
     # survive, but a bare "\n\n\n" suggestion must not slip through as a
     # blank-line commit (FLINT finding on #558).
     stripped_suggestion = f.suggestion.strip("\n\r") if f.suggestion else ""
-    if (
+    if span is not None and committable:
+        body = (
+            f"{head}\n\n**Fix** (one-click, lines "
+            f"{span.start_line}-{span.end_line}):\n"
+            f"```suggestion\n{span.text}\n```"
+        )
+    elif (
         committable
         and f.suggestion
         and "```" not in f.suggestion
@@ -1451,6 +1468,29 @@ def _checked_comment_body(f: Finding, file_text: str, precedent_note: str) -> st
     return _inline_comment_body(replace(f, suggestion=checked), precedent_note)
 
 
+def _checked_inline_comment(
+    f: Finding, file_text: str, precedent_note: str,
+    hunks: tuple[HunkView, ...],
+) -> InlineComment:
+    """One inline comment. A multi-line fix that `checked_span_suggestion`
+    verified anchors the span (start_line..line, both RIGHT); every other
+    finding anchors its own line exactly as before (#1759)."""
+    span = (
+        None if checked_suggestion(f, f.line, file_text) is not None
+        else checked_span_suggestion(f, file_text, hunks)
+    )
+    if span is None:
+        return InlineComment(
+            path=f.file, line=f.line,
+            body=_checked_comment_body(f, file_text, precedent_note),
+        )
+    return InlineComment(
+        path=f.file, line=span.end_line,
+        start_line=span.start_line, start_side="RIGHT",
+        body=_inline_comment_body(f, precedent_note, span=span),
+    )
+
+
 _RUN_MARKER = "<!-- grug:elder-run started={} -->"
 _RUN_MARKER_RE = re.compile(r"<!-- grug:elder-run started=(\S+) -->")
 
@@ -1524,6 +1564,7 @@ def build_review_result(
     held_back: frozenset[str] = frozenset(),
     posts_verdict: bool = False,
     run_started_at: datetime | None = None,
+    diff_text: str = "",
 ) -> tuple[ReviewResult | None, tuple[Finding, ...]]:
     """Build the ReviewResult, or (None, ()) if nothing NEW to post.
 
@@ -1553,7 +1594,11 @@ def build_review_result(
 
     `file_contents` is the head text dispatch already loaded. Every fix is
     offered as a committable block only after `checked_suggestion` (#1149)
-    verifies it against that text; a file with no loaded text gets prose."""
+    verifies it against that text; a file with no loaded text gets prose.
+
+    `diff_text` (#1759) is the PR diff. A multi-line fix is offered as a block
+    only when its span sits inside one hunk of it; without a diff every
+    multi-line fix stays prose."""
     if evaluation.degraded_reason not in (None, "", *PUBLISHABLE_DEGRADATIONS):
         return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)
@@ -1602,13 +1647,12 @@ def build_review_result(
         return None, ()
     notes = precedent_notes or {}
     texts = file_contents or {}
+    right_side = diff_right_side(diff_text)
     comments = tuple(
-        InlineComment(
-            path=f.file, line=f.line,
-            body=_checked_comment_body(
-                f, texts.get(f.file, ""),
-                notes.get(finding_key(f.file, f.line, f.rule_name), ""),
-            ),
+        _checked_inline_comment(
+            f, texts.get(f.file, ""),
+            notes.get(finding_key(f.file, f.line, f.rule_name), ""),
+            right_side.get(f.file, ()),
         )
         for f in new_findings
     )
@@ -1701,6 +1745,7 @@ def project(finished: FinishedPass) -> Markings:
         held_back=finished.held_back,
         posts_verdict=finished.posts_verdict,
         run_started_at=finished.run_started_at,
+        diff_text=finished.diff_text,
     )
     stack_body: str | None = None
     stack_error = ""

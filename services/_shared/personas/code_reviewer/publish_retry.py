@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
 from adapters import pg_publish_retry_store as store
-from github_reviews_client import InlineComment, ReviewResult
+from github_reviews_client import InlineComment, ReviewResult, review_payload
 from llm_client import Backend, FindingOrigin
 
 from personas.code_reviewer.persona import Finding
@@ -70,7 +70,7 @@ def publication_key(
             "installation_id": installation_id,
             "repo": f"{owner}/{repo_name}",
             "pull_number": pull_number,
-            "review": asdict(result),
+            "review": review_payload(result),
         },
         sort_keys=True,
     )

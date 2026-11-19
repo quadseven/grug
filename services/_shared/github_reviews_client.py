@@ -72,6 +72,11 @@ class InlineComment:
     # not promise a default - an implicit LEFT would anchor committable
     # suggestion blocks (#553) on the wrong side of the diff.
     side: Literal["LEFT", "RIGHT"] = "RIGHT"
+    # A multi-line suggestion (#1759) anchors a span: `start_line` is its
+    # first line and `line` its last, both on the same side. None for the
+    # usual one-line comment, in which case neither key is sent.
+    start_line: int | None = None
+    start_side: Literal["LEFT", "RIGHT"] | None = None
 
     def __post_init__(self) -> None:
         if self.line < 1:
@@ -81,6 +86,18 @@ class InlineComment:
             )
         if not self.path:
             raise ValueError("InlineComment.path must be non-empty")
+        if self.start_line is None:
+            if self.start_side is not None:
+                raise ValueError("InlineComment.start_side needs a start_line")
+        elif not 1 <= self.start_line < self.line:
+            raise ValueError(
+                f"InlineComment.start_line must be >= 1 and before line "
+                f"(got {self.start_line} .. {self.line})"
+            )
+        elif self.start_side is None:
+            object.__setattr__(self, "start_side", self.side)
+        elif self.start_side != self.side:
+            raise ValueError("InlineComment.start_side must match side")
 
 
 @dataclass(frozen=True)
@@ -118,6 +135,19 @@ class ReviewResult:
             )
 
 
+def review_payload(result: ReviewResult) -> dict:
+    """`asdict(result)` as it goes on the wire: a one-line comment carries no
+    start_line or start_side (GitHub reads a null start_line as a malformed
+    multi-line anchor), so existing payloads and their dedup keys are
+    unchanged (#1759)."""
+    payload = asdict(result)
+    for comment in payload["comments"]:
+        if comment.get("start_line") is None:
+            comment.pop("start_line", None)
+            comment.pop("start_side", None)
+    return payload
+
+
 def post_review(
     install_token: str,
     owner: str,
@@ -144,9 +174,10 @@ def post_review(
     # /comments with path/line/body). Manual marshalling would have to
     # stay in lockstep with field renames; this stays correct by
     # construction.
+    payload = review_payload(result)
     resp = httpx.post(
         f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/pulls/{pull_number}/reviews",
-        json=asdict(result),
+        json=payload,
         headers={
             "Authorization": f"Bearer {install_token}",
             "Accept": "application/vnd.github+json",
