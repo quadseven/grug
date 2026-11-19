@@ -1,19 +1,16 @@
 """Throwaway fixture tests. Not product code."""
 
-import pytest
-
 from title_cleaner import clean_label, sanitize_title
 
-CASES = [
-    ("Hello, world.", "Hello, world."),
-    ("a |hop", "a hop"),
-    ("tabs\tand   spaces", "tabs and spaces"),
-]
 
-
-@pytest.mark.parametrize(("raw", "want"), CASES)
-def test_sanitize_title(raw, want):
-    assert sanitize_title(raw) == want
+def test_sanitize_title_table():
+    cases = [
+        ("Hello, world.", "Hello, world."),
+        ("a |hop", "a hop"),
+        ("tabs\tand   spaces", "tabs and spaces"),
+    ]
+    for raw, want in cases:
+        assert sanitize_title(raw) == want
 
 
 def test_clean_label_unchanged_text():
