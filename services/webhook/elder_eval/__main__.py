@@ -20,8 +20,10 @@ without a model call or GitHub token.
 Corpus source: `--repo <owner/name>` reads the INGESTED store rows (needs
 the DB env; the in-cluster path), else `--jsonl <path>` parses the
 committed corpus via the slice-1 `ledger.parse_jsonl` layer (default:
-logs/review-ledger.jsonl at the repo root). Both flow through slice-1
-types - there is no third parser.
+logs/review-ledger.jsonl at the repo root). `--clean-controls-jsonl <path>`
+adds reviewed clean PRs to the replay set; unexpected classes on a control
+count as noise. All inputs flow through the corpus types; there is no third
+finding parser.
 
 Model replay modes make REAL backend calls (`sast_benchmark.backends`
 GRUG_BENCH_* env) and REAL GitHub diff fetches - never run in the per-PR
@@ -86,7 +88,12 @@ from ledger import parse_jsonl
 from personas.code_reviewer.reactions import ledger_label
 from personas.code_reviewer.verify_only import is_summary_only
 
-from .corpus import build_cases, load_fixture_cases, rows_from_store
+from .corpus import (
+    build_cases,
+    load_fixture_cases,
+    parse_clean_controls,
+    rows_from_store,
+)
 from .gate import (
     BASELINE_PATH,
     compute_prompt_sha,
@@ -295,6 +302,10 @@ def _parse_args(
         default=str(_DEFAULT_JSONL),
         help="ledger JSONL path (the default also includes committed cross-file fixtures)",
     )
+    parser.add_argument(
+        "--clean-controls-jsonl",
+        help="JSONL file of reviewed clean PR controls, each with repo and pr",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--record", action="store_true", help="write baseline.json")
     mode.add_argument(
@@ -342,7 +353,11 @@ def _load_corpus(args):
         if args.repo
         else parse_jsonl(Path(args.jsonl).read_text())
     )
-    all_cases = build_cases(rows)
+    controls = (
+        parse_clean_controls(Path(args.clean_controls_jsonl).read_text())
+        if args.clean_controls_jsonl else ()
+    )
+    all_cases = build_cases(rows, clean_controls=controls)
     if not args.repo and Path(args.jsonl) == _DEFAULT_JSONL:
         all_cases += load_fixture_cases()
     cases = tuple(case for case in all_cases if case.scorable)
