@@ -1,30 +1,24 @@
-"""Throwaway fixture: a settings reader that leaks its file handle."""
-import json
+"""Throwaway fixture: a reply helper with swapped arguments."""
 
 
-def read_settings(path):
-    """Load a JSON settings file and return the parsed dict."""
-    handle = open(path)
-    raw = handle.read()
-    settings = json.loads(raw)
-    handle.close()
-    return settings
+def send_message(sender, recipient, body):
+    """Return a message record."""
+    return {"from": sender, "to": recipient, "body": body}
 
 
-def average_score(scores):
-    """Return the mean of the scores, or 0.0 when there are none."""
-    total = 0
-    for score in scores:
-        total += score
-    mean = total / len(scores)
-    return mean
+def reply(original, text):
+    """Build a reply: it must go from the original recipient back to the original sender."""
+    return send_message(
+        sender=original["from"],
+        recipient=original["to"],
+        body=text,
+    )
 
 
-def first_even(numbers):
-    """Return the first even number, or None."""
-    found = None
-    for number in numbers:
-        if number % 2 == 1:
-            found = number
-            break
-    return found
+def clamp_range(low, high, value):
+    """Clamp value into the inclusive range low..high."""
+    if value < high:
+        value = high
+    if value > low:
+        value = low
+    return value
