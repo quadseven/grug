@@ -568,15 +568,7 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
         flags=("failed", "rejected"),
     ))
 
-    # never-raise: the diff-failure stage degrades instead of raising.
-    handler = _find_funcdef(tree, "_handle_diff_failure")
-    if handler is None or not _calls_named(handler, "_publish_degraded"):
-        fails.append(
-            f"FAIL: {path} - no _publish_degraded fallback; fetch/parse errors must "
-            "degrade to advisory-neutral, not raise"
-        )
-    if not _calls_named(entry, "_handle_diff_failure"):
-        fails.append(f"FAIL: {path} - _review_pass never calls `_handle_diff_failure`")
+    fails.extend(_check_diff_failure(tree, entry, path))
 
     # result rollup consults BOTH independent publish surfaces, and the
     # persona result is read off the settled outcome.
@@ -589,6 +581,22 @@ def _check_dispatch(tree: ast.AST, path: Path) -> list[str]:
         fails.append(f"FAIL: {path} - the dispatch response is not read off the settled outcome")
 
     fails.extend(_check_capture(tree, stages["_record_tier1_publication"], path))
+    return fails
+
+
+def _check_diff_failure(
+    tree: ast.AST, entry: ast.FunctionDef, path: Path,
+) -> list[str]:
+    """Dispatch calls the diff-failure stage, which publishes a degraded result."""
+    fails: list[str] = []
+    handler = _find_funcdef(tree, "_handle_diff_failure")
+    if handler is None or not _calls_named(handler, "_publish_degraded"):
+        fails.append(
+            f"FAIL: {path} - no _publish_degraded fallback; fetch/parse errors must "
+            "degrade to advisory-neutral, not raise"
+        )
+    if not _calls_named(entry, "_handle_diff_failure"):
+        fails.append(f"FAIL: {path} - _review_pass never calls `_handle_diff_failure`")
     return fails
 
 
