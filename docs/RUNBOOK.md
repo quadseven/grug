@@ -294,6 +294,31 @@ users re-sign-in to re-encrypt. Zero impact for the admin-only user base.
 - **Monitors:** k8s-native (CrashLoopBackOff / workload-not-ready / restart-spike / poller-cronjob, #406) + owned queue-depth family (cave-jobs backlog / re-run DLQ / cave DLQs / consumer backlog / telemetry health, on `grug.sqs.*` gauges the consumer emits - #379), all routing to `@webhook-grug-discord-monitoring`
 - **Pulumi state + CF dashboard:** via the operator's Pulumi org + Cloudflare account.
 
+## Kept signals (#1699)
+
+The few metrics worth keeping once Datadog is gone. The table lives in code
+as `KEPT_SIGNALS` in `services/_shared/observability.py`; a unit test pins
+that no kept signal carries a per-request, per-runner, per-branch, per-PR,
+per-repo or per-install tag (unbounded cardinality). Emitters go through the
+vendor-neutral `MetricsBackend` seam; the default is a no-op, and DogStatsD
+is one implementation, selected only while the Datadog switch is on. No
+replacement backend is chosen or wired yet.
+
+| Name | Type | Allowed tags | Why kept | Emitted today |
+|---|---|---|---|---|
+| `grug.review.outcome` | count | `outcome` | Review outcomes (posted, degraded, failed): the error rate | no |
+| `grug.review.latency_ms` | gauge | `backend` | Review latency per backend | no |
+| `grug.elder.tier_served` | count | `tier`, `backend`, `model` | Which backend tier answered a review | yes |
+| `grug.github_api.error` | gauge | none | Backend (GitHub) call outcome: 1 on error | yes |
+| `grug.sqs.messages_visible` | gauge | `queue` | Queue depth | yes |
+| `grug.sqs.stalled` | gauge | `queue` | Queue age proxy: work waiting and nothing claimed | yes |
+| `grug.elder.degenerate_empty_review` | count | `backend`, `model` | A degraded review: empty model output | yes |
+| `grug.review.degraded` | count | `reason` | Degraded-review reasons, one closed set | no |
+
+`model` is the configured model list (small and fixed), not free text.
+Still open: webhook uptime check and the backend that receives these
+(operator decisions).
+
 ## Service tags
 
 All grug DD entities tagged: `service:` one of `grug-api` / `grug-webhook` /
