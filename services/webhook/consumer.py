@@ -1058,6 +1058,13 @@ def _startup_check() -> None:
         raise SystemExit(1)
     log.info("consumer_startup_check_passed", extra={"deps": rep.deps})
 
+    # The analyzer sandbox is not a gate (the review still runs without
+    # analyzers), but a kernel that cannot start it skips every analyzer, so
+    # say so loudly once at startup (#1576). Logs ERROR when unavailable.
+    from personas.code_reviewer.analyzer_sandbox import sandbox_state
+
+    sandbox_state()
+
 
 def main() -> None:
     # 2026-07-24 audit: this used to be a bare logging.basicConfig(), which

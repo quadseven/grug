@@ -87,7 +87,8 @@ from personas.code_reviewer.suppression_scope import (
     PR_ADDED_NOTE, record, ruff_scope,
 )
 from personas.code_reviewer.analyzer_sandbox import (
-    AnalyzerSkip, read_only_tree, run_analyzer, sandbox_env,
+    SANDBOX_UNAVAILABLE, AnalyzerSkip, SandboxUnavailable, read_only_tree,
+    run_analyzer, sandbox_env,
 )
 
 log = logging.getLogger("grug.code_reviewer.lint")
@@ -373,6 +374,10 @@ def _run_ruff(
                 )
                 return _degrade(strict, "error")
             return json.loads(proc.stdout or "[]"), tmp.rstrip("/") + "/"
+    except SandboxUnavailable:
+        # The kernel boundary cannot start here; the launcher already logged
+        # why. Never run ruff without it (#1576).
+        return _degrade(strict, SANDBOX_UNAVAILABLE)
     except FileNotFoundError:
         # WARNING, not info: reaching here means someone set
         # GRUG_LINT_EVIDENCE=ruff and is getting silent nothing, because the

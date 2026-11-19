@@ -408,3 +408,90 @@ def test_both_review_workloads_configure_the_analyzer_set(manifest):
     env = {e["name"]: e.get("value") for e in container.get("env", [])}
     assert configured_engines(env.get("GRUG_ELDER_ANALYZERS", ""), "") == (
         "ruff", "opengrep")
+
+
+# --- unsupported-kernel path: fail closed, say why, never run unsandboxed ----
+
+_LANDLOCK_OFF = "landlock_create_ruleset: Operation not supported\n"
+
+
+def _launcher_fails(argv, **kw):
+    return subprocess.CompletedProcess(argv, 2, "", _LANDLOCK_OFF)
+
+
+@pytest.fixture
+def launcher_env(monkeypatch):
+    from personas.code_reviewer import analyzer_sandbox as sb
+    monkeypatch.setenv("GRUG_ANALYZER_SANDBOX", "/launcher")
+    monkeypatch.setattr(sb, "_state", None)
+    yield sb
+
+
+def test_run_analyzer_raises_sandbox_unavailable_when_landlock_is_off(launcher_env):
+    with patch("shutil.which", return_value="/usr/bin/ruff"), \
+            patch("subprocess.run", side_effect=_launcher_fails) as run:
+        with pytest.raises(launcher_env.SandboxUnavailable) as err:
+            launcher_env.run_analyzer(
+                ["ruff", "x"], scan_root="/tmp", env={"PATH": "/usr/bin"}, timeout=5)
+    assert str(err.value) == "sandbox unavailable"
+    assert run.call_count == 1  # never retried unsandboxed
+
+
+def test_an_engine_exit_2_is_not_mistaken_for_the_sandbox(launcher_env):
+    def engine_fails(argv, **kw):
+        return subprocess.CompletedProcess(argv, 2, "", "ruff: bad config\n")
+    with patch("shutil.which", return_value="/usr/bin/ruff"), \
+            patch("subprocess.run", side_effect=engine_fails):
+        proc = launcher_env.run_analyzer(
+            ["ruff", "x"], scan_root="/tmp", env={"PATH": "/usr/bin"}, timeout=5)
+    assert proc.returncode == 2
+
+
+def test_ruff_skip_reason_names_the_sandbox(launcher_env):
+    with patch("shutil.which", return_value="/usr/bin/ruff"), \
+            patch("subprocess.run", side_effect=_launcher_fails):
+        run = run_analyzers((_hunk("a.py"),), {"a.py": "x = 1\n"}, ("ruff",))
+    assert run.skipped == (("ruff", "sandbox unavailable"),)
+    assert run.findings == ()
+
+
+def test_best_effort_lint_does_not_raise_when_the_sandbox_is_unavailable(launcher_env):
+    with patch("shutil.which", return_value="/usr/bin/ruff"), \
+            patch("subprocess.run", side_effect=_launcher_fails):
+        assert lint_mod.scan_ruff((_hunk("a.py"),), {"a.py": "x\n"}, enabled=True) == ()
+
+
+def test_skip_note_explains_an_unavailable_sandbox():
+    from personas.code_reviewer import dispatch
+    note = dispatch._analyzer_skip_note([("ruff", "sandbox unavailable")])
+    assert "ruff (sandbox unavailable)" in note
+    assert "sandbox cannot start" in note
+    assert "sandbox cannot start" not in dispatch._analyzer_skip_note([("ruff", "missing")])
+
+
+def test_probe_reports_unavailable_and_logs_one_loud_error(launcher_env, caplog):
+    with patch("subprocess.run", side_effect=_launcher_fails):
+        with caplog.at_level("INFO", logger="grug.code_reviewer.analyzer_sandbox"):
+            st = launcher_env.sandbox_state()
+            launcher_env.sandbox_state()  # cached: no second probe, no second line
+    assert (st.required, st.available) == (True, False)
+    assert "landlock_create_ruleset" in st.detail
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "analyzer_sandbox_unavailable" in errors[0].getMessage()
+
+
+def test_probe_reports_available_when_the_launcher_runs(launcher_env):
+    ok = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", "")  # noqa: E731
+    with patch("subprocess.run", side_effect=ok):
+        st = launcher_env.sandbox_state()
+    assert (st.required, st.available) == (True, True)
+
+
+def test_probe_needs_nothing_without_a_launcher(monkeypatch):
+    from personas.code_reviewer import analyzer_sandbox as sb
+    monkeypatch.delenv("GRUG_ANALYZER_SANDBOX", raising=False)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+    monkeypatch.setattr(sb, "_state", None)
+    st = sb.sandbox_state()
+    assert (st.required, st.available) == (False, True)

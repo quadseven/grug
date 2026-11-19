@@ -108,6 +108,7 @@ from personas.code_reviewer.claim_check import (
 from personas.code_reviewer.model_metrics import emit_finding_posted
 from personas import board
 from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
+from personas.code_reviewer.analyzer_sandbox import SANDBOX_UNAVAILABLE
 from personas.code_reviewer.analyzers import (
     RepoAnalyzerConfig, configured_engines, merge_analyzer_findings,
     run_analyzers,
@@ -986,9 +987,13 @@ def _analyzer_skip_note(skipped: list[tuple[str, str]]) -> str:
     """One summary line naming each analyzer that degraded to a skip."""
     if not skipped:
         return ""
-    return "\n\nAnalyzers skipped: " + ", ".join(
+    note = "\n\nAnalyzers skipped: " + ", ".join(
         f"{engine} ({reason})" for engine, reason in skipped
     ) + ". The review went on without them."
+    if any(reason == SANDBOX_UNAVAILABLE for _, reason in skipped):
+        note += (" The analyzer sandbox cannot start on the host that ran this"
+                 " review, and analyzers never run without it.")
+    return note
 
 
 _SEMGREPIGNORE_PATH = ".semgrepignore"
