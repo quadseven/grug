@@ -485,7 +485,7 @@ def _build_piece(
     chunk = body[head:end]
     old_n = sum(1 for x in chunk if x.startswith("-") or _is_context(x))
     new_n = sum(1 for x in chunk if x.startswith("+") or _is_context(x))
-    old_start = old_at[head] - (1 if old_n == 0 else 0)
+    old_start = max(old_at[head] - (1 if old_n == 0 else 0), 0)
     new_start = max(new_at[head] - (1 if new_n == 0 else 0), 1)
     header = f"@@ -{old_start},{old_n} +{new_start},{new_n} @@"
     added = frozenset(new_at[i] for i in range(start, end) if body[i].startswith("+"))
@@ -511,7 +511,10 @@ def _split_one_hunk(
     if m is None:
         return None
     body = lines[1:]
-    cursors = _cursors(body, int(m.group(1)), hunk.new_start)
+    # A zero old count names the line BEFORE the change, so the first old
+    # line the cursor walks is one further on.
+    first_old = int(m.group(1)) + (1 if m.group(2) == "0" else 0)
+    cursors = _cursors(body, first_old, hunk.new_start)
     pieces: list[DiffHunk] = []
     start = 0
     while start < len(body):

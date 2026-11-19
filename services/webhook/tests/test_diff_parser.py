@@ -884,3 +884,30 @@ class TestSplitLargeHunks:
     def test_zero_budget_is_a_no_op(self):
         hunks = (_big_hunk(),)
         assert split_large_hunks(hunks, 0) == (hunks, ())
+
+
+class TestSplitHeaderOldSide:
+    """Old-side numbers in recomputed headers are never negative and keep
+    git's convention for a zero count (the line BEFORE the change)."""
+
+    @staticmethod
+    def _old_headers(hunk, budget):
+        out, split = split_large_hunks((hunk,), budget)
+        assert split and len(out) >= 2
+        return [re.match(r"@@ -(\d+),(\d+) ", p.body).groups() for p in out]
+
+    def test_pieces_of_a_new_file_start_at_old_zero(self):
+        hunk = _parse_diff(
+            "diff --git a/n.py b/n.py\nnew file mode 100644\n--- /dev/null\n+++ b/n.py\n"
+            "@@ -0,0 +1,300 @@\n" + "".join(f"+row {i:04d} {'x' * 20}\n" for i in range(300))
+        )[0]
+        heads = self._old_headers(hunk, len(hunk.body) // 3 + 200)
+        assert all(h == ("0", "0") for h in heads)
+
+    def test_pieces_of_a_pure_insertion_keep_the_line_before(self):
+        hunk = _parse_diff(
+            "diff --git a/n.py b/n.py\n--- a/n.py\n+++ b/n.py\n"
+            "@@ -5,0 +6,300 @@\n" + "".join(f"+row {i:04d} {'x' * 20}\n" for i in range(300))
+        )[0]
+        heads = self._old_headers(hunk, len(hunk.body) // 3 + 200)
+        assert all(h == ("5", "0") for h in heads)
