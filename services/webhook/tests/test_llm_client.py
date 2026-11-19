@@ -5678,6 +5678,43 @@ def test_a_response_format_rejection_benches_the_model_on_the_first_call(monkeyp
     assert entry.benched_until - clock[0] == availability._BENCH_BASE_SECONDS
 
 
+def test_the_chain_serves_from_the_next_tier_and_never_asks_the_refusing_model_again(
+    monkeypatch,
+) -> None:
+    """grug#1745 criterion 2, through the real review chain: the first tier
+    answers 400 naming response_format, the next tier serves the review, and
+    across that review AND a second one inside the bench window the refusing
+    model is called exactly once."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    refusing = lc._opencode_go_chain_config().model
+    calls: list[str] = []
+    served = httpx.Response(200, json=_openai_json_response(
+        '{"findings": [{"path": "x.py", "line": 1, "rule": "next-tier-found-it",'
+        ' "severity": "low", "message": "m"}]}'
+    ))
+
+    def post(url, **kwargs):
+        model = kwargs["json"]["model"]
+        calls.append(model)
+        if model == refusing:
+            return _err(400, f"Structured response_format is not enabled for model '{model}'")
+        return served
+
+    with patch.object(httpx, "post", side_effect=post):
+        first = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        second = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert first.kind == "reviewed" and second.kind == "reviewed"
+    assert first.backend_used == Backend.OPENROUTER, "the next tier answered"
+    assert second.backend_used == Backend.OPENROUTER
+    assert calls.count(refusing) == 1, "asked once in total, not once per review"
+    assert calls == [refusing, "z-ai/glm-5.2:free", "z-ai/glm-5.2:free"]
+    assert availability._model_is_benched("opencode-go", refusing)
+
+
 def test_a_response_format_bench_ends_when_it_expires(monkeypatch) -> None:
     monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
     clock = [1000.0]
