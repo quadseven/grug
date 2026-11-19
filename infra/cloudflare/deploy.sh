@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy the grug-webhook-host-rewrite CF Worker + bind to webhook.grug.lol/*.
+# Deploy the grug-webhook-host-rewrite CF Worker + bind to webhook.${DOMAIN}/*.
 #
 # Mirrors a host-rewrite Worker pattern the operator uses across other
 # services. Pulumi can't manage CF Workers reliably (script-exists,
@@ -31,19 +31,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$0")"
 
+# Deployment-specific values: GRUG_AWS_REGION / GRUG_DOMAIN, else the Pulumi
+# stack file (see scripts/deploy_config.sh).
+REGION="$(bash "$SCRIPT_DIR/../../scripts/deploy_config.sh" region)"
+DOMAIN="$(bash "$SCRIPT_DIR/../../scripts/deploy_config.sh" domain)"
+
 # Single source of truth for the auth-boundary header name + Worker
 # secret binding name. Both are sed-substituted into worker.js
 # placeholders below; Lambda middleware must read the same SECRET_HEADER.
 SECRET_HEADER="X-Grug-CF-Secret"
 BINDING_NAME="GRUG_CF_SECRET"
 
-CF_TOKEN=$(aws ssm get-parameter --region us-east-1 \
+CF_TOKEN=$(aws ssm get-parameter --region "$REGION" \
     --name /grug/cloudflare-api-token --with-decryption \
     --query 'Parameter.Value' --output text)
-CF_ACCOUNT=$(aws ssm get-parameter --region us-east-1 \
+CF_ACCOUNT=$(aws ssm get-parameter --region "$REGION" \
     --name /grug/cloudflare-account-id \
     --query 'Parameter.Value' --output text)
-CF_ZONE=$(aws ssm get-parameter --region us-east-1 \
+CF_ZONE=$(aws ssm get-parameter --region "$REGION" \
     --name /grug/cloudflare-zone-id \
     --query 'Parameter.Value' --output text)
 
@@ -54,7 +59,7 @@ CF_ZONE=$(aws ssm get-parameter --region us-east-1 \
 # leave the binding unset while SSM has the value — a security
 # regression the operator wouldn't see until manually checking CF.
 CF_SHARED_SECRET=""
-if cf_secret_raw=$(aws ssm get-parameter --region us-east-1 \
+if cf_secret_raw=$(aws ssm get-parameter --region "$REGION" \
         --name /grug/cf-shared-secret --with-decryption \
         --query 'Parameter.Value' --output text 2>&1); then
     CF_SHARED_SECRET="$cf_secret_raw"
@@ -96,7 +101,7 @@ deploy_one() {
     local upstream_host=""
     if [ -n "$override_param" ]; then
         local override
-        override=$(aws ssm get-parameter --region us-east-1 \
+        override=$(aws ssm get-parameter --region "$REGION" \
             --name "$override_param" \
             --query 'Parameter.Value' --output text 2>/dev/null || true)
         if [ -n "$override" ] && [ "$override" != "None" ]; then
@@ -198,14 +203,14 @@ except (json.JSONDecodeError, ValueError):
     fi
 }
 
-deploy_one "grug-webhook-host-rewrite" "webhook.grug.lol/*" "webhook_function_url" "/grug/webhook-upstream-host"
-deploy_one "grug-api-host-rewrite"     "api.grug.lol/*"     "api_function_url" "/grug/api-upstream-host"
+deploy_one "grug-webhook-host-rewrite" "webhook.${DOMAIN}/*" "webhook_function_url" "/grug/webhook-upstream-host"
+deploy_one "grug-api-host-rewrite"     "api.${DOMAIN}/*"     "api_function_url" "/grug/api-upstream-host"
 
 echo "Done. Smoke:"
-echo "  curl -i -X POST https://webhook.grug.lol/webhook/github -H 'X-Hub-Signature-256: sha256=invalid' -d '{}'  # → 401 (HMAC)"
-echo "  curl -i https://api.grug.lol/livez                                                                          # → 200 ok"
+echo "  curl -i -X POST https://webhook.${DOMAIN}/webhook/github -H 'X-Hub-Signature-256: sha256=invalid' -d '{}'  # → 401 (HMAC)"
+echo "  curl -i https://api.${DOMAIN}/livez                                                                          # → 200 ok"
 if [ -n "$CF_SHARED_SECRET" ]; then
     echo "  # Boundary check (after middleware enforces): direct must 401, via-CF must 200."
     echo "  curl -i \"\$(pulumi -C $PULUMI_DIR stack output api_function_url)\"livez   # direct hit → 401 (header missing)"
-    echo "  curl -i https://api.grug.lol/livez                                                                       # via CF → 200"
+    echo "  curl -i https://api.${DOMAIN}/livez                                                                       # via CF → 200"
 fi

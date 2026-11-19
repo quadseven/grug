@@ -26,6 +26,10 @@
 # would seed the upstream owner as the lifetime admin of the fork's own
 # database (an accidental backdoor). You MUST supply your own via env:
 #   GRUG_ADMIN_USER_ID=12345 GRUG_ADMIN_LOGIN=you GRUG_ADMIN_INSTALL_ID=678 make rebuild
+# Public apex domain the smoke target probes: GRUG_DOMAIN, else the Pulumi
+# stack file (see scripts/deploy_config.sh; GRUG_STACK picks the stack).
+DOMAIN ?= $(shell bash scripts/deploy_config.sh domain)
+
 GRUG_ADMIN_USER_ID ?=
 GRUG_ADMIN_LOGIN   ?=
 GRUG_ADMIN_INSTALL_ID ?=
@@ -106,12 +110,12 @@ rebuild: tear-down
 	@echo ">> step 2/5: pulumi up - recreate AWS infra (SSM/KMS/SQS/S3/IAM)"
 	cd infra/pulumi && pulumi up --stack dev --yes
 	@echo ">> step 3/5: trigger deploy.k8s.yml — build+push images, apply k8s/"
-	gh workflow run deploy.k8s.yml --ref $$(git branch --show-current) --repo quadseven/grug
+	gh workflow run deploy.k8s.yml --ref $$(git branch --show-current)
 	@echo ">>   waiting for run to start..."
 	@sleep 10
-	@RUN_ID=$$(gh run list --workflow=deploy.k8s.yml --branch=$$(git branch --show-current) --repo quadseven/grug --limit=1 --json databaseId --jq '.[0].databaseId'); \
+	@RUN_ID=$$(gh run list --workflow=deploy.k8s.yml --branch=$$(git branch --show-current) --limit=1 --json databaseId --jq '.[0].databaseId'); \
 	  echo ">>   following run $$RUN_ID"; \
-	  gh run watch $$RUN_ID --exit-status --repo quadseven/grug
+	  gh run watch $$RUN_ID --exit-status
 	@echo ">> step 4/5: CF Workers re-deploy + admin re-seed"
 	bash infra/cloudflare/deploy.sh
 	@test -n "$(GRUG_ADMIN_USER_ID)" || { echo "FATAL: set GRUG_ADMIN_USER_ID (and GRUG_ADMIN_LOGIN/GRUG_ADMIN_INSTALL_ID) to YOUR own GitHub identity before seeding admin"; exit 1; }
@@ -128,16 +132,16 @@ rebuild: tear-down
 # Read-only smoke. Asserts public URLs respond as expected.
 smoke:
 	@echo ">> smoke: webhook /livez"
-	@curl -sf -o /dev/null -w "  https://webhook.grug.lol/livez → %{http_code}\n" https://webhook.grug.lol/livez
+	@curl -sf -o /dev/null -w "  https://webhook.$(DOMAIN)/livez → %{http_code}\n" https://webhook.$(DOMAIN)/livez
 	@echo ">> smoke: api /livez"
-	@curl -sf -o /dev/null -w "  https://api.grug.lol/livez → %{http_code}\n" https://api.grug.lol/livez
+	@curl -sf -o /dev/null -w "  https://api.$(DOMAIN)/livez → %{http_code}\n" https://api.$(DOMAIN)/livez
 	@echo ">> smoke: api /api/v1/health"
-	@curl -sf -o /dev/null -w "  https://api.grug.lol/api/v1/health → %{http_code}\n" https://api.grug.lol/api/v1/health
+	@curl -sf -o /dev/null -w "  https://api.$(DOMAIN)/api/v1/health → %{http_code}\n" https://api.$(DOMAIN)/api/v1/health
 	@echo ">> smoke: splash"
-	@curl -sf -o /dev/null -w "  https://grug.lol → %{http_code}\n" https://grug.lol
+	@curl -sf -o /dev/null -w "  https://$(DOMAIN) → %{http_code}\n" https://$(DOMAIN)
 	@echo ">> smoke: webhook HMAC reject (unsigned POST must return 401)"
 	@code=$$(curl -s -o /dev/null -w "%{http_code}" \
-	  -X POST https://webhook.grug.lol/webhook/github -H 'Content-Type: application/json' -d '{}'); \
+	  -X POST https://webhook.$(DOMAIN)/webhook/github -H 'Content-Type: application/json' -d '{}'); \
 	  if [ "$$code" = "401" ]; then \
 	    echo "  POST /webhook/github (no sig) → 401 ✓"; \
 	  else \

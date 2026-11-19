@@ -43,6 +43,8 @@ jobs:
     # runner 2026-05-24.
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      smoke_endpoints: ${{ steps.smoke.outputs.endpoints }}
     steps:
       - name: 01. Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -52,16 +54,49 @@ jobs:
         with:
           node-version: '20'
 
+      - name: 02a. Resolve deployment config
+        id: cfg
+        env:
+          GRUG_AWS_REGION: ${{ vars.GRUG_AWS_REGION }}
+          GRUG_DOMAIN: ${{ vars.GRUG_DOMAIN }}
+        run: |
+          set -euo pipefail
+          region="$(bash scripts/deploy_config.sh region)"
+          domain="$(bash scripts/deploy_config.sh domain)"
+          {
+            echo "region=$region"
+            echo "domain=$domain"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "GRUG_AWS_REGION=$region"
+            echo "GRUG_DOMAIN=$domain"
+          } >> "$GITHUB_ENV"
+
+      - name: 02b. Build smoke endpoints for the configured domain
+        id: smoke
+        env:
+          DOMAIN: ${{ steps.cfg.outputs.domain }}
+        run: |
+          set -euo pipefail
+          # The page content assertions name the published source repo,
+          # which the static pages link to regardless of deployment.
+          endpoints="$(jq -cn --arg d "$DOMAIN" '[
+            {name: "signin link", url: ("https://" + $d + "/"), "expect-status": "200", contains: "href=\"/signin\""},
+            {name: "source CTA", url: ("https://" + $d + "/"), "expect-status": "200", contains: "quadseven/grug"},
+            {name: "AGPL", url: ("https://" + $d + "/"), "expect-status": "200", contains: "AGPL-3.0"}
+          ]')"
+          echo "endpoints=$endpoints" >> "$GITHUB_OUTPUT"
+
       - name: 03. Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-          aws-region: us-east-1
+          aws-region: ${{ steps.cfg.outputs.region }}
 
       - name: 04. Resolve secrets from SSM
         id: secrets
         env:
-          AWS_REGION: us-east-1
+          AWS_REGION: ${{ steps.cfg.outputs.region }}
         run: |
           set -euo pipefail
           # OIDC must be configured BEFORE this step. Earlier ordering
@@ -237,9 +272,4 @@ jobs:
       timeout: 15
       pre-delay: 30
       user-agent: "grug-deploy-smoke/1.0"
-      endpoints: |
-        [
-          {"name": "grug.lol signin link", "url": "https://grug.lol/", "expect-status": "200", "contains": "href=\"/signin\""},
-          {"name": "grug.lol source CTA", "url": "https://grug.lol/", "expect-status": "200", "contains": "quadseven/grug"},
-          {"name": "grug.lol AGPL", "url": "https://grug.lol/", "expect-status": "200", "contains": "AGPL-3.0"}
-        ]
+      endpoints: ${{ needs.build-and-deploy.outputs.smoke_endpoints }}

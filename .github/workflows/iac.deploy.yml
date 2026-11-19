@@ -59,14 +59,48 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      smoke_endpoints: ${{ steps.smoke.outputs.endpoints }}
     steps:
       - name: 01. Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: 01a. Resolve deployment config
+        id: cfg
+        env:
+          GRUG_AWS_REGION: ${{ vars.GRUG_AWS_REGION }}
+          GRUG_DOMAIN: ${{ vars.GRUG_DOMAIN }}
+        run: |
+          set -euo pipefail
+          region="$(bash scripts/deploy_config.sh region)"
+          domain="$(bash scripts/deploy_config.sh domain)"
+          {
+            echo "region=$region"
+            echo "domain=$domain"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "GRUG_AWS_REGION=$region"
+            echo "GRUG_DOMAIN=$domain"
+          } >> "$GITHUB_ENV"
+
+      - name: 01b. Build smoke endpoints for the configured domain
+        id: smoke
+        env:
+          DOMAIN: ${{ steps.cfg.outputs.domain }}
+        run: |
+          set -euo pipefail
+          endpoints="$(jq -cn --arg d "$DOMAIN" '[
+            {name: "api /livez", url: ("https://api." + $d + "/livez"), "expect-status": "200"},
+            {name: "webhook /livez", url: ("https://webhook." + $d + "/livez"), "expect-status": "200"},
+            {name: "webhook unsigned POST", url: ("https://webhook." + $d + "/webhook/github"), "expect-status": "401", method: "POST",
+             headers: ["Content-Type: application/json", "X-GitHub-Event: ping"], body: "{\"zen\":\"smoke\"}"}
+          ]')"
+          echo "endpoints=$endpoints" >> "$GITHUB_OUTPUT"
+
       - name: 02. Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-          aws-region: us-east-1
+          aws-region: ${{ steps.cfg.outputs.region }}
       - name: 03. Stack name
         id: stack
         run: echo "stack=prod" >> "$GITHUB_OUTPUT"
@@ -128,9 +162,4 @@ jobs:
       retries: 3
       retry-delay: 5
       timeout: 30
-      endpoints: |
-        [
-          {"name": "api /livez", "url": "https://api.grug.lol/livez", "expect-status": "200"},
-          {"name": "webhook /livez", "url": "https://webhook.grug.lol/livez", "expect-status": "200"},
-          {"name": "webhook unsigned POST", "url": "https://webhook.grug.lol/webhook/github", "expect-status": "401", "method": "POST", "headers": ["Content-Type: application/json", "X-GitHub-Event: ping"], "body": "{\"zen\":\"smoke\"}"}
-        ]
+      endpoints: ${{ needs.pulumi-up.outputs.smoke_endpoints }}
