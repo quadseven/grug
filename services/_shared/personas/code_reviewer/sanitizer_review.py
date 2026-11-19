@@ -28,7 +28,9 @@ Pure: file changes and hunks in; findings out.
 
 from __future__ import annotations
 
+import ast
 import re
+import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -259,8 +261,44 @@ def _is_negated_char_class(pattern: str) -> bool:
     return bool(re.fullmatch(r"\[\^[^\]]+\]", pattern))
 
 
-def _plain_text_change(pattern: str, replacement: str = "") -> tuple[str, str] | None:
+class _Undecodable:
+    """Marks a replacement literal that cannot be evaluated safely."""
+
+
+UNDECODABLE = _Undecodable()
+
+
+def _decode_literal(source: str, raw: bool) -> str | _Undecodable:
+    """The value Python gives the string literal whose text between the
+    quotes is `source`, or UNDECODABLE when it does not evaluate to a plain
+    string.  The reviewed text is only ever parsed by `ast.literal_eval`;
+    it is never handed to `re` as a template (#1834)."""
+    prefix = "r" if raw else ""
+    for quote in ('"', "'", '\"\"\"', "'''"):
+        try:
+            with warnings.catch_warnings():
+                # A literal with an invalid escape only warns when parsed.
+                warnings.simplefilter("ignore")
+                value = ast.literal_eval(f"{prefix}{quote}{source}{quote}")
+        except (SyntaxError, ValueError, MemoryError, RecursionError):
+            continue
+        if isinstance(value, str):
+            return value
+    return UNDECODABLE
+
+
+def _prefix_is_raw(text: str, quote_at: int) -> bool:
+    """True when the string literal opening at `quote_at` is an r-string."""
+    return quote_at > 0 and text[quote_at - 1] in "rR"
+
+
+def _plain_text_change(
+    pattern: str, replacement: str = "",
+) -> tuple[str, str] | None:
     """(probe, result) for the first ordinary probe the pattern changes.
+
+    `replacement` is the decoded value, applied literally: a function
+    replacement means no escape or group reference in it is processed.
 
     Patterns that match only whitespace or are a single negated character
     class (an allow-list) are never reported.
@@ -272,7 +310,7 @@ def _plain_text_change(pattern: str, replacement: str = "") -> tuple[str, str] |
     except re.error:
         return None
     for probe in _PROBES:
-        result = compiled.sub(replacement, probe)
+        result = compiled.sub(lambda _m: replacement, probe)
         if result != probe:
             return probe, result
     return None
@@ -289,11 +327,12 @@ _PATTERN_TO_REPLACEMENT_GAP_RE = re.compile(r"[\"']*\s*,\s*[rRuU]?")
 _LEADING_PREFIX_RE = re.compile(r"\s*[rRuU]?")
 
 
-def _replacement_for_call(body: str, match: re.Match) -> str:
-    """The replacement string literal of a re.sub/re.subn call.
+def _replacement_for_call(body: str, match: re.Match) -> str | _Undecodable:
+    """The replacement string literal of a re.sub/re.subn call, decoded.
 
     Only the argument directly after the pattern counts. When it is a name
-    or any other expression, no literal is known and the result is "".
+    or any other expression, no literal is known and the result is "". A
+    literal that does not decode is UNDECODABLE.
     """
     after = body[match.end():]
     literals = _string_literals(after)
@@ -303,18 +342,21 @@ def _replacement_for_call(body: str, match: re.Match) -> str:
     gap = after[first_at + 1 + len(first_value):second_at]
     if _PATTERN_TO_REPLACEMENT_GAP_RE.fullmatch(gap) is None:
         return ""
-    return second_value
+    return _decode_literal(second_value, _prefix_is_raw(after, second_at))
 
 
-def _replacement_for_constant_sub(body: str, const_name: str) -> str | None:
-    """The replacement string literal of a CONST.sub(...) call, or None when
-    there is no such call or its first argument is not a string literal."""
+def _replacement_for_constant_sub(
+    body: str, const_name: str,
+) -> str | _Undecodable | None:
+    """The replacement string literal of a CONST.sub(...) call, decoded, or
+    None when there is no such call or its first argument is not a string
+    literal.  A literal that does not decode is UNDECODABLE."""
     pattern = rf"(?<!\w){re.escape(const_name)}\.subn?\s*\("
     for match in re.finditer(pattern, body):
         after = body[match.end():]
         first = _first_string_after(after, 0)
         if first is not None and _LEADING_PREFIX_RE.fullmatch(after[:first[1]]):
-            return first[0]
+            return _decode_literal(first[0], _prefix_is_raw(after, first[1]))
     return None
 
 
@@ -327,7 +369,7 @@ def _pattern_for(function: _Function, constants: dict[str, str]) -> tuple[str, i
     """
     body = function.body
     start_line = function.def_line
-    candidates: list[tuple[str, int, str]] = []
+    candidates: list[tuple[str, int, str | _Undecodable]] = []
     for match in _REGEX_CALL_RE.finditer(body):
         first = _first_string_after(body, match.end())
         if first is None:
@@ -348,6 +390,8 @@ def _pattern_for(function: _Function, constants: dict[str, str]) -> tuple[str, i
             if replacement is not None:  # A .sub call with a literal, "" included
                 candidates.append((pattern, start_line, replacement))
     for pattern, line, replacement in candidates:
+        if isinstance(replacement, _Undecodable):
+            continue
         change = _plain_text_change(pattern, replacement)
         if change is not None:
             probe, result = change

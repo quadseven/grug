@@ -36,6 +36,7 @@ Pure: diff text, parsed hunks, file contents and PR text in; findings out.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Iterable
 
@@ -56,6 +57,8 @@ from personas.code_reviewer.unbacked_claim import scan_unbacked_claims
 from personas.code_reviewer.weakened_verification import scan_weakened_verification
 from personas.code_reviewer.wrong_target import scan_wrong_target
 from personas.tpm.ticket_compliance import closes_refs
+
+log = logging.getLogger(__name__)
 
 # The footer a Loom lane writes on every pull request it opens.
 _LANE_FOOTER_RE = re.compile(r"^Loom ticket \S+, lane \S+", re.MULTILINE)
@@ -104,6 +107,24 @@ def _open_only(
     return tuple(c for c in criteria if (c.issue, c.number) not in ticked)
 
 
+def _run_rule(
+    name: str, rule: Callable[[], Iterable[Finding]],
+    failed: list[tuple[str, str]] | None,
+) -> list[Finding]:
+    """One rule's findings. A rule that raises yields none, is logged once
+    by name and exception kind, and is recorded in `failed`, so one rule
+    cannot switch off the others or let the pass read as fully clear
+    (#1834)."""
+    try:
+        return list(rule())
+    except Exception as e:  # noqa: BLE001 - one rule must not abort the others
+        kind = type(e).__name__
+        log.warning("lane_work_rule_failed", extra={"rule": name, "kind": kind})
+        if failed is not None:
+            failed.append((name, kind))
+        return []
+
+
 def lane_work_findings(
     *,
     diff_text: str,
@@ -116,6 +137,7 @@ def lane_work_findings(
     changes: tuple[FileChange, ...] | None = None,
     health_issues: Iterable[int] = (),
     criteria_judge: CriteriaJudge | None = None,
+    failed: list[tuple[str, str]] | None = None,
 ) -> tuple[Finding, ...]:
     """Every deterministic lane-work finding for one PR.
 
@@ -126,13 +148,20 @@ def lane_work_findings(
     full counts of a diff it stores truncated). `health_issues`: linked
     issues that are health findings (`linked_issue.rendered_health_issues`);
     without it a PR title starting `Health:` marks one. `criteria_judge`
-    decides the criteria the partial-delivery mapping cannot (#1389)."""
+    decides the criteria the partial-delivery mapping cannot (#1389).
+    Each rule runs apart: one that raises is appended to `failed` as
+    (rule name, exception kind) and the rest still run (#1834)."""
     if changes is None:
         changes = file_changes(diff_text)
     boxes = tuple(boxes() if callable(boxes) else boxes)
     pr_title = pr_title() if callable(pr_title) else pr_title
     criteria = criteria_in_scope(boxes, pr_body)
-    findings = list(scan_criteria_coverage(
+    findings: list[Finding] = []
+
+    def run(name: str, rule: Callable[[], Iterable[Finding]]) -> None:
+        findings.extend(_run_rule(name, rule, failed))
+
+    run("criteria-coverage", lambda: scan_criteria_coverage(
         hunks, file_contents, criteria=criteria,
         pr_title=pr_title, pr_body=pr_body,
         new_files=frozenset(c.path for c in changes if c.status == "added"),
@@ -142,32 +171,34 @@ def lane_work_findings(
             if c.status == "renamed" and c.previous_path
         ),
     ))
-    findings.extend(scan_destructive_edits(
+    run("destructive-edit", lambda: scan_destructive_edits(
         changes, base_line_counts, criteria=criteria,
         pr_title=pr_title, hunks=hunks,
     ))
-    findings.extend(scan_weakened_verification(
+    run("weakened-verification", lambda: scan_weakened_verification(
         changes, hunks, criteria=criteria, pr_title=pr_title, diff_text=diff_text,
     ))
-    findings.extend(scan_sanitizers(changes, hunks))
-    findings.extend(scan_fabricated_results(changes, hunks))
-    findings.extend(scan_unbacked_claims(pr_body, criteria=criteria, hunks=hunks))
+    run("sanitizers", lambda: scan_sanitizers(changes, hunks))
+    run("fabricated-results", lambda: scan_fabricated_results(changes, hunks))
+    run("unbacked-claims", lambda: scan_unbacked_claims(
+        pr_body, criteria=criteria, hunks=hunks,
+    ))
     # A ticked box was delivered by an earlier slice; only open boxes can
     # name what this diff should have changed.
-    findings.extend(scan_wrong_target(
+    run("wrong-target", lambda: scan_wrong_target(
         changes, hunks, criteria=_open_only(criteria, boxes), pr_title=pr_title,
     ))
-    findings.extend(scan_measurement_only(
+    run("measurement-only", lambda: scan_measurement_only(
         changes, hunks, criteria=criteria, pr_title=pr_title, health_issues=health_issues,
     ))
     # Criteria coverage already reports every runtime criterion unmet when
     # nothing in the diff runs; partial delivery would say it again.
     if not any(f.rule_name == "intent-mismatch" and f.severity == "high" for f in findings):
-        findings.extend(scan_partial_delivery(
+        run("partial-delivery", lambda: scan_partial_delivery(
             _open_only(criteria, boxes), changes, hunks, judge=criteria_judge,
         ))
-    doa = scan_dead_on_arrival(
+    doa = _run_rule("dead-on-arrival", lambda: scan_dead_on_arrival(
         changes, hunks, pr_body=pr_body, prior=tuple(findings),
         file_contents=file_contents, lane=is_lane_pr(pr_body),
-    )
+    ), failed)
     return (*drop_superseded(findings, doa), *doa)

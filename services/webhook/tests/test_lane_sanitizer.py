@@ -154,3 +154,99 @@ def test_lane_work_findings_runs_the_sanitizer_check():
         pr_body="## Why\nStrip the client markup.\n",
     )
     assert {RULE_EATS_TEXT, RULE_MISSING_TEST} <= _names(found)
+
+
+# #1834: the replacement literal is reviewed source text. It is decoded as
+# Python would decode it and applied literally, never parsed as a template.
+_MARKDOWN_SAFETY_COPY = [
+    "import re",
+    "",
+    '_MENTION_RE = re.compile(r"(?<!\\w)@(?=\\w)")',
+    "",
+    "",
+    "def neutralize_mentions(text):",
+    '    return _MENTION_RE.sub("@\\u200b", text)',
+]
+
+# Source text between the quotes of a replacement literal.
+_HOSTILE_LITERALS = (
+    "\\u200b",  # unicode escape
+    "@\\u200b",
+    "\\u12",  # truncated unicode escape: not valid Python
+    "\\1",  # group reference
+    "\\g<name>",
+    "\\g<0>",
+    "\\",  # lone backslash (swallows the closing quote)
+    "\\\\",
+    "\\x",
+    "\\N{NOPE}",
+    "\\777",
+    "\\8",
+    "(?P<x>",
+    "$1 ${name}",
+    "\\n\\t\\0",
+)
+
+
+def test_a_sanitizer_replacement_literal_with_an_escape_does_not_raise():
+    diff = _diff(_MARKDOWN_SAFETY_COPY, _POSITIVE_TESTS)
+    # No exception, and the right answer: the mention pattern leaves
+    # ordinary text alone, so only the missing negative test is marked.
+    assert _names(_scan(diff)) == {RULE_MISSING_TEST}
+
+
+def test_the_replacement_literal_is_decoded_before_it_is_applied():
+    source = [
+        "import re",
+        "",
+        "",
+        "def sanitize_chat(text):",
+        '    return re.sub(r"\\|", "\\u200b", text)',
+    ]
+    eaten = next(
+        f for f in _scan(_diff(source, _POSITIVE_TESTS)) if f.rule_name == RULE_EATS_TEXT
+    )
+    assert "`a ​hop`" in eaten.message
+
+
+def test_a_group_reference_in_a_replacement_literal_is_applied_literally():
+    source = [
+        "import re",
+        "",
+        "",
+        "def sanitize_chat(text):",
+        '    return re.sub(r"\\|", "\\\\1", text)',
+    ]
+    eaten = next(
+        f for f in _scan(_diff(source, _POSITIVE_TESTS)) if f.rule_name == RULE_EATS_TEXT
+    )
+    assert "`a \\1hop`" in eaten.message
+
+
+def test_hostile_replacement_literals_never_raise():
+    for literal in _HOSTILE_LITERALS:
+        inline = [
+            "import re",
+            "",
+            "",
+            "def sanitize_chat(text):",
+            f'    return re.sub(r"\\|", "{literal}", text)',
+        ]
+        constant = [
+            "import re",
+            "",
+            'PIPE_RE = re.compile(r"\\|")',
+            "",
+            "",
+            "def sanitize_chat(text):",
+            f'    return PIPE_RE.sub("{literal}", text)',
+        ]
+        raw = [
+            "import re",
+            "",
+            "",
+            "def sanitize_chat(text):",
+            f'    return re.sub(r"\\|", r"{literal}", text)',
+        ]
+        for source in (inline, constant, raw):
+            _scan(_diff(source, _POSITIVE_TESTS + _NEGATIVE_TEST))
