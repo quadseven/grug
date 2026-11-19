@@ -106,7 +106,7 @@ def _clean_tag(text: str) -> str:
     return text.replace("|", "_").replace(",", "_").replace("#", "_").replace("\n", "_")
 
 
-def emit_gauge(
+def _dogstatsd_gauge(
     metric: str,
     value: float,
     tags: dict[str, str] | None = None,
@@ -149,7 +149,7 @@ def emit_gauge(
         )
 
 
-def emit_count(
+def _dogstatsd_count(
     metric: str,
     value: float = 1,
     tags: dict[str, str] | None = None,
@@ -177,6 +177,101 @@ def emit_count(
             "count_emit_failed",
             extra={"metric": metric, "kind": type(e).__name__},
         )
+
+
+# Kept signals (#1699): the few metrics worth keeping, with the only tags
+# each may carry. Every tag set is a small closed or configured set; a
+# per-request, per-runner, per-branch or per-PR tag (unbounded cardinality)
+# is never allowed. docs/RUNBOOK.md "Kept signals" mirrors this table.
+# `emitted` is False for a signal the runbook keeps but no code emits yet.
+KEPT_SIGNALS: dict[str, dict[str, object]] = {
+    "grug.elder.tier_served": {
+        "type": "count", "tags": ("tier", "backend", "model"), "emitted": True,
+    },
+    "grug.github_api.error": {"type": "gauge", "tags": (), "emitted": True},
+    "grug.sqs.messages_visible": {"type": "gauge", "tags": ("queue",), "emitted": True},
+    "grug.sqs.stalled": {"type": "gauge", "tags": ("queue",), "emitted": True},
+    "grug.elder.degenerate_empty_review": {
+        "type": "count", "tags": ("backend", "model"), "emitted": True,
+    },
+    "grug.review.outcome": {"type": "count", "tags": ("outcome",), "emitted": False},
+    "grug.review.latency_ms": {"type": "gauge", "tags": ("backend",), "emitted": False},
+    "grug.review.degraded": {"type": "count", "tags": ("reason",), "emitted": False},
+}
+
+# Tag keys that are unbounded by construction. Never allowed on a kept signal.
+FORBIDDEN_TAG_KEYS = frozenset({
+    "request_id", "delivery_id", "runner", "runner_id", "branch", "ref",
+    "pr", "pr_number", "pull_number", "sha", "commit", "repo", "install_id",
+    "user", "user_id",
+})
+
+
+class MetricsBackend:
+    """The vendor-neutral metrics seam (#1699): one interface, one method per
+    metric kind. Callers never name a vendor; `get_metrics_backend()` picks
+    the implementation. Implementations must never raise into the caller.
+
+    The base class is the no-op (the default): every method does nothing."""
+
+    def gauge(self, metric: str, value: float, tags: dict[str, str] | None = None) -> None:
+        return None
+
+    def count(self, metric: str, value: float = 1, tags: dict[str, str] | None = None) -> None:
+        return None
+
+
+class NoopBackend(MetricsBackend):
+    """Explicit name for the default: emits nothing, logs nothing."""
+
+
+class DogStatsDBackend(MetricsBackend):
+    """The existing DogStatsD-over-UDP client, unchanged in what it sends,
+    as one implementation of the seam."""
+
+    def gauge(self, metric: str, value: float, tags: dict[str, str] | None = None) -> None:
+        _dogstatsd_gauge(metric, value, tags)
+
+    def count(self, metric: str, value: float = 1, tags: dict[str, str] | None = None) -> None:
+        _dogstatsd_count(metric, value, tags)
+
+
+_NOOP = NoopBackend()
+_DOGSTATSD = DogStatsDBackend()
+_override: MetricsBackend | None = None
+
+
+def set_metrics_backend(backend: MetricsBackend | None) -> None:
+    """Install a backend explicitly (None restores the default selection).
+    A future real backend plugs in here; none is wired today."""
+    global _override
+    _override = backend
+
+
+def get_metrics_backend() -> MetricsBackend:
+    """Explicit override, else DogStatsD when the Datadog switch is on
+    (#1208), else the no-op. Read per call so the env is always current."""
+    if _override is not None:
+        return _override
+    return _DOGSTATSD if datadog_enabled() else _NOOP
+
+
+def emit_gauge(
+    metric: str,
+    value: float,
+    tags: dict[str, str] | None = None,
+) -> None:
+    """Emit a gauge through the active metrics backend."""
+    get_metrics_backend().gauge(metric, value, tags)
+
+
+def emit_count(
+    metric: str,
+    value: float = 1,
+    tags: dict[str, str] | None = None,
+) -> None:
+    """Emit a count through the active metrics backend."""
+    get_metrics_backend().count(metric, value, tags)
 
 
 def emit_enforcement_metric(

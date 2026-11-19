@@ -262,3 +262,63 @@ def test_emit_gauge_skips_non_finite_values(monkeypatch, caplog):
     assert sent == []
     assert sum(1 for r in caplog.records
                if r.msg == "gauge_skipped_non_finite") == 2
+
+
+# --- #1699: vendor-neutral seam + kept-signal cardinality -------------------
+
+
+def test_kept_signals_carry_no_unbounded_tag():
+    import observability as o
+
+    assert o.KEPT_SIGNALS
+    for name, spec in o.KEPT_SIGNALS.items():
+        assert spec["type"] in {"gauge", "count"}, name
+        bad = set(spec["tags"]) & o.FORBIDDEN_TAG_KEYS
+        assert not bad, f"{name} carries unbounded tag(s): {sorted(bad)}"
+
+
+def test_runbook_lists_every_kept_signal():
+    import pathlib
+
+    import observability as o
+
+    text = (pathlib.Path(__file__).resolve().parents[3] / "docs" / "RUNBOOK.md").read_text()
+    for name in o.KEPT_SIGNALS:
+        assert f"`{name}`" in text, name
+
+
+def test_default_backend_is_noop_when_switch_off(monkeypatch):
+    import observability as o
+
+    monkeypatch.setenv("GRUG_DATADOG_ENABLED", "false")
+    assert type(o.get_metrics_backend()) is o.NoopBackend
+
+
+def test_default_backend_is_dogstatsd_when_switch_on():
+    import observability as o
+
+    assert isinstance(o.get_metrics_backend(), o.DogStatsDBackend)
+
+
+def test_emitters_route_through_installed_backend():
+    import observability as o
+
+    calls = []
+
+    class Rec(o.MetricsBackend):
+        def gauge(self, metric, value, tags=None):
+            calls.append(("g", metric, value, tags))
+
+        def count(self, metric, value=1, tags=None):
+            calls.append(("c", metric, value, tags))
+
+    o.set_metrics_backend(Rec())
+    try:
+        o.emit_gauge("grug.sqs.stalled", 1.0, {"queue": "q"})
+        o.emit_count("grug.elder.tier_served", 1, {"tier": "t"})
+    finally:
+        o.set_metrics_backend(None)
+    assert calls == [
+        ("g", "grug.sqs.stalled", 1.0, {"queue": "q"}),
+        ("c", "grug.elder.tier_served", 1, {"tier": "t"}),
+    ]
