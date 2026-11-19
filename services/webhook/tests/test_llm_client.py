@@ -1307,7 +1307,7 @@ def test_review_llm_timeout_invalid_value_falls_back_to_default(monkeypatch) -> 
 def test_cave_calls_are_tagged_interactive_priority(monkeypatch) -> None:
     """Grug's own review ensemble (coder + reasoner arms) carries
     X-Spark-Priority: interactive so the spark-gateway priority queue
-    (quadseven/infra#1768) lets it jump ahead of Hermes's long agentic turns
+    (a gateway infra ticket) lets it jump ahead of Hermes's long agentic turns
     on the same shared, single-generation-slot Ollama target - the exact
     2026-07-12 incident this header exists to prevent. Deep depth so BOTH
     arms fire (see test_deep_review_consults_both_arms_and_merges_findings)
@@ -5659,6 +5659,78 @@ def test_failures_outside_the_window_do_not_accumulate(monkeypatch) -> None:
     assert not availability._model_is_benched("opencode-go", "space-bunny-free")
 
 
+_RESPONSE_FORMAT_MESSAGE = "Structured response_format is not enabled for model 'space-bunny-free'"
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_a_response_format_rejection_benches_the_model_on_the_first_call(monkeypatch, status) -> None:
+    # grug#1745: a model that rejects response_format will reject every review,
+    # so one refusal is enough; counting three more costs a call per review.
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    clock = [1000.0]
+    monkeypatch.setattr(lc.time, "time", lambda: clock[0])
+    cfg = _go_cfg()
+    assert "space-bunny-free" in _free_models()
+    _call(cfg, _err(status, _RESPONSE_FORMAT_MESSAGE))
+    assert availability._model_is_benched("opencode-go", "space-bunny-free")
+    assert "space-bunny-free" not in _free_models(), "the chain moves on to the next tier"
+    entry = availability._bench_state[("opencode-go", "space-bunny-free")]
+    assert entry.benched_until - clock[0] == availability._BENCH_BASE_SECONDS
+
+
+def test_the_chain_serves_from_the_next_tier_and_never_asks_the_refusing_model_again(
+    monkeypatch,
+) -> None:
+    """grug#1745 criterion 2, through the real review chain: the first tier
+    answers 400 naming response_format, the next tier serves the review, and
+    across that review AND a second one inside the bench window the refusing
+    model is called exactly once."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    refusing = lc._opencode_go_chain_config().model
+    calls: list[str] = []
+    served = httpx.Response(200, json=_openai_json_response(
+        '{"findings": [{"path": "x.py", "line": 1, "rule": "next-tier-found-it",'
+        ' "severity": "low", "message": "m"}]}'
+    ))
+
+    def post(url, **kwargs):
+        model = kwargs["json"]["model"]
+        calls.append(model)
+        if model == refusing:
+            return _err(400, f"Structured response_format is not enabled for model '{model}'")
+        return served
+
+    with patch.object(httpx, "post", side_effect=post):
+        first = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        second = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert first.kind == "reviewed" and second.kind == "reviewed"
+    assert first.backend_used == Backend.OPENROUTER, "the next tier answered"
+    assert second.backend_used == Backend.OPENROUTER
+    assert calls.count(refusing) == 1, "asked once in total, not once per review"
+    assert calls == [refusing, "z-ai/glm-5.2:free", "z-ai/glm-5.2:free"]
+    assert availability._model_is_benched("opencode-go", refusing)
+
+
+def test_a_response_format_bench_ends_when_it_expires(monkeypatch) -> None:
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    clock = [1000.0]
+    monkeypatch.setattr(lc.time, "time", lambda: clock[0])
+    _call(_go_cfg(), _err(400, _RESPONSE_FORMAT_MESSAGE))
+    clock[0] += availability._BENCH_BASE_SECONDS + 1
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
+    assert "space-bunny-free" in _free_models()
+
+
+def test_other_client_errors_still_wait_for_three_failures(monkeypatch) -> None:
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    _call(_go_cfg(), _err(400, "invalid temperature"))
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
+
+
 def test_a_success_unbenches_immediately(monkeypatch) -> None:
     cfg = _go_cfg()
     for _ in range(3):
@@ -6321,3 +6393,126 @@ def test_answer_pr_question_prompt_demands_grug_not_know(monkeypatch) -> None:
 class _NullSpan:
     def __enter__(self): return self
     def __exit__(self, *a): return False
+
+
+# --- grug#1811: the subscription tier rides out a gateway flap ---------------
+
+
+def _flap_setup(monkeypatch):
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", "http://lane.test/v1/chat/completions")
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    sleeps: list[float] = []
+    monkeypatch.setattr(lc, "_FLAP_SLEEP", sleeps.append)
+    return sleeps, lc._subscription_fallback_config()
+
+
+def _flap_run(cfg, outcomes, cancel_event=None):
+    """Feed `outcomes` (a response or an exception) to successive POSTs."""
+    seq = list(outcomes)
+
+    def post(url, **kwargs):
+        item = seq.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    with patch.object(httpx, "post", side_effect=post) as m:
+        try:
+            return lc._call_backend(cfg, [{"role": "user", "content": "hi"}]), m.call_count
+        except httpx.RequestError as e:
+            return e, m.call_count
+
+
+def _status(code: int) -> httpx.Response:
+    return httpx.Response(code, json={"error": {"message": "x"}})
+
+
+def test_flap_502_then_200_is_served_by_the_subscription_tier_with_one_retry(monkeypatch, caplog) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    ok = _usage_response('{"findings": []}', 500, 20)
+    with caplog.at_level("WARNING"):
+        out, calls = _flap_run(cfg, [_status(502), ok])
+    assert out is ok and calls == 2
+    assert len(sleeps) == 1 and 4.5 <= sleeps[0] <= 5.5
+    rec = [r for r in caplog.records if r.getMessage() == "llm_subscription_flap_retry"]
+    assert [(r.attempt, r.outcome) for r in rec] == [(1, "recovered")]
+
+
+def test_flap_502_504_200_is_served_on_the_third_attempt(monkeypatch, caplog) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    ok = _usage_response('{"findings": []}', 500, 20)
+    with caplog.at_level("WARNING"):
+        out, calls = _flap_run(cfg, [_status(502), _status(504), ok])
+    assert out is ok and calls == 3
+    assert 4.5 <= sleeps[0] <= 5.5 and 7.2 <= sleeps[1] <= 8.8
+    assert sum(sleeps) > 10 * 0.9
+    rec = [r for r in caplog.records if r.getMessage() == "llm_subscription_flap_retry"]
+    assert [(r.attempt, r.outcome) for r in rec] == [(1, "http_504"), (2, "recovered")]
+
+
+def test_flap_three_failures_fall_through_as_before(monkeypatch) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    out, calls = _flap_run(cfg, [_status(502), _status(503), _status(504)])
+    assert isinstance(out, httpx.Response) and out.status_code == 504
+    assert calls == 3 and len(sleeps) == 2
+
+
+def test_flap_connect_error_and_fast_read_failure_are_retried(monkeypatch) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    ok = _usage_response('{"findings": []}', 500, 20)
+    out, calls = _flap_run(cfg, [httpx.ConnectError("refused"), httpx.RemoteProtocolError("closed"), ok])
+    assert out is ok and calls == 3
+
+
+@pytest.mark.parametrize("code", [400, 401, 429])
+def test_flap_client_errors_and_429_are_not_retried(monkeypatch, code) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    out, calls = _flap_run(cfg, [_status(code), _usage_response("{}", 1, 1)])
+    assert out.status_code == code and calls == 1 and sleeps == []
+
+
+def test_flap_slow_read_timeout_is_not_retried(monkeypatch) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    out, calls = _flap_run(cfg, [httpx.ReadTimeout("slow"), _usage_response("{}", 1, 1)])
+    assert isinstance(out, httpx.ReadTimeout) and calls == 1 and sleeps == []
+
+
+def test_flap_a_read_failure_after_a_long_call_is_not_retried(monkeypatch) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    ticks = iter([0.0, 90.0, 90.0, 90.0])
+    monkeypatch.setattr(lc.time, "monotonic", lambda: next(ticks, 90.0))
+    out, calls = _flap_run(cfg, [httpx.ReadError("reset"), _usage_response("{}", 1, 1)])
+    assert isinstance(out, httpx.ReadError) and calls == 1 and sleeps == []
+
+
+def test_flap_a_nearly_spent_budget_skips_the_retry(monkeypatch, caplog) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    token = lc._REVIEW_DEADLINE.set(lc.time.monotonic() + 12.0)  # < 5s wait + 10s call floor
+    try:
+        with caplog.at_level("WARNING"):
+            out, calls = _flap_run(cfg, [_status(502), _usage_response("{}", 1, 1)])
+    finally:
+        lc._REVIEW_DEADLINE.reset(token)
+    assert out.status_code == 502 and calls == 1 and sleeps == []
+    rec = [r for r in caplog.records if r.getMessage() == "llm_subscription_flap_retry"]
+    assert [r.outcome for r in rec] == ["skipped_budget"]
+
+
+def test_flap_other_backends_are_not_retried(monkeypatch) -> None:
+    sleeps, _ = _flap_setup(monkeypatch)
+    cfg = _go_cfg()
+    out, calls = _flap_run(cfg, [_status(502), _usage_response("{}", 1, 1)])
+    assert out.status_code == 502 and calls == 1 and sleeps == []
+
+
+def test_flap_a_flap_does_not_bench_the_subscription_tier(monkeypatch) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    monkeypatch.undo()  # keep the real bench code: only the env and sleep matter here
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", "http://lane.test/v1/chat/completions")
+    monkeypatch.setattr(lc, "_FLAP_SLEEP", lambda _s: None)
+    cfg = lc._subscription_fallback_config()
+    _flap_run(cfg, [_status(502), _status(504), _status(502)])
+    assert not availability._model_is_benched("subscription", cfg.model)
+    assert availability.subscription_status(cfg) != "unavailable"

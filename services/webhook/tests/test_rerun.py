@@ -2267,7 +2267,7 @@ def test_run_ask_no_answer_falls_back_without_crashing_on_none(monkeypatch):
 
 # --- #716 follow-up: the staleness watch must not kill live work ------------
 #
-# Live on quadseven/infra#2157 (2026-08-02), a PR titled "break the packet-mode
+# Live on an infra ticket (2026-08-02), a PR titled "break the packet-mode
 # bootstrap deadlock with per-leg keepalives":
 #
 #   13:51:12  llm_staged_review_planned      cohort_count=2, 43111 chars

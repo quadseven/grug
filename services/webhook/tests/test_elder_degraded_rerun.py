@@ -15,7 +15,7 @@ These tests pin the widened rule:
    publishes the failure and completes.
 4. A degraded review that still found a blocking problem is a real verdict:
    it publishes `failure` at once and is not re-run.
-5. WARN mode stays neutral, as before.
+5. WARN mode waits too when a backend caused the degradation (#818).
 
 #818 widened it again for the reasons the queue always re-runs
 (`RETRIED_DEGRADATIONS`): those stay pending in BOTH modes, because a
@@ -129,11 +129,73 @@ def test_degraded_review_with_no_rerun_left_still_fails_when_blocking(
 
 
 @pytest.mark.parametrize("reason", sorted(_DEGRADED))
-def test_degraded_review_in_warn_mode_stays_neutral(elder, reason) -> None:
+def test_a_backend_caused_degradation_in_warn_mode_reads_pending_while_a_rerun_is_owed(
+    elder, reason,
+) -> None:
+    """#818: a pass degraded by failing backends publishes nothing
+    author-visible while the queue still owes a re-run, in WARN mode too."""
     result, posted = elder(_DEGRADED[reason], blocking=False, rerun_pending=True)
+
+    assert result.get("rerun_scheduled") == "true"
+    assert [(c.status, c.conclusion) for c in posted] == [("in_progress", None)]
+
+
+@pytest.mark.parametrize("reason", sorted(_DEGRADED))
+def test_a_degraded_review_in_warn_mode_with_no_rerun_left_publishes_neutral(
+    elder, reason,
+) -> None:
+    result, posted = elder(_DEGRADED[reason], blocking=False, rerun_pending=False)
 
     assert "rerun_scheduled" not in result
     assert [(c.status, c.conclusion) for c in posted] == [("completed", "neutral")]
+
+
+def test_a_partial_review_not_caused_by_a_backend_is_not_held_in_warn_mode(elder) -> None:
+    """A cohort the budget never walked is a big diff, not an outage: no
+    re-run would repair it, so WARN mode publishes it at once."""
+    budget_partial = LlmReviewResponse(
+        kind="reviewed",
+        error="partial review: cohorts [2] failed",
+        backend_used=Backend.POOLSIDE,
+        coverage=ReviewCoverage(
+            total_cohorts=2, completed_cohorts=1, failed_cohorts=(2,),
+            unattempted_cohorts=(2,), cohort_labels=("a", "b"),
+        ),
+    )
+    result, posted = elder(budget_partial, blocking=False, rerun_pending=True)
+
+    assert "rerun_scheduled" not in result
+    assert [(c.status, c.conclusion) for c in posted] == [("completed", "neutral")]
+
+
+@pytest.mark.parametrize("blocking", [True, False])
+def test_a_degraded_pass_that_succeeds_on_the_rerun_never_shows_a_degraded_notice(
+    elder, blocking,
+) -> None:
+    """First delivery degrades (pending), the re-run reviews cleanly: every
+    check posted is pending or the clean verdict, none says degraded."""
+    _first, posted = elder(_LOW_CONFIDENCE, blocking=blocking, rerun_pending=True)
+    clean = LlmReviewResponse(kind="reviewed", backend_used=Backend.POOLSIDE)
+    _second, posted = elder(clean, blocking=blocking, rerun_pending=False)
+
+    assert [c.status for c in posted] == ["in_progress", "completed"]
+    assert not any(c.summary.startswith("Degraded review") for c in posted)
+    assert not any("could not review" in c.title.lower() for c in posted)
+
+
+@pytest.mark.parametrize("blocking", [True, False])
+def test_a_pass_that_degrades_on_every_attempt_publishes_the_notice_once_at_the_end(
+    elder, blocking,
+) -> None:
+    posted = []
+    for pending in (True, True, True, False):
+        _result, posted = elder(_LOW_CONFIDENCE, blocking=blocking, rerun_pending=pending)
+
+    assert [c.status for c in posted] == ["in_progress"] * 3 + ["completed"]
+    notices = [c for c in posted if c.status == "completed"]
+    assert len(notices) == 1
+    assert notices[0].conclusion == ("failure" if blocking else "neutral")
+    assert "Degraded review (low_confidence_review)" in notices[0].summary
 
 
 def test_a_partial_review_with_a_blocking_finding_is_not_rerun(elder) -> None:
@@ -232,7 +294,7 @@ def _durable(monkeypatch, *, reason: str, receive_count: int):
 
     def fake_dispatch(payload, *, blocking, cancel_event, rerun_pending):
         out = {"persona": "code_reviewer", "result": "skipped", "degraded_reason": reason}
-        if rerun_pending and blocking:
+        if rerun_pending:
             out["rerun_scheduled"] = "true"
         return out
 
