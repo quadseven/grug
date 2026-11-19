@@ -2145,9 +2145,12 @@ def _merge_lane_work(
     evaluation: CodeReviewEvaluation, hunks: tuple[DiffHunk, ...],
     diff_text: str, file_contents: dict[str, str],
     base_contents: dict[str, str], pr_context: PrContext, *,
-    correctness_only: bool,
+    correctness_only: bool, skipped: list[tuple[str, str]] | None = None,
 ) -> CodeReviewEvaluation:
     """Merge the deterministic lane-work findings (#1179, #1363).
+
+    A rule that raised is appended to `skipped` as ("lane-work:<rule>",
+    exception kind), so the summary names it like a skipped analyzer (#1834).
 
     The criteria in scope are those of an issue the PR closes, every linked
     criterion of a lane PR (the station closes its ticket on merge), and a
@@ -2162,6 +2165,7 @@ def _merge_lane_work(
     if callable(linked_context):
         linked_context = linked_context()
     linked_context = str(linked_context or "")
+    failed: list[tuple[str, str]] = []
     found = lane_work_findings(
         diff_text=diff_text,
         hunks=hunks,
@@ -2174,7 +2178,10 @@ def _merge_lane_work(
         pr_body=body,
         health_issues=rendered_health_issues(linked_context),
         criteria_judge=criteria_judge_for(pr_context),
+        failed=failed,
     )
+    if skipped is not None:
+        skipped.extend((f"lane-work:{rule}", kind) for rule, kind in failed)
     if correctness_only:
         found = tuple(f for f in found if f.rule_name != "dead-code")
     return with_extra_findings(
@@ -2362,6 +2369,7 @@ def _merge_lane_work_for_pass(
     evaluation: CodeReviewEvaluation, this_pass: _LaneWorkInputs,
     pr_context: PrContext, *, living_range: str, base_sha: str,
     correctness_only: bool, action: str = "",
+    skipped: list[tuple[str, str]] | None = None,
 ) -> CodeReviewEvaluation:
     """Merge the lane-work findings for one review pass. A full review
     judges the diff it reviewed; a living delta hides callers and the
@@ -2401,6 +2409,7 @@ def _merge_lane_work_for_pass(
             evaluation = _merge_lane_work(
                 evaluation, inputs.hunks, inputs.diff_text, inputs.file_contents,
                 inputs.base_contents, pr_context, correctness_only=correctness_only,
+                skipped=skipped,
             )
     except Exception as e:  # noqa: BLE001 - enrichment must never abort a review
         log.info(
@@ -3523,7 +3532,7 @@ def _assess_review(run: _ReviewRun, diff: _PreparedDiff, voice: VoiceSelection) 
         _LaneWorkInputs(diff.text, diff.parsed_hunks, inputs.file_contents, inputs.base_file_contents),
         run.pr_context, living_range=diff.living.range, base_sha=run.base_sha,
         correctness_only=correctness_only,
-        action=run.action,
+        action=run.action, skipped=analyzer_skips,
     )
     evaluation, review_threads = _filter_resolved_findings(run, evaluation)
     return _ReviewAssessment(
