@@ -6321,3 +6321,126 @@ def test_answer_pr_question_prompt_demands_grug_not_know(monkeypatch) -> None:
 class _NullSpan:
     def __enter__(self): return self
     def __exit__(self, *a): return False
+
+
+# --- grug#1811: the subscription tier rides out a gateway flap ---------------
+
+
+def _flap_setup(monkeypatch):
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", "http://lane.test/v1/chat/completions")
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    sleeps: list[float] = []
+    monkeypatch.setattr(lc, "_FLAP_SLEEP", sleeps.append)
+    return sleeps, lc._subscription_fallback_config()
+
+
+def _flap_run(cfg, outcomes, cancel_event=None):
+    """Feed `outcomes` (a response or an exception) to successive POSTs."""
+    seq = list(outcomes)
+
+    def post(url, **kwargs):
+        item = seq.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    with patch.object(httpx, "post", side_effect=post) as m:
+        try:
+            return lc._call_backend(cfg, [{"role": "user", "content": "hi"}]), m.call_count
+        except httpx.RequestError as e:
+            return e, m.call_count
+
+
+def _status(code: int) -> httpx.Response:
+    return httpx.Response(code, json={"error": {"message": "x"}})
+
+
+def test_flap_502_then_200_is_served_by_the_subscription_tier_with_one_retry(monkeypatch, caplog) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    ok = _usage_response('{"findings": []}', 500, 20)
+    with caplog.at_level("WARNING"):
+        out, calls = _flap_run(cfg, [_status(502), ok])
+    assert out is ok and calls == 2
+    assert len(sleeps) == 1 and 4.5 <= sleeps[0] <= 5.5
+    rec = [r for r in caplog.records if r.getMessage() == "llm_subscription_flap_retry"]
+    assert [(r.attempt, r.outcome) for r in rec] == [(1, "recovered")]
+
+
+def test_flap_502_504_200_is_served_on_the_third_attempt(monkeypatch, caplog) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    ok = _usage_response('{"findings": []}', 500, 20)
+    with caplog.at_level("WARNING"):
+        out, calls = _flap_run(cfg, [_status(502), _status(504), ok])
+    assert out is ok and calls == 3
+    assert 4.5 <= sleeps[0] <= 5.5 and 7.2 <= sleeps[1] <= 8.8
+    assert sum(sleeps) > 10 * 0.9
+    rec = [r for r in caplog.records if r.getMessage() == "llm_subscription_flap_retry"]
+    assert [(r.attempt, r.outcome) for r in rec] == [(1, "http_504"), (2, "recovered")]
+
+
+def test_flap_three_failures_fall_through_as_before(monkeypatch) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    out, calls = _flap_run(cfg, [_status(502), _status(503), _status(504)])
+    assert isinstance(out, httpx.Response) and out.status_code == 504
+    assert calls == 3 and len(sleeps) == 2
+
+
+def test_flap_connect_error_and_fast_read_failure_are_retried(monkeypatch) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    ok = _usage_response('{"findings": []}', 500, 20)
+    out, calls = _flap_run(cfg, [httpx.ConnectError("refused"), httpx.RemoteProtocolError("closed"), ok])
+    assert out is ok and calls == 3
+
+
+@pytest.mark.parametrize("code", [400, 401, 429])
+def test_flap_client_errors_and_429_are_not_retried(monkeypatch, code) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    out, calls = _flap_run(cfg, [_status(code), _usage_response("{}", 1, 1)])
+    assert out.status_code == code and calls == 1 and sleeps == []
+
+
+def test_flap_slow_read_timeout_is_not_retried(monkeypatch) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    out, calls = _flap_run(cfg, [httpx.ReadTimeout("slow"), _usage_response("{}", 1, 1)])
+    assert isinstance(out, httpx.ReadTimeout) and calls == 1 and sleeps == []
+
+
+def test_flap_a_read_failure_after_a_long_call_is_not_retried(monkeypatch) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    ticks = iter([0.0, 90.0, 90.0, 90.0])
+    monkeypatch.setattr(lc.time, "monotonic", lambda: next(ticks, 90.0))
+    out, calls = _flap_run(cfg, [httpx.ReadError("reset"), _usage_response("{}", 1, 1)])
+    assert isinstance(out, httpx.ReadError) and calls == 1 and sleeps == []
+
+
+def test_flap_a_nearly_spent_budget_skips_the_retry(monkeypatch, caplog) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    token = lc._REVIEW_DEADLINE.set(lc.time.monotonic() + 12.0)  # < 5s wait + 10s call floor
+    try:
+        with caplog.at_level("WARNING"):
+            out, calls = _flap_run(cfg, [_status(502), _usage_response("{}", 1, 1)])
+    finally:
+        lc._REVIEW_DEADLINE.reset(token)
+    assert out.status_code == 502 and calls == 1 and sleeps == []
+    rec = [r for r in caplog.records if r.getMessage() == "llm_subscription_flap_retry"]
+    assert [r.outcome for r in rec] == ["skipped_budget"]
+
+
+def test_flap_other_backends_are_not_retried(monkeypatch) -> None:
+    sleeps, _ = _flap_setup(monkeypatch)
+    cfg = _go_cfg()
+    out, calls = _flap_run(cfg, [_status(502), _usage_response("{}", 1, 1)])
+    assert out.status_code == 502 and calls == 1 and sleeps == []
+
+
+def test_flap_a_flap_does_not_bench_the_subscription_tier(monkeypatch) -> None:
+    sleeps, cfg = _flap_setup(monkeypatch)
+    monkeypatch.undo()  # keep the real bench code: only the env and sleep matter here
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_FALLBACK", "true")
+    monkeypatch.setenv("GRUG_SUBSCRIPTION_URL", "http://lane.test/v1/chat/completions")
+    monkeypatch.setattr(lc, "_FLAP_SLEEP", lambda _s: None)
+    cfg = lc._subscription_fallback_config()
+    _flap_run(cfg, [_status(502), _status(504), _status(502)])
+    assert not availability._model_is_benched("subscription", cfg.model)
+    assert availability.subscription_status(cfg) != "unavailable"
