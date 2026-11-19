@@ -5659,6 +5659,78 @@ def test_failures_outside_the_window_do_not_accumulate(monkeypatch) -> None:
     assert not availability._model_is_benched("opencode-go", "space-bunny-free")
 
 
+_RESPONSE_FORMAT_MESSAGE = "Structured response_format is not enabled for model 'space-bunny-free'"
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_a_response_format_rejection_benches_the_model_on_the_first_call(monkeypatch, status) -> None:
+    # grug#1745: a model that rejects response_format will reject every review,
+    # so one refusal is enough; counting three more costs a call per review.
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    clock = [1000.0]
+    monkeypatch.setattr(lc.time, "time", lambda: clock[0])
+    cfg = _go_cfg()
+    assert "space-bunny-free" in _free_models()
+    _call(cfg, _err(status, _RESPONSE_FORMAT_MESSAGE))
+    assert availability._model_is_benched("opencode-go", "space-bunny-free")
+    assert "space-bunny-free" not in _free_models(), "the chain moves on to the next tier"
+    entry = availability._bench_state[("opencode-go", "space-bunny-free")]
+    assert entry.benched_until - clock[0] == availability._BENCH_BASE_SECONDS
+
+
+def test_the_chain_serves_from_the_next_tier_and_never_asks_the_refusing_model_again(
+    monkeypatch,
+) -> None:
+    """grug#1745 criterion 2, through the real review chain: the first tier
+    answers 400 naming response_format, the next tier serves the review, and
+    across that review AND a second one inside the bench window the refusing
+    model is called exactly once."""
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
+    monkeypatch.setenv("GRUG_CLOUD_FREE_TIER_MODEL", "z-ai/glm-5.2:free")
+    _admit_free_tier(monkeypatch)
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    refusing = lc._opencode_go_chain_config().model
+    calls: list[str] = []
+    served = httpx.Response(200, json=_openai_json_response(
+        '{"findings": [{"path": "x.py", "line": 1, "rule": "next-tier-found-it",'
+        ' "severity": "low", "message": "m"}]}'
+    ))
+
+    def post(url, **kwargs):
+        model = kwargs["json"]["model"]
+        calls.append(model)
+        if model == refusing:
+            return _err(400, f"Structured response_format is not enabled for model '{model}'")
+        return served
+
+    with patch.object(httpx, "post", side_effect=post):
+        first = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+        second = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert first.kind == "reviewed" and second.kind == "reviewed"
+    assert first.backend_used == Backend.OPENROUTER, "the next tier answered"
+    assert second.backend_used == Backend.OPENROUTER
+    assert calls.count(refusing) == 1, "asked once in total, not once per review"
+    assert calls == [refusing, "z-ai/glm-5.2:free", "z-ai/glm-5.2:free"]
+    assert availability._model_is_benched("opencode-go", refusing)
+
+
+def test_a_response_format_bench_ends_when_it_expires(monkeypatch) -> None:
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    clock = [1000.0]
+    monkeypatch.setattr(lc.time, "time", lambda: clock[0])
+    _call(_go_cfg(), _err(400, _RESPONSE_FORMAT_MESSAGE))
+    clock[0] += availability._BENCH_BASE_SECONDS + 1
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
+    assert "space-bunny-free" in _free_models()
+
+
+def test_other_client_errors_still_wait_for_three_failures(monkeypatch) -> None:
+    monkeypatch.setattr(availability, "_note_provider_response", lambda *_: None)
+    _call(_go_cfg(), _err(400, "invalid temperature"))
+    assert not availability._model_is_benched("opencode-go", "space-bunny-free")
+
+
 def test_a_success_unbenches_immediately(monkeypatch) -> None:
     cfg = _go_cfg()
     for _ in range(3):

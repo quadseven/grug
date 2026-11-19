@@ -330,6 +330,10 @@ def _reserve_opencode_go_call(config: BackendConfig) -> None:
 # request-specific error (oversized context) says nothing about the model.
 # Counted per process; an open bench is shared with every pod and survives
 # a restart through `shared_benches` (grug#1286), like both breakers.
+# One exception trips on the first failure: a 400 that says the model does not
+# accept `response_format` is a fact about the model, not a flake, so counting
+# three more refused calls (each spending a pacing slot and tier time on every
+# review) only repeats the answer (grug#1745).
 _BENCH_FAILURE_THRESHOLD = 3
 _BENCH_WINDOW_SECONDS = 600.0
 _BENCH_BASE_SECONDS = 3600.0
@@ -373,15 +377,24 @@ def _is_benchable_failure(resp: httpx.Response) -> bool:
     return not any(m in text for m in _BENCH_QUOTA_MARKERS + _BENCH_REQUEST_MARKERS)
 
 
-def _record_model_failure(backend: str, model: str, status: int, now: float) -> float | None:
-    """Count one failure; return the bench duration when it trips the bench."""
+def _rejects_response_format(resp: httpx.Response) -> bool:
+    """A 400 or 422 whose body says the model does not accept `response_format`
+    (OpenCode Go: "Structured response_format is not enabled for model ...")."""
+    return resp.status_code in (400, 422) and "response_format" in (resp.text or "").lower()
+
+
+def _record_model_failure(
+    backend: str, model: str, status: int, now: float, *, immediate: bool = False,
+) -> float | None:
+    """Count one failure; return the bench duration when it trips the bench.
+    `immediate` trips it on this failure without waiting for the threshold."""
     with _bench_lock:
         entry = _bench_state.setdefault((backend, model), _BenchEntry())
         if now < entry.benched_until:
             return None
         entry.failures = [t for t in entry.failures if now - t < _BENCH_WINDOW_SECONDS]
         entry.failures.append(now)
-        if len(entry.failures) < _BENCH_FAILURE_THRESHOLD:
+        if len(entry.failures) < _BENCH_FAILURE_THRESHOLD and not immediate:
             return None
         seconds = entry.next_seconds
         entry.benched_until = now + seconds
@@ -421,7 +434,9 @@ def _note_model_response(config: BackendConfig, resp: httpx.Response) -> None:
     if not _is_benchable_failure(resp):
         return
     now = time.time()
-    seconds = _record_model_failure(*key, resp.status_code, now)
+    seconds = _record_model_failure(
+        *key, resp.status_code, now, immediate=_rejects_response_format(resp),
+    )
     if seconds is not None:
         shared_benches.publish("bench", *key, now + seconds)
         _announce_model_benched(*key, resp.status_code, seconds)
