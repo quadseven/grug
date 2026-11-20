@@ -35,7 +35,7 @@ def _run(key: str, *args: str, env: dict | None = None) -> subprocess.CompletedP
     full = {k: v for k, v in os.environ.items() if not k.startswith("GRUG_")}
     full.update(env or {})
     return subprocess.run(
-        [shutil.which("bash"), "scripts/deploy_config.sh", key, *args],
+        [shutil.which("bash"), _SCRIPT, key, *args],
         capture_output=True,
         text=True,
         encoding="utf-8",
