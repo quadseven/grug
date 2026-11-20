@@ -27,7 +27,7 @@ def test_escape_of_a_pr_outside_the_window_is_ignored():
     assert escape_rates(_pulls(), [999])[AGENT].escapes == 0
 
 
-def test_no_merged_pulls_gives_no_rate_not_zero():
+def test_author_kind_with_no_merged_pulls_gets_no_rate_not_zero():
     rates = escape_rates([MergedPull(1, AGENT)], [])
     assert rates[HUMAN].per_100 is None
     assert rates[AGENT].per_100 == 0.0
