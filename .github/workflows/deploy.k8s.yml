@@ -62,11 +62,29 @@ jobs:
           # tracked in the parameter store) - no OAuth client needed.
           authkey: ${{ secrets.TS_AUTHKEY }}
 
+      - name: Resolve deployment config
+        id: cfg
+        env:
+          GRUG_AWS_REGION: ${{ vars.GRUG_AWS_REGION }}
+          GRUG_DOMAIN: ${{ vars.GRUG_DOMAIN }}
+        run: |
+          set -euo pipefail
+          region="$(bash scripts/deploy_config.sh region)"
+          domain="$(bash scripts/deploy_config.sh domain)"
+          {
+            echo "region=$region"
+            echo "domain=$domain"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "GRUG_AWS_REGION=$region"
+            echo "GRUG_DOMAIN=$domain"
+          } >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials (app-secret seed)
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-          aws-region: us-east-1
+          aws-region: ${{ steps.cfg.outputs.region }}
 
       - name: Registry login
         uses: ./.github/actions/registry-login
@@ -354,7 +372,7 @@ jobs:
           ENVF="$RUNNER_TEMP/grug-secrets.env"
           install -m 600 /dev/null "$ENVF"
           {
-            echo "AWS_DEFAULT_REGION=us-east-1"
+            echo "AWS_DEFAULT_REGION=${GRUG_AWS_REGION}"
             echo "GRUG_DATABASE_URL=$(get /grug/database-url)"
             # GRUG_KMS_CMK_ARN: envelope-encryption CMK for OAuth/credential
             # blobs (crypto/kms_envelope.encrypt_for_user hard-requires it at
@@ -412,6 +430,7 @@ jobs:
         continue-on-error: true
         env:
           REGISTRY_HOST: ${{ vars.DEPLOY_REGISTRY_HOST }}
+          ALLOWED_APP_BOT_LOGINS: ${{ vars.GRUG_ALLOWED_APP_BOT_LOGINS }}
         run: |
           set -euo pipefail
           # Pin images by digest (audit #7): replace each FULL
@@ -454,11 +473,33 @@ jobs:
             -e "s|RA_TRUST_ANCHOR_ARN_PLACEHOLDER|${RA_ANCHOR}|g" \
             -e "s|RA_PROFILE_ARN_PLACEHOLDER|${RA_PROFILE}|g" \
             -e "s|RA_ROLE_ARN_PLACEHOLDER|${RA_ROLE}|g" \
+            -e "s|AWS_REGION_PLACEHOLDER|${GRUG_AWS_REGION}|g" \
             k8s/*.yaml
           # Post-sed sentinel: a future manifest that escapes substitution
           # must fail the deploy, not ship a literal placeholder (F7).
-          if grep -rn 'REGISTRY_PLACEHOLDER\|TAG_PLACEHOLDER\|RA_.*_ARN_PLACEHOLDER' k8s/; then
+          if grep -rn 'REGISTRY_PLACEHOLDER\|TAG_PLACEHOLDER\|RA_.*_ARN_PLACEHOLDER\|AWS_REGION_PLACEHOLDER' k8s/; then
             echo "::error::unsubstituted placeholder in k8s/"; exit 1
+          fi
+          # App bot logins allowed to run Elder re-run commands (grug#1445):
+          # a config entry, not a manifest literal. Precedence: the
+          # GRUG_ALLOWED_APP_BOT_LOGINS repository variable (applied every
+          # deploy); else an existing grug-webhook-config ConfigMap is kept;
+          # else it is seeded once from the value the live deployment still
+          # carries inline (so the switch to a ConfigMap changes nothing),
+          # or empty (feature off, the self-hosted default).
+          bots=""
+          if [ -n "${ALLOWED_APP_BOT_LOGINS}" ]; then
+            bots="${ALLOWED_APP_BOT_LOGINS}"; write_bots=true
+          elif kubectl -n grug get configmap grug-webhook-config >/dev/null 2>&1; then
+            write_bots=false
+          else
+            bots="$(kubectl -n grug get deploy grug-webhook -o jsonpath='{.spec.template.spec.containers[?(@.name=="webhook")].env[?(@.name=="GRUG_ALLOWED_APP_BOT_LOGINS")].value}' 2>/dev/null || true)"
+            write_bots=true
+          fi
+          if [ "$write_bots" = "true" ]; then
+            kubectl -n grug create configmap grug-webhook-config \
+              --from-literal=allowed_app_bot_logins="${bots}" \
+              --dry-run=client -o yaml | kubectl apply -f -
           fi
           kubectl apply -k k8s/
           # The rollout gate captures pods, describe and events into the
@@ -526,10 +567,10 @@ jobs:
             echo "  last status for $1: ${code:-none}"
             return 1
           }
-          edge "https://webhook.grug.lol/livez"  || fail "public edge webhook /livez unreachable (DNS/CF/tunnel/TLS/app)"
-          edge "https://webhook.grug.lol/readyz" || fail "public edge webhook /readyz unhealthy"
-          edge "https://api.grug.lol/livez"      || fail "public edge api /livez unreachable"
-          edge "https://api.grug.lol/readyz"     || fail "public edge api /readyz unhealthy"
+          edge "https://webhook.${GRUG_DOMAIN}/livez"  || fail "public edge webhook /livez unreachable (DNS/CF/tunnel/TLS/app)"
+          edge "https://webhook.${GRUG_DOMAIN}/readyz" || fail "public edge webhook /readyz unhealthy"
+          edge "https://api.${GRUG_DOMAIN}/livez"      || fail "public edge api /livez unreachable"
+          edge "https://api.${GRUG_DOMAIN}/readyz"     || fail "public edge api /readyz unhealthy"
           echo "public-edge endpoints OK (both services /livez + /readyz)" >> "$GITHUB_STEP_SUMMARY"
           # Signed PING through the FULL real path (Qodo requirement gap on
           # #526; the issue's #368 proof mechanics, automated): POST a
@@ -561,7 +602,7 @@ jobs:
             -H "X-GitHub-Delivery: synthetic-${GITHUB_SHA}" \
             -H "X-Hub-Signature-256: sha256=${PING_SIG}" \
             -H "Content-Type: application/json" \
-            --data "$PING_BODY" "https://webhook.grug.lol/webhook/github" 2>/dev/null) || true
+            --data "$PING_BODY" "https://webhook.${GRUG_DOMAIN}/webhook/github" 2>/dev/null) || true
           ping_code=${ping_code:0:3}
           [ -n "$ping_code" ] || ping_code=000
           [ "$ping_code" = "200" ] || fail "signed public ping got HTTP $ping_code (full auth path: DNS/CF/HMAC/app): $(head -c 120 "$PING_OUT" 2>/dev/null)"

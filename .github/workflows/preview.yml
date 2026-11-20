@@ -54,11 +54,29 @@ jobs:
         uses: ./.github/actions/join-tailnet
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
+      - name: Resolve deployment config
+        id: cfg
+        env:
+          GRUG_AWS_REGION: ${{ vars.GRUG_AWS_REGION }}
+          GRUG_DOMAIN: ${{ vars.GRUG_DOMAIN }}
+        run: |
+          set -euo pipefail
+          region="$(bash scripts/deploy_config.sh region)"
+          domain="$(bash scripts/deploy_config.sh domain)"
+          {
+            echo "region=$region"
+            echo "domain=$domain"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "GRUG_AWS_REGION=$region"
+            echo "GRUG_DOMAIN=$domain"
+          } >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-          aws-region: us-east-1
+          aws-region: ${{ steps.cfg.outputs.region }}
       - name: Write kubeconfig
         uses: ./.github/actions/write-kubeconfig
         with:
@@ -125,6 +143,7 @@ jobs:
             --docker-server="$REGISTRY_HOST" --docker-username="$REGISTRY_USERNAME" \
             --docker-password="$REGISTRY_PASSWORD" --dry-run=client -o yaml | kubectl apply -f -
           sed -e "s|PREVIEW_NS|${NS}|g" -e "s|PREVIEW_PR|${PR}|g" \
+              -e "s|PREVIEW_AWS_REGION|${GRUG_AWS_REGION}|g" \
               -e "s|PREVIEW_IMAGE_WEBHOOK|${REGISTRY_HOST}/grug-webhook@${DIG_W}|g" \
               -e "s|PREVIEW_IMAGE_API|${REGISTRY_HOST}/grug-api@${DIG_A}|g" \
               k8s/preview/namespace.yaml k8s/preview/deployments.yaml | kubectl apply -f -
@@ -157,11 +176,29 @@ jobs:
         uses: ./.github/actions/join-tailnet
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
+      - name: Resolve deployment config
+        id: cfg
+        env:
+          GRUG_AWS_REGION: ${{ vars.GRUG_AWS_REGION }}
+          GRUG_DOMAIN: ${{ vars.GRUG_DOMAIN }}
+        run: |
+          set -euo pipefail
+          region="$(bash scripts/deploy_config.sh region)"
+          domain="$(bash scripts/deploy_config.sh domain)"
+          {
+            echo "region=$region"
+            echo "domain=$domain"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "GRUG_AWS_REGION=$region"
+            echo "GRUG_DOMAIN=$domain"
+          } >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-          aws-region: us-east-1
+          aws-region: ${{ steps.cfg.outputs.region }}
       - name: Write kubeconfig
         uses: ./.github/actions/write-kubeconfig
         with:

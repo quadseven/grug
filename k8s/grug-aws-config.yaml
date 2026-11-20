@@ -27,5 +27,5 @@ metadata:
 data:
   config: |
     [default]
-    region = us-east-1
+    region = AWS_REGION_PLACEHOLDER
     credential_process = aws_signing_helper credential-process --certificate /var/run/grug-pki/tls.crt --private-key /var/run/grug-pki/tls.key --intermediates /var/run/grug-pki/tls.crt --trust-anchor-arn RA_TRUST_ANCHOR_ARN_PLACEHOLDER --profile-arn RA_PROFILE_ARN_PLACEHOLDER --role-arn RA_ROLE_ARN_PLACEHOLDER

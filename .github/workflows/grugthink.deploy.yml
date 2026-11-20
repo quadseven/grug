@@ -46,6 +46,24 @@ jobs:
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
 
+      - name: Resolve deployment config
+        id: cfg
+        env:
+          GRUG_AWS_REGION: ${{ vars.GRUG_AWS_REGION }}
+          GRUG_DOMAIN: ${{ vars.GRUG_DOMAIN }}
+        run: |
+          set -euo pipefail
+          region="$(bash scripts/deploy_config.sh region)"
+          domain="$(bash scripts/deploy_config.sh domain)"
+          {
+            echo "region=$region"
+            echo "domain=$domain"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "GRUG_AWS_REGION=$region"
+            echo "GRUG_DOMAIN=$domain"
+          } >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials (LLM fallback key seed)
         # Same grug-gha-deploy OIDC role deploy.k8s.yml uses (infra/pulumi's
         # oidc_role.create trust policy already allows the `k8s-prod`
@@ -56,7 +74,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/grug-gha-deploy
-          aws-region: us-east-1
+          aws-region: ${{ steps.cfg.outputs.region }}
 
       - name: Registry login
         uses: ./.github/actions/registry-login

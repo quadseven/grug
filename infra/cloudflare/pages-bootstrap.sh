@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bootstrap the grug-web Cloudflare Pages project + apex grug.lol domain.
+# Bootstrap the grug-web Cloudflare Pages project + the apex domain.
 #
 # Idempotent — safe to re-run. Handles three states:
 #   1. project doesn't exist        → create
@@ -14,15 +14,20 @@
 
 set -euo pipefail
 
-CF_TOKEN=$(aws ssm get-parameter --region us-east-1 \
+# Deployment-specific values: GRUG_AWS_REGION / GRUG_DOMAIN, else the Pulumi
+# stack file (see scripts/deploy_config.sh).
+REGION="$(bash "$(dirname "$0")/../../scripts/deploy_config.sh" region)"
+DOMAIN="$(bash "$(dirname "$0")/../../scripts/deploy_config.sh" domain)"
+
+CF_TOKEN=$(aws ssm get-parameter --region "$REGION" \
     --name /grug/cloudflare-api-token --with-decryption \
     --query 'Parameter.Value' --output text)
-CF_ACCOUNT=$(aws ssm get-parameter --region us-east-1 \
+CF_ACCOUNT=$(aws ssm get-parameter --region "$REGION" \
     --name /grug/cloudflare-account-id \
     --query 'Parameter.Value' --output text)
 
 PROJECT="grug-web"
-APEX="grug.lol"
+APEX="$DOMAIN"
 PROD_BRANCH="main"
 
 api() {
@@ -68,7 +73,7 @@ except Exception:
 
   Fix:
     1. https://dash.cloudflare.com/profile/api-tokens
-    2. Edit the grug.lol token → Add 'Account → Cloudflare Pages: Edit'
+    2. Edit the Cloudflare API token → Add 'Account → Cloudflare Pages: Edit'
     3. Save → re-run this script (idempotent).
 
   See docs/HITL_PREREQUISITES.md / issue #46 for context.

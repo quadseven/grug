@@ -76,6 +76,24 @@ pulumi config set env dev
 pulumi config set domain <your-domain>   # e.g. grug.example.com
 ```
 
+### Deployment values you set
+
+The deploy workflows, `infra/cloudflare/*.sh` and the Makefile smoke target
+read these from one place each. Set the repository variable, or edit your
+Pulumi stack file; the workflows fall back to `infra/pulumi/Pulumi.prod.yaml`.
+`scripts/deploy_config.sh` is the single resolver.
+
+| Value | Repository variable | Pulumi stack key |
+| --- | --- | --- |
+| AWS region | `GRUG_AWS_REGION` | `aws:region` |
+| Public apex domain | `GRUG_DOMAIN` | `grug:domain` |
+| App bot logins allowed to run Elder re-run commands | `GRUG_ALLOWED_APP_BOT_LOGINS` (comma separated) | none |
+
+`GRUG_ALLOWED_APP_BOT_LOGINS` is written into the `grug-webhook-config`
+ConfigMap on each deploy. Left unset on a fresh cluster it is empty, which
+turns the feature off (the self-hosted default). Also set `DEPLOY_REGISTRY_HOST`
+and the secrets listed in the workflows.
+
 ### 4. Provision the Postgres store
 
 Grug stores everything in a single Postgres table `grug_kv` (the #354

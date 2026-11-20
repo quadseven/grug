@@ -187,8 +187,8 @@ def test_configmap_placeholders_match_the_deploy_sed_and_sentinel():
     assert tokens, "expected ARN placeholders in the ConfigMap"
     for tok in tokens:
         assert f"s|{tok}|" in workflow, f"{tok} has no sed substitution in deploy.k8s.yml"
-        assert re.fullmatch(r"RA_.*_ARN_PLACEHOLDER", tok), (
-            f"{tok} escapes the post-sed sentinel shape RA_.*_ARN_PLACEHOLDER"
+        assert re.fullmatch(r"RA_.*_ARN_PLACEHOLDER|AWS_REGION_PLACEHOLDER", tok), (
+            f"{tok} escapes the post-sed sentinel shape RA_.*_ARN_PLACEHOLDER|AWS_REGION_PLACEHOLDER"
         )
 
 def test_deploy_sed_simulation_leaves_no_sentinel_matches():
@@ -208,8 +208,9 @@ def test_deploy_sed_simulation_leaves_no_sentinel_matches():
         "RA_TRUST_ANCHOR_ARN_PLACEHOLDER": "arn:aws:rolesanywhere:x:1:trust-anchor/t",
         "RA_PROFILE_ARN_PLACEHOLDER": "arn:aws:rolesanywhere:x:1:profile/p",
         "RA_ROLE_ARN_PLACEHOLDER": "arn:aws:iam::1:role/r",
+        "AWS_REGION_PLACEHOLDER": "xx-test-1",
     }
-    sentinel = re.compile(r"REGISTRY_PLACEHOLDER|TAG_PLACEHOLDER|RA_.*_ARN_PLACEHOLDER")
+    sentinel = re.compile(r"REGISTRY_PLACEHOLDER|TAG_PLACEHOLDER|RA_.*_ARN_PLACEHOLDER|AWS_REGION_PLACEHOLDER")
     offenders = []
     for manifest in sorted(K8S.glob("*.yaml")):
         text = manifest.read_text()
