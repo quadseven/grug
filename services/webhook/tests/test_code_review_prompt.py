@@ -518,3 +518,13 @@ def test_stale_reverse_check_intermediary_rule_requires_concrete_stale_entry():
     for variant in ("v1", "v2"):
         prompt = crp.build_system_prompt(variant)
         assert "MUST name the concrete stale entry that would pass" in prompt
+
+
+def test_prompt_lets_the_model_offer_a_multi_line_statement_replacement():
+    """#1759: the gate can anchor a 2 to 6 line span, but the model only
+    emits one if the contract allows it."""
+    for variant in ("v1", "v2"):
+        prompt = crp.build_system_prompt(variant)
+        assert "ONLY the flagged line" in prompt
+        assert "whole statement that holds the flagged line" in prompt
+        assert "2 to 6 lines" in prompt
