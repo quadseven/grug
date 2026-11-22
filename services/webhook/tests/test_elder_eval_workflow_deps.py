@@ -14,6 +14,7 @@ import ast
 import re
 import sys
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -47,6 +48,28 @@ def _module_level(tree: ast.Module):
                 stack += handler.body
 
 
+def _file_imports(path: Path) -> Iterator[str | Path]:
+    """Yield absolute module names and paths for local relative imports."""
+    for node in _module_level(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            yield from (alias.name for alias in node.names)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level == 0:
+            if node.module:
+                yield node.module
+            continue
+
+        base = path.parent
+        for _ in range(node.level - 1):
+            base = base.parent
+        target = base.joinpath(*node.module.split(".")) if node.module else base
+        for candidate in (target.with_suffix(".py"), target / "__init__.py"):
+            if candidate.exists():
+                yield candidate
+
+
 def third_party_imports() -> dict[str, str]:
     todo = sorted(ENTRY.glob("*.py"))
     seen: set[Path] = set()
@@ -56,25 +79,16 @@ def third_party_imports() -> dict[str, str]:
         if path in seen:
             continue
         seen.add(path)
-        for node in _module_level(ast.parse(path.read_text())):
-            names: list[str] = []
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                names = [node.module]
-            elif isinstance(node, ast.ImportFrom) and node.level:
-                base = path.parent
-                for _ in range(node.level - 1):
-                    base = base.parent
-                target = base.joinpath(*(node.module or "").split(".")) if node.module else base
-                todo += [c for c in (target.with_suffix(".py"), target / "__init__.py") if c.exists()]
+        for imported in _file_imports(path):
+            if isinstance(imported, Path):
+                todo.append(imported)
                 continue
-            for name in names:
-                local = _resolve(name) or _resolve(name.split(".")[0])
-                if local:
-                    todo.append(local)
-                elif name.split(".")[0] not in sys.stdlib_module_names:
-                    found.setdefault(name.split(".")[0], path.relative_to(REPO).as_posix())
+            root = imported.split(".")[0]
+            local = _resolve(imported) or _resolve(root)
+            if local:
+                todo.append(local)
+            elif root not in sys.stdlib_module_names:
+                found.setdefault(root, path.relative_to(REPO).as_posix())
     return found
 
 
