@@ -139,7 +139,10 @@ jobs:
             cave|openrouter|poolside) BACKEND="--backend $EVAL_BACKEND" ;;
             *) echo "::error::unknown backend '$EVAL_BACKEND'"; exit 2 ;;
           esac
+          # pyyaml: repo_config.py (.grug.yaml) loads at import (#989);
+          # tests/test_elder_eval_workflow_deps.py checks this list.
           uv run --with httpx --with pyjwt --with cryptography --with boto3 \
+            --with 'pyyaml>=6,<7' \
             --with 'psycopg[binary,pool]' --with 'ddtrace>=3.5,<4' \
             --with 'datadog-lambda>=6.107,<7' \
             python -m elder_eval $FLAG $AB $BACKEND | tee "$RUNNER_TEMP/eval-report.txt"
