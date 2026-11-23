@@ -18,6 +18,7 @@ import opencode_go_free
 import shared_benches
 from llm_backend import Backend, BackendConfig
 from openrouter_free_limiter import RateLimitTimeoutError, acquire_free_tier_slot, is_free_tier_model
+from retry_after import parse_retry_after
 from redact import redact_secrets as _redact_secrets
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.llm_client")
@@ -203,13 +204,9 @@ def _opencode_go_available(now: float | None = None) -> bool:
     return current >= max(local, shared_benches.blocked_until("go", Backend.OPENCODE_GO.value))
 
 
-def _retry_after_seconds(resp: httpx.Response) -> float:
-    raw = (resp.headers.get("retry-after") or "").strip()
-    try:
-        seconds = float(raw)
-    except ValueError:
-        return _OPENCODE_GO_DEFAULT_BLOCK_SECONDS
-    if not math.isfinite(seconds) or seconds <= 0:
+def _retry_after_seconds(resp: httpx.Response, now: float | None = None) -> float:
+    seconds = parse_retry_after(resp, now)
+    if seconds is None:
         return _OPENCODE_GO_DEFAULT_BLOCK_SECONDS
     return min(seconds, _OPENCODE_GO_MAX_BLOCK_SECONDS)
 

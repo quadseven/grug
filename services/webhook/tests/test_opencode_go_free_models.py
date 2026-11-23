@@ -505,3 +505,20 @@ def test_every_elder_deployment_turns_discovery_on() -> None:
     for name in ("consumer-deployment.yaml", "webhook-deployment.yaml", "poller-cronjob.yaml"):
         text = (k8s / name).read_text(encoding="utf-8")
         assert "GRUG_OPENCODE_GO_FREE_DISCOVERY" in text, name
+
+
+def _ra(value: str | None) -> httpx.Response:
+    return httpx.Response(429, headers={"retry-after": value} if value is not None else {})
+
+
+def test_retry_after_reads_an_http_date() -> None:
+    from email.utils import formatdate
+
+    now = 1_800_000_000.0
+    assert og.retry_after_seconds(_ra(formatdate(now + 120, usegmt=True)), now) == pytest.approx(120, abs=1)
+    far = formatdate(now + 10 * 86400, usegmt=True)
+    assert og.retry_after_seconds(_ra(far), now) == og.MAX_RETRY_AFTER_SECONDS
+    assert og.retry_after_seconds(_ra(formatdate(now - 60, usegmt=True)), now) is None
+    assert og.retry_after_seconds(_ra("not a date"), now) is None
+    assert og.retry_after_seconds(_ra(None), now) is None
+    assert og.retry_after_seconds(_ra("30"), now) == 30
