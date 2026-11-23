@@ -459,7 +459,7 @@ def query_ollama_api(
 # models, same enable_thinking=false switch on Poolside) but NOT its
 # multi-minute review-scale timeout/retry budget - a Discord reply needs to
 # feel close to instant even in the failure case, per a past incident
-# (Poolside's laguna-m.1 defaults to thinking ON: an early, unbounded config
+# (Poolside's laguna thinking defaults to thinking ON: an early, unbounded config
 # blew a 30s read timeout - measured 72s for even a tiny prompt - and each
 # review call could still retry 3x on top of that; see grug's
 # `_saas_overload_fallback_config` for the same lesson learned the hard way
@@ -490,9 +490,13 @@ def query_ollama_api(
 _FALLBACK_TIMEOUT = (5, 10)  # (connect, read) seconds - see math above.
 
 _POOLSIDE_URL = "https://inference.poolside.ai/v1/chat/completions"
-_POOLSIDE_MODEL = "poolside/laguna-m.1"
+# `laguna-m.1` was retired upstream (404). `laguna-s-2.1` is the current free
+# Poolside model, the same id grug's Elder already runs on this key.
+_POOLSIDE_MODEL = "poolside/laguna-s-2.1"
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-_OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"
+# Haiku 4.5 is a paid model: the account has no credit, so it answers 403.
+# Only free (`:free`) ids may sit here - never a paid one.
+_OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
 
 
 def _extract_chat_message(body: dict) -> str:
@@ -660,7 +664,7 @@ def query_poolside_api(
         url=_POOLSIDE_URL,
         model=_POOLSIDE_MODEL,
         api_key=config.POOLSIDE_API_KEY,
-        # Poolside's laguna-m.1 defaults to thinking ON - disables it so the
+        # Poolside's laguna models default to thinking ON - disables it so the
         # reply lands well inside _FALLBACK_TIMEOUT instead of spending the
         # whole budget on hidden reasoning tokens (same fix grug's Elder
         # applies on its own Poolside config, measured 72s->under 1s live).
@@ -681,7 +685,7 @@ def query_openrouter_api(
     module-level comment above _FALLBACK_TIMEOUT for the full worst-case-
     time math.
 
-    Deliberately uses the fast default Haiku 4.5 model, NOT the Opus-plus-
+    Deliberately uses a small free model (no credit on the account), NOT the Opus-plus-
     high-reasoning override grug's Elder review persona configures via
     GRUG_OPENROUTER_REVIEW_MODEL - that combination is tuned for a multi-
     minute deep-review pass and is unsuited to a realtime chat reply.
