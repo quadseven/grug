@@ -38,6 +38,8 @@ from typing import Any, Callable
 
 import httpx
 
+from retry_after import parse_retry_after
+
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.opencode_go_free")
 
 MODELS_URL = "https://opencode.ai/zen/go/v1/models"
@@ -115,13 +117,9 @@ def _priced_ids(payload: Any, free: list[str]) -> frozenset[str]:
 
 
 def retry_after_seconds(resp: httpx.Response) -> float | None:
-    """Retry-After in seconds, capped; None when absent or not a number."""
-    raw = (resp.headers.get("retry-after") or "").strip()
-    try:
-        seconds = float(raw)
-    except ValueError:
-        return None
-    if not math.isfinite(seconds) or seconds <= 0:
+    """Retry-After (seconds or HTTP-date) in seconds, capped; None when unusable."""
+    seconds = parse_retry_after(resp.headers.get("retry-after"))
+    if seconds is None:
         return None
     return min(seconds, MAX_RETRY_AFTER_SECONDS)
 
