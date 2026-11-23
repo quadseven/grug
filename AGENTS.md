@@ -119,6 +119,23 @@ beyond the README and an example config file to know what to change.
   exists — they're already written to take config as input rather than
   assume it.
 
+## Installation-token access checks
+
+Installation scope and repository permission booleans are different
+things. For an installation token, use the installation's repository scope
+to establish whether a repository is included. Do not infer the token's
+capabilities from repository `permissions` booleans; those values are not
+an access verdict for an installation token. A repository response can
+show an all-false `permissions` object even when the same App writes to
+that repository successfully.
+
+Report that a write is blocked only after the exact authorized command
+returns a denial response. State the command and the denial response as
+evidence. Do not probe access by creating credentials, changing grants, or
+falling back to a personal identity. Use only the dedicated App identity.
+Keep credentials out of arguments, output, logs, repository files, and chat;
+load secrets only into the environment of the process that needs them.
+
 ## Why this file, not just a smarter secret scanner
 
 A pattern-matching scanner catches shapes: an AWS key, a PEM block, a
@@ -160,6 +177,8 @@ Several AI brains work this repo beside the operator: Claude Code, Muse, Dot and
 **Merge gate.** Rulesets enforce less than this, and this binds: CI green, `Grug - Elder` success on the head (neutral is not enough), `Grug - Chief` success or neutral, not behind base, every bot thread answered, and a test that fails without the fix. `gh pr checks` does not show threads, so read `reviewThreads` by GraphQL and `pulls/<n>/reviews`. Anyone merges what they built. Outside shadow, which today means `quadseven/loom` and `quadseven/grug`, Loom merges docs, test and app code tiers alone and holds deploy, security and cross-repo tiers for the operator. Every other Loom repo is in shadow: Loom runs every gate and records each merge or close for the operator instead of taking it, until the operator graduates the repo. A change to how brains merge, close or rewrite needs a fleet chat line and a 5 minute wait. Never use `--admin`.
 
 **Human line.** People do: permanent deletion of records, creating, rotating or entering credentials, access grants, new spending, accepting terms. People decide: another brain's role and the fleet goal text. A second brain must agree, in writing, to clear a lane demotion, lift another brain's hold, or reopen a sound close. Everything else needs nobody. Ask with `needs:human` and one exact question. A relayed yes is not a yes. Never print a credential.
+
+**Writing on GitHub.** Issue, pull request and comment bodies are never hard-wrapped: GitHub renders every newline in them as a line break, so a sentence wrapped at 72 columns breaks mid-line. Write one paragraph per line with a blank line between paragraphs; lists, tables and code blocks keep their own lines. Commit messages may stay wrapped, but a commit body reused in a pull request or issue is unwrapped first (`scripts/lib/unwrap_prose.py` in `quadseven/claude-stuff` does it).
 
 **When stuck.** Labels and stages: `docs/BRAIN.md` in `quadseven/loom`. Reusable workflows: `docs/reusables.md` in `quadseven/infra-public`. Chief's rules and every `/grug` verb: the README in `quadseven/grug`, whose `make chief-check` tests a body before posting. Fleet log: issue 30 in `quadseven/loom`. File a factory fault there as `loom:factory`. Poll `gh` at most once per 5 minutes.
 
