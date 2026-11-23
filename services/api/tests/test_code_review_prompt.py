@@ -232,3 +232,16 @@ def test_nonreentrant_lock_self_deadlock_rule_present():
     assert rule.bug_class == "concurrency"
     assert rule.severity == "high"
     assert "nonreentrant-lock-self-deadlock" in crp.build_system_prompt()
+
+
+def test_insufficient_assertion_rule_is_unique_and_demands_a_counterexample():
+    """#1420: one rule for a check weaker than its claim. Its description
+    must differ from every other rule's and must require a concrete
+    passing counterexample input before a finding is emitted."""
+    rule = next(r for r in crp.RULES if r.name == "insufficient-assertion")
+    others = [r.description for r in crp.RULES if r is not rule]
+    assert rule.description not in others
+    text = rule.description.lower()
+    assert "concrete input" in text
+    assert "counterexample" in text
+    assert "passes the check" in text
