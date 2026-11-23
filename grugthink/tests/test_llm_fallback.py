@@ -216,9 +216,20 @@ class TestFallbackOrder:
             "https://openrouter.ai/api/v1/chat/completions",
         ]
 
+    def test_poolside_uses_current_model(self, monkeypatch):
+        """laguna-m.1 was retired (404); the current free id must be sent."""
+        router = _make_router(
+            ollama=lambda: requests.exceptions.Timeout("primary down"),
+            poolside=lambda: _chat_completion_ok("POOLSIDE_REPLY"),
+        )
+        _run_query_model(monkeypatch, router, _mock_config())
+
+        poolside_call = next(c for c in router.call_log if "poolside" in c["url"])
+        assert poolside_call["json"]["model"] == "poolside/laguna-s-2.1"
+
     def test_poolside_disables_thinking_mode(self, monkeypatch):
         """Regression guard for the exact incident grug's Elder hit on this
-        same backend: laguna-m.1 defaults to thinking ON, which blows the
+        same backend: laguna defaults to thinking ON, which blows the
         short fallback timeout. The request body must carry
         chat_template_kwargs.enable_thinking=false."""
         router = _make_router(
@@ -230,7 +241,7 @@ class TestFallbackOrder:
         poolside_call = next(c for c in router.call_log if "poolside" in c["url"])
         assert poolside_call["json"]["chat_template_kwargs"] == {"enable_thinking": False}
 
-    def test_openrouter_uses_fast_haiku_model_not_review_config(self, monkeypatch):
+    def test_openrouter_uses_free_model_not_review_config(self, monkeypatch):
         """Must NOT reuse grug Elder's Opus-plus-high-reasoning OpenRouter
         config - that is a multi-minute review config, unsuited to a
         realtime chat reply."""
@@ -242,7 +253,10 @@ class TestFallbackOrder:
         _run_query_model(monkeypatch, router, _mock_config())
 
         openrouter_call = next(c for c in router.call_log if "openrouter" in c["url"])
-        assert openrouter_call["json"]["model"] == "anthropic/claude-haiku-4.5"
+        model = openrouter_call["json"]["model"]
+        # Free ids only: the account has no credit, a paid id answers 403.
+        assert model == "google/gemma-4-31b-it:free"
+        assert model.endswith(":free")
         assert "reasoning" not in openrouter_call["json"]
 
 
