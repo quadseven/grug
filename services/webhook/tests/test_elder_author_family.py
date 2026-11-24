@@ -153,6 +153,46 @@ def test_app_footer_without_a_trusted_known_family_keeps_arm_order(monkeypatch, 
     assert response.families is None
 
 
+@pytest.mark.parametrize(("backend", "selector"), [
+    (Backend.CAVE, "spark:warm-any"),
+    (Backend.FREE_POOL, "free-pool"),
+])
+@pytest.mark.parametrize("other_family_fails", [False, True])
+def test_routed_review_uses_the_served_family(monkeypatch, backend, selector, other_family_fails) -> None:
+    routed = _tier(backend, selector)
+    other = _tier(Backend.CAVE_REASONER if backend == Backend.CAVE else Backend.POOLSIDE, _LAGUNA)
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cave")
+    if backend == Backend.CAVE:
+        configs = {backend: routed, other.backend: other}
+        monkeypatch.setattr(lc, "_review_backend_config", configs.__getitem__)
+    else:
+        monkeypatch.setattr(lc, "_free_provider_fallback_configs", lambda: [routed, other])
+    called = []
+
+    def post(url, **kwargs):
+        requested = kwargs["json"]["model"]
+        called.append(requested)
+        if requested == _LAGUNA and other_family_fails:
+            raise httpx.ConnectTimeout("arm down")
+        body = _answer().json()
+        body["model"] = _GLM if requested == selector else _LAGUNA
+        body["choices"][0]["message"]["content"] = json.dumps({"findings": [{
+            "path": "src/x.py", "line": 1, "rule": "unhandled-error",
+            "severity": "high", "message": "Check the error return.",
+        }]})
+        return httpx.Response(200, json=body)
+
+    evidence = assemble_evidence(
+        [_hunk()], pr_context={"repo": "o/r", "pr_number": 1, "author_family": "glm"},
+    )
+    with patch.object(httpx, "post", side_effect=post):
+        response = review_diff(evidence, installation_id=1)
+
+    assert called == ([selector, _LAGUNA, selector] if other_family_fails else [selector, _LAGUNA])
+    assert response.kind == "reviewed"
+    assert response.models_used == ((_GLM,) if other_family_fails else (_LAGUNA,))
+
+
 def test_no_footer_keeps_todays_arm_order() -> None:
     response, called = _review("A person wrote this.\n")
 
