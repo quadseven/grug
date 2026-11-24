@@ -171,7 +171,7 @@ spec:
             - {name: GRUG_REVIEW_DEPTH, value: tiered}
             # grug#1553: GitHub App logins whose PRs carry an author family, as
             # `login:family` pairs for single-engine Apps, split by `;`.
-            - {name: GRUG_APP_AUTHOR_FAMILIES, value: ""}
+            - {name: GRUG_APP_AUTHOR_FAMILIES, value: "agent-anthropic-claude-code[bot]:claude;agent-openai-codex-luna[bot]:gpt"}
             - {name: GRUG_APP_FOOTER_AUTHORS, value: "loom-lanes[bot],loom-brain[bot]"}
             # Deep escalation (#645). WAS 500 lines / 0.05 sample, tuned for
             # speed. Measured 2026-08-12: grug's own PRs run 18-260 added
@@ -187,13 +187,10 @@ spec:
             # auto | on_demand. on_demand runs the deep pass only on a
             # "deep review" marker in the PR title or body. Full comments in
             # consumer-deployment.
-            # TEMPORARY (2026-10-27): on_demand while both Spark machines are
-            # away for RMA (about a month from 2026-10-27). With the Sparks off
-            # and the free cloud tier exhausted the deep pass ended all_failed
-            # and Elder concluded failure, blocking merges. Revert to auto when
-            # the Spark reasoner returns or paid OpenRouter credits are enabled
-            # (grug#1487).
-            - {name: GRUG_DEEP_ESCALATION, value: "on_demand"}
+            # auto again from 2026-11-23: both Sparks are back from RMA and the
+            # Spark reasoner answers through spark-gateway. on_demand (2026-10-27,
+            # grug#1487) kept the deep pass from ending all_failed while they were away.
+            - {name: GRUG_DEEP_ESCALATION, value: "auto"}
             # Keep the compatibility worker's staging policy identical to the
             # durable consumer even though production uses the consumer path.
             - {name: GRUG_STAGED_REVIEW_BUDGET_S, value: "700"}

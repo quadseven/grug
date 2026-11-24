@@ -118,7 +118,7 @@ spec:
                 - {name: GRUG_REVIEW_DEPTH, value: tiered}
                 # grug#1553: GitHub App logins whose PRs carry an author family, as
                 # `login:family` pairs for single-engine Apps, split by `;`.
-                - {name: GRUG_APP_AUTHOR_FAMILIES, value: ""}
+                - {name: GRUG_APP_AUTHOR_FAMILIES, value: "agent-anthropic-claude-code[bot]:claude;agent-openai-codex-luna[bot]:gpt"}
                 - {name: GRUG_APP_FOOTER_AUTHORS, value: "loom-lanes[bot],loom-brain[bot]"}
                 - {name: GRUG_PROMPT_EXPERIMENT_SSM, value: /grug/elder-prompt-experiment}
                 - {name: GRUG_FALLBACK_ENABLED_SSM, value: /grug/elder-fallback-enabled}
