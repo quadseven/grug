@@ -25,6 +25,7 @@ import model_availability as availability
 _CLAUDE = "claude-haiku-4.5"
 _LAGUNA = "poolside/laguna-s-2.1"
 _DEEPSEEK = "deepseek-v4.1-flash"
+_GLM = "z-ai/glm-5"
 
 
 def _tier(backend: Backend, model: str) -> BackendConfig:
@@ -76,7 +77,7 @@ def _answer() -> httpx.Response:
     return httpx.Response(200, text=json.dumps(body))
 
 
-def _review(body: str, *, down: frozenset[str] = frozenset()):
+def _review(body: str, *, bot_login: str | None = None, down: frozenset[str] = frozenset()):
     """Run one review; returns (response, models called in order)."""
     called: list[str] = []
 
@@ -88,7 +89,8 @@ def _review(body: str, *, down: frozenset[str] = frozenset()):
         return _answer()
 
     context = {"repo": "o/r", "pr_number": 1, "head_sha": "a" * 40, "body": body}
-    family = cr_dispatch._author_family(_pr(body))
+    pr = _pr(body, "NONE", "Bot", bot_login) if bot_login else _pr(body)
+    family = cr_dispatch._author_family(pr)
     if family:
         context["author_family"] = family
     evidence = assemble_evidence([_hunk()], pr_context=context)
@@ -117,6 +119,38 @@ def test_other_arm_failing_walks_back_to_the_same_family_with_a_note() -> None:
     assert "same-family review" in summary
     assert "Author family: `claude`" in summary
     assert "Reviewer family: `claude`" in summary
+
+
+@pytest.mark.parametrize("other_family_fails", [False, True])
+def test_listed_app_footer_gates_its_glm_family(monkeypatch, other_family_fails) -> None:
+    monkeypatch.setenv("GRUG_APP_FOOTER_AUTHORS", "loom-brain[bot], loom-lanes[bot]")
+    monkeypatch.setattr(
+        lc, "_cloud_chain_tiers",
+        lambda: [_tier(Backend.OPENROUTER, _GLM), _tier(Backend.POOLSIDE, _LAGUNA)],
+    )
+    response, called = _review(
+        f"Loom ticket #7, lane fix, model {_GLM}.\n",
+        bot_login="loom-lanes[bot]",
+        down=frozenset({_LAGUNA}) if other_family_fails else frozenset(),
+    )
+
+    assert called == ([_LAGUNA, _GLM] if other_family_fails else [_LAGUNA])
+    assert response.kind == "reviewed"
+    assert response.families == ReviewFamilies(
+        author="glm", reviewers=("glm" if other_family_fails else "laguna",),
+    )
+
+
+@pytest.mark.parametrize(("login", "model"), [
+    ("other-app[bot]", _GLM),
+    ("loom-brain[bot]", "mystery-9"),
+])
+def test_app_footer_without_a_trusted_known_family_keeps_arm_order(monkeypatch, login, model) -> None:
+    monkeypatch.setenv("GRUG_APP_FOOTER_AUTHORS", "loom-lanes[bot], LOOM-BRAIN[BOT]")
+    response, called = _review(f"Loom ticket #7, lane fix, model {model}.\n", bot_login=login)
+
+    assert called == [_CLAUDE]
+    assert response.families is None
 
 
 def test_no_footer_keeps_todays_arm_order() -> None:
