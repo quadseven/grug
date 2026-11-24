@@ -166,6 +166,43 @@ def test_repo_config_defaults_sparse_update_and_enforcement_remove(pg):
     assert store.get_repo_config(1, 2)["tpm_enabled"] is False
 
 
+def test_get_repo_configs_batches_install_rows(pg):
+    from adapters import pg_install_store as store
+
+    store.record_installation(
+        install_id=1, account_login="org1", account_type="Organization", installed_by_user_id=9
+    )
+    store.set_repo_config(
+        install_id=1,
+        repo_id=10,
+        repo_full_name="org1/a",
+        tpm_enabled=False,
+        updated_by_user_id="9",
+    )
+    store.set_enforcement_id(1, 10, 555)
+    store.set_repo_config(
+        install_id=1,
+        repo_id=20,
+        repo_full_name="org1/b",
+        dep_watch_enabled=True,
+        updated_by_user_id="9",
+    )
+    # Row under another installation must not leak into install 1.
+    store.set_repo_config(
+        install_id=2,
+        repo_id=30,
+        repo_full_name="org2/c",
+        tpm_enabled=False,
+        updated_by_user_id="9",
+    )
+
+    cfgs = store.get_repo_configs(1)
+    assert set(cfgs.keys()) == {10, 20}
+    assert cfgs[10] == store.get_repo_config(1, 10)
+    assert cfgs[20] == store.get_repo_config(1, 20)
+    assert store.get_repo_configs(999) == {}
+
+
 def test_check_verdicts_upsert_order_limit_and_derived_verdict(pg):
     from adapters import pg_install_store as store
 

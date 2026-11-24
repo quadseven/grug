@@ -288,13 +288,16 @@ def _read_int_repo_flag(flag: str, raw: Any) -> int | None:
     return None
 
 
-def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
-    # A missing row and an empty row are the same shape: every field
-    # falls through to its default below (no separate early-return to
-    # keep in sync). Persona flags derive from _DEFAULT_PERSONA_CONFIG's
-    # keys (#465, ADR-0010): adding a persona's flags to the default
-    # dict makes them flow through this read path with no edit here.
-    item = _get_item(_inst_pk(install_id), _repo_sk(repo_id)) or {}
+def _decode_repo_config(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Decode a stored REPO# row (or an empty mapping for defaults) into
+    the normalized repo-config dict.
+
+    A missing row and an empty row are the same shape: every field
+    falls through to its default below (no separate early-return to
+    keep in sync). Persona flags derive from _DEFAULT_PERSONA_CONFIG's
+    keys (#465, ADR-0010): adding a persona's flags to the default
+    dict makes them flow through this read path with no edit here.
+    """
     rid = item.get("enforcement_ruleset_id")
     cfg: dict[str, Any] = {
         flag: bool(item.get(flag, default))
@@ -334,6 +337,41 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     for _flag in _INT_REPO_FLAGS:
         cfg[_flag] = _read_int_repo_flag(_flag, item.get(_flag))
     return cfg
+
+
+def default_repo_config() -> dict[str, Any]:
+    """Return a fresh normalized default repo-config dict."""
+    return _decode_repo_config({})
+
+
+def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
+    item = _get_item(_inst_pk(install_id), _repo_sk(repo_id)) or {}
+    return _decode_repo_config(item)
+
+
+def get_repo_configs(install_id: int) -> dict[int, dict[str, Any]]:
+    """Fetch all stored per-repo configs for an installation in one query,
+    keyed by repo_id. Repos without a stored row are omitted; callers fall
+    back to `default_repo_config()`."""
+    pk = _inst_pk(install_id)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"SELECT sk, data FROM grug_kv WHERE pk = %s AND sk LIKE 'REPO#%%' AND {TTL_LIVE}",  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+            (pk,),
+        ).fetchall()
+    out: dict[int, dict[str, Any]] = {}
+    for sk, data in rows:
+        _, sep, id_str = sk.partition("#")
+        if not sep:
+            continue
+        try:
+            repo_id = int(id_str)
+        except (TypeError, ValueError):
+            log.warning("repo_config_sk_unparsable", extra={"pk": pk, "sk": sk})
+            continue
+        item = decode_item(pk, sk, data)
+        out[repo_id] = _decode_repo_config(item)
+    return out
 
 
 def _merge_attrs(pk: str, sk: str, attrs: dict[str, Any]) -> None:
