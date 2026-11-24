@@ -5090,7 +5090,13 @@ def _run_llm_attempt(
             walk.diff_chars if walk else None,
         )
     if walk is not None:
+        # Record transport health before treating a family mismatch as a skip.
         walk.record(config, outcome)
+        if outcome.error_kind is None and walk.routed_model_gated(config.model, outcome.model):
+            return replace(
+                outcome, error_kind="config",
+                error_text=f"{backend.value}: {outcome.model or config.model} is gated out by model family",
+            )
     return outcome
 
 
