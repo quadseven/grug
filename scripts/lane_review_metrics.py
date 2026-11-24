@@ -73,11 +73,7 @@ class Finding:
     handled_at: str | None
 
 
-def classify_findings(
-    comments: list[dict],
-    changed_at: Callable[[dict], str | None],
-) -> list[Finding]:
-    """Classify the threaded comments from GitHub's flat review-comment list."""
+def _non_bot_reply_times(comments: list[dict]) -> dict[int, list[str]]:
     replies: dict[int, list[str]] = defaultdict(list)
     for comment in comments:
         user = comment.get("user") or {}
@@ -90,7 +86,15 @@ def classify_findings(
             and not login.lower().endswith("[bot]")
         ):
             replies[parent].append(comment["created_at"])
+    return replies
 
+
+def classify_findings(
+    comments: list[dict],
+    changed_at: Callable[[dict], str | None],
+) -> list[Finding]:
+    """Classify the threaded comments from GitHub's flat review-comment list."""
+    replies = _non_bot_reply_times(comments)
     findings = []
     for root in comments:
         user = root.get("user") or {}
@@ -254,23 +258,8 @@ def _pr_commits(run: Runner, repo: str, number: int) -> list[tuple[str, str]]:
     return commits
 
 
-def _ready_minutes(
-    run: Runner,
-    repo_path: str,
-    pr: dict,
-    opened: str,
-    findings: list[Finding],
-) -> float | None:
-    merged_at = pr.get("merged_at")
-    clean_open = pr["state"] == "open" and pr.get("mergeable_state") == "clean"
-    if (
-        pr["draft"]
-        or not (merged_at or clean_open)
-        or any(f.handled_at is None for f in findings)
-    ):
-        return None
-
-    endpoint = f"{repo_path}/commits/{pr['head']['sha']}"
+def _passing_head_times(run: Runner, endpoint: str) -> list[str] | None:
+    """Collect completion times if the head's check runs and statuses pass."""
     checks = [
         check
         for page in _pages(run, f"{endpoint}/check-runs?per_page=100&filter=latest")
@@ -278,7 +267,7 @@ def _ready_minutes(
     ]
     if not _REQUIRED_CHECKS.issubset(check["name"] for check in checks):
         return None
-    times = [opened, *(finding.handled_at for finding in findings)]
+    times = []
     for check in checks:
         passing = {"success"}
         if check["name"] != "Grug - Elder":
@@ -297,7 +286,30 @@ def _ready_minutes(
         if status["state"] != "success":
             return None
         times.append(status["created_at"])
+    return times
 
+
+def _ready_minutes(
+    run: Runner,
+    repo_path: str,
+    pr: dict,
+    opened: str,
+    findings: list[Finding],
+) -> float | None:
+    merged_at = pr.get("merged_at")
+    clean_open = pr["state"] == "open" and pr.get("mergeable_state") == "clean"
+    if (
+        pr["draft"]
+        or not (merged_at or clean_open)
+        or any(f.handled_at is None for f in findings)
+    ):
+        return None
+
+    endpoint = f"{repo_path}/commits/{pr['head']['sha']}"
+    head_times = _passing_head_times(run, endpoint)
+    if head_times is None:
+        return None
+    times = [opened, *(finding.handled_at for finding in findings), *head_times]
     for page in _pages(run, f"{repo_path}/issues/{pr['number']}/timeline?per_page=100"):
         times.extend(
             event["created_at"]
