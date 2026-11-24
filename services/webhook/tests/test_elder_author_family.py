@@ -25,6 +25,7 @@ import model_availability as availability
 _CLAUDE = "claude-haiku-4.5"
 _LAGUNA = "poolside/laguna-s-2.1"
 _DEEPSEEK = "deepseek-v4.1-flash"
+_GLM = "z-ai/glm-5"
 
 
 def _tier(backend: Backend, model: str) -> BackendConfig:
@@ -76,7 +77,7 @@ def _answer() -> httpx.Response:
     return httpx.Response(200, text=json.dumps(body))
 
 
-def _review(body: str, *, down: frozenset[str] = frozenset()):
+def _review(body: str, *, bot_login: str | None = None, down: frozenset[str] = frozenset()):
     """Run one review; returns (response, models called in order)."""
     called: list[str] = []
 
@@ -88,7 +89,8 @@ def _review(body: str, *, down: frozenset[str] = frozenset()):
         return _answer()
 
     context = {"repo": "o/r", "pr_number": 1, "head_sha": "a" * 40, "body": body}
-    family = cr_dispatch._author_family(_pr(body))
+    pr = _pr(body, "NONE", "Bot", bot_login) if bot_login else _pr(body)
+    family = cr_dispatch._author_family(pr)
     if family:
         context["author_family"] = family
     evidence = assemble_evidence([_hunk()], pr_context=context)
@@ -117,6 +119,78 @@ def test_other_arm_failing_walks_back_to_the_same_family_with_a_note() -> None:
     assert "same-family review" in summary
     assert "Author family: `claude`" in summary
     assert "Reviewer family: `claude`" in summary
+
+
+@pytest.mark.parametrize("other_family_fails", [False, True])
+def test_listed_app_footer_gates_its_glm_family(monkeypatch, other_family_fails) -> None:
+    monkeypatch.setenv("GRUG_APP_FOOTER_AUTHORS", "loom-brain[bot], loom-lanes[bot]")
+    monkeypatch.setattr(
+        lc, "_cloud_chain_tiers",
+        lambda: [_tier(Backend.OPENROUTER, _GLM), _tier(Backend.POOLSIDE, _LAGUNA)],
+    )
+    response, called = _review(
+        f"Loom ticket #7, lane fix, model {_GLM}.\n",
+        bot_login="loom-lanes[bot]",
+        down=frozenset({_LAGUNA}) if other_family_fails else frozenset(),
+    )
+
+    assert called == ([_LAGUNA, _GLM] if other_family_fails else [_LAGUNA])
+    assert response.kind == "reviewed"
+    assert response.families == ReviewFamilies(
+        author="glm", reviewers=("glm" if other_family_fails else "laguna",),
+    )
+
+
+@pytest.mark.parametrize(("login", "model"), [
+    ("other-app[bot]", _GLM),
+    ("loom-brain[bot]", "mystery-9"),
+])
+def test_app_footer_without_a_trusted_known_family_keeps_arm_order(monkeypatch, login, model) -> None:
+    monkeypatch.setenv("GRUG_APP_FOOTER_AUTHORS", "loom-lanes[bot], LOOM-BRAIN[BOT]")
+    response, called = _review(f"Loom ticket #7, lane fix, model {model}.\n", bot_login=login)
+
+    assert called == [_CLAUDE]
+    assert response.families is None
+
+
+@pytest.mark.parametrize(("backend", "selector"), [
+    (Backend.CAVE, "spark:warm-any"),
+    (Backend.FREE_POOL, "free-pool"),
+])
+@pytest.mark.parametrize("other_family_fails", [False, True])
+def test_routed_review_uses_the_served_family(monkeypatch, backend, selector, other_family_fails) -> None:
+    routed = _tier(backend, selector)
+    other = _tier(Backend.CAVE_REASONER if backend == Backend.CAVE else Backend.POOLSIDE, _LAGUNA)
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cave")
+    if backend == Backend.CAVE:
+        configs = {backend: routed, other.backend: other}
+        monkeypatch.setattr(lc, "_review_backend_config", configs.__getitem__)
+    else:
+        monkeypatch.setattr(lc, "_free_provider_fallback_configs", lambda: [routed, other])
+    called = []
+
+    def post(url, **kwargs):
+        requested = kwargs["json"]["model"]
+        called.append(requested)
+        if requested == _LAGUNA and other_family_fails:
+            raise httpx.ConnectTimeout("arm down")
+        body = _answer().json()
+        body["model"] = _GLM if requested == selector else _LAGUNA
+        body["choices"][0]["message"]["content"] = json.dumps({"findings": [{
+            "path": "src/x.py", "line": 1, "rule": "unhandled-error",
+            "severity": "high", "message": "Check the error return.",
+        }]})
+        return httpx.Response(200, json=body)
+
+    evidence = assemble_evidence(
+        [_hunk()], pr_context={"repo": "o/r", "pr_number": 1, "author_family": "glm"},
+    )
+    with patch.object(httpx, "post", side_effect=post):
+        response = review_diff(evidence, installation_id=1)
+
+    assert called == ([selector, _LAGUNA, selector] if other_family_fails else [selector, _LAGUNA])
+    assert response.kind == "reviewed"
+    assert response.models_used == ((_GLM,) if other_family_fails else (_LAGUNA,))
 
 
 def test_no_footer_keeps_todays_arm_order() -> None:

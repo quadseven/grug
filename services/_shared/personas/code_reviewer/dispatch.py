@@ -44,7 +44,7 @@ from urllib.parse import quote
 import httpx
 
 from activity_log import record_check_verdict
-from model_family import app_author_family, model_family
+from model_family import app_author_family, app_uses_author_footer, model_family
 from github_app_auth import (
     get_app_id, installation_permission_summary_note, with_install_token_retry,
 )
@@ -1185,21 +1185,16 @@ def _to_llm_hunks(hunks: tuple[DiffHunk, ...]) -> list[LlmHunk]:
 
 
 def _author_family(pr: Mapping[str, Any]) -> str | None:
-    """The family of the model a trusted operator's Loom footer names, or None.
-
-    For trusted operator humans, uses the Loom footer. For App authors (bots),
-    uses a trusted source mapping App logins to model families (grug#1553).
-    Both are "trusted source" but differ in how the family is derived.
-    """
-    if is_trusted_operator(pr):
-        return model_family(loom_footer_model(str(pr.get("body") or "")))
-
-    user = pr.get("user")
-    if isinstance(user, Mapping) and user.get("type") == "Bot":
+    """Read the author family from a trusted footer or the fixed App mapping."""
+    if not is_trusted_operator(pr):
+        user = pr.get("user")
+        if not isinstance(user, Mapping) or user.get("type") != "Bot":
+            return None
         app_login = user.get("login")
-        return app_author_family(str(app_login) if app_login else None)
-
-    return None
+        login = str(app_login) if app_login else None
+        if not app_uses_author_footer(login):
+            return app_author_family(login)
+    return model_family(loom_footer_model(str(pr.get("body") or "")))
 
 
 _STACK_COMMENT_TIMEOUT = 10.0
