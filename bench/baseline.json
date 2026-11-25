@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "status": "corpus_only",
+  "benchmark": {
+    "name": "Elder free-confirm fixed defect corpus",
+    "scope": "The free-model empty-answer confirmation path, not every Elder backend or review path."
+  },
+  "corpus": {
+    "source": "services/webhook/elder_eval/free_confirm_corpus.py",
+    "digest": "0db7f0f5880f9527",
+    "case_count": 48,
+    "defect_cases": 24,
+    "clean_cases": 24,
+    "languages": [
+      "cpp",
+      "go",
+      "python",
+      "shell",
+      "sql",
+      "typescript",
+      "yaml"
+    ],
+    "definition": "Twenty-four invented source diffs each have one planted defect and a clean twin. Documentation hunks pad each diff to the size where short empty answers are untrusted."
+  },
+  "metric_definitions": {
+    "defects_caught": "Defect cases with a finding on the defective source file.",
+    "false_positives_per_clean_pr": "Clean cases with at least one finding divided by scored clean cases; each clean case represents one PR.",
+    "time_to_verdict_seconds": "Per-case elapsed wall time from review request to parsed verdict. The current evaluator does not record this."
+  },
+  "revisions": {
+    "pre_epic": {
+      "commit": null,
+      "defects_caught": null,
+      "false_positives_per_clean_pr": null,
+      "time_to_verdict_seconds": null
+    },
+    "current_default": {
+      "commit": "960ca66b21faebc57b51d7ffeff415f94763a2fe",
+      "defects_caught": null,
+      "false_positives_per_clean_pr": null,
+      "time_to_verdict_seconds": null
+    }
+  },
+  "missing_requirements": [
+    "This lane has no network. A live evaluation needs a reachable model backend and its configured credential.",
+    "The checkout is shallow at 0c334344084acb3e8fb75480934478f579a6749c, so it does not contain the pre-epic revision.",
+    "The evaluator does not record per-case verdict duration; timing instrumentation is needed for that metric.",
+    "A comparable two-revision run needs one fixed model selection; the evaluator discovers free models by default."
+  ]
+}
