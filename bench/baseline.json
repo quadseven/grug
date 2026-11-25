@@ -1,0 +1,49 @@
+{
+  "status": "corpus_only",
+  "corpus": {
+    "manifest": "services/webhook/elder_eval/fixtures/cross_file/corpus.json",
+    "defects": 3,
+    "clean_prs": 2,
+    "sha256": {
+      "corpus.json": "2d484a40049b04b03627d80ffc599817db3918c3f2a26e0b1cc0a7e65b3989d1",
+      "correct_job.py.txt": "58538a08a11fe0de8e833398033fa4438ebb337c6d3d11fc92f7a40125b8ced1",
+      "correct_status_test.py.txt": "94e000d1a867ad401c76aee340c06223d406c7c8f24ac0d781ef9336942e7e5c",
+      "fetch.diff": "306789cc4d8d290470486931a9b5d0d5032f087f30232111eab3caac1276a916",
+      "render.diff": "ca154dbc2d304d9db6fb7d032004a88b61e1630a9d7db82173f31fef1a3583ed",
+      "stale_cli.py.txt": "3f683acf71df7a77b1cc06ee8ada8e11f0dc3fdaabdecdb69e43ff6fed9a41be",
+      "stale_job.py.txt": "89cc6d848150dcc08865b7a8359c1d0ac9870c45d3413139d30aa5a90b44e071",
+      "stale_status_test.py.txt": "f75a35f283fa29dc512c15abb51e97a39eb9269ae4adf481ce934facd501b674",
+      "status.diff": "5544ddaf649ea62ca5b56c230742233db26156a48255d7d268c6a5a55fff91c4"
+    }
+  },
+  "metric_definitions": {
+    "defects_caught": "Count of defect fixtures with a finding in the expected class.",
+    "false_positives_per_clean_pr": "Total findings on the clean fixtures divided by the number of clean fixtures.",
+    "time_to_verdict_seconds": "Median elapsed seconds per fixture from sending the review request through parsing the verdict."
+  },
+  "revisions": {
+    "pre_epic": {
+      "commit": "a0e314393b1f99a3bd22d47eef8b3445103f3286",
+      "basis": "First parent of #1769, the earliest epic child merge identified in local history.",
+      "scores": {
+        "defects_caught": null,
+        "false_positives_per_clean_pr": null,
+        "time_to_verdict_seconds": null
+      }
+    },
+    "current_default": {
+      "commit": "960ca66b21faebc57b51d7ffeff415f94763a2fe",
+      "basis": "Local origin/main snapshot.",
+      "scores": {
+        "defects_caught": null,
+        "false_positives_per_clean_pr": null,
+        "time_to_verdict_seconds": null
+      }
+    }
+  },
+  "missing_requirements": [
+    "Replay against the same reachable backend and concrete model at both revisions, using the pinned fixtures as input.",
+    "A cross-revision fixture adapter because the pre-epic runner predates the fixture loader and cross-file evidence.",
+    "Per-fixture verdict timing and a separate tally of findings on clean fixtures. The replay report provides catch and aggregate noise rates."
+  ]
+}
