@@ -86,6 +86,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 from ledger import parse_jsonl
@@ -105,7 +106,6 @@ from .gate import (
     merge_baseline,
 )
 from .runner import run_eval, run_production_eval
-from .thermal import ENV_URLS, ThermalAbort, pacer_from_env
 from .scoring import (
     EvalReport,
     compare_to_baseline,
@@ -116,6 +116,7 @@ from .scoring import (
     staged_cases_advisories,
     to_baseline_dict,
 )
+from .thermal import ENV_URLS, ThermalAbort, pacer_from_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_JSONL = _REPO_ROOT / "logs" / "review-ledger.jsonl"
@@ -278,20 +279,22 @@ def _print_report(name: str, report: EvalReport) -> None:
 
 
 
-def _run_ab_arm(
-    backend, all_cases, cases, token, baseline_report, *, label, block, kwarg,
-    before_case=None,
-) -> None:
-    """One ON-arm replay + delta print vs the baseline report. `kwarg` is
-    the run_eval keyword carrying the block (team_practices / few_shot)."""
-    on = score(
+def _score_ab_arm(
+    backend, all_cases, cases, token, *, block, kwarg, before_case=None,
+) -> EvalReport:
+    return score(
         all_cases,
         run_eval(
             backend, cases, token=token, before_case=before_case,
             **{kwarg: block},
         ),
     )
-    _print_report(f"{backend.name} + {label}", on)
+
+
+def _print_ab_arm(
+    backend_name: str, label: str, baseline_report: EvalReport, on: EvalReport,
+) -> None:
+    _print_report(f"{backend_name} + {label}", on)
     print(
         f"\n{label} delta: catch "
         f"{baseline_report.overall_catch:.2f} -> {on.overall_catch:.2f} "
@@ -441,9 +444,9 @@ def _pacer_for(backend, pacer):
     return pacer if backend.name == "cave" else None
 
 
-def _run_ab_modes(
-    args, rows, all_cases, cases, token, report, backend, before_case=None
-) -> None:
+def _score_ab_modes(
+    args, rows, all_cases, cases, token, backend, before_case=None
+) -> Iterator[tuple[str, EvalReport]]:
     block = ""
     if args.ab_practices:
         from best_practices import derive_practices, practices_block
@@ -455,13 +458,11 @@ def _run_ab_modes(
                 "skipping ON arm (delta would be A/A noise)"
             )
     if block:
-        _run_ab_arm(
+        yield "practices (#527)", _score_ab_arm(
             backend,
             all_cases,
             cases,
             token,
-            report,
-            label="practices (#527)",
             block=block,
             kwarg="team_practices",
             before_case=_pacer_for(backend, before_case),
@@ -482,13 +483,11 @@ def _run_ab_modes(
                 "A/A noise)"
             )
     if examples:
-        _run_ab_arm(
+        yield "few-shot (#538)", _score_ab_arm(
             backend,
             all_cases,
             cases,
             token,
-            report,
-            label="few-shot (#538)",
             block=examples,
             kwarg="few_shot",
             before_case=_pacer_for(backend, before_case),
@@ -590,6 +589,19 @@ def _replay_and_score(args, parser, rows, all_cases, cases, token, pacer):
         return 2
 
     report = score(all_cases, replays)
+    arms = []
+    if not report.all_errored:
+        if backend is not None:
+            arms = list(
+                _score_ab_modes(
+                    args, rows, all_cases, cases, token, backend, before_case=pacer,
+                )
+            )
+        if pacer is not None and pacer.used:
+            # A hot reading after the last case voids the run before any scores
+            # are printed or recorded.
+            pacer.check()
+
     _print_report(backend_name, report)
 
     if report.all_errored:
@@ -599,15 +611,8 @@ def _replay_and_score(args, parser, rows, all_cases, cases, token, pacer):
         )
         return 3
 
-    if backend is not None:
-        _run_ab_modes(
-            args, rows, all_cases, cases, token, report, backend,
-            before_case=pacer,
-        )
-    if pacer is not None and pacer.used:
-        # The last case ran past the final pre-case check; a Spark that
-        # ended it above the stop line voids the run.
-        pacer.check()
+    for label, arm_report in arms:
+        _print_ab_arm(backend_name, label, report, arm_report)
     return backend, backend_name, report
 
 

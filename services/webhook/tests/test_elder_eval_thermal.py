@@ -10,7 +10,6 @@ reading as JSON (`hottest_c`); thresholds live in `elder_eval.thermal`.
 from __future__ import annotations
 
 import pytest
-
 from elder_eval.thermal import ThermalAbort, ThermalPacer, pacer_from_env
 
 A = "http://spark-a.example.com:11439/status"
@@ -213,33 +212,51 @@ def test_main_stops_with_exit_4_and_writes_no_baseline(monkeypatch, capsys):
     assert "84.6" in capsys.readouterr().err
 
 
-def test_an_ab_arm_is_paced_and_its_abort_records_nothing(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    ("arm_start", "arm_end", "exit_code"),
+    [(83.0, 50.0, 4), (50.0, 83.0, 4), (50.0, 50.0, 0)],
+    ids=["hot-before-arm", "hot-after-arm", "cool"],
+)
+def test_ab_results_require_a_cool_run(
+    monkeypatch, capsys, tmp_path, arm_start, arm_end, exit_code
+):
     from elder_eval import __main__ as cli
-    from types import SimpleNamespace
+    from elder_eval.scoring import CaseReplay
 
-    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.setenv("GRUG_BENCH_THERMAL_URLS", A)
-    cases = _cases()
-    monkeypatch.setattr(cli, "_load_corpus", lambda _a: ([], cases, cases))
-    monkeypatch.setattr(
-        cli, "_run_requested_mode",
-        lambda *_a, **_k: (_backend(), "fake", {}),
+    corpus = tmp_path / "corpus.jsonl"
+    corpus.write_text(
+        '{"repo":"example/project","pr":1,"reviewer":"reviewer","severity":"HIGH",'
+        '"class":"correctness","finding":"synthetic finding","verdict":"fixed"}\n'
     )
-    monkeypatch.setattr(cli, "score", lambda *_a: SimpleNamespace(all_errored=False))
-
-    def arms(*_a, before_case=None):
-        assert isinstance(before_case, ThermalPacer)
-        raise ThermalAbort("spark-b reads 83.0 C")
-
-    monkeypatch.setattr(cli, "_run_ab_modes", arms)
-    monkeypatch.setattr(cli, "_print_report", lambda *_a: None)
+    baseline = tmp_path / "baseline.json"
+    monkeypatch.setattr(cli, "BASELINE_PATH", baseline)
+    monkeypatch.setattr("sast_benchmark.backends.configured_backends", lambda: [_cave()])
     monkeypatch.setattr(
-        cli, "_record_report",
-        lambda *_a: pytest.fail("an aborted run must not record"),
+        "elder_eval.thermal.read_guard", _Feed({A: [50.0, arm_start, arm_end]})
     )
 
-    assert cli.main(["--record"]) == 4
-    assert "83.0" in capsys.readouterr().err
+    def replay(_backend, cases, *, token, before_case, **_blocks):
+        for case in cases:
+            before_case(case.case_id)
+        return {case.case_id: CaseReplay(case.case_id, {}, False) for case in cases}
+
+    monkeypatch.setattr(cli, "run_eval", replay)
+
+    assert cli.main(
+        ["--allow-anonymous", "--jsonl", str(corpus), "--ab-few-shot", "--record"]
+    ) == exit_code
+    output = capsys.readouterr()
+    assert baseline.exists() == (exit_code == 0)
+    if exit_code == 4:
+        assert "83.0" in output.err
+        assert "=== backend:" not in output.out
+        assert "delta:" not in output.out
+    else:
+        assert output.out.index("=== backend: cave ===") < output.out.index(
+            "=== backend: cave + few-shot (#538) ==="
+        ) < output.out.index("few-shot (#538) delta:")
 
 
 
@@ -252,8 +269,13 @@ def _cave():
 def _args(**kw):
     from types import SimpleNamespace
 
-    base = dict(published=False, production=False, backend=None,
-                ab_practices=False, ab_few_shot=False)
+    base = {
+        "published": False,
+        "production": False,
+        "backend": None,
+        "ab_practices": False,
+        "ab_few_shot": False,
+    }
     return SimpleNamespace(**{**base, **kw})
 
 
@@ -319,7 +341,6 @@ def test_a_spark_hot_after_the_last_case_voids_the_run(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_run_requested_mode", run)
     monkeypatch.setattr(cli, "score", lambda *_a: SimpleNamespace(all_errored=False))
     monkeypatch.setattr(cli, "_print_report", lambda *_a: None)
-    monkeypatch.setattr(cli, "_run_ab_modes", lambda *_a, **_k: None)
     monkeypatch.setattr(
         cli, "_record_report",
         lambda *_a: pytest.fail("a run that ended hot must not record"),
