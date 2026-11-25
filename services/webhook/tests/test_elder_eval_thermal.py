@@ -321,3 +321,33 @@ def test_a_spark_hot_after_the_last_case_voids_the_run(monkeypatch, capsys):
 
     assert cli.main(["--record"]) == 4
     assert "after the last case" in capsys.readouterr().err
+
+
+def test_a_real_guard_read_logs_no_url(caplog):
+    """The CLI logs at INFO into public Actions logs; a guard read must not
+    put the private address there."""
+    import json
+    import logging
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Guard(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"hottest_c": 50.0}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_a):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Guard)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}/status"
+    try:
+        with caplog.at_level(logging.DEBUG):
+            ThermalPacer((url,))("case-1")
+    finally:
+        server.shutdown()
+    assert str(server.server_port) not in caplog.text

@@ -16,11 +16,11 @@ temperature is not pacing.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-
-import httpx
 
 log = logging.getLogger("grug.elder_eval")
 
@@ -38,9 +38,10 @@ class ThermalAbort(RuntimeError):
 
 
 def read_guard(url: str) -> dict:
-    resp = httpx.get(url, timeout=10.0)
-    resp.raise_for_status()
-    return resp.json()
+    """stdlib, not httpx: httpx logs each request URL at INFO, and the CLI
+    logs at INFO into public Actions logs."""
+    with urllib.request.urlopen(url, timeout=10.0) as resp:  # noqa: S310 - operator-set URL
+        return json.loads(resp.read())
 
 
 class ThermalPacer:
