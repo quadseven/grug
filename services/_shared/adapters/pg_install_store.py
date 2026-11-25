@@ -2513,6 +2513,53 @@ def list_comment_nudge_repos(install_id: int) -> list[dict[str, Any]]:
     return out
 
 
+_STALE_NEUTRAL_REQUEUE_TTL_DAYS = 30
+
+
+def claim_stale_neutral_requeue(install_id: int, repo: str, head_sha: str) -> bool:
+    """Win-once claim for the check-run reconciler's stale-NEUTRAL Elder
+    re-queue (grug#1872): True = re-queue this head now; False = this head
+    was already re-queued. Held per head, not per check-run id: the
+    re-queued review posts a NEW run, and a blocking-mode Elder that
+    concludes NEUTRAL on purpose would otherwise be re-queued every tick.
+    A new push is a new head and gets its own single chance. Same atomic
+    upsert-if-expired shape as claim_pulse_nudge; DB errors propagate."""
+    pg_base.maybe_purge_expired()
+    ttl = int(
+        datetime.now(timezone.utc).timestamp() + _STALE_NEUTRAL_REQUEUE_TTL_DAYS * 86400
+    )
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+                WHERE grug_kv.ttl IS NOT NULL
+                  AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+            RETURNING pk
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": f"STALENEUTRAL#{repo}#{head_sha}",
+                "data": Jsonb({"ttl": ttl}),
+                "ttl": ttl,
+            },
+        ).fetchone()
+    return row is not None
+
+
+def release_stale_neutral_requeue(install_id: int, repo: str, head_sha: str) -> None:
+    """Release a stale-NEUTRAL claim whose rerun-queue send failed, so the
+    claim stands for a QUEUED re-review, not an attempt, and the next
+    poller tick retries."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM grug_kv WHERE pk = %s AND sk = %s",
+            (_inst_pk(install_id), f"STALENEUTRAL#{repo}#{head_sha}"),
+        )
+
+
 def release_pulse_nudge(install_id: int, repo: str, pr_number: int) -> None:
     """Release a pulse-nudge claim whose COMMENT POST failed (codex PR
     #489): the claim must represent a COMPLETED nudge, not an attempt -

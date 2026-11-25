@@ -504,3 +504,211 @@ def test_restart_recovery_flow_requeues_once_and_then_leaves_the_new_run_alone()
     mock_enqueue2.assert_not_called()
     mock_dispatch2.assert_not_called()
     mock_patch2.assert_not_called()
+
+
+# --- grug#1872: a NEUTRAL Elder left over from before the repo went blocking ---
+
+
+def _neutral_elder(run_id: int = 31) -> dict:
+    return {
+        "id": run_id, "name": "Grug - Elder", "status": "completed",
+        "conclusion": "neutral", "started_at": _iso(600),
+    }
+
+
+class _ClaimStore:
+    """In-memory stand-in for the per-head stale-neutral claim."""
+
+    def __init__(self) -> None:
+        self.held: set[tuple[int, str, str]] = set()
+
+    def claim(self, install_id: int, repo: str, head_sha: str) -> bool:
+        key = (install_id, repo, head_sha)
+        if key in self.held:
+            return False
+        self.held.add(key)
+        return True
+
+    def release(self, install_id: int, repo: str, head_sha: str) -> None:
+        self.held.discard((install_id, repo, head_sha))
+
+
+def _stale_pass(runs, *, blocking, claims, budget=None, prs=None, expected=None):
+    """One reconcile_repo pass with the store, queue and dispatch mocked."""
+    prs = prs or [{"number": 5, "head": {"sha": "abc"}, "body": ""}]
+    cfg = (
+        {"side_effect": blocking} if isinstance(blocking, Exception)
+        else {"return_value": {"code_reviewer_blocking": blocking}}
+    )
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=prs), \
+         patch("check_run_reconciler.expected_personas",
+               return_value=expected if expected is not None else [_CHIEF, _ELDER]), \
+         patch("check_run_reconciler.list_check_runs_for_ref", return_value=runs), \
+         patch("check_run_reconciler.get_repo_config", **cfg) as mock_cfg, \
+         patch("check_run_reconciler.claim_stale_neutral_requeue", side_effect=claims.claim), \
+         patch("check_run_reconciler.release_stale_neutral_requeue", side_effect=claims.release), \
+         patch("check_run_reconciler.patch_check_run") as mock_patch, \
+         patch("rerun.enqueue_rerun") as mock_enqueue, \
+         patch("dispatcher.dispatch") as mock_dispatch:
+        result = reconciler.reconcile_repo("tok", 1, "o", "r", 2, stale_budget=budget)
+    return result, mock_enqueue, mock_dispatch, mock_patch, mock_cfg
+
+
+_CHIEF_DONE = {"name": "Grug - Chief", "status": "completed"}
+
+
+def test_stale_neutral_elder_on_a_blocking_repo_is_requeued_once_with_no_comment():
+    """Acceptance 1: head carries a completed NEUTRAL Elder from advisory
+    mode and the repo is now blocking. One pass re-queues Elder once on
+    the rerun lane, keyed by the stale run's id, posts nothing to the PR
+    and dispatches nothing inline; a second pass does nothing."""
+    claims = _ClaimStore()
+    runs = [_neutral_elder(31), _CHIEF_DONE]
+    result, enqueue, dispatch, patch_run, _ = _stale_pass(runs, blocking=True, claims=claims)
+    assert result == (1, 0)
+    enqueue.assert_called_once()
+    assert enqueue.call_args.kwargs["persona"] == "elder"
+    assert enqueue.call_args.kwargs["pr_number"] == 5
+    assert enqueue.call_args.kwargs["repo"] == "o/r"
+    assert enqueue.call_args.kwargs["dedup_key"] == "stale-neutral:31"
+    dispatch.assert_not_called()
+    patch_run.assert_not_called()
+
+    result2, enqueue2, dispatch2, patch2, _ = _stale_pass(runs, blocking=True, claims=claims)
+    assert result2 == (0, 0)
+    enqueue2.assert_not_called()
+    dispatch2.assert_not_called()
+    patch2.assert_not_called()
+
+
+def test_neutral_elder_on_an_advisory_repo_is_left_alone():
+    """Acceptance 2: in advisory mode NEUTRAL is Elder's normal verdict."""
+    claims = _ClaimStore()
+    result, enqueue, dispatch, _, _ = _stale_pass(
+        [_neutral_elder(), _CHIEF_DONE], blocking=False, claims=claims,
+    )
+    assert result == (0, 0)
+    enqueue.assert_not_called()
+    dispatch.assert_not_called()
+    assert claims.held == set()
+
+
+def test_unreadable_elder_mode_requeues_nothing():
+    """A config-store error is not proof the repo is blocking."""
+    claims = _ClaimStore()
+    result, enqueue, _, _, _ = _stale_pass(
+        [_neutral_elder(), _CHIEF_DONE], blocking=RuntimeError("db down"), claims=claims,
+    )
+    assert result == (0, 0)
+    enqueue.assert_not_called()
+    assert claims.held == set()
+
+
+def test_a_neutral_from_blocking_mode_elder_is_not_requeued_in_a_loop():
+    """Acceptance 3: the re-queued review runs in blocking mode and may
+    itself conclude NEUTRAL on purpose (a skip). That run has a new id, so
+    a key on the run id alone would re-queue it every tick. The claim is
+    held per head, so the same head is re-queued at most once."""
+    claims = _ClaimStore()
+    result, enqueue, _, _, _ = _stale_pass([_neutral_elder(31), _CHIEF_DONE], blocking=True, claims=claims)
+    assert result == (1, 0)
+    assert enqueue.call_count == 1
+
+    for later_run_id in (32, 33):
+        result, enqueue, dispatch, _, _ = _stale_pass(
+            [_neutral_elder(later_run_id), _CHIEF_DONE], blocking=True, claims=claims,
+        )
+        assert result == (0, 0)
+        enqueue.assert_not_called()
+        dispatch.assert_not_called()
+
+    # A new push is a new head: it gets its own single chance.
+    pushed = [{"number": 5, "head": {"sha": "def"}, "body": ""}]
+    result, enqueue, _, _, _ = _stale_pass(
+        [_neutral_elder(40), _CHIEF_DONE], blocking=True, claims=claims, prs=pushed,
+    )
+    assert result == (1, 0)
+    assert enqueue.call_args.kwargs["dedup_key"] == "stale-neutral:40"
+
+
+def test_elder_success_or_failure_on_a_blocking_repo_is_not_requeued():
+    claims = _ClaimStore()
+    for conclusion in ("success", "failure"):
+        run = {**_neutral_elder(), "conclusion": conclusion}
+        result, enqueue, _, _, cfg = _stale_pass([run, _CHIEF_DONE], blocking=True, claims=claims)
+        assert result == (0, 0)
+        enqueue.assert_not_called()
+        cfg.assert_not_called()  # the mode is read only when a NEUTRAL is seen
+
+
+def test_stale_neutral_requeues_are_bounded_per_tick_and_logged():
+    """Acceptance 4: a mode switch on a repo with many open PRs drains a
+    bounded number per tick. PRs past the budget are not claimed, so a
+    later tick still re-queues them."""
+    claims = _ClaimStore()
+    prs = [{"number": n, "head": {"sha": f"sha{n}"}, "body": ""} for n in range(1, 6)]
+    budget = reconciler.StaleNeutralBudget(limit=2)
+    with patch.object(reconciler.log, "info") as mock_info:
+        result, enqueue, _, _, cfg = _stale_pass(
+            [_neutral_elder(), _CHIEF_DONE], blocking=True, claims=claims, budget=budget, prs=prs,
+        )
+    assert result == (2, 0)
+    assert enqueue.call_count == 2
+    assert cfg.call_count == 1  # the mode is read once per repo pass
+    assert (budget.requeued, budget.deferred) == (2, 3)
+    assert len(claims.held) == 2
+    events = [c.args[0] for c in mock_info.call_args_list]
+    assert events.count("check_run_stale_neutral_requeued") == 2
+
+    next_tick = reconciler.StaleNeutralBudget(limit=2)
+    result, _, _, _, _ = _stale_pass(
+        [_neutral_elder(), _CHIEF_DONE], blocking=True, claims=claims, budget=next_tick, prs=prs,
+    )
+    assert result == (2, 0)
+    assert len(claims.held) == 4
+
+
+def test_a_failed_stale_neutral_send_releases_the_claim_for_the_next_tick():
+    claims = _ClaimStore()
+    with patch("check_run_reconciler._list_open_pull_requests",
+               return_value=[{"number": 5, "head": {"sha": "abc"}, "body": ""}]), \
+         patch("check_run_reconciler.expected_personas", return_value=[_ELDER]), \
+         patch("check_run_reconciler.list_check_runs_for_ref", return_value=[_neutral_elder()]), \
+         patch("check_run_reconciler.get_repo_config", return_value={"code_reviewer_blocking": True}), \
+         patch("check_run_reconciler.claim_stale_neutral_requeue", side_effect=claims.claim), \
+         patch("check_run_reconciler.release_stale_neutral_requeue", side_effect=claims.release), \
+         patch("rerun.enqueue_rerun", side_effect=RuntimeError("no queue")), \
+         patch.object(reconciler.log, "error") as mock_error:
+        assert reconciler.reconcile_repo("tok", 1, "o", "r", 2) == (0, 0)
+    assert claims.held == set()
+    assert mock_error.call_args.args[0] == "check_run_stale_neutral_requeue_failed"
+
+
+def test_stale_neutral_is_ignored_when_elder_is_disabled():
+    claims = _ClaimStore()
+    result, enqueue, _, _, _ = _stale_pass(
+        [_neutral_elder(), _CHIEF_DONE], blocking=True, claims=claims, expected=[_CHIEF],
+    )
+    assert result == (0, 0)
+    enqueue.assert_not_called()
+
+
+def test_reconcile_installs_shares_one_stale_neutral_budget_and_logs_it():
+    budgets: list = []
+
+    def fake_reconcile_repo(token, iid, owner, repo, repo_id, *, stale_budget=None):
+        budgets.append(stale_budget)
+        return (0, 0)
+
+    with patch("check_run_reconciler.list_check_run_reconcile_repos",
+               return_value=[{"id": 9, "full_name": "o/r"}, {"id": 10, "full_name": "o/r2"}]), \
+         patch("check_run_reconciler.with_install_token_retry",
+               side_effect=lambda iid, fn: fn("tok")), \
+         patch("check_run_reconciler.reconcile_repo", side_effect=fake_reconcile_repo), \
+         patch.object(reconciler.log, "info") as mock_info:
+        reconciler.reconcile_installs([1, 2])
+    assert len(budgets) == 4
+    assert all(b is budgets[0] for b in budgets)
+    assert budgets[0].limit == reconciler._STALE_NEUTRAL_REQUEUE_MAX_PER_TICK
+    events = [c.args[0] for c in mock_info.call_args_list]
+    assert "check_run_stale_neutral_tick" in events

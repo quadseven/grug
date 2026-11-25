@@ -129,6 +129,20 @@ during a GitHub or grug outage mid-review. No action needed beyond
 confirming the underlying degradation (see the error-rate signal above)
 has cleared; the author gets a real review on their next push.
 
+### Stale NEUTRAL Elder after a switch to blocking
+
+When a repo's Elder moves from advisory to blocking (`code_reviewer_blocking`),
+open PRs keep the NEUTRAL Elder they got under advisory, and a blocking merge
+gate never accepts it. The same reconciler pass (#1872) re-queues Elder once
+per PR head on the rerun lane, with no PR comment. At most
+`GRUG_STALE_NEUTRAL_REQUEUE_MAX_PER_TICK` (default 10) go out per poller tick
+across all repos, so a busy repo drains over several ticks. Each re-queue logs
+`check_run_stale_neutral_requeued`, and each tick logs
+`check_run_stale_neutral_tick` with `requeued` and `deferred` counts. The pass
+runs only for repos with `check_run_reconcile_enabled` set, so turn that flag
+on for every repo whose Elder is blocking (the repo config `PUT` in the API,
+`/installations/<install_id>/repos/<repo_id>/config`).
+
 ### Inbound webhook silence
 
 `[grug] No inbound GitHub webhook deliveries (4h)` fires when
