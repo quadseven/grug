@@ -762,6 +762,30 @@ set identical. Decision rule for #649: only cut over if p95 complete at
 C=4/8 improves without a parse-fail regression. That cutover now goes
 through the optional vLLM deep arm below (grug#1191).
 
+### Thermal pacing for Elder eval runs on the cave backend (grug#989)
+
+A review-sized call heats a local GPU host by several degrees on its own, and
+sustained load has cut power to them. `python -m elder_eval` therefore
+refuses the `cave` backend unless `GRUG_BENCH_THERMAL_URLS` names each host's
+thermal guard status URL (comma-separated; each answers JSON with
+`hottest_c`). The thresholds live in `elder_eval/thermal.py`:
+
+- Each case starts only when every host reads `START_AT_C` (65 C) or below.
+  The eval polls every 15 seconds and stops after 10 minutes without cooling.
+- A host above `ABORT_ABOVE_C` (82 C), a guard that cannot be read, or a hot
+  reading after the last case stops the run with exit code 4. Nothing is
+  recorded.
+- Cloud backends are not paced. `--production` is paced when the variable
+  is set.
+
+```bash
+export GRUG_BENCH_THERMAL_URLS='http://<host-a>:11439/status,http://<host-b>:11439/status'
+make elder-eval ARGS="--backend cave --record"
+```
+
+Messages name a guard by its position in the list, never by URL, so the
+private addresses stay out of logs.
+
 ### Optional vLLM deep arm: shadow, eval gate, serve (grug#1191)
 
 The deep (reasoner) pass can use a dedicated vLLM server. One env var,
