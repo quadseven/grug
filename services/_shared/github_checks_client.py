@@ -193,27 +193,32 @@ def patch_check_run(
     repo: str,
     check_run_id: int,
     result: CheckRunResult,
+    *,
+    output_only: bool = False,
+    summary_footer: str = "",
 ) -> dict:
-    """PATCH an EXISTING check-run by id to a new status/conclusion.
+    """PATCH an EXISTING check-run by id, optionally updating only its output.
 
     Unlike `post_check_run` (create), this genuinely is idempotent in the
     sense that matters here: it updates the SAME object rather than
     creating a new one, so grug#947's sweeper can safely re-patch a run
     it already closed out without multiplying check-runs."""
+    footer = f"\n\n{summary_footer}" if summary_footer else ""
     summary = result.summary
-    if len(summary) > _MAX_SUMMARY_CHARS:
-        summary = summary[:_MAX_SUMMARY_CHARS] + "\n\n(summary truncated)"
-    body = {
-        "name": result.name,
-        "status": result.status,
+    limit = _MAX_SUMMARY_CHARS - len(footer)
+    if len(summary) > limit:
+        summary = summary[:limit] + "\n\n(summary truncated)"
+    body: dict[str, object] = {
         "output": {
             "title": result.title,
-            "summary": summary,
+            "summary": summary + footer,
             **({"text": result.text} if result.text else {}),
         },
     }
-    if result.conclusion:
-        body["conclusion"] = result.conclusion
+    if not output_only:
+        body.update(name=result.name, status=result.status)
+        if result.conclusion:
+            body["conclusion"] = result.conclusion
     resp = httpx.patch(
         f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
         f"/check-runs/{int(check_run_id)}",

@@ -42,6 +42,7 @@ from activity_log import record_check_verdict
 from github_app_auth import get_app_id, with_install_token_retry
 from github_checks_client import CheckRunResult, list_check_runs_for_ref, post_check_run
 from personas.code_reviewer import carry_forward
+from personas.code_reviewer.review_timing import ReviewTiming
 from personas.tribe import CHECK_ELDER
 
 log = logging.getLogger(
@@ -217,7 +218,7 @@ def store_record(req: CarryRequest, *, diff_id: str) -> None:
 
 
 def carry_if_unchanged(
-    req: CarryRequest, *, fetch_pr_diff: Callable[[], str],
+    req: CarryRequest, *, fetch_pr_diff: Callable[[], str], timing: ReviewTiming,
 ) -> dict[str, Any] | None:
     """Publish the carried check and return the dispatch result, or None.
 
@@ -232,6 +233,7 @@ def carry_if_unchanged(
     )
     if threads is None:
         return None
+    timing.advance("post")
     line = f"carried from {prior[:12]}: diff unchanged"
     conclusion, title, summary = carry_forward.apply_to_check(
         carry_forward.select_carried(threads, ()),
@@ -244,18 +246,20 @@ def carry_if_unchanged(
         ),
         blocking_mode=req.blocking,
     )
+    result = CheckRunResult(
+        name=CHECK_ELDER, head_sha=req.head_sha, status="completed",
+        conclusion=conclusion, title=title, summary=summary,
+    )
     try:
-        with_install_token_retry(
+        response = with_install_token_retry(
             req.installation_id,
             lambda token: post_check_run(
                 token, req.owner, req.repo_name,
-                CheckRunResult(
-                    name=CHECK_ELDER, head_sha=req.head_sha, status="completed",
-                    conclusion=conclusion, title=title, summary=summary,
-                ),
+                result,
                 external_id=f"grug-cr:{req.pr}:{req.head_sha}",
             ),
         )
+        timing.record_check(result, response)
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.error("elder_carry_publish_failed", extra={"pr": req.pr, "kind": type(e).__name__})
         return {"persona": "code_reviewer", "result": "publish_failed"}
