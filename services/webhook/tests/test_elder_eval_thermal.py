@@ -115,6 +115,12 @@ def test_messages_never_carry_a_guard_url():
         assert "spark-a" not in str(err) and "http" not in str(err)
 
 
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://h/status", "h:11439"])
+def test_a_guard_must_be_an_http_url(url):
+    with pytest.raises(ValueError, match="guard 2 is not an http"):
+        ThermalPacer((A, url))
+
+
 def test_the_pacer_needs_at_least_one_guard():
     with pytest.raises(ValueError):
         ThermalPacer(())

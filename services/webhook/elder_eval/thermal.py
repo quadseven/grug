@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 
@@ -40,7 +41,7 @@ class ThermalAbort(RuntimeError):
 def read_guard(url: str) -> dict:
     """stdlib, not httpx: httpx logs each request URL at INFO, and the CLI
     logs at INFO into public Actions logs."""
-    with urllib.request.urlopen(url, timeout=10.0) as resp:  # noqa: S310 - operator-set URL
+    with urllib.request.urlopen(url, timeout=10.0) as resp:  # noqa: S310 - ThermalPacer admits http(s) only
         return json.loads(resp.read())
 
 
@@ -60,6 +61,10 @@ class ThermalPacer:
     ) -> None:
         if not urls:
             raise ValueError("thermal pacing needs at least one guard URL")
+        for index, url in enumerate(urls):
+            if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+                # urlopen would also read file: and custom schemes.
+                raise ValueError(f"thermal guard {index + 1} is not an http(s) URL")
         self.urls = tuple(urls)
         self.used = False
         self.poll_s = poll_s
