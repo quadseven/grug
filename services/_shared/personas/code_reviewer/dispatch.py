@@ -36,6 +36,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -3113,14 +3114,12 @@ def _handle_diff_failure(
     return degraded
 
 
-def _assemble_review_evidence(run: _ReviewRun, diff: _PreparedDiff) -> _ReviewEvidence:
-    # Full-file context (#336): fetch the whole current content of each changed
-    # file at head SHA so the Elder + judge can see mitigations OUTSIDE the diff
-    # hunk (the #1149 false-positive class). Best-effort + self-guarding - any
-    # failure degrades to the pre-#336 diff-only review, never blocks it.
-    changed_paths = tuple(dict.fromkeys(h.file_path for h in diff.hunks))
+def _fetch_head_contents(
+    run: _ReviewRun, changed_paths: tuple[str, ...],
+) -> dict[str, str]:
+    """Full-file context (#336) at head SHA. Best-effort and self-guarding."""
     try:
-        file_contents = with_install_token_retry(
+        return with_install_token_retry(
             run.installation_id,
             lambda token: fetch_file_contents(
                 token, run.owner, run.repo_name, changed_paths, run.head_sha
@@ -3131,31 +3130,48 @@ def _assemble_review_evidence(run: _ReviewRun, diff: _PreparedDiff) -> _ReviewEv
             "code_review_file_contents_unavailable",
             extra={"pr": run.pr_name, "error": str(e)},
         )
-        file_contents = {}
+        return {}
 
-    # Base revision of the SAME files, so complexity can report what THIS PR
-    # did rather than the function's pre-existing debt (#767). Measured: the
-    # absolute-threshold form was 85 of the last 120 findings, most replies
-    # saying "pre-existing" or "outside this PR".
-    #
-    # Degrades to {} on any failure, which `scan_complexity` reads as "no base"
-    # and falls back to the old absolute behavior. That direction is
-    # deliberate: going SILENT on a fetch error would hide real regressions,
-    # whereas falling back only restores the previous noise level.
-    # A renamed file's base text lives at its old path (#1365).
+
+def _fetch_head_and_cross_file(
+    run: _ReviewRun, hunks: tuple[DiffHunk, ...], changed_paths: tuple[str, ...],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Fetch changed head files, then resolve cross-file symbols from them."""
+    file_contents = _fetch_head_contents(run, changed_paths)
+    cross_file_contents = _review_cross_file_context(run, hunks, file_contents, changed_paths)
+    return file_contents, cross_file_contents
+
+
+def _assemble_review_evidence(run: _ReviewRun, diff: _PreparedDiff) -> _ReviewEvidence:
+    # Gather independent review context stages concurrently: head files +
+    # cross-file resolution, base files (for complexity deltas), Datadog Omen
+    # runtime signal, GitHub CI check-runs, and repo docs + linked issues.
+    changed_paths = tuple(dict.fromkeys(h.file_path for h in diff.hunks))
     rename_sources = tuple(
         c.previous_path for c in file_changes(diff.text)
         if c.status == "renamed" and c.previous_path
     )
-    base_file_contents = _fetch_base_contents(
-        run.installation_id, run.owner, run.repo_name, run.pull_number,
-        tuple(dict.fromkeys(changed_paths + rename_sources)),
-        str(run.pr_context.get("base_sha") or ""),
-    )
+    base_paths = tuple(dict.fromkeys(changed_paths + rename_sources))
+    base_sha = str(run.pr_context.get("base_sha") or "")
 
-    cross_file_contents = _review_cross_file_context(run, diff.hunks, file_contents, changed_paths)
-    runtime_context, ci_context, head_check_runs = _review_runtime_and_ci(run, diff.hunks)
-    repo_docs_context = _review_docs_and_intent(run, diff, changed_paths)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        head_cross_future = pool.submit(
+            _fetch_head_and_cross_file, run, diff.hunks, changed_paths,
+        )
+        base_future = pool.submit(
+            _fetch_base_contents,
+            run.installation_id, run.owner, run.repo_name, run.pull_number,
+            base_paths, base_sha,
+        )
+        runtime_future = pool.submit(_review_runtime_context, run, diff.hunks)
+        ci_future = pool.submit(_review_ci_context, run, diff.hunks)
+        docs_future = pool.submit(_review_docs_and_intent, run, diff, changed_paths)
+
+        file_contents, cross_file_contents = head_cross_future.result()
+        base_file_contents = base_future.result()
+        runtime_context = runtime_future.result()
+        ci_context, head_check_runs = ci_future.result()
+        repo_docs_context = docs_future.result()
 
     # The reviewer, judge, refute gate, and deep arm use the same evidence.
     evidence = assemble_evidence(
@@ -3205,15 +3221,14 @@ def _review_cross_file_context(
     return cross_file_contents
 
 
-def _review_runtime_and_ci(
+def _review_runtime_context(
     run: _ReviewRun, hunks: tuple[DiffHunk, ...],
-) -> tuple[str | None, str | None, list[dict[str, Any]]]:
+) -> str | None:
     # Production signal (#470 Omen): DD error counts for the diff's
     # files, injected as review context. FAIL-SAFE + explicit-allow: no
     # service mapping (or any failure) = None = today's review.
-    runtime_context: str | None = None
     try:
-        runtime_context = build_runtime_context(run.owner, run.repo_name, hunks)
+        return build_runtime_context(run.owner, run.repo_name, hunks)
     except Exception as e:  # noqa: BLE001 - omen is additive; never break the review
         log.info(
             "omen_degraded",
@@ -3223,7 +3238,12 @@ def _review_runtime_and_ci(
                 "kind": type(e).__name__,
             },
         )
+        return None
 
+
+def _review_ci_context(
+    run: _ReviewRun, hunks: tuple[DiffHunk, ...],
+) -> tuple[str | None, list[dict[str, Any]]]:
     # CI status (#902): the PR's OWN check-run status on the reviewed head
     # SHA, injected as review context so Elder can see whether the PR's own
     # tests passed. FAIL-SAFE + additive: any failure degrades to None =
@@ -3258,6 +3278,14 @@ def _review_runtime_and_ci(
                 "kind": type(e).__name__,
             },
         )
+    return ci_context, head_check_runs
+
+
+def _review_runtime_and_ci(
+    run: _ReviewRun, hunks: tuple[DiffHunk, ...],
+) -> tuple[str | None, str | None, list[dict[str, Any]]]:
+    runtime_context = _review_runtime_context(run, hunks)
+    ci_context, head_check_runs = _review_ci_context(run, hunks)
     return runtime_context, ci_context, head_check_runs
 
 
