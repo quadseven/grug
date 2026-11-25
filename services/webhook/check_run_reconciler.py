@@ -354,16 +354,9 @@ def _reconcile_pr(
     runs = list_check_runs_for_ref(token, owner, repo, head_sha)
     expected = expected_personas(installation_id, repo_id)
     missing, present_keys, stuck = _split_missing_present_stuck(runs, expected)
-    requeue = _requeue_specs(expected, stuck)
-    # Elder rides the durable rerun lane; it is enqueued BEFORE the sweep so
-    # a failed send is known when the swept run's summary is written - that
-    # run then honestly asks for a push instead of promising a re-review.
-    elder_queued = any(spec.check_run_name == _ELDER_CHECK_RUN_NAME for spec in requeue)
-    if elder_queued and not _enqueue_elder_recovery(
-        installation_id, owner, repo, pr_number,
-        [run for run in stuck if str(run.get("name") or "") == _ELDER_CHECK_RUN_NAME],
-    ):
-        requeue = [s for s in requeue if s.check_run_name != _ELDER_CHECK_RUN_NAME]
+    requeue = _queue_stuck_elder(
+        installation_id, owner, repo, pr_number, _requeue_specs(expected, stuck), stuck,
+    )
     swept = _sweep_stuck_runs(
         token, installation_id, owner, repo, pr_number, head_sha, stuck,
         {spec.check_run_name for spec in requeue},
@@ -395,6 +388,23 @@ def _reconcile_pr(
         },
     )
     return 1, swept
+
+
+def _queue_stuck_elder(
+    installation_id: int, owner: str, repo: str, pr_number: int,
+    requeue: list[persona_registry.PersonaSpec], stuck: list[dict[str, Any]],
+) -> list[persona_registry.PersonaSpec]:
+    """Send a stuck Elder's re-queue (grug#1275) and return the specs that
+    are really re-queued. Elder rides the durable rerun lane; it is
+    enqueued BEFORE the sweep so a failed send is known when the swept
+    run's summary is written - that run then honestly asks for a push
+    instead of promising a re-review."""
+    if not any(spec.check_run_name == _ELDER_CHECK_RUN_NAME for spec in requeue):
+        return requeue
+    elder_runs = [run for run in stuck if str(run.get("name") or "") == _ELDER_CHECK_RUN_NAME]
+    if _enqueue_elder_recovery(installation_id, owner, repo, pr_number, elder_runs):
+        return requeue
+    return [s for s in requeue if s.check_run_name != _ELDER_CHECK_RUN_NAME]
 
 
 def _sweep_stuck_runs(
