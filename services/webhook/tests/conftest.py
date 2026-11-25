@@ -217,6 +217,14 @@ def _pr_head_has_not_moved(monkeypatch):
     monkeypatch.setattr(dispatch, "_pr_head_state", lambda *a, **k: "current")
 
 
+@pytest.fixture(autouse=True)
+def _mock_elder_timing_patch(monkeypatch):
+    """Keep timing updates offline when a test fakes a posted Elder check ID."""
+    from personas.code_reviewer import review_timing
+
+    monkeypatch.setattr(review_timing, "with_install_token_retry", lambda *_: {})
+
+
 class _LabelHttpResponse:
     """Minimal httpx.Response stand-in for the label calls."""
 
