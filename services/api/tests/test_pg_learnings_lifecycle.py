@@ -282,3 +282,24 @@ def test_the_decline_outcome_query_is_one_literal_that_filters_expired_rows():
     assert isinstance(query, str)
     assert TTL_LIVE in query
     assert "DECLINE#%%" in query
+
+
+def test_list_all_learnings_orders_by_repo_and_respects_active_filter(store):
+    a = _teach(store, "rule a", repo="o/a")
+    b = _teach(store, "rule b", repo="o/b")
+    store.set_learning_status("o/b", b, cd.STATUS_DISABLED, actor="op")
+
+    active = store.list_all_learnings()
+    assert [(r["repo"], r["id"]) for r in active] == [("o/a", a)]
+
+    everything = store.list_all_learnings(include_inactive=True)
+    assert [(r["repo"], r["id"]) for r in everything] == [("o/a", a), ("o/b", b)]
+
+
+def test_get_learnings_by_ids_returns_live_matches_and_omits_missing(store):
+    a = _teach(store, "rule a", repo="o/r")
+    b = _teach(store, "rule b", repo="o/r")
+    found = store.get_learnings_by_ids("o/r", [b, "000000000000", a, b])
+    assert set(found.keys()) == {a, b}
+    assert found[a]["text"] == "rule a"
+    assert found[b]["text"] == "rule b"

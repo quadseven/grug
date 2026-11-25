@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from admin import router as admin_router
 from auth.github_oauth import router as github_oauth_router
@@ -45,6 +46,11 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+# Compress JSON payloads >= 500 bytes when clients send Accept-Encoding: gzip.
+# Added inside CfAuthMiddleware and CORSMiddleware so auth short-circuits stay
+# cheap and CORSMiddleware remains the outermost layer.
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # CF→AWS auth boundary — reject direct Function URL hits that bypass
 # Cloudflare. Fail-open when the env var/SSM secret isn't configured

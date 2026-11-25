@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
 from psycopg.types.json import Jsonb
@@ -1623,6 +1623,21 @@ def delete_learning(repo: str, digest: str) -> bool:
     return bool(cur.rowcount)
 
 
+def _decode_and_filter_learnings(
+    rows: Sequence[tuple[str, str, dict[str, Any]]],
+    *,
+    include_inactive: bool,
+    limit: int | None,
+) -> list[Learning]:
+    now = datetime.now(timezone.utc)
+    out: list[Learning] = []
+    for pk, sk, data in rows:
+        row = _decode_learning(pk, sk, data)
+        if include_inactive or _learning_is_active(row, now):
+            out.append(row)
+    return out if limit is None else out[:limit]
+
+
 def list_learnings(
     repo: str, limit: int | None = None, *, include_inactive: bool = False,
 ) -> list[Learning]:
@@ -1646,16 +1661,28 @@ def list_learnings(
             -- fall back to created_at for pre-reinforced_at rows.
             ORDER BY COALESCE(data->>'reinforced_at', data->>'created_at') ASC,
                      sk COLLATE "C" ASC
-            """,
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
             (_learning_pk(repo),),
         ).fetchall()
-    now = datetime.now(timezone.utc)
-    out: list[Learning] = []
-    for pk, sk, data in rows:
-        row = _decode_learning(pk, sk, data)
-        if include_inactive or _learning_is_active(row, now):
-            out.append(row)
-    return out if limit is None else out[:limit]
+    return _decode_and_filter_learnings(rows, include_inactive=include_inactive, limit=limit)
+
+
+def list_all_learnings(
+    limit: int | None = None, *, include_inactive: bool = False,
+) -> list[Learning]:
+    """Every live learning across all repositories in one query, ordered by
+    repo name then reinforced/created time and sort key."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT pk, sk, data FROM grug_kv
+            WHERE pk LIKE 'LEARN#%%' AND sk LIKE 'LEARNING#%%' AND {TTL_LIVE}
+            ORDER BY pk COLLATE "C" ASC,
+                     COALESCE(data->>'reinforced_at', data->>'created_at') ASC,
+                     sk COLLATE "C" ASC
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+        ).fetchall()
+    return _decode_and_filter_learnings(rows, include_inactive=include_inactive, limit=limit)
 
 
 def _decode_learning(pk: str, sk: str, data: dict[str, Any]) -> Learning:
@@ -1754,6 +1781,30 @@ def get_learning(repo: str, learning_id: str) -> Optional[Learning]:
         return None
     item["id"] = learning_id
     return cast("Learning", item)
+
+
+def get_learnings_by_ids(
+    repo: str, learning_ids: Sequence[str],
+) -> dict[str, Learning]:
+    """Batch-fetch live learnings for `repo` by id in a single query.
+    Missing or TTL-expired ids are omitted from the returned mapping."""
+    unique_ids = list(dict.fromkeys(learning_ids))
+    if not unique_ids:
+        return {}
+    sks = [_learning_sk(lid) for lid in unique_ids]
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT pk, sk, data FROM grug_kv
+            WHERE pk = %s AND sk = ANY(%s) AND {TTL_LIVE}
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+            (_learning_pk(repo), sks),
+        ).fetchall()
+    out: dict[str, Learning] = {}
+    for pk, sk, data in rows:
+        row = _decode_learning(pk, sk, data)
+        out[str(row["id"])] = row
+    return out
 
 
 def list_learning_repos() -> list[str]:

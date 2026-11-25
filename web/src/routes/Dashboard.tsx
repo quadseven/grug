@@ -646,8 +646,10 @@ function ActivityPanel({ show, installId }: { show: boolean; installId?: number 
   const [filter, setFilter] = useState("all");
   // Real Check-verdict feed (PRD #301 / S2). The `verdict` badge is derived
   // server-side; we render it verbatim. "No lies": real rows or an honest
-  // empty state — never fabricated.
-  const activity = useActivity(installId, filter);
+  // empty state - never fabricated. Defer the fetch until the Activity tab is
+  // shown so landing on Repositories does not trigger an unused full-partition
+  // activity scan on the API.
+  const activity = useActivity(show ? installId : undefined, filter);
   const rows = activity.data?.activity ?? [];
   // #305: re-run an errored row. Track which rows are mid-re-run so the ↻
   // becomes RE-RUNNING until the feed refreshes with the healed verdict.

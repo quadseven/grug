@@ -231,3 +231,20 @@ describe("Repositories panel pulse nudge switch (grug#1482)", () => {
     expect((await nudgeSwitch()).getAttribute("aria-checked")).toBe("true");
   });
 });
+
+describe("Activity panel lazy fetch", () => {
+  it("defers the activity request until the Activity tab is opened", async () => {
+    mount();
+    await screen.findByTitle("Toggle the pulse comment nudge for acme/app");
+
+    const fetchMock = vi.mocked(fetch);
+    const activityCalls = () =>
+      fetchMock.mock.calls.filter(([input]) => String(input).includes("/activity"));
+
+    expect(activityCalls()).toHaveLength(0);
+
+    const rail = await screen.findByText("Activity", { selector: ".lbl" });
+    fireEvent.click(rail.closest("button")!);
+    await waitFor(() => expect(activityCalls()).toHaveLength(1));
+  });
+});
