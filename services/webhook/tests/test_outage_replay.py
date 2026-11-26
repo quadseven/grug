@@ -8,7 +8,7 @@ the real dispatcher and Chief against a fake GitHub Checks API.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import check_run_reconciler as reconciler
 import dispatcher
@@ -46,7 +46,7 @@ _GITHUB_DELIVERY = "00000000-0000-4000-8000-000000000001"
 
 
 def _tick(runs_by_sha: dict[str, list[dict]]):
-    """One poller pass; returns (result, dispatch mock)."""
+    """One poller pass with the inline dispatcher and durable queue stubbed."""
     prs = [_OPENED_DURING_OUTAGE, _PUSHED_DURING_OUTAGE]
     with (
         patch("check_run_reconciler._list_open_pull_requests", return_value=prs),
@@ -56,15 +56,16 @@ def _tick(runs_by_sha: dict[str, list[dict]]):
             side_effect=lambda _t, _o, _r, sha: runs_by_sha.get(sha, []),
         ),
         patch("dispatcher.dispatch") as mock_dispatch,
+        patch("rerun.enqueue_rerun") as enqueue_elder,
     ):
         result = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
-    return result, mock_dispatch
+    return result, mock_dispatch, enqueue_elder
 
 
 def test_missed_opened_and_pushed_events_are_replayed_once_per_head():
     # Outage: no check-runs exist for either head.
     runs: dict[str, list[dict]] = {}
-    (dispatched, swept), mock_dispatch = _tick(runs)
+    (dispatched, swept), mock_dispatch, enqueue_elder = _tick(runs)
 
     assert (dispatched, swept) == (2, 0)
     assert mock_dispatch.call_count == 2
@@ -73,11 +74,13 @@ def test_missed_opened_and_pushed_events_are_replayed_once_per_head():
         for c in mock_dispatch.call_args_list
     }
     assert set(by_sha) == {"sha-opened", "sha-pushed-new"}
-    for sha, call in by_sha.items():
-        assert call.kwargs["skip_personas"] == frozenset(), (
-            "both Elder and Chief must run"
-        )
-        assert call.kwargs["delivery_id"] == f"reconcile:o/r:{sha}"
+    for sha, dispatch_call in by_sha.items():
+        assert dispatch_call.kwargs["skip_personas"] == frozenset({"code_reviewer"})
+        assert dispatch_call.kwargs["delivery_id"] == f"reconcile:o/r:{sha}"
+    assert enqueue_elder.call_args_list == [
+        call(install_id=1, repo="o/r", pr_number=1, persona="elder", dedup_key="reconcile:sha-opened"),
+        call(install_id=1, repo="o/r", pr_number=2, persona="elder", dedup_key="reconcile:sha-pushed-new"),
+    ]
 
     # Recovery: the replay posted its runs. The next ticks cause no second
     # review of the same head.
@@ -91,20 +94,23 @@ def test_missed_opened_and_pushed_events_are_replayed_once_per_head():
         }
     )
     for _ in range(2):
-        (dispatched, swept), mock_dispatch = _tick(runs)
+        (dispatched, swept), mock_dispatch, enqueue_elder = _tick(runs)
         assert (dispatched, swept) == (0, 0)
         mock_dispatch.assert_not_called()
+        enqueue_elder.assert_not_called()
 
 
 def test_replay_runs_only_the_persona_the_outage_cost():
     runs = {"sha-opened": [{"name": "Grug - Chief", "status": "completed"}]}
-    _, mock_dispatch = _tick(runs)
-    calls = {
-        c.args[1]["pull_request"]["head"]["sha"]: c
-        for c in mock_dispatch.call_args_list
-    }
-    assert calls["sha-opened"].kwargs["skip_personas"] == frozenset({"tpm"})
-    assert calls["sha-pushed-new"].kwargs["skip_personas"] == frozenset()
+    result, mock_dispatch, enqueue_elder = _tick(runs)
+    assert result == (2, 0)
+    mock_dispatch.assert_called_once()
+    assert mock_dispatch.call_args.args[1]["pull_request"]["head"]["sha"] == "sha-pushed-new"
+    assert mock_dispatch.call_args.kwargs["skip_personas"] == frozenset({"code_reviewer"})
+    assert enqueue_elder.call_args_list == [
+        call(install_id=1, repo="o/r", pr_number=1, persona="elder", dedup_key="reconcile:sha-opened"),
+        call(install_id=1, repo="o/r", pr_number=2, persona="elder", dedup_key="reconcile:sha-pushed-new"),
+    ]
 
 
 @pytest.fixture
