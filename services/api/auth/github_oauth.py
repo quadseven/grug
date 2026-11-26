@@ -135,30 +135,30 @@ class SessionSigningNotProvisioned(RuntimeError):
     """Production has no dedicated session signing key; refuse to run."""
 
 
-def _signing_key_required() -> bool:
-    """Production refuses the fallback only once the deployment opts in with
-    GRUG_SESSION_SIGNING_REQUIRED=1, which is set after the dedicated key is
-    provisioned, so a deploy cannot outrun provisioning (#1870)."""
-    return (
-        os.environ.get("GRUG_ENV", "") == "prod"
-        and os.environ.get("GRUG_SESSION_SIGNING_REQUIRED", "") == "1"
-    )
+def _is_prod() -> bool:
+    return os.environ.get("GRUG_ENV", "") == "prod"
 
 
 def _refuse_fallback_in_production(reason: str) -> None:
-    """When the key is required, the webhook-secret fallback is not allowed."""
-    if _signing_key_required():
-        log.error("session_signing_secret_%s_refusing_fallback", reason)
-        raise SessionSigningNotProvisioned(reason)
+    """Production fails closed: the webhook-secret fallback is refused unless
+    the deployment sets the escape hatch GRUG_SESSION_SIGNING_ALLOW_FALLBACK=1,
+    which is logged at error level on every use (#1870)."""
+    if not _is_prod():
+        return
+    if os.environ.get("GRUG_SESSION_SIGNING_ALLOW_FALLBACK", "") == "1":
+        log.error("session_signing_secret_%s_allowed_fallback_in_production", reason)
+        return
+    log.error("session_signing_secret_%s_refusing_fallback", reason)
+    raise SessionSigningNotProvisioned(reason)
 
 
 def require_session_signing_secret_at_startup() -> None:
-    """Resolve the signing key once at boot so a required key fails fast.
+    """Resolve the signing key once at boot so production fails fast.
 
-    Without the opt-in this is a no-op, so local runs, tests and a production
-    deploy that precedes provisioning keep the documented fallback.
+    Outside production this is a no-op, so local runs and tests keep the
+    documented fallback.
     """
-    if _signing_key_required():
+    if _is_prod():
         _state_secret()
 
 
