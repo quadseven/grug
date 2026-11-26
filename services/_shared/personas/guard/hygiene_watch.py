@@ -503,12 +503,25 @@ def run_hygiene_watch_for_install(
                 # dead-ref violation is never mistaken for a clean scan.
                 log.info("hygiene_watch_dead_ref_unconfigured", extra={"repo": full})
             violations: list[Violation] = []
+            files_scanned = 0
             for path in _discover_files(token, owner, name):
                 text = _fetch_file(token, owner, name, path)
                 if text:
+                    files_scanned += 1
                     violations.extend(scan_file(path, text, dead_patterns))
+            if files_scanned == 0:
+                # A scan that read nothing proves nothing: never call it clean.
+                log.warning(
+                    "hygiene_watch_scanned_nothing",
+                    extra={"repo": full, "files_scanned": 0, "findings": 0},
+                )
+                continue
             if not violations:
-                log.info("hygiene_watch_clean", extra={"repo": full})
+                log.info(
+                    "hygiene_watch_clean",
+                    extra={"repo": full, "files_scanned": files_scanned,
+                           "findings": 0},
+                )
                 continue
             # Read-only lookup BEFORE the claim: a read failure must not
             # burn the weekly window, and before the claim exists there is
