@@ -225,9 +225,24 @@ def test_loader_bug_is_not_masked_as_outage(real_state_secret, monkeypatch):
     assert mod._signing_secret_cache is None
 
 
+def test_prod_keeps_fallback_until_the_key_is_required(real_state_secret, monkeypatch):
+    """Without GRUG_SESSION_SIGNING_REQUIRED, prod starts and signs with the
+    fallback, so a deploy cannot outrun provisioning of the dedicated key."""
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.delenv("GRUG_SESSION_SIGNING_REQUIRED", raising=False)
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [_not_found()]
+
+    mod.require_session_signing_secret_at_startup()
+    assert calls == []
+    assert mod._state_secret() == "webhook"
+
+
 def test_prod_refuses_unprovisioned_fallback(real_state_secret, monkeypatch):
     mod, calls, script = real_state_secret
     monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_REQUIRED", "1")
     monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
     script[_DEDICATED] = [_not_found()]
 
@@ -239,6 +254,7 @@ def test_prod_refuses_unprovisioned_fallback(real_state_secret, monkeypatch):
 def test_prod_refuses_unconfigured_fallback(real_state_secret, monkeypatch):
     mod, calls, _script = real_state_secret
     monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_REQUIRED", "1")
     monkeypatch.delenv("GRUG_SESSION_SIGNING_SECRET_SSM", raising=False)
 
     with pytest.raises(mod.SessionSigningNotProvisioned):
