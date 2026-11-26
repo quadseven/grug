@@ -225,9 +225,29 @@ def test_loader_bug_is_not_masked_as_outage(real_state_secret, monkeypatch):
     assert mod._signing_secret_cache is None
 
 
+def test_prod_with_escape_hatch_logs_error_and_uses_fallback(
+    real_state_secret, monkeypatch, caplog
+):
+    """GRUG_SESSION_SIGNING_ALLOW_FALLBACK=1 lets prod start on the fallback
+    key while the dedicated key is unprovisioned, and says so at error level."""
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_ALLOW_FALLBACK", "1")
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [_not_found()]
+
+    with caplog.at_level("ERROR", logger="grug.api.auth"):
+        mod.require_session_signing_secret_at_startup()
+    assert mod._state_secret() == "webhook"
+    assert _WEBHOOK in calls
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("allowed_fallback" in r.getMessage() for r in errors)
+
+
 def test_prod_refuses_unprovisioned_fallback(real_state_secret, monkeypatch):
     mod, calls, script = real_state_secret
     monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.delenv("GRUG_SESSION_SIGNING_ALLOW_FALLBACK", raising=False)
     monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
     script[_DEDICATED] = [_not_found()]
 
@@ -239,6 +259,7 @@ def test_prod_refuses_unprovisioned_fallback(real_state_secret, monkeypatch):
 def test_prod_refuses_unconfigured_fallback(real_state_secret, monkeypatch):
     mod, calls, _script = real_state_secret
     monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.delenv("GRUG_SESSION_SIGNING_ALLOW_FALLBACK", raising=False)
     monkeypatch.delenv("GRUG_SESSION_SIGNING_SECRET_SSM", raising=False)
 
     with pytest.raises(mod.SessionSigningNotProvisioned):
@@ -251,3 +272,25 @@ def test_startup_check_is_noop_outside_prod(real_state_secret, monkeypatch):
     monkeypatch.delenv("GRUG_ENV", raising=False)
     mod.require_session_signing_secret_at_startup()
     assert calls == []
+
+
+def test_non_prod_uses_the_fallback_without_the_escape_hatch(real_state_secret, monkeypatch):
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_ENV", "dev")
+    monkeypatch.delenv("GRUG_SESSION_SIGNING_ALLOW_FALLBACK", raising=False)
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [_not_found()]
+
+    mod.require_session_signing_secret_at_startup()
+    assert mod._state_secret() == "webhook"
+    assert _WEBHOOK in calls
+
+
+def test_the_api_deployment_sets_the_escape_hatch_until_the_key_exists():
+    """Prod fails closed by default, so the API manifest must opt in to the
+    fallback explicitly while the dedicated key is unprovisioned."""
+    from pathlib import Path
+
+    manifest = Path(__file__).resolve().parents[3] / "k8s" / "api-deployment.yaml"
+    text = manifest.read_text()
+    assert "{name: GRUG_SESSION_SIGNING_ALLOW_FALLBACK, value: \"1\"}" in text
