@@ -125,6 +125,15 @@ def test_five_line_rewrite_in_one_hunk_anchors_the_span():
     ast.parse("\n".join(lines[:8] + new.split("\n") + lines[13:]))
 
 
+def test_span_cannot_replace_head_code_that_differs_from_its_hunk():
+    f = _finding(4, "    if options is None:\n        return []")
+    text = FILE.replace("        return None", "        return default")
+    assert _span(f, text=text) is None
+    comment = _comment(f, text=text)
+    assert "```suggestion" not in comment.body
+    assert "return []" in comment.body
+
+
 def test_span_leaving_the_hunk_falls_back_to_prose():
     # The hunk shows lines 3-5 only; the guard fits, the split call does not.
     diff = _diff(
@@ -172,9 +181,9 @@ def test_span_crossing_a_deleted_line_falls_back_to_prose():
 
 
 def test_span_on_unchanged_context_lines_still_anchors():
-    # Only line 8 is added; the rest of the call is plain context GitHub shows.
+    # Only line 9 is added; the rest of the call is plain context GitHub shows.
     diff = _diff(
-        "@@ -9,6 +9,6 @@\n"
+        "@@ -8,6 +8,7 @@\n"
         " def build(a, b, c):\n"
         "+    result = combine(\n"
         "         a,\n"

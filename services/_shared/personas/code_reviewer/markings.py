@@ -1459,10 +1459,13 @@ def _muted_lines(
     )
 
 
-def _checked_comment_body(f: Finding, file_text: str, precedent_note: str) -> str:
+def _checked_comment_body(
+    f: Finding, file_text: str, precedent_note: str,
+    hunks: tuple[HunkView, ...] | None = None,
+) -> str:
     """Inline body whose committable block, if any, passed `checked_suggestion`.
     A fix that fails the check still renders, as prose under "Fix"."""
-    checked = checked_suggestion(f, f.line, file_text)
+    checked = checked_suggestion(f, f.line, file_text, hunks=hunks)
     if checked is None:
         return _inline_comment_body(f, precedent_note, committable=False)
     return _inline_comment_body(replace(f, suggestion=checked), precedent_note)
@@ -1476,13 +1479,13 @@ def _checked_inline_comment(
     verified anchors the span (start_line..line, both RIGHT); every other
     finding anchors its own line exactly as before (#1759)."""
     span = (
-        None if checked_suggestion(f, f.line, file_text) is not None
+        None if checked_suggestion(f, f.line, file_text, hunks=hunks) is not None
         else checked_span_suggestion(f, file_text, hunks)
     )
     if span is None:
         return InlineComment(
             path=f.file, line=f.line,
-            body=_checked_comment_body(f, file_text, precedent_note),
+            body=_checked_comment_body(f, file_text, precedent_note, hunks),
         )
     return SpanComment(
         path=f.file, line=span.end_line, start_line=span.start_line,
@@ -1595,9 +1598,8 @@ def build_review_result(
     offered as a committable block only after `checked_suggestion` (#1149)
     verifies it against that text; a file with no loaded text gets prose.
 
-    `diff_text` (#1759) is the PR diff. A multi-line fix is offered as a block
-    only when its span sits inside one hunk of it; without a diff every
-    multi-line fix stays prose."""
+    `diff_text` is the PR diff. A fix is committable only when the exact
+    original line or span is visible on the right side of one hunk."""
     if evaluation.degraded_reason not in (None, "", *PUBLISHABLE_DEGRADATIONS):
         return None, ()
     new_findings = dedup_findings(evaluation.findings, prior_keys)

@@ -13,7 +13,7 @@ the exact one-line fix out in prose (a null-deref finding gave
 `checked_suggestion` is the single gate every block passes through:
 
   (a) the finding's own single-line suggestion, kept only if it changes the
-      anchored line and, for Python, the file still parses with it applied;
+      anchored line and, for Python, keeps its recognizable anchor and parses;
   (b) when there is none, the message's ONE inline code span, promoted only
       if it starts with the anchored line's assignment target or leading
       statement keyword, and it passes the same check;
@@ -49,6 +49,7 @@ import io
 import keyword
 import re
 import tokenize
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,6 +67,7 @@ _ASSIGN_TARGET = re.compile(
     r"^([A-Za-z_][\w.]*(?:\[[^\]]*\])?)\s*(?::[^=]+)?(?:[-+*/%&|^@]|//|>>|<<|\*\*)?=(?!=)"
 )
 _LEADING_WORD = re.compile(r"^([A-Za-z_]\w*)")
+_CALL_HEAD = re.compile(r"^([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*)\s*\(")
 
 # Prose detection for files the gate cannot parse-check (mod-overseer PR
 # 1083). The sign-off closes every review message, so it never belongs in
@@ -91,6 +93,7 @@ _BARE_WORD = re.compile(r"(?<![\w.])([A-Za-z]+)(?![\w(])")
 
 def checked_suggestion(
     finding: Finding, anchored_line: int, file_text: str,
+    *, expected_line: str | None = None, hunks: tuple[HunkView, ...] | None = None,
 ) -> str | None:
     """The exact replacement for `anchored_line` (1-based) in `file_text`,
     or None when no fix survives the checks. See the module docstring."""
@@ -98,6 +101,12 @@ def checked_suggestion(
     if not 1 <= anchored_line <= len(lines):
         return None
     original = lines[anchored_line - 1]
+    if expected_line is not None and original != expected_line:
+        return None
+    if hunks is not None and not any(
+        view.matches(anchored_line, [original]) for view in hunks
+    ):
+        return None
     # A filled field, even blank or fenced, is the model's own answer; the
     # prose span is read only when the field is None. A span that merely
     # quotes the anchored line is dropped by the unchanged-line check below.
@@ -111,7 +120,10 @@ def checked_suggestion(
     if candidate.rstrip() == original.rstrip():
         return None
     if finding.file.endswith(_PYTHON_SUFFIXES):
-        if not _still_parses(lines, anchored_line, candidate):
+        if not (
+            _same_python_anchor(original, candidate)
+            and _still_parses(lines, anchored_line, candidate)
+        ):
             return None
     elif _reads_as_prose(candidate, finding.file):
         return None
@@ -221,6 +233,27 @@ def _line_anchor(stripped_line: str) -> str | None:
     return None
 
 
+def _same_python_anchor(original: str, candidate: str) -> bool:
+    """Keep a recognizable statement or call anchor, and keep code as code.
+
+    Fragments such as dictionary entries still rely on source evidence and
+    parsing. The gate does not guess a statement anchor for those fragments.
+    """
+    original, candidate = original.strip(), candidate.strip()
+    return (
+        bool(original) and original.startswith("#") == candidate.startswith("#")
+        and _python_anchor(original) == _python_anchor(candidate)
+    )
+
+
+def _python_anchor(line: str) -> tuple[str, str] | None:
+    if anchor := _line_anchor(line):
+        return "statement", anchor
+    if call := _CALL_HEAD.match(line):
+        return "call", "".join(call[1].split())
+    return None
+
+
 def _with_indent_of(candidate: str, original: str) -> str:
     """Give an unindented candidate the anchored line's indentation. Models
     and prose drop it; GitHub commits the block verbatim as the whole line."""
@@ -280,18 +313,20 @@ _HUNK_START = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)")
 class HunkView:
     """The right (new) side of one hunk, as GitHub lets a comment anchor to it.
 
-    `visible` is every new-side line the hunk shows, added or context.
+    `right_lines` holds the text of the visible added and context lines.
     `cuts` holds each visible line that a deleted line follows, so a span that
     would run from that line to the next crosses the deletion."""
 
-    visible: frozenset[int]
+    right_lines: dict[int, str]
     cuts: frozenset[int]
 
-    def holds(self, start: int, end: int) -> bool:
-        """True when start..end are all visible with no deletion between."""
-        if not all(n in self.visible for n in range(start, end + 1)):
+    def matches(self, start: int, lines: Sequence[str]) -> bool:
+        """Check the exact new-side text with no deletion within the span."""
+        if not all(
+            self.right_lines.get(number) == text for number, text in enumerate(lines, start)
+        ):
             return False
-        return not any(n in self.cuts for n in range(start, end))
+        return not any(n in self.cuts for n in range(start, start + len(lines) - 1))
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,19 +360,19 @@ def _hunk_view(body: str) -> HunkView | None:
     if header is None:
         return None
     cursor = int(header.group(1))
-    visible: set[int] = set()
+    right_lines: dict[int, str] = {}
     cuts: set[int] = set()
     for raw in rows[1:]:
         if raw.startswith("\\"):
             continue
         if raw.startswith("-"):
-            if cursor - 1 in visible:
+            if cursor - 1 in right_lines:
                 cuts.add(cursor - 1)
             continue
         # Added, context, or an empty context line some tools trim.
-        visible.add(cursor)
+        right_lines[cursor] = raw[1:]
         cursor += 1
-    return HunkView(frozenset(visible), frozenset(cuts))
+    return HunkView(right_lines, frozenset(cuts))
 
 
 def checked_span_suggestion(
@@ -365,9 +400,9 @@ def checked_span_suggestion(
     start, end = span
     if end - start + 1 > MAX_SPAN_LINES:
         return None
-    if not any(view.holds(start, end) for view in hunks):
-        return None
     original = lines[start - 1:end]
+    if not any(view.matches(start, original) for view in hunks):
+        return None
     replacement = _indented_like(replacement, original[0])
     if [r.rstrip() for r in replacement] == [o.rstrip() for o in original]:
         return None

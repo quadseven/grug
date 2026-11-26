@@ -40,6 +40,14 @@ def _finding(
     )
 
 
+def _added_diff(path, text):
+    lines = text.splitlines()
+    return (
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+        f"@@ -0,0 +1,{len(lines)} @@\n" + "\n".join("+" + line for line in lines)
+    )
+
+
 def test_prose_replacement_is_promoted_to_suggestion():
     """The live miss: the exact one-line fix sat in the message as a code
     span, the suggestion field was empty, and no block was offered."""
@@ -58,11 +66,60 @@ def test_suggestion_that_breaks_parse_renders_as_prose():
     result, _ = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
         file_contents={"app/pick.py": _NULL_DEREF_FILE},
+        diff_text=_added_diff("app/pick.py", _NULL_DEREF_FILE),
     )
     assert result is not None
     body = result.comments[0].body
     assert "```suggestion" not in body
     assert "next((o for o in options, None)" in body
+
+
+@pytest.mark.parametrize(("text", "line", "candidate"), [
+    ('spec = {\n    "query": "count(results)",\n    "window": 5,\n}\n', 2,
+     "    # pages = load_pages()"),
+    ("ending = '\\n'\nlines.append(value + ending)\n", 1,
+     "lines.append(value + ending)"),
+    ("count = load_count()\n", 1, "total = load_count()"),
+    ("pending.append(value)\nunrelated.clear()\n", 1, "unrelated.clear()"),
+    ("pending.append(value)\n", 1, "pending.clear()"),
+])
+def test_parseable_replacement_for_a_different_python_line_stays_as_prose(
+    text, line, candidate,
+):
+    path = "app/t.py"
+    finding = _finding(suggestion=candidate, file=path, line=line)
+    lines = text.splitlines()
+    ast.parse("\n".join(lines[:line - 1] + [candidate] + lines[line:]))
+    assert checked_suggestion(finding, line, text) is None
+    result, _ = cr_dispatch.build_review_result(
+        CodeReviewEvaluation(findings=(finding,), conclusion="failure"),
+        head_sha="a" * 40, event="COMMENT", file_contents={path: text},
+        diff_text=_added_diff(path, text),
+    )
+    body = result.comments[0].body
+    assert "```suggestion" not in body
+    assert candidate.strip() in body
+
+
+def test_same_call_can_change_arguments():
+    text = "pending . append(value)\n"
+    finding = _finding(suggestion="pending.append(normalize(value))", line=1)
+    assert checked_suggestion(finding, 1, text) == "pending.append(normalize(value))"
+
+
+def test_inline_suggestion_requires_the_hunk_line_to_match_head_text():
+    path = "app/t.py"
+    finding = _finding(suggestion="count = 3", file=path, line=1)
+    diff = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+    diff += "@@ -1 +1 @@\n-count = 0\n+count = 1\n"
+    result, _ = cr_dispatch.build_review_result(
+        CodeReviewEvaluation(findings=(finding,), conclusion="failure"),
+        head_sha="a" * 40, event="COMMENT", file_contents={path: "count = 2\n"},
+        diff_text=diff,
+    )
+    body = result.comments[0].body
+    assert "```suggestion" not in body
+    assert "count = 3" in body
 
 
 def test_ruff_safe_fix_becomes_suggestion():
@@ -159,7 +216,8 @@ def test_dispatch_inline_body_carries_checked_suggestion_block():
     )
     result, posted = cr_dispatch.build_review_result(
         evaluation, head_sha="a" * 40, event="COMMENT",
-        file_contents={"app/pick.py": _NULL_DEREF_FILE},
+        file_contents={"app/pick.py": _NULL_DEREF_FILE.replace("\n", "\r\n")},
+        diff_text=_added_diff("app/pick.py", _NULL_DEREF_FILE),
     )
     assert result is not None
     assert posted == (finding,)

@@ -63,7 +63,11 @@ def _fix_still_applies(
     rec: FindingRecord, file_text: str,
 ) -> str | None:
     """Return the verified replacement line, or None when it no longer applies."""
-    return checked_suggestion(_FixCandidate(rec), rec.line, file_text)
+    if not rec.evidence:
+        return None
+    return checked_suggestion(
+        _FixCandidate(rec), rec.line, file_text, expected_line=rec.evidence,
+    )
 
 
 def _default_post_reply(
