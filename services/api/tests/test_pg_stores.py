@@ -1134,6 +1134,28 @@ def test_release_pulse_nudge_allows_retry(pg):
     assert store.claim_pulse_nudge(1, "o/r", 7) is True  # slot free again
 
 
+def test_claim_stale_neutral_requeue_is_win_once_per_head(pg):
+    """grug#1872: the stale-NEUTRAL Elder re-queue is held per (install,
+    repo, head), so a re-review that itself concludes NEUTRAL is never
+    re-queued again on the same head."""
+    from adapters import pg_install_store as store
+
+    assert store.claim_stale_neutral_requeue(1, "o/r", "abc") is True
+    assert store.claim_stale_neutral_requeue(1, "o/r", "abc") is False
+    assert store.claim_stale_neutral_requeue(1, "o/r", "def") is True    # new push
+    assert store.claim_stale_neutral_requeue(1, "o/r2", "abc") is True   # other repo
+    assert store.claim_stale_neutral_requeue(2, "o/r", "abc") is True    # other install
+
+
+def test_release_stale_neutral_requeue_allows_retry(pg):
+    """A failed rerun-queue send releases the claim so the next tick retries."""
+    from adapters import pg_install_store as store
+
+    assert store.claim_stale_neutral_requeue(1, "o/r", "abc") is True
+    store.release_stale_neutral_requeue(1, "o/r", "abc")
+    assert store.claim_stale_neutral_requeue(1, "o/r", "abc") is True
+
+
 def test_warder_pulse_flags_flow_through_config(pg):
     """Codex PR #489: warder_enabled/pulse_enabled reachable end-to-end
     through the generic store plumbing."""

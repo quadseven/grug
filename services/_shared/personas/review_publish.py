@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Literal
 from urllib.parse import quote
@@ -309,11 +310,56 @@ def fetch_pr_diff_with_scope(
 # the LLM context budget. Files beyond the cap (and any that error) degrade to
 # diff-only - correctness is unchanged, only the extra context is skipped.
 _MAX_CONTEXT_FILES = 20
+_FETCH_MAX_WORKERS = 8
 
 
 class ContextFilesTruncated(RuntimeError):
     """More paths than `fetch_file_contents` reads, for a caller that reads
     an absent file as a fact."""
+
+
+def _fetch_one_file(
+    install_token: str,
+    owner: str,
+    repo: str,
+    path: str,
+    ref: str,
+    *,
+    only_404_skips: bool = False,
+) -> tuple[str, str | None]:
+    """Fetch one file's raw contents at `ref`, returning `(path, text | None)`."""
+    try:
+        # quote the path SEGMENT (safe="/" keeps the dir separators): a
+        # filename with a space, `#`, `?`, or unicode would otherwise
+        # truncate/reshape the URL -> silent 404 -> diff-only degrade that
+        # masks the encoding bug as a "fetch skip".
+        resp = httpx.get(
+            f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(path, safe='/')}",
+            params={"ref": ref},
+            headers={
+                "Authorization": f"Bearer {install_token}",
+                # `.raw` returns the file body directly (no base64 JSON).
+                "Accept": "application/vnd.github.raw",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=DIFF_FETCH_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return path, resp.text
+    except (httpx.HTTPStatusError, httpx.RequestError) as e:
+        if only_404_skips and not (
+            isinstance(e, httpx.HTTPStatusError)
+            and e.response.status_code == httpx.codes.NOT_FOUND
+        ):
+            raise
+        # Deleted-in-PR / binary / rename-old-path / transient - diff-only
+        # is the correct, safe degrade. Log so a systemic fetch outage is
+        # visible (not silently reverting every review to hunk-blind).
+        log.info(
+            "code_review_file_fetch_skipped",
+            extra={"path": path, "ref": ref, "error": str(e)},
+        )
+        return path, None
 
 
 def fetch_file_contents(
@@ -337,40 +383,28 @@ def fetch_file_contents(
     """
     if only_404_skips and len(paths) > _MAX_CONTEXT_FILES:
         raise ContextFilesTruncated(f"{len(paths)} paths over {_MAX_CONTEXT_FILES}")
-    contents: dict[str, str] = {}
-    for path in paths[:_MAX_CONTEXT_FILES]:
-        try:
-            # quote the path SEGMENT (safe="/" keeps the dir separators): a
-            # filename with a space, `#`, `?`, or unicode would otherwise
-            # truncate/reshape the URL -> silent 404 -> diff-only degrade that
-            # masks the encoding bug as a "fetch skip".
-            resp = httpx.get(
-                f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(path, safe='/')}",
-                params={"ref": ref},
-                headers={
-                    "Authorization": f"Bearer {install_token}",
-                    # `.raw` returns the file body directly (no base64 JSON).
-                    "Accept": "application/vnd.github.raw",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                },
-                timeout=DIFF_FETCH_TIMEOUT,
+    target_paths = paths[:_MAX_CONTEXT_FILES]
+    if not target_paths:
+        return {}
+    if len(target_paths) == 1:
+        path, text = _fetch_one_file(
+            install_token, owner, repo, target_paths[0], ref,
+            only_404_skips=only_404_skips,
+        )
+        return {path: text} if text is not None else {}
+
+    workers = min(_FETCH_MAX_WORKERS, len(target_paths))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(
+                _fetch_one_file,
+                install_token, owner, repo, path, ref,
+                only_404_skips=only_404_skips,
             )
-            resp.raise_for_status()
-            contents[path] = resp.text
-        except (httpx.HTTPStatusError, httpx.RequestError) as e:
-            if only_404_skips and not (
-                isinstance(e, httpx.HTTPStatusError)
-                and e.response.status_code == httpx.codes.NOT_FOUND
-            ):
-                raise
-            # Deleted-in-PR / binary / rename-old-path / transient - diff-only
-            # is the correct, safe degrade. Log so a systemic fetch outage is
-            # visible (not silently reverting every review to hunk-blind).
-            log.info(
-                "code_review_file_fetch_skipped",
-                extra={"path": path, "ref": ref, "error": str(e)},
-            )
-    return contents
+            for path in target_paths
+        ]
+        results = [future.result() for future in futures]
+    return {path: text for path, text in results if text is not None}
 
 
 def fetch_review_comment_body(

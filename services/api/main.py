@@ -21,7 +21,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
 from admin import router as admin_router
-from auth.github_oauth import router as github_oauth_router
+from auth.github_oauth import (
+    require_session_signing_secret_at_startup,
+    router as github_oauth_router,
+)
 from cf_auth import CfAuthMiddleware
 from installations import router as installations_router
 from learnings import router as learnings_router
@@ -38,6 +41,9 @@ _STARTED_AT = datetime.now(timezone.utc)
 # Roles Anywhere boot proof (#389): import-time + UNGUARDED on purpose -
 # rationale in the aws_identity module docstring.
 prove_roles_anywhere_identity()
+
+# Production must have a provisioned session signing key (#1870).
+require_session_signing_secret_at_startup()
 
 app = FastAPI(
     title="grug-api",

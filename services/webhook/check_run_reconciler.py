@@ -10,6 +10,8 @@ App webhook-deliveries log `delivery_replay.py` (#407) already replays
 from, because from GitHub's side the delivery to grug's inbound endpoint
 succeeded with a 2xx. This compares what check-runs exist against what
 SHOULD exist for currently-open PRs, and dispatches the missing ones.
+Missing Elder runs go directly to the durable rerun lane; other missing
+personas use the webhook dispatcher.
 
 **Sweep** (a check-run stuck `in_progress` forever): GitHub never expires
 one, so an orphaned run - Elder's own, mid-review 503 - hangs indefinitely,
@@ -19,6 +21,13 @@ run on the same commit) past a bounded age with `conclusion: failure` and
 a body that says plainly that it errored. For Elder and Chief - the runs a
 consumer restart can orphan mid-review - the same pass also re-queues the
 persona exactly once (grug#1275; see `reconcile_repo`).
+
+**Stale NEUTRAL** (grug#1872): when a repo's Elder moves from advisory to
+blocking, every open PR keeps the NEUTRAL Elder it got under advisory.
+That run is complete, so the reconcile half counts it present and nothing
+re-reviews the PR until a push. The same per-PR pass re-queues Elder once
+per head on the durable rerun lane, with no PR comment, bounded per tick
+(see `_requeue_stale_neutral_elder`).
 
 Store-driven targeting (`check_run_reconcile_enabled`), same opt-in shape
 as dep_watch/pulse/reopen_watch (codex PR #489's rationale: no
@@ -45,13 +54,20 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-from adapters.install_store import is_persona_enabled, list_check_run_reconcile_repos
+from adapters.install_store import (
+    claim_stale_neutral_requeue,
+    get_repo_config,
+    is_persona_enabled,
+    list_check_run_reconcile_repos,
+    release_stale_neutral_requeue,
+)
 from github_app_auth import with_install_token_retry
 from github_checks_client import CheckRunResult, list_check_runs_for_ref, patch_check_run
 from personas import registry as persona_registry
@@ -73,6 +89,28 @@ _MAX_PR_PAGES = 10
 _STUCK_IN_PROGRESS_MAX_AGE_MINUTES = int(
     os.getenv("GRUG_CHECK_RUN_STUCK_MAX_AGE_MINUTES", "60")
 )
+
+# grug#1872: stale-NEUTRAL Elder re-queues allowed per poller tick, across
+# every install and repo. Each one is a full Elder review on the consumers
+# plus its GitHub calls, so a mode switch on a repo with dozens of open PRs
+# drains over several ticks instead of one burst against the App budget.
+_STALE_NEUTRAL_REQUEUE_MAX_PER_TICK = int(
+    os.getenv("GRUG_STALE_NEUTRAL_REQUEUE_MAX_PER_TICK", "10")
+)
+
+
+class StaleNeutralBudget:
+    """How many stale-NEUTRAL Elder re-queues this tick may still send.
+    `deferred` counts PRs seen past the cap; they are left unclaimed, so a
+    later tick re-queues them."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(0, limit)
+        self.requeued = 0
+        self.deferred = 0
+
+    def available(self) -> bool:
+        return self.requeued < self.limit
 
 
 def _list_open_pull_requests(token: str, owner: str, repo: str) -> list[dict[str, Any]]:
@@ -236,15 +274,49 @@ def _synthetic_pull_request_payload(
     }
 
 
+def _elder_blocking_reader(installation_id: int, repo_id: int) -> Callable[[], bool]:
+    """The repo's Elder mode (`code_reviewer_blocking`, the same store
+    field `rerun._elder_blocking_from_pr` reads), read lazily at most once
+    per repo pass: only a PR whose head carries a NEUTRAL Elder needs it.
+    An unreadable mode is logged and read as not blocking - a store error
+    is no proof the NEUTRAL is stale, and re-queueing on a guess would
+    spend review budget on a repo that may still be advisory."""
+    cached: list[bool] = []
+
+    def read() -> bool:
+        if not cached:
+            try:
+                blocking = get_repo_config(installation_id, repo_id).get(
+                    "code_reviewer_blocking", False
+                ) is True
+            except Exception as e:  # noqa: BLE001 - unknown mode re-queues nothing
+                log.warning(
+                    "check_run_stale_neutral_mode_unreadable",
+                    extra={
+                        "installation_id": installation_id, "repo_id": repo_id,
+                        "kind": type(e).__name__,
+                    },
+                )
+                blocking = False
+            cached.append(blocking)
+        return cached[0]
+
+    return read
+
+
 def reconcile_repo(
     token: str, installation_id: int, owner: str, repo: str, repo_id: int,
+    *, stale_budget: StaleNeutralBudget | None = None,
 ) -> tuple[int, int]:
     """Reconcile + sweep one repo's open PRs. Returns (dispatched, swept):
     PRs that had a missing (or re-queued) persona run started, and stuck
     check-runs closed out. Best-effort per PR - one PR's failure must not
-    abort the rest of the repo's pass."""
+    abort the rest of the repo's pass. `stale_budget` is the tick's shared
+    stale-NEUTRAL cap (grug#1872); a caller without one gets a fresh one."""
     dispatched = 0
     swept = 0
+    budget = stale_budget or StaleNeutralBudget(_STALE_NEUTRAL_REQUEUE_MAX_PER_TICK)
+    elder_blocking = _elder_blocking_reader(installation_id, repo_id)
     for pr in _list_open_pull_requests(token, owner, repo):
         head_sha = (pr.get("head") or {}).get("sha")
         pr_number = pr.get("number")
@@ -253,6 +325,7 @@ def reconcile_repo(
         try:
             pr_dispatched, pr_swept = _reconcile_pr(
                 token, installation_id, owner, repo, repo_id, pr,
+                elder_blocking, budget,
             )
             dispatched += pr_dispatched
             swept += pr_swept
@@ -269,10 +342,12 @@ def reconcile_repo(
 
 def _reconcile_pr(
     token: str, installation_id: int, owner: str, repo: str, repo_id: int,
-    pr: dict[str, Any],
+    pr: dict[str, Any], elder_blocking: Callable[[], bool],
+    stale_budget: StaleNeutralBudget,
 ) -> tuple[int, int]:
     """One PR: sweep its stuck runs, re-queue a stuck Elder/Chief once
-    (grug#1275), and dispatch any persona with no run at all (grug#947).
+    (grug#1275), re-queue a stale NEUTRAL Elder once (grug#1872), and
+    dispatch any persona with no run at all (grug#947).
     Returns (1 if anything was started else 0, runs swept)."""
     from dispatcher import dispatch  # local import: heavy persona graph
 
@@ -281,33 +356,54 @@ def _reconcile_pr(
     runs = list_check_runs_for_ref(token, owner, repo, head_sha)
     expected = expected_personas(installation_id, repo_id)
     missing, present_keys, stuck = _split_missing_present_stuck(runs, expected)
-    requeue = _requeue_specs(expected, stuck)
-    # Elder rides the durable rerun lane; it is enqueued BEFORE the sweep so
-    # a failed send is known when the swept run's summary is written - that
-    # run then honestly asks for a push instead of promising a re-review.
-    elder_queued = any(spec.check_run_name == _ELDER_CHECK_RUN_NAME for spec in requeue)
-    if elder_queued and not _enqueue_elder_recovery(
-        installation_id, owner, repo, pr_number,
-        [run for run in stuck if str(run.get("name") or "") == _ELDER_CHECK_RUN_NAME],
-    ):
-        requeue = [s for s in requeue if s.check_run_name != _ELDER_CHECK_RUN_NAME]
+    requeue = _queue_stuck_elder(
+        installation_id, owner, repo, pr_number, _requeue_specs(expected, stuck), stuck,
+    )
     swept = _sweep_stuck_runs(
         token, installation_id, owner, repo, pr_number, head_sha, stuck,
         {spec.check_run_name for spec in requeue},
     )
-    # Everything else (Chief, and every missing persona) goes through one
-    # inline dispatch.
+    # Missing Elder runs need the same durable lane as stuck-run recovery:
+    # the poller process can exit before a local review thread finishes.
+    missing_elder = {s.key for s in missing if s.check_run_name == _ELDER_CHECK_RUN_NAME}
     inline_requeue = [s for s in requeue if s.check_run_name != _ELDER_CHECK_RUN_NAME]
-    to_run = {spec.key for spec in missing} | {spec.key for spec in inline_requeue}
+    to_run = ({spec.key for spec in missing} - missing_elder) | {spec.key for spec in inline_requeue}
     if to_run:
         dispatch(
             "pull_request",
             _synthetic_pull_request_payload(installation_id, owner, repo, repo_id, pr),
             delivery_id=_recovery_delivery_id(owner, repo, head_sha, inline_requeue, stuck),
-            skip_personas=frozenset(key for key in present_keys if key not in to_run),
+            skip_personas=frozenset((present_keys | missing_elder) - to_run),
         )
-    if not (to_run or requeue):
-        return 0, swept
+    missing_elder_queued = False
+    if missing_elder:
+        from rerun import enqueue_rerun  # local import: rerun imports this module
+
+        try:
+            enqueue_rerun(
+                install_id=installation_id,
+                repo=f"{owner}/{repo}",
+                pr_number=pr_number,
+                persona="elder",
+                dedup_key=f"reconcile:{head_sha}",
+            )
+        except Exception as e:  # noqa: BLE001 - continue reconciliation after a failed send
+            log.error(
+                "check_run_missing_elder_enqueue_failed",
+                extra={
+                    "installation_id": installation_id, "owner": owner, "repo": repo,
+                    "pr_number": pr_number, "head_sha": head_sha[:8],
+                    "kind": type(e).__name__,
+                },
+            )
+        else:
+            missing_elder_queued = True
+    stale_requeued = _requeue_stale_neutral_elder(
+        installation_id, owner, repo, pr_number, head_sha, runs, expected,
+        elder_blocking, stale_budget,
+    )
+    if not (to_run or requeue or missing_elder_queued):
+        return (1 if stale_requeued else 0), swept
     log.info(
         "check_run_reconcile_dispatched",
         extra={
@@ -318,6 +414,23 @@ def _reconcile_pr(
         },
     )
     return 1, swept
+
+
+def _queue_stuck_elder(
+    installation_id: int, owner: str, repo: str, pr_number: int,
+    requeue: list[persona_registry.PersonaSpec], stuck: list[dict[str, Any]],
+) -> list[persona_registry.PersonaSpec]:
+    """Send a stuck Elder's re-queue (grug#1275) and return the specs that
+    are really re-queued. Elder rides the durable rerun lane; it is
+    enqueued BEFORE the sweep so a failed send is known when the swept
+    run's summary is written - that run then honestly asks for a push
+    instead of promising a re-review."""
+    if not any(spec.check_run_name == _ELDER_CHECK_RUN_NAME for spec in requeue):
+        return requeue
+    elder_runs = [run for run in stuck if str(run.get("name") or "") == _ELDER_CHECK_RUN_NAME]
+    if _enqueue_elder_recovery(installation_id, owner, repo, pr_number, elder_runs):
+        return requeue
+    return [s for s in requeue if s.check_run_name != _ELDER_CHECK_RUN_NAME]
 
 
 def _sweep_stuck_runs(
@@ -400,6 +513,76 @@ def _enqueue_elder_recovery(
     return True
 
 
+def _stale_neutral_elder_run(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The head's completed NEUTRAL Elder run, if it has one. The listing is
+    `filter=latest`, so there is at most one Elder run per head."""
+    for run in runs:
+        if (
+            str(run.get("name") or "") == _ELDER_CHECK_RUN_NAME
+            and str(run.get("status") or "") == "completed"
+            and str(run.get("conclusion") or "") == "neutral"
+        ):
+            return run
+    return None
+
+
+def _requeue_stale_neutral_elder(
+    installation_id: int, owner: str, repo: str, pr_number: int, head_sha: str,
+    runs: list[dict[str, Any]], expected: list[persona_registry.PersonaSpec],
+    elder_blocking: Callable[[], bool], budget: StaleNeutralBudget,
+) -> bool:
+    """grug#1872: a NEUTRAL Elder on the head of a repo whose Elder is now
+    blocking is stale - it is the advisory verdict from before the switch,
+    and a blocking merge gate never accepts it. Re-queue Elder once on the
+    durable rerun lane (the `/grug improve` path, same as grug#1275), with
+    no PR comment. Returns True when a re-review was queued.
+
+    Once per HEAD, held in the store (`claim_stale_neutral_requeue`). The
+    SQS dedup id is the stale run's id, but that alone cannot stop a loop:
+    the re-queued review posts a new run, and a blocking-mode Elder may
+    conclude NEUTRAL on purpose. The per-tick `budget` bounds the burst;
+    a PR past it is not claimed, so a later tick picks it up."""
+    run = _stale_neutral_elder_run(runs)
+    if run is None:
+        return False
+    if not any(spec.check_run_name == _ELDER_CHECK_RUN_NAME for spec in expected):
+        return False
+    if not elder_blocking():
+        return False
+    if not budget.available():
+        budget.deferred += 1
+        return False
+    repo_full = f"{owner}/{repo}"
+    if not claim_stale_neutral_requeue(installation_id, repo_full, head_sha):
+        return False
+
+    from rerun import enqueue_rerun  # local import: rerun imports this module
+
+    fields = {
+        "installation_id": installation_id, "owner": owner, "repo": repo,
+        "pr_number": pr_number, "head_sha": head_sha[:8],
+        "check_run_id": run.get("id"),
+    }
+    try:
+        enqueue_rerun(
+            install_id=installation_id,
+            repo=repo_full,
+            pr_number=pr_number,
+            persona="elder",
+            dedup_key=f"stale-neutral:{run.get('id')}",
+        )
+    except Exception as e:  # noqa: BLE001 - one PR's send must not abort the pass
+        log.error(
+            "check_run_stale_neutral_requeue_failed",
+            extra={**fields, "kind": type(e).__name__},
+        )
+        release_stale_neutral_requeue(installation_id, repo_full, head_sha)
+        return False
+    budget.requeued += 1
+    log.info("check_run_stale_neutral_requeued", extra=fields)
+    return True
+
+
 def _recovery_delivery_id(
     owner: str, repo: str, head_sha: str,
     requeue: list[persona_registry.PersonaSpec], stuck: list[dict[str, Any]],
@@ -441,6 +624,7 @@ def reconcile_installs(installs: list[int]) -> tuple[int, int]:
     total = 0
     failed = 0
     total_swept = 0
+    stale_budget = StaleNeutralBudget(_STALE_NEUTRAL_REQUEUE_MAX_PER_TICK)
     for install_id in installs:
         try:
             repos = list_check_run_reconcile_repos(install_id)
@@ -450,7 +634,8 @@ def reconcile_installs(installs: list[int]) -> tuple[int, int]:
                 install_id,
                 lambda token, iid=install_id, rs=repos: [
                     reconcile_repo(token, iid, r["full_name"].split("/", 1)[0],
-                                    r["full_name"].split("/", 1)[1], r["id"])
+                                    r["full_name"].split("/", 1)[1], r["id"],
+                                    stale_budget=stale_budget)
                     for r in rs
                 ],
             ) or []
@@ -463,4 +648,11 @@ def reconcile_installs(installs: list[int]) -> tuple[int, int]:
             )
             failed += 1
     _emit_stuck_check_run_metric(total_swept)
+    log.info(
+        "check_run_stale_neutral_tick",
+        extra={
+            "requeued": stale_budget.requeued, "deferred": stale_budget.deferred,
+            "limit": stale_budget.limit,
+        },
+    )
     return total, failed
