@@ -10,6 +10,8 @@ App webhook-deliveries log `delivery_replay.py` (#407) already replays
 from, because from GitHub's side the delivery to grug's inbound endpoint
 succeeded with a 2xx. This compares what check-runs exist against what
 SHOULD exist for currently-open PRs, and dispatches the missing ones.
+Missing Elder runs go directly to the durable rerun lane; other missing
+personas use the webhook dispatcher.
 
 **Sweep** (a check-run stuck `in_progress` forever): GitHub never expires
 one, so an orphaned run - Elder's own, mid-review 503 - hangs indefinitely,
@@ -361,22 +363,46 @@ def _reconcile_pr(
         token, installation_id, owner, repo, pr_number, head_sha, stuck,
         {spec.check_run_name for spec in requeue},
     )
-    # Everything else (Chief, and every missing persona) goes through one
-    # inline dispatch.
+    # Missing Elder runs need the same durable lane as stuck-run recovery:
+    # the poller process can exit before a local review thread finishes.
+    missing_elder = {s.key for s in missing if s.check_run_name == _ELDER_CHECK_RUN_NAME}
     inline_requeue = [s for s in requeue if s.check_run_name != _ELDER_CHECK_RUN_NAME]
-    to_run = {spec.key for spec in missing} | {spec.key for spec in inline_requeue}
+    to_run = ({spec.key for spec in missing} - missing_elder) | {spec.key for spec in inline_requeue}
     if to_run:
         dispatch(
             "pull_request",
             _synthetic_pull_request_payload(installation_id, owner, repo, repo_id, pr),
             delivery_id=_recovery_delivery_id(owner, repo, head_sha, inline_requeue, stuck),
-            skip_personas=frozenset(key for key in present_keys if key not in to_run),
+            skip_personas=frozenset((present_keys | missing_elder) - to_run),
         )
+    missing_elder_queued = False
+    if missing_elder:
+        from rerun import enqueue_rerun  # local import: rerun imports this module
+
+        try:
+            enqueue_rerun(
+                install_id=installation_id,
+                repo=f"{owner}/{repo}",
+                pr_number=pr_number,
+                persona="elder",
+                dedup_key=f"reconcile:{head_sha}",
+            )
+        except Exception as e:  # noqa: BLE001 - continue reconciliation after a failed send
+            log.error(
+                "check_run_missing_elder_enqueue_failed",
+                extra={
+                    "installation_id": installation_id, "owner": owner, "repo": repo,
+                    "pr_number": pr_number, "head_sha": head_sha[:8],
+                    "kind": type(e).__name__,
+                },
+            )
+        else:
+            missing_elder_queued = True
     stale_requeued = _requeue_stale_neutral_elder(
         installation_id, owner, repo, pr_number, head_sha, runs, expected,
         elder_blocking, stale_budget,
     )
-    if not (to_run or requeue):
+    if not (to_run or requeue or missing_elder_queued):
         return (1 if stale_requeued else 0), swept
     log.info(
         "check_run_reconcile_dispatched",
