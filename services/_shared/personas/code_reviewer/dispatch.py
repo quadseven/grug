@@ -3281,14 +3281,6 @@ def _review_ci_context(
     return ci_context, head_check_runs
 
 
-def _review_runtime_and_ci(
-    run: _ReviewRun, hunks: tuple[DiffHunk, ...],
-) -> tuple[str | None, str | None, list[dict[str, Any]]]:
-    runtime_context = _review_runtime_context(run, hunks)
-    ci_context, head_check_runs = _review_ci_context(run, hunks)
-    return runtime_context, ci_context, head_check_runs
-
-
 def _review_docs_and_intent(
     run: _ReviewRun, diff: _PreparedDiff, changed_paths: tuple[str, ...],
 ) -> str | None:
