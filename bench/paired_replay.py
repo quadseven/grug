@@ -175,6 +175,23 @@ def measure(snapshots, *, suite, output, checkouts, revisions, model, pace,
     return comparison
 
 
+def _measure_frozen(snapshots, *, suite, output, roots, model, pace):
+    revisions = {
+        arm: _checkout_revision(root, "services/webhook", "services/_shared")
+        for arm, root in roots.items()
+    }
+    if revisions["baseline"] != BASELINE_REVISION or revisions["candidate"] == BASELINE_REVISION:
+        raise ReplayError("baseline must be the pinned pre-epic revision and candidate must differ")
+    with tempfile.TemporaryDirectory(prefix="elder-pair-", dir=output.parent) as directory:
+        work = Path(directory)
+        checkouts = {arm: work / arm for arm in roots}
+        for arm, root in roots.items():
+            _export_checkout(root, revisions[arm], checkouts[arm], "services/webhook", "services/_shared")
+        _export_checkout(suite.parent.parent, SCORER_REVISION, work / "scorer", "suites/pr_review")
+        measure(snapshots, suite=work / "scorer/suites/pr_review", output=output,
+                checkouts=checkouts, revisions=revisions, model=model, pace=pace)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", required=True, type=Path, help="pinned public benchmark suite checkout")
@@ -202,20 +219,9 @@ def main(argv=None) -> int:
             raise ReplayError("replay needs the configured local benchmark endpoint and thermal guards")
         if args.model == "spark:warm-any" or args.model != os.environ.get("GRUG_BENCH_CAVE_MODEL"):
             raise ReplayError("the replay model must be concrete and match the benchmark configuration")
-        checkouts = {arm: getattr(args, arm).resolve() for arm in ("baseline", "candidate")}
-        revisions = {arm: _checkout_revision(root, "services/webhook", "services/_shared")
-                     for arm, root in checkouts.items()}
-        if revisions["baseline"] != BASELINE_REVISION or revisions["candidate"] == BASELINE_REVISION:
-            raise ReplayError("baseline must be the pinned pre-epic revision and candidate must differ")
-        output = args.output.resolve()
-        with tempfile.TemporaryDirectory(prefix="elder-pair-", dir=output.parent) as directory:
-            work = Path(directory)
-            for arm, root in checkouts.items():
-                _export_checkout(root, revisions[arm], work / arm, "services/webhook", "services/_shared")
-            _export_checkout(suite.parent.parent, SCORER_REVISION, work / "scorer", "suites/pr_review")
-            measure(snapshots, suite=work / "scorer/suites/pr_review", output=output,
-                    checkouts={arm: work / arm for arm in checkouts}, revisions=revisions,
-                    model=args.model, pace=pace)
+        roots = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
+        _measure_frozen(snapshots, suite=suite, output=args.output.resolve(), roots=roots,
+                        model=args.model, pace=pace)
     except ReplayError as exc:
         print(str(exc), file=sys.stderr)
         return 1
