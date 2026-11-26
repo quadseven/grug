@@ -224,15 +224,104 @@ def test_reconcile_repo_skips_pr_with_nothing_missing_or_stuck():
     mock_patch.assert_not_called()
 
 
-def test_reconcile_repo_dispatches_only_for_the_missing_persona():
-    """grug#947 acceptance #2: an absent expected check-run gets created -
-    via the normal dispatch path, with the ALREADY-PRESENT persona passed
-    as skip_personas so it is not re-run."""
+def test_reconcile_repo_queues_missing_elder_on_durable_lane(monkeypatch, caplog):
+    """A missing Elder survives the poller exiting, without a failed handoff."""
+    monkeypatch.delenv("GRUG_K8S_RUNTIME", raising=False)
+    monkeypatch.delenv("GRUG_ELDER_DURABLE_QUEUE", raising=False)
     pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
     with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
          patch("check_run_reconciler.expected_personas", return_value=[_CHIEF, _ELDER]), \
          patch("check_run_reconciler.list_check_runs_for_ref",
                return_value=[{"name": "Grug - Chief", "status": "completed"}]), \
+         patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda _i, _r, key: key == "code_reviewer"), \
+         patch("dispatcher.get_repo_config", return_value={}), \
+         patch("rerun.enqueue_rerun") as enqueue, \
+         patch("rerun.enqueue_review") as webhook_enqueue, \
+         patch("async_dispatch.self_recover_review") as recover, \
+         patch("async_dispatch.threading.Thread") as thread:
+        result = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
+
+    enqueue.assert_called_once_with(
+        install_id=1, repo="o/r", pr_number=5, persona="elder",
+        dedup_key="reconcile:abc",
+    )
+    assert result == (1, 0)
+    webhook_enqueue.assert_not_called()
+    recover.assert_not_called()
+    thread.assert_not_called()
+    assert "elder_enqueue_failed" not in caplog.messages
+
+
+def test_missing_elder_enqueue_failure_logs_error_and_continues_repo(caplog):
+    prs = [
+        {"number": 5, "head": {"sha": "abc123456"}, "body": ""},
+        {"number": 6, "head": {"sha": "def123456"}, "body": ""},
+    ]
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=prs), \
+         patch("check_run_reconciler.expected_personas", return_value=[_CHIEF, _ELDER]), \
+         patch("check_run_reconciler.list_check_runs_for_ref",
+               return_value=[{"name": "Grug - Chief", "status": "completed"}]), \
+         patch("rerun.enqueue_rerun", side_effect=[RuntimeError("send failed"), None]) as enqueue, \
+         patch("dispatcher.dispatch") as dispatch:
+        result = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
+
+    assert result == (1, 0)
+    assert [call.kwargs["pr_number"] for call in enqueue.call_args_list] == [5, 6]
+    dispatch.assert_not_called()
+    errors = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert len(errors) == 1
+    error = errors[0]
+    assert error.message == "check_run_missing_elder_enqueue_failed"
+    assert (error.installation_id, error.owner, error.repo, error.pr_number) == (1, "o", "r", 5)
+    assert error.head_sha == "abc12345"
+    assert error.kind == "RuntimeError"
+    assert "check_run_reconcile_pr_failed" not in caplog.messages
+
+
+def test_webhook_elder_keeps_durable_snapshot_queue(monkeypatch):
+    """Ordinary webhooks still enqueue their snapshot and quiet window."""
+    from dispatcher import dispatch
+
+    monkeypatch.setenv("GRUG_ELDER_DURABLE_QUEUE", "1")
+    monkeypatch.setenv("GRUG_ELDER_SETTLE_SECONDS", "120")
+    payload = {
+        "action": "opened",
+        "installation": {"id": 1},
+        "repository": {"id": 2, "name": "r", "owner": {"login": "o"}},
+        "pull_request": {
+            "number": 5, "head": {"sha": "abc"}, "base": {"sha": "base123"},
+            "title": "Review", "body": "",
+        },
+    }
+    with patch("dispatcher.is_install_allowlisted", return_value=True), \
+         patch("dispatcher.is_persona_enabled", side_effect=lambda _i, _r, key: key == "code_reviewer"), \
+         patch("dispatcher.get_repo_config", return_value={}), \
+         patch("rerun.enqueue_review") as enqueue, \
+         patch("rerun.enqueue_rerun") as recovery_enqueue, \
+         patch("async_dispatch.self_recover_review") as recover, \
+         patch("async_dispatch.threading.Thread") as thread:
+        result = dispatch("pull_request", payload, delivery_id="webhook-delivery")
+
+    enqueue.assert_called_once_with(
+        install_id=1, repo="o/r", pr_number=5,
+        requested_base_sha="base123", requested_head_sha="abc",
+        requested_title="Review", requested_body="", settle_seconds=120,
+    )
+    assert result["personas"] == [{"persona": "code_reviewer", "result": "queued"}]
+    recovery_enqueue.assert_not_called()
+    recover.assert_not_called()
+    thread.assert_not_called()
+
+
+def test_reconcile_repo_dispatches_only_for_the_missing_persona():
+    """Missing Guard dispatch skips both present Chief and durably queued Elder."""
+    pr = {"number": 5, "head": {"sha": "abc"}, "body": ""}
+    with patch("check_run_reconciler._list_open_pull_requests", return_value=[pr]), \
+         patch("check_run_reconciler.expected_personas", return_value=[_CHIEF, _ELDER, _GUARD]), \
+         patch("check_run_reconciler.list_check_runs_for_ref",
+               return_value=[{"name": "Grug - Chief", "status": "completed"}]), \
+         patch("rerun.enqueue_rerun") as enqueue, \
          patch("dispatcher.dispatch") as mock_dispatch:
         dispatched, swept = reconciler.reconcile_repo("tok", 1, "o", "r", 2)
 
@@ -242,9 +331,10 @@ def test_reconcile_repo_dispatches_only_for_the_missing_persona():
     assert args[0] == "pull_request"
     assert args[1]["pull_request"]["head"]["sha"] == "abc"
     assert args[1]["action"] == "synchronize"
-    assert kwargs["skip_personas"] == frozenset({"tpm"}), (
-        "the persona that already has a check-run must be skipped, "
-        "not re-dispatched"
+    assert kwargs["skip_personas"] == frozenset({"tpm", "code_reviewer"})
+    enqueue.assert_called_once_with(
+        install_id=1, repo="o/r", pr_number=5, persona="elder",
+        dedup_key="reconcile:abc",
     )
 
 
