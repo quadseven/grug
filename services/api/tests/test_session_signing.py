@@ -223,3 +223,31 @@ def test_loader_bug_is_not_masked_as_outage(real_state_secret, monkeypatch):
         mod._state_secret()
     assert _WEBHOOK not in calls
     assert mod._signing_secret_cache is None
+
+
+def test_prod_refuses_unprovisioned_fallback(real_state_secret, monkeypatch):
+    mod, calls, script = real_state_secret
+    monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.setenv("GRUG_SESSION_SIGNING_SECRET_SSM", _DEDICATED)
+    script[_DEDICATED] = [_not_found()]
+
+    with pytest.raises(mod.SessionSigningNotProvisioned):
+        mod.require_session_signing_secret_at_startup()
+    assert _WEBHOOK not in calls
+
+
+def test_prod_refuses_unconfigured_fallback(real_state_secret, monkeypatch):
+    mod, calls, _script = real_state_secret
+    monkeypatch.setenv("GRUG_ENV", "prod")
+    monkeypatch.delenv("GRUG_SESSION_SIGNING_SECRET_SSM", raising=False)
+
+    with pytest.raises(mod.SessionSigningNotProvisioned):
+        mod.require_session_signing_secret_at_startup()
+    assert calls == []
+
+
+def test_startup_check_is_noop_outside_prod(real_state_secret, monkeypatch):
+    mod, calls, _script = real_state_secret
+    monkeypatch.delenv("GRUG_ENV", raising=False)
+    mod.require_session_signing_secret_at_startup()
+    assert calls == []
