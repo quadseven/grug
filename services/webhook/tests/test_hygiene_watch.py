@@ -379,6 +379,25 @@ def test_clean_repo_files_no_issue(monkeypatch):
     assert writes == []
 
 
+def test_clean_line_carries_files_scanned_and_findings(monkeypatch, caplog):
+    clean = "jobs:\n  build:\n    runs-on: ubuntu-latest\n    timeout-minutes: 5\n"
+    _wire(monkeypatch, content=clean)
+    with caplog.at_level("INFO", logger=hw.log.name):
+        hw.run_hygiene_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+    rec = [r for r in caplog.records if r.message == "hygiene_watch_clean"]
+    assert len(rec) == 1
+    assert rec[0].files_scanned == 1 and rec[0].findings == 0
+
+
+def test_zero_files_scanned_reads_as_broken_not_clean(monkeypatch, caplog):
+    _wire(monkeypatch, content="")
+    with caplog.at_level("INFO", logger=hw.log.name):
+        hw.run_hygiene_watch_for_install("tok", 1, [{"id": 9, "full_name": "o/r"}])
+    msgs = [r.message for r in caplog.records]
+    assert "hygiene_watch_scanned_nothing" in msgs
+    assert "hygiene_watch_clean" not in msgs
+
+
 def test_disabled_repo_costs_no_fetch(monkeypatch):
     monkeypatch.setattr(
         hw, "get_repo_config", lambda i, r: {"guard_hygiene_watch_enabled": False})

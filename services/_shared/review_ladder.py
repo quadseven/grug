@@ -443,6 +443,9 @@ class ChunkAttempt:
     trail: list[_LadderAttempt] = field(default_factory=list)
 
 
+_ROUTED_REVIEW_MODELS = frozenset({"spark:warm-any", "free-pool"})
+
+
 @dataclass(slots=True)
 class ReviewWalk:
     """Routing data for a single walk, including calls made by both Cave arms."""
@@ -456,17 +459,21 @@ class ReviewWalk:
     # Concurrent arms only append. Fallback ordering reads the list after both join.
     gateway_calls: list[_GatewayCall] = field(default_factory=list)
 
-    def family_gated(self, model: str) -> bool:
+    def family_gated(self, model: str | None) -> bool:
         return self.author_family is not None and (
             (model_family(model) == self.author_family) != self.same_family_only
         )
 
     def skip_reason(self, backend: Backend, model: str) -> str:
-        if self.family_gated(model):
+        if model not in _ROUTED_REVIEW_MODELS and self.family_gated(model):
             return f"{backend.value}: {model} is gated out by model family"
         if self.chunk is not None and (backend.value, model) in self.chunk.skip:
             return f"{backend.value}: {model} already failed on this chunk"
         return ""
+
+    def routed_model_gated(self, requested_model: str, served_model: str | None) -> bool:
+        """Apply either walk's gate once a router names the model that answered."""
+        return requested_model in _ROUTED_REVIEW_MODELS and self.family_gated(served_model)
 
     def author_family_answered(self, model: str) -> bool:
         # The lane picks its own model. On the first walk, verify who answered.

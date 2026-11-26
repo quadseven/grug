@@ -129,6 +129,20 @@ during a GitHub or grug outage mid-review. No action needed beyond
 confirming the underlying degradation (see the error-rate signal above)
 has cleared; the author gets a real review on their next push.
 
+### Stale NEUTRAL Elder after a switch to blocking
+
+When a repo's Elder moves from advisory to blocking (`code_reviewer_blocking`),
+open PRs keep the NEUTRAL Elder they got under advisory, and a blocking merge
+gate never accepts it. The same reconciler pass (#1872) re-queues Elder once
+per PR head on the rerun lane, with no PR comment. At most
+`GRUG_STALE_NEUTRAL_REQUEUE_MAX_PER_TICK` (default 10) go out per poller tick
+across all repos, so a busy repo drains over several ticks. Each re-queue logs
+`check_run_stale_neutral_requeued`, and each tick logs
+`check_run_stale_neutral_tick` with `requeued` and `deferred` counts. The pass
+runs only for repos with `check_run_reconcile_enabled` set, so turn that flag
+on for every repo whose Elder is blocking (the repo config `PUT` in the API,
+`/installations/<install_id>/repos/<repo_id>/config`).
+
 ### Inbound webhook silence
 
 `[grug] No inbound GitHub webhook deliveries (4h)` fires when
@@ -761,6 +775,30 @@ at that server with the same model id and re-running; keep the fixture
 set identical. Decision rule for #649: only cut over if p95 complete at
 C=4/8 improves without a parse-fail regression. That cutover now goes
 through the optional vLLM deep arm below (grug#1191).
+
+### Thermal pacing for Elder eval runs on the cave backend (grug#989)
+
+A review-sized call heats a local GPU host by several degrees on its own, and
+sustained load has cut power to them. `python -m elder_eval` therefore
+refuses the `cave` backend unless `GRUG_BENCH_THERMAL_URLS` names each host's
+thermal guard status URL (comma-separated; each answers JSON with
+`hottest_c`). The thresholds live in `elder_eval/thermal.py`:
+
+- Each case starts only when every host reads `START_AT_C` (65 C) or below.
+  The eval polls every 15 seconds and stops after 10 minutes without cooling.
+- A host above `ABORT_ABOVE_C` (82 C), a guard that cannot be read, or a hot
+  reading after the last case stops the run with exit code 4. Nothing is
+  recorded.
+- Cloud backends are not paced. `--production` is paced when the variable
+  is set.
+
+```bash
+export GRUG_BENCH_THERMAL_URLS='http://<host-a>:11439/status,http://<host-b>:11439/status'
+make elder-eval ARGS="--backend cave --record"
+```
+
+Messages name a guard by its position in the list, never by URL, so the
+private addresses stay out of logs.
 
 ### Optional vLLM deep arm: shadow, eval gate, serve (grug#1191)
 

@@ -7,8 +7,8 @@ from an untrusted pull request body, and only a family from this table ever
 reaches a check summary. A name it does not know has no family, which keeps
 today's arm order.
 
-For PRs opened by GitHub Apps (bots), a trusted source (grug#1553) maps
-App logins to model families instead of using the Loom footer.
+For PRs opened by GitHub Apps (bots), configuration names the Apps whose
+footers are trusted and maps single-engine App logins to model families.
 """
 from __future__ import annotations
 
@@ -42,9 +42,7 @@ _FAMILY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 
 # Trusted source for App author families (grug#1553). GRUG_APP_AUTHOR_FAMILIES
 # lists `login:family` pairs, separated by `;` or newlines, for example
-# `lane-app[bot]:claude;other-app[bot]:gpt`. Unset or empty means no App gets a
-# family. A login matches only exactly (case-insensitive), never as a
-# substring, so a login that merely contains a model name gains nothing.
+# `lane-app[bot]:claude;other-app[bot]:gpt`. Logins match exactly, ignoring case.
 _APP_AUTHOR_FAMILIES_ENV = "GRUG_APP_AUTHOR_FAMILIES"
 _KNOWN_FAMILIES = frozenset(family for family, _ in _FAMILY_PATTERNS)
 
@@ -66,6 +64,15 @@ def app_author_family(login: str | None) -> str | None:
         if sep and name.strip() and family in _KNOWN_FAMILIES:
             table[name.strip().lower()] = family
     return table.get(wanted)
+
+
+def app_uses_author_footer(login: str | None) -> bool:
+    """Whether the exact App login is on the comma-separated footer allowlist."""
+    wanted = (login or "").strip().lower()
+    return bool(wanted) and any(
+        wanted == name.strip().lower()
+        for name in os.getenv("GRUG_APP_FOOTER_AUTHORS", "").split(",")
+    )
 
 
 def model_family(model: str | None) -> str | None:

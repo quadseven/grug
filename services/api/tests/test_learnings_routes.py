@@ -357,3 +357,117 @@ def test_preview_maps_other_github_failures_to_502(bare_api, monkeypatch):
     with pytest.raises(HTTPException) as e:
         api.preview_learning_paths(body, user=_admin())
     assert e.value.status_code == 502
+
+
+def test_list_all_repos_uses_single_batch_query(bare_api, monkeypatch):
+    calls: list[bool] = []
+    rows = [
+        {"id": "111111111111", "text": "rule a", "repo": "o/a"},
+        {"id": "222222222222", "text": "rule b", "repo": "o/b"},
+    ]
+
+    def fake_list_all(*, include_inactive: bool = False):
+        calls.append(include_inactive)
+        return rows
+
+    monkeypatch.setattr(bare_api.install_store, "list_all_learnings", fake_list_all)
+    monkeypatch.setattr(
+        bare_api.install_store,
+        "list_learning_repos",
+        lambda: pytest.fail("list_learning_repos should not be called"),
+    )
+    monkeypatch.setattr(
+        bare_api.install_store,
+        "list_learnings",
+        lambda *a, **kw: pytest.fail("list_learnings should not be called"),
+    )
+
+    out = bare_api.list_learnings(repo="", q="", status="", user=_admin())
+    assert calls == [True]
+    assert [v["id"] for v in out["learnings"]] == ["111111111111", "222222222222"]
+    assert out["truncated"] is False
+
+
+def test_fired_learnings_uses_single_batch_lookup(bare_api, monkeypatch):
+    batch_calls: list[tuple[str, list[str]]] = []
+
+    def fake_get_by_ids(repo: str, lids: list[str]):
+        batch_calls.append((repo, list(lids)))
+        return {
+            "aaaaaaaaaaaa": {"id": "aaaaaaaaaaaa", "text": "rule a", "repo": repo},
+        }
+
+    monkeypatch.setattr(
+        bare_api.install_store,
+        "get_review_fired_learnings",
+        lambda repo, review: ["aaaaaaaaaaaa", "bbbbbbbbbbbb"],
+    )
+    monkeypatch.setattr(bare_api.install_store, "get_learnings_by_ids", fake_get_by_ids)
+    monkeypatch.setattr(
+        bare_api.install_store,
+        "get_learning",
+        lambda *a, **kw: pytest.fail("get_learning should not be called"),
+    )
+
+    out = bare_api.fired_learnings(repo="o/r", pr=9, head_sha="abc", user=_admin())
+    assert batch_calls == [("o/r", ["aaaaaaaaaaaa", "bbbbbbbbbbbb"])]
+    assert out["fired"][0]["id"] == "aaaaaaaaaaaa"
+    assert out["fired"][0]["text"] == "rule a"
+    assert out["fired"][1] == {"id": "bbbbbbbbbbbb", "text": "", "deleted": True}
+
+
+def test_fired_learnings_empty_skips_batch_lookup(bare_api, monkeypatch):
+    monkeypatch.setattr(
+        bare_api.install_store, "get_review_fired_learnings", lambda repo, review: [],
+    )
+    monkeypatch.setattr(
+        bare_api.install_store,
+        "get_learnings_by_ids",
+        lambda *a, **kw: pytest.fail("get_learnings_by_ids should not be called"),
+    )
+
+    out = bare_api.fired_learnings(repo="o/r", pr=9, head_sha="abc", user=_admin())
+    assert out == {"repo": "o/r", "review": "9@abc", "fired": []}
+
+
+def test_get_learnings_by_ids_empty_skips_pool(monkeypatch):
+    from adapters import pg_install_store
+
+    monkeypatch.setattr(
+        pg_install_store, "get_pool", lambda: pytest.fail("pool should not be touched"),
+    )
+    assert pg_install_store.get_learnings_by_ids("o/r", []) == {}
+
+
+def test_get_learnings_by_ids_deduplicates_and_decodes(monkeypatch):
+    from adapters import pg_install_store
+
+    executed: list[tuple[str, tuple[object, ...]]] = []
+
+    class _FakeCursor:
+        def fetchall(self):
+            return [
+                ("LEARN#o/r", "LEARNING#aaaaaaaaaaaa", {"repo": "o/r", "text": "rule a"}),
+            ]
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=()):
+            executed.append((sql, params))
+            return _FakeCursor()
+
+    class _FakePool:
+        def connection(self):
+            return _FakeConn()
+
+    monkeypatch.setattr(pg_install_store, "get_pool", lambda: _FakePool())
+    out = pg_install_store.get_learnings_by_ids("o/r", ["aaaaaaaaaaaa", "aaaaaaaaaaaa", "bbbbbbbbbbbb"])
+    assert len(executed) == 1
+    assert executed[0][1] == ("LEARN#o/r", ["LEARNING#aaaaaaaaaaaa", "LEARNING#bbbbbbbbbbbb"])
+    assert list(out.keys()) == ["aaaaaaaaaaaa"]
+    assert out["aaaaaaaaaaaa"]["text"] == "rule a"

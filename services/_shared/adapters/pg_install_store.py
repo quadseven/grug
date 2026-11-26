@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Literal, NotRequired, Optional, TypedDict, cast
 
 from psycopg.types.json import Jsonb
@@ -288,13 +288,16 @@ def _read_int_repo_flag(flag: str, raw: Any) -> int | None:
     return None
 
 
-def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
-    # A missing row and an empty row are the same shape: every field
-    # falls through to its default below (no separate early-return to
-    # keep in sync). Persona flags derive from _DEFAULT_PERSONA_CONFIG's
-    # keys (#465, ADR-0010): adding a persona's flags to the default
-    # dict makes them flow through this read path with no edit here.
-    item = _get_item(_inst_pk(install_id), _repo_sk(repo_id)) or {}
+def _decode_repo_config(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Decode a stored REPO# row (or an empty mapping for defaults) into
+    the normalized repo-config dict.
+
+    A missing row and an empty row are the same shape: every field
+    falls through to its default below (no separate early-return to
+    keep in sync). Persona flags derive from _DEFAULT_PERSONA_CONFIG's
+    keys (#465, ADR-0010): adding a persona's flags to the default
+    dict makes them flow through this read path with no edit here.
+    """
     rid = item.get("enforcement_ruleset_id")
     cfg: dict[str, Any] = {
         flag: bool(item.get(flag, default))
@@ -334,6 +337,41 @@ def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
     for _flag in _INT_REPO_FLAGS:
         cfg[_flag] = _read_int_repo_flag(_flag, item.get(_flag))
     return cfg
+
+
+def default_repo_config() -> dict[str, Any]:
+    """Return a fresh normalized default repo-config dict."""
+    return _decode_repo_config({})
+
+
+def get_repo_config(install_id: int, repo_id: int) -> dict[str, Any]:
+    item = _get_item(_inst_pk(install_id), _repo_sk(repo_id)) or {}
+    return _decode_repo_config(item)
+
+
+def get_repo_configs(install_id: int) -> dict[int, dict[str, Any]]:
+    """Fetch all stored per-repo configs for an installation in one query,
+    keyed by repo_id. Repos without a stored row are omitted; callers fall
+    back to `default_repo_config()`."""
+    pk = _inst_pk(install_id)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"SELECT sk, data FROM grug_kv WHERE pk = %s AND sk LIKE 'REPO#%%' AND {TTL_LIVE}",  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+            (pk,),
+        ).fetchall()
+    out: dict[int, dict[str, Any]] = {}
+    for sk, data in rows:
+        _, sep, id_str = sk.partition("#")
+        if not sep:
+            continue
+        try:
+            repo_id = int(id_str)
+        except (TypeError, ValueError):
+            log.warning("repo_config_sk_unparsable", extra={"pk": pk, "sk": sk})
+            continue
+        item = decode_item(pk, sk, data)
+        out[repo_id] = _decode_repo_config(item)
+    return out
 
 
 def _merge_attrs(pk: str, sk: str, attrs: dict[str, Any]) -> None:
@@ -1585,6 +1623,21 @@ def delete_learning(repo: str, digest: str) -> bool:
     return bool(cur.rowcount)
 
 
+def _decode_and_filter_learnings(
+    rows: Sequence[tuple[str, str, dict[str, Any]]],
+    *,
+    include_inactive: bool,
+    limit: int | None,
+) -> list[Learning]:
+    now = datetime.now(timezone.utc)
+    out: list[Learning] = []
+    for pk, sk, data in rows:
+        row = _decode_learning(pk, sk, data)
+        if include_inactive or _learning_is_active(row, now):
+            out.append(row)
+    return out if limit is None else out[:limit]
+
+
 def list_learnings(
     repo: str, limit: int | None = None, *, include_inactive: bool = False,
 ) -> list[Learning]:
@@ -1608,16 +1661,28 @@ def list_learnings(
             -- fall back to created_at for pre-reinforced_at rows.
             ORDER BY COALESCE(data->>'reinforced_at', data->>'created_at') ASC,
                      sk COLLATE "C" ASC
-            """,
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
             (_learning_pk(repo),),
         ).fetchall()
-    now = datetime.now(timezone.utc)
-    out: list[Learning] = []
-    for pk, sk, data in rows:
-        row = _decode_learning(pk, sk, data)
-        if include_inactive or _learning_is_active(row, now):
-            out.append(row)
-    return out if limit is None else out[:limit]
+    return _decode_and_filter_learnings(rows, include_inactive=include_inactive, limit=limit)
+
+
+def list_all_learnings(
+    limit: int | None = None, *, include_inactive: bool = False,
+) -> list[Learning]:
+    """Every live learning across all repositories in one query, ordered by
+    repo name then reinforced/created time and sort key."""
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT pk, sk, data FROM grug_kv
+            WHERE pk LIKE 'LEARN#%%' AND sk LIKE 'LEARNING#%%' AND {TTL_LIVE}
+            ORDER BY pk COLLATE "C" ASC,
+                     COALESCE(data->>'reinforced_at', data->>'created_at') ASC,
+                     sk COLLATE "C" ASC
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+        ).fetchall()
+    return _decode_and_filter_learnings(rows, include_inactive=include_inactive, limit=limit)
 
 
 def _decode_learning(pk: str, sk: str, data: dict[str, Any]) -> Learning:
@@ -1716,6 +1781,30 @@ def get_learning(repo: str, learning_id: str) -> Optional[Learning]:
         return None
     item["id"] = learning_id
     return cast("Learning", item)
+
+
+def get_learnings_by_ids(
+    repo: str, learning_ids: Sequence[str],
+) -> dict[str, Learning]:
+    """Batch-fetch live learnings for `repo` by id in a single query.
+    Missing or TTL-expired ids are omitted from the returned mapping."""
+    unique_ids = list(dict.fromkeys(learning_ids))
+    if not unique_ids:
+        return {}
+    sks = [_learning_sk(lid) for lid in unique_ids]
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT pk, sk, data FROM grug_kv
+            WHERE pk = %s AND sk = ANY(%s) AND {TTL_LIVE}
+            """,  # noqa: S608 - TTL_LIVE is a fixed pg_base clause, not input
+            (_learning_pk(repo), sks),
+        ).fetchall()
+    out: dict[str, Learning] = {}
+    for pk, sk, data in rows:
+        row = _decode_learning(pk, sk, data)
+        out[str(row["id"])] = row
+    return out
 
 
 def list_learning_repos() -> list[str]:
@@ -2422,6 +2511,53 @@ def list_comment_nudge_repos(install_id: int) -> list[dict[str, Any]]:
         if sep and full:
             out.append({"id": rid, "full_name": full})
     return out
+
+
+_STALE_NEUTRAL_REQUEUE_TTL_DAYS = 30
+
+
+def claim_stale_neutral_requeue(install_id: int, repo: str, head_sha: str) -> bool:
+    """Win-once claim for the check-run reconciler's stale-NEUTRAL Elder
+    re-queue (grug#1872): True = re-queue this head now; False = this head
+    was already re-queued. Held per head, not per check-run id: the
+    re-queued review posts a NEW run, and a blocking-mode Elder that
+    concludes NEUTRAL on purpose would otherwise be re-queued every tick.
+    A new push is a new head and gets its own single chance. Same atomic
+    upsert-if-expired shape as claim_pulse_nudge; DB errors propagate."""
+    pg_base.maybe_purge_expired()
+    ttl = int(
+        datetime.now(timezone.utc).timestamp() + _STALE_NEUTRAL_REQUEUE_TTL_DAYS * 86400
+    )
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO grug_kv (pk, sk, data, ttl)
+            VALUES (%(pk)s, %(sk)s, %(data)s, %(ttl)s)
+            ON CONFLICT (pk, sk) DO UPDATE
+                SET data = %(data)s, ttl = %(ttl)s
+                WHERE grug_kv.ttl IS NOT NULL
+                  AND grug_kv.ttl <= EXTRACT(EPOCH FROM now())
+            RETURNING pk
+            """,
+            {
+                "pk": _inst_pk(install_id),
+                "sk": f"STALENEUTRAL#{repo}#{head_sha}",
+                "data": Jsonb({"ttl": ttl}),
+                "ttl": ttl,
+            },
+        ).fetchone()
+    return row is not None
+
+
+def release_stale_neutral_requeue(install_id: int, repo: str, head_sha: str) -> None:
+    """Release a stale-NEUTRAL claim whose rerun-queue send failed, so the
+    claim stands for a QUEUED re-review, not an attempt, and the next
+    poller tick retries."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            "DELETE FROM grug_kv WHERE pk = %s AND sk = %s",
+            (_inst_pk(install_id), f"STALENEUTRAL#{repo}#{head_sha}"),
+        )
 
 
 def release_pulse_nudge(install_id: int, repo: str, pr_number: int) -> None:

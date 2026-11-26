@@ -629,11 +629,12 @@ def run_production_eval(
     token: str = "",
     review: Callable[..., LlmReviewResponse] = review_diff,
     published: bool = False,
+    before_case: Callable[[str], None] | None = None,
 ) -> dict[str, CaseReplay]:
     """Replay the corpus through the shipped staged discovery pipeline.
     `fetch` is the FINAL-diff fallback (injectable for tests, same as
     `run_eval`); `diff_for_case` (#545) tries each case's anchored pre-fix
-    snapshot first and falls back to it."""
+    snapshot first and falls back to it. `before_case` is as in `run_eval`."""
     replays: dict[str, CaseReplay] = {}
     for case in cases:
         if case.unresolvable_reason:
@@ -641,6 +642,8 @@ def run_production_eval(
             # only rediscover the same 404 every run. `scoring.score`
             # reports it without needing a replay entry.
             continue
+        if before_case is not None:
+            before_case(case.case_id)
         try:
             diff, anchored = diff_for_case(case, token, fetch_final=fetch)
         except Exception as e:  # noqa: BLE001 - fetch failure is an errored case
@@ -669,12 +672,17 @@ def run_eval(
     token: str = "",
     team_practices: str = "",
     few_shot: str = "",
+    before_case: Callable[[str], None] | None = None,
 ) -> dict[str, CaseReplay]:
     """Replay the whole corpus through one backend. `fetch` is the
     FINAL-diff fallback and is injectable for tests; `diff_for_case` (#545)
     tries each case's anchored pre-fix snapshot first and falls back to it
     on any resolution trouble. Returns case_id -> CaseReplay for
-    `scoring.score`."""
+    `scoring.score`.
+
+    `before_case` (grug#989) runs before each case is fetched and replayed:
+    the thermal pacer blocks there until the Sparks are cool and raises
+    `ThermalAbort` to end the run."""
     log.info("eval_start backend=%s cases=%d", backend.name, len(cases))
     replays: dict[str, CaseReplay] = {}
     for case in cases:
@@ -683,6 +691,8 @@ def run_eval(
             # "prune or annotate it" case the 404/406 branch below already
             # calls out; pruned here means never re-attempted.
             continue
+        if before_case is not None:
+            before_case(case.case_id)
         try:
             diff, anchored = diff_for_case(case, token, fetch_final=fetch)
         except httpx.HTTPStatusError as e:

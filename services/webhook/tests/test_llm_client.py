@@ -5266,6 +5266,16 @@ def test_breaker_caps_an_absurd_retry_after() -> None:
     )
 
 
+def test_breaker_honours_an_http_date_retry_after() -> None:
+    from email.utils import formatdate
+
+    availability._note_opencode_go_response(
+        _go_limit_429(formatdate(lc.time.time() + 1800, usegmt=True)),
+    )
+    assert not availability._opencode_go_available(now=lc.time.time() + 1700)
+    assert availability._opencode_go_available(now=lc.time.time() + 1900)
+
+
 def test_open_breaker_drops_go_from_interactive_order(monkeypatch) -> None:
     monkeypatch.setenv("GRUG_OPENCODE_GO_API_KEY_SSM", "/x")
     assert Backend.OPENCODE_GO in lc._interactive_backend_order(1)

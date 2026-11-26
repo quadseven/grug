@@ -32,8 +32,10 @@ from typing import Annotated, Any
 
 import httpx
 from adapters.install_store import (
+    default_repo_config,
     get_installation,
     get_repo_config,
+    get_repo_configs,
     list_check_verdicts,
     list_ledger_rows,
     list_user_installations,
@@ -230,31 +232,31 @@ def list_install_repos(
     # up to 55min. Closes #50.
     def _fetch(token: str) -> list[dict[str, Any]]:
         try:
-            repos = paginate_all(
+            return paginate_all(
                 token, f"{_GH_API}/installation/repositories",
                 item_key="repositories", max_pages=10,
             )
         except GitHubMalformedPayload:
-            # GH returned 200 but a malformed payload — distinguish from
+            # GH returned 200 but a malformed payload - distinguish from
             # "0 repos" so the caller doesn't show an empty dashboard for
             # what's really upstream broken. silent-failure-hunter P1 #3.
             log.error("gh_install_repos_malformed", extra={"install_id": install_id})
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY, detail="gh_upstream_malformed",
             ) from None
-        out: list[dict[str, Any]] = []
-        for r in repos:
-            cfg = get_repo_config(install_id, r["id"])
-            out.append({
-                "repo_id": r["id"],
-                "full_name": r["full_name"],
-                "private": r.get("private", False),
-                "default_branch": r.get("default_branch", "main"),
-                "config": cfg,
-            })
-        return out
 
-    repos = with_install_token_retry(install_id, _fetch)
+    gh_repos = with_install_token_retry(install_id, _fetch)
+    configs = get_repo_configs(install_id) if gh_repos else {}
+    repos = [
+        {
+            "repo_id": r["id"],
+            "full_name": r["full_name"],
+            "private": r.get("private", False),
+            "default_branch": r.get("default_branch", "main"),
+            "config": configs[r["id"]] if r["id"] in configs else default_repo_config(),
+        }
+        for r in gh_repos
+    ]
     return {"repos": repos}
 
 

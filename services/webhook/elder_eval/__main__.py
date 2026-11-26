@@ -13,6 +13,10 @@
     python -m elder_eval --verify-only INSTALLATION_ID
                                              # replay captured Elder comments
 
+Exit codes: 0 ok, 1 regression (--check), 2 nothing to run or refused,
+3 errored run, 4 thermal stop (grug#989): GRUG_BENCH_THERMAL_URLS names each
+Spark's thermal guard status URL; the cave backend refuses to run without it.
+
 The verify-only replay reads the installation's retained comment records
 from the database. It reports potential demotions and later trusted outcomes
 without a model call or GitHub token.
@@ -82,6 +86,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 from ledger import parse_jsonl
@@ -111,6 +116,7 @@ from .scoring import (
     staged_cases_advisories,
     to_baseline_dict,
 )
+from .thermal import ENV_URLS, ThermalAbort, pacer_from_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_JSONL = _REPO_ROOT / "logs" / "review-ledger.jsonl"
@@ -273,15 +279,22 @@ def _print_report(name: str, report: EvalReport) -> None:
 
 
 
-def _run_ab_arm(
-    backend, all_cases, cases, token, baseline_report, *, label, block, kwarg
-) -> None:
-    """One ON-arm replay + delta print vs the baseline report. `kwarg` is
-    the run_eval keyword carrying the block (team_practices / few_shot)."""
-    on = score(
-        all_cases, run_eval(backend, cases, token=token, **{kwarg: block})
+def _score_ab_arm(
+    backend, all_cases, cases, token, *, block, kwarg, before_case=None,
+) -> EvalReport:
+    return score(
+        all_cases,
+        run_eval(
+            backend, cases, token=token, before_case=before_case,
+            **{kwarg: block},
+        ),
     )
-    _print_report(f"{backend.name} + {label}", on)
+
+
+def _print_ab_arm(
+    backend_name: str, label: str, baseline_report: EvalReport, on: EvalReport,
+) -> None:
+    _print_report(f"{backend_name} + {label}", on)
     print(
         f"\n{label} delta: catch "
         f"{baseline_report.overall_catch:.2f} -> {on.overall_catch:.2f} "
@@ -370,7 +383,7 @@ def _load_corpus(args):
     return rows, all_cases, cases
 
 
-def _run_requested_mode(parser, args, cases, token):
+def _run_requested_mode(parser, args, cases, token, before_case=None):
     if args.published and not args.production:
         parser.error("--published requires --production")
     if args.production:
@@ -382,7 +395,10 @@ def _run_requested_mode(parser, args, cases, token):
         return (
             None,
             name,
-            run_production_eval(cases, token=token, published=args.published),
+            run_production_eval(
+                cases, token=token, published=args.published,
+                before_case=before_case,
+            ),
         )
 
     from sast_benchmark.backends import configured_backends
@@ -406,10 +422,31 @@ def _run_requested_mode(parser, args, cases, token):
             f"{', '.join(item.name for item in backends[1:])} "
             "(use --backend to select)"
         )
-    return backend, backend.name, run_eval(backend, cases, token=token)
+    paced = _pacer_for(backend, before_case)
+    if backend.name == "cave" and paced is None:
+        print(_UNPACED_CAVE_ERROR, file=sys.stderr)
+        return None, "", None
+    return backend, backend.name, run_eval(
+        backend, cases, token=token, before_case=paced
+    )
 
 
-def _run_ab_modes(args, rows, all_cases, cases, token, report, backend) -> None:
+_UNPACED_CAVE_ERROR = (
+    "refusing an unpaced run on the cave backend: set "
+    f"{ENV_URLS} to each Spark's thermal guard status URL, "
+    "comma-separated (grug#989)"
+)
+
+
+def _pacer_for(backend, pacer):
+    """Only the cave backend runs on the Sparks; a cloud backend is never
+    paced, so a run that cannot reach the guards still works there."""
+    return pacer if backend.name == "cave" else None
+
+
+def _score_ab_modes(
+    args, rows, all_cases, cases, token, backend, before_case=None
+) -> Iterator[tuple[str, EvalReport]]:
     block = ""
     if args.ab_practices:
         from best_practices import derive_practices, practices_block
@@ -421,15 +458,14 @@ def _run_ab_modes(args, rows, all_cases, cases, token, report, backend) -> None:
                 "skipping ON arm (delta would be A/A noise)"
             )
     if block:
-        _run_ab_arm(
+        yield "practices (#527)", _score_ab_arm(
             backend,
             all_cases,
             cases,
             token,
-            report,
-            label="practices (#527)",
             block=block,
             kwarg="team_practices",
+            before_case=_pacer_for(backend, before_case),
         )
 
     examples = ""
@@ -447,15 +483,14 @@ def _run_ab_modes(args, rows, all_cases, cases, token, report, backend) -> None:
                 "A/A noise)"
             )
     if examples:
-        _run_ab_arm(
+        yield "few-shot (#538)", _score_ab_arm(
             backend,
             all_cases,
             cases,
             token,
-            report,
-            label="few-shot (#538)",
             block=examples,
             kwarg="few_shot",
+            before_case=_pacer_for(backend, before_case),
         )
 
 
@@ -544,6 +579,43 @@ def _report_verify_only_replay(installation_id: int) -> None:
     print(f"Later marked real: {real}")
 
 
+def _replay_and_score(args, parser, rows, all_cases, cases, token, pacer):
+    """Run the requested replay (and A/B arms) and score it. Returns an exit
+    code when the run cannot yield a result, else (backend, name, report)."""
+    backend, backend_name, replays = _run_requested_mode(
+        parser, args, cases, token, before_case=pacer
+    )
+    if replays is None:
+        return 2
+
+    report = score(all_cases, replays)
+    arms = []
+    if not report.all_errored:
+        if backend is not None:
+            arms = list(
+                _score_ab_modes(
+                    args, rows, all_cases, cases, token, backend, before_case=pacer,
+                )
+            )
+        if pacer is not None and pacer.used:
+            # A hot reading after the last case voids the run before any scores
+            # are printed or recorded.
+            pacer.check()
+
+    _print_report(backend_name, report)
+
+    if report.all_errored:
+        print(
+            "every case errored - refusing to treat a broken run as a result",
+            file=sys.stderr,
+        )
+        return 3
+
+    for label, arm_report in arms:
+        _print_ab_arm(backend_name, label, report, arm_report)
+    return backend, backend_name, report
+
+
 def main(argv: list[str] | None = None) -> int:
     parser, args = _parse_args(argv)
 
@@ -563,22 +635,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    backend, backend_name, replays = _run_requested_mode(parser, args, cases, token)
-    if replays is None:
-        return 2
-
-    report = score(all_cases, replays)
-    _print_report(backend_name, report)
-
-    if report.all_errored:
-        print(
-            "every case errored - refusing to treat a broken run as a result",
-            file=sys.stderr,
-        )
-        return 3
-
-    if backend is not None:
-        _run_ab_modes(args, rows, all_cases, cases, token, report, backend)
+    # grug#989: with GRUG_BENCH_THERMAL_URLS set, each case on the Sparks
+    # waits for them to cool, and a hot or unreadable Spark ends the run
+    # with exit 4 and nothing recorded.
+    pacer = pacer_from_env(os.environ)
+    try:
+        outcome = _replay_and_score(args, parser, rows, all_cases, cases, token, pacer)
+    except ThermalAbort as e:
+        print(f"thermal stop, nothing recorded: {e}", file=sys.stderr)
+        return 4
+    if isinstance(outcome, int):
+        return outcome
+    backend, backend_name, report = outcome
 
     # grug#843: the configured model id. `--production` runs a multi-arm,
     # multi-backend chain with no single configured model, so it has none.

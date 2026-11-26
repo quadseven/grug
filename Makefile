@@ -18,7 +18,7 @@
 .PHONY: test webhook-test api-test pg-test pulumi-preview pulumi-up \
         tear-down rebuild smoke docker-build-webhook sast-benchmark \
         sast-candidate-counts review-latency elder-eval elder-eval-column \
-        scripts-test chief-check
+        scripts-test chief-check lane-review-metrics
 
 # Admin seed values — the row (re)installed after a tear-down so the
 # allowlist gate works on the first PR after rebuild. NO DEFAULTS on
@@ -53,6 +53,11 @@ chief-check:
 		echo "usage: make chief-check REPO=owner/name BODY=pr.md  (or PR=N)"; exit 2; fi
 	uv run --python 3.13 --with httpx --with pyjwt --with cryptography --with boto3 --with 'psycopg[binary,pool]' \
 		python scripts/chief_check.py --repo $(REPO) $(if $(PR),--pr $(PR),--body-file $(BODY))
+
+# Read-only review metrics for lane PRs opened in a UTC date window.
+#   make lane-review-metrics REPO=owner/name SINCE=2026-10-01 UNTIL=2026-11-01
+lane-review-metrics:
+	@python3 scripts/lane_review_metrics.py --repo "$(REPO)" --since "$(SINCE)" --until "$(UNTIL)"
 
 # webhook-test / api-test are hermetic against your ~/.aws: the shared
 # conftest pins fake AWS keys at import (#1340), so no extra env is needed.

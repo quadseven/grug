@@ -44,7 +44,7 @@ from urllib.parse import quote
 import httpx
 
 from activity_log import record_check_verdict
-from model_family import app_author_family, model_family
+from model_family import app_author_family, app_uses_author_footer, model_family
 from github_app_auth import (
     get_app_id, installation_permission_summary_note, with_install_token_retry,
 )
@@ -106,6 +106,7 @@ from personas.code_reviewer.claim_check import (
     scan_claim_checks,
 )
 from personas.code_reviewer.model_metrics import emit_finding_posted
+from personas.code_reviewer.review_timing import ReviewTiming
 from personas import board
 from personas.code_reviewer.complexity import ComplexityScan, scan_complexity_full
 from personas.code_reviewer.analyzer_sandbox import SANDBOX_UNAVAILABLE
@@ -835,7 +836,7 @@ def pr_skip_rule(
 
 def _publish_config_skip(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
-    head_sha: str, *, rule: str,
+    head_sha: str, *, rule: str, timing: ReviewTiming,
 ) -> dict[str, str]:
     """Complete the Elder check `success` for a PR skipped by `skip_prs`.
 
@@ -843,22 +844,21 @@ def _publish_config_skip(
     out on the base branch, so the check passes and says why. A publish
     failure returns `publish_failed` so the durable consumer redrives
     instead of leaving the enqueue's in_progress check behind."""
-    summary = skip_summary(rule)
+    result = CheckRunResult(
+        name=_CHECK_NAME, head_sha=head_sha, status="completed",
+        conclusion="success", title="Elder skipped this PR", summary=skip_summary(rule),
+    )
     try:
-        with_install_token_retry(
+        response = with_install_token_retry(
             installation_id,
             lambda token: post_check_run(
-                token, owner, repo_name,
-                CheckRunResult(
-                    name=_CHECK_NAME, head_sha=head_sha, status="completed",
-                    conclusion="success", title="Elder skipped this PR",
-                    summary=summary,
-                ),
+                token, owner, repo_name, result,
                 external_id=(
                     f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
                 ),
             ),
         )
+        timing.record_check(result, response)
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         log.error(
             "code_review_config_skip_publish_failed",
@@ -1185,21 +1185,16 @@ def _to_llm_hunks(hunks: tuple[DiffHunk, ...]) -> list[LlmHunk]:
 
 
 def _author_family(pr: Mapping[str, Any]) -> str | None:
-    """The family of the model a trusted operator's Loom footer names, or None.
-
-    For trusted operator humans, uses the Loom footer. For App authors (bots),
-    uses a trusted source mapping App logins to model families (grug#1553).
-    Both are "trusted source" but differ in how the family is derived.
-    """
-    if is_trusted_operator(pr):
-        return model_family(loom_footer_model(str(pr.get("body") or "")))
-
-    user = pr.get("user")
-    if isinstance(user, Mapping) and user.get("type") == "Bot":
+    """Read the author family from a trusted footer or the fixed App mapping."""
+    if not is_trusted_operator(pr):
+        user = pr.get("user")
+        if not isinstance(user, Mapping) or user.get("type") != "Bot":
+            return None
         app_login = user.get("login")
-        return app_author_family(str(app_login) if app_login else None)
-
-    return None
+        login = str(app_login) if app_login else None
+        if not app_uses_author_footer(login):
+            return app_author_family(login)
+    return model_family(loom_footer_model(str(pr.get("body") or "")))
 
 
 _STACK_COMMENT_TIMEOUT = 10.0
@@ -2479,7 +2474,7 @@ class _ReviewRun:
     mode: ReviewMode
     cancel_event: threading.Event | None
     run_started_at: datetime
-    run_started_monotonic: float
+    timing: ReviewTiming
     started_at: str
 
     @property
@@ -2489,6 +2484,11 @@ class _ReviewRun:
     @property
     def pr_name(self) -> str:
         return f"{self.full_repo}#{self.pull_number}"
+
+    def publish_timing(self) -> None:
+        self.timing.publish(
+            self.installation_id, self.owner, self.repo_name, self.pull_number, self.head_sha,
+        )
 
 
 @dataclass(frozen=True)
@@ -2683,10 +2683,13 @@ def _review_pass(
         run.pr, run.installation_id, run.owner, run.repo_name, config=base_repo_config,
     )
     if skip_rule is not None:
-        return _publish_config_skip(
+        run.timing.advance("post")
+        result = _publish_config_skip(
             run.installation_id, run.owner, run.repo_name, run.pull_number,
-            run.head_sha, rule=skip_rule,
+            run.head_sha, rule=skip_rule, timing=run.timing,
         )
+        run.publish_timing()
+        return result
 
     carry_request = _carry_request(run, base_repo_config)
     # AI-REVIEW 2026-11-12 [gpt-6.1-sol/code-review] 1730-R1 (PR #1731; issue #1730):
@@ -2696,17 +2699,24 @@ def _review_pass(
         _fetch_full_pr_diff, run.installation_id, run.owner, run.repo_name,
         run.pull_number, base_sha=run.base_sha, head_sha=run.head_sha,
     ))
-    carried = carry_verdict.carry_if_unchanged(carry_request, fetch_pr_diff=full_pr_diff)
+    carried = carry_verdict.carry_if_unchanged(
+        carry_request, fetch_pr_diff=full_pr_diff, timing=run.timing,
+    )
     if carried is not None:
+        run.publish_timing()
         return carried
 
     try:
         diff_text, living = _fetch_review_diff(run, living, full_pr_diff)
         diff = _prepare_review_diff(run, diff_text, living, base_repo_config)
     except (httpx.HTTPStatusError, httpx.RequestError, DiffParseError) as e:
-        return _handle_diff_failure(run, e, rerun_pending=rerun_pending)
+        try:
+            return _handle_diff_failure(run, e, rerun_pending=rerun_pending)
+        finally:
+            run.publish_timing()
 
     assessment = _assess_review(run, diff, voice)
+    run.timing.advance("post")
 
     # A durable review can spend minutes in inference. Share this gate
     # between direct publication and enqueuing fallback work.
@@ -2726,16 +2736,19 @@ def _review_pass(
     plan = _plan_tier1_publication(run, diff, assessment, comments)
     # Check and review publication fail independently.
     check = _post_tier1_check(run, plan)
-    comments = _read_prior_comments(run, comments)
-    markings = _project_tier1(run, diff, assessment, comments, plan)
-    review = _post_tier1_review(run, markings.review)
-    _record_tier1_publication(run, diff, assessment, plan, check, review, markings)
-    outcome = _record_dispatch_outcome(run, assessment, plan, check, review, comments)
-    _remember_review_baseline(
-        run, diff, assessment, comments.budget, plan.conclusion, outcome,
-        carry_request, full_pr_diff,
-    )
-    _finish_tier1_review(run, diff, assessment, voice, comments, plan, check, review, markings)
+    try:
+        comments = _read_prior_comments(run, comments)
+        markings = _project_tier1(run, diff, assessment, comments, plan)
+        review = _post_tier1_review(run, markings.review)
+        _record_tier1_publication(run, diff, assessment, plan, check, review, markings)
+        outcome = _record_dispatch_outcome(run, assessment, plan, check, review, comments)
+        _remember_review_baseline(
+            run, diff, assessment, comments.budget, plan.conclusion, outcome,
+            carry_request, full_pr_diff,
+        )
+        _finish_tier1_review(run, diff, assessment, voice, comments, plan, check, review, markings)
+    finally:
+        run.publish_timing()
 
     response = {"persona": "code_reviewer", "result": outcome.result}
     if evaluation.degraded_reason:
@@ -2792,7 +2805,7 @@ def _start_review_run(
         pull_number=pull_number, head_sha=head_sha, base_sha=base_sha, snapshot_id=snapshot_id,
         action=action, author_login=author_login, labels=labels, pr_context=pr_context,
         blocking=blocking, mode=mode, cancel_event=cancel_event, run_started_at=run_started_at,
-        run_started_monotonic=run_started_monotonic, started_at=started_at,
+        timing=ReviewTiming(run_started_monotonic), started_at=started_at,
     )
 
 
@@ -3077,9 +3090,10 @@ def _handle_diff_failure(
                 run.installation_id, run.owner, run.repo_name, run.pull_number, run.head_sha,
                 reason, blocking=run.blocking,
             )
+    run.timing.advance("post", completed=False)
     degraded = _publish_degraded(
         run.installation_id, run.owner, run.repo_name, run.pull_number, run.head_sha,
-        reason=reason, summary=check_summary, blocking=run.blocking,
+        reason=reason, summary=check_summary, blocking=run.blocking, timing=run.timing,
     )
     # Errored Activity row (PRD #301): Grug couldn't even fetch/parse the
     # diff - record it so it surfaces as `errored` (re-runnable in S3a),
@@ -3381,7 +3395,7 @@ def _review_additional_lineages(
     config_note = diff.config_note
     evaluation, quarantine_gap = _run_quarantined_pass(
         evaluation, diff.hunks, evidence, run.installation_id,
-        repo_config=diff.repo_config, started=run.run_started_monotonic,
+        repo_config=diff.repo_config, started=run.timing.started,
         voice=voice, cancel_event=run.cancel_event,
         owner=run.owner, repo_name=run.repo_name, pull_number=run.pull_number,
         head_sha=run.head_sha,
@@ -3397,7 +3411,7 @@ def _review_additional_lineages(
     evaluation, lineage_gap = _run_second_lineage_pass(
         evaluation, diff.hunks, evidence, run.installation_id,
         primary_models=llm_response.models_used,
-        repo_config=diff.repo_config, started=run.run_started_monotonic,
+        repo_config=diff.repo_config, started=run.timing.started,
         cancel_event=run.cancel_event, owner=run.owner, repo_name=run.repo_name,
         pull_number=run.pull_number, head_sha=run.head_sha,
         skip=(
@@ -3501,11 +3515,13 @@ def _review_documented_claims(
 
 def _assess_review(run: _ReviewRun, diff: _PreparedDiff, voice: VoiceSelection) -> _ReviewAssessment:
     inputs = _assemble_review_evidence(run, diff)
+    run.timing.advance("model")
     model_response, funnel = _review_and_adjudicate_tier1(run, diff, inputs, voice)
     correctness_only = bool(run.pr_context.get("review_scope"))
     evaluation, quarantine_gap, config_note = _review_additional_lineages(
         run, diff, inputs.evidence, voice, model_response, funnel.evaluation,
     )
+    run.timing.advance("analyzers", completed=model_response.kind == "reviewed")
 
     # Deterministic evidence is added after the model finding funnel.
     evaluation = _review_complexity(run, diff, inputs, evaluation, correctness_only=correctness_only)
@@ -3799,6 +3815,7 @@ def _post_tier1_check(run: _ReviewRun, plan: _Tier1Publication) -> _PostedCheck:
                 external_id=f"grug-cr:{run.pr_name}:{run.head_sha}",
             ),
         )
+        run.timing.record_check(check_result, check_resp)
         return _PostedCheck(
             run_id=(check_resp or {}).get("id"),
             url=str((check_resp or {}).get("html_url") or ""),
@@ -4222,8 +4239,11 @@ def _finish_tier1_review(
             deferred_approval=plan.deferred_approval,
             vouched=not (assessment.quarantine_gap or diff.unreviewed_paths),
             run_started_at=run.run_started_at,
+            timing=run.timing,
         )
     except Exception as e:  # noqa: BLE001 - deep append is best-effort
+        if run.timing.stage == "model":
+            run.timing.advance("post", completed=False)
         log.warning(
             "elder_async_deep_append_failed",
             extra={
@@ -4963,8 +4983,13 @@ def _publish_deep_check(
     conclusion: CheckConclusion,
     title: str,
     summary: str,
+    timing: ReviewTiming,
 ) -> int | None:
     """Post the deep append's check run; its id, or None when it failed."""
+    result = CheckRunResult(
+        name=_CHECK_NAME, head_sha=head_sha, status="completed",
+        conclusion=conclusion, title=title, summary=summary,
+    )
     try:
         response = with_install_token_retry(
             installation_id,
@@ -4972,17 +4997,11 @@ def _publish_deep_check(
                 token,
                 owner,
                 repo_name,
-                CheckRunResult(
-                    name=_CHECK_NAME,
-                    head_sha=head_sha,
-                    status="completed",
-                    conclusion=conclusion,
-                    title=title,
-                    summary=summary,
-                ),
+                result,
                 external_id=f"grug-cr-deep:{owner}/{repo_name}#{pull_number}:{head_sha}",
             ),
         )
+        timing.record_check(result, response)
     except (httpx.HTTPStatusError, httpx.RequestError) as error:
         log.warning(
             "elder_async_deep_check_publish_failed",
@@ -5831,6 +5850,7 @@ def _async_deep_append_if_needed(
     deferred_approval: bool = False,
     vouched: bool,
     run_started_at: datetime,
+    timing: ReviewTiming,
 ) -> CodeReviewEvaluation | None:
     """Run reasoner after Tier-1 publish when tiered escalation fires (#646).
 
@@ -5875,6 +5895,7 @@ def _async_deep_append_if_needed(
     ):
         return None
 
+    timing.advance("model")
     deep_llm = review_reasoner_diff(
         evidence,
         installation_id=installation_id,
@@ -5894,6 +5915,7 @@ def _async_deep_append_if_needed(
         if not is_blackout(deep_llm.kind):
             # `no_diff`: nothing for the reasoner to look at is not a
             # failure to look (BENIGN_DEGRADATIONS) - nothing to qualify.
+            timing.advance("post", completed=False)
             return evaluation
         # grug#848: the reasoner did NOT run (transport or parse failure).
         # This used to `return` here, leaving Tier-1's already-published
@@ -5925,6 +5947,7 @@ def _async_deep_append_if_needed(
             pull_number=pull_number,
             head_sha=head_sha,
         )
+    timing.advance("post", completed=arm_ran)
 
     # Supersession after long reasoner/judge work (#646 FLINT).
     if cancel_event is not None and cancel_event.is_set():
@@ -6082,6 +6105,7 @@ def _async_deep_append_if_needed(
             conclusion=conclusion,
             title=title,
             summary=summary,
+            timing=timing,
         )
     _publish_deep_review(
         deep_eval,
@@ -6260,6 +6284,7 @@ def _publish_degraded(
     installation_id: int, owner: str, repo_name: str, pull_number: int,
     head_sha: str, *, reason: str, summary: str | None = None,
     blocking: bool = False,
+    timing: ReviewTiming,
 ) -> dict[str, str]:
     """Post the terminal "could not review" check-run when fetch/parse fails
     (grug#818: one voice with the other no-review surfaces). Best-effort -
@@ -6280,22 +6305,22 @@ def _publish_degraded(
     summary = lead_with_degraded_line(summary or (
         could_not_review_sentence(reason) + " " + gate_sentence(blocking)
     ), reason)
-    conclusion = degraded_conclusion(blocking)
+    result = CheckRunResult(
+        name=_CHECK_NAME, head_sha=head_sha, status="completed",
+        conclusion=degraded_conclusion(blocking), title=title, summary=summary,
+    )
     publish_failed = False
     try:
-        with_install_token_retry(
+        response = with_install_token_retry(
             installation_id,
             lambda token: post_check_run(
-                token, owner, repo_name,
-                CheckRunResult(
-                    name=_CHECK_NAME, head_sha=head_sha, status="completed",
-                    conclusion=conclusion, title=title, summary=summary,
-                ),
+                token, owner, repo_name, result,
                 external_id=(
                     f"grug-cr:{owner}/{repo_name}#{pull_number}:{head_sha}"
                 ),
             ),
         )
+        timing.record_check(result, response)
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
         # No recovery path beyond logging — but a silent miss here
         # means the PR shows NO check-run at all, indistinguishable
