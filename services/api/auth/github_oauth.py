@@ -131,6 +131,27 @@ def _state_secret() -> str:
         return _signing_secret_cache
 
 
+class SessionSigningNotProvisioned(RuntimeError):
+    """Production has no dedicated session signing key; refuse to run."""
+
+
+def _refuse_fallback_in_production(reason: str) -> None:
+    """In production the webhook-secret fallback is not allowed (#1870)."""
+    if os.environ.get("GRUG_ENV", "") == "prod":
+        log.error("session_signing_secret_%s_refusing_fallback", reason)
+        raise SessionSigningNotProvisioned(reason)
+
+
+def require_session_signing_secret_at_startup() -> None:
+    """Resolve the signing key once at boot so production fails fast.
+
+    Outside production this is a no-op, so local runs and tests keep the
+    documented fallback.
+    """
+    if os.environ.get("GRUG_ENV", "") == "prod":
+        _state_secret()
+
+
 def _resolve_signing_secret() -> str:
     from botocore.exceptions import BotoCoreError, ClientError
     from secrets_loader import _get_ssm_secure_string  # type: ignore
@@ -152,8 +173,10 @@ def _resolve_signing_secret() -> str:
                     extra={"kind": type(e).__name__},
                 )
                 raise SessionSigningUnavailable() from e
+            _refuse_fallback_in_production("unprovisioned")
             log.warning("session_signing_secret_unprovisioned_using_fallback")
     else:
+        _refuse_fallback_in_production("unconfigured")
         log.warning("session_signing_secret_unconfigured_using_fallback")
     return _get_ssm_secure_string(
         os.environ.get("GITHUB_APP_WEBHOOK_SECRET_SSM", "")
