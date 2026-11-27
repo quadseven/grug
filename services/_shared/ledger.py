@@ -54,7 +54,10 @@ VERIFIER_REVIEWER = "elder-verifier"
 # finding only it raised, `second-lineage-run` per run, `single-lineage` per
 # high-risk PR that got one lineage.
 SECOND_LINEAGE_REVIEWER = "elder-second-lineage"
-TELEMETRY_REVIEWERS = frozenset({VERIFIER_REVIEWER, SECOND_LINEAGE_REVIEWER})
+ESCAPE_REVIEWER = "escape-loop"
+TELEMETRY_REVIEWERS = frozenset(
+    {VERIFIER_REVIEWER, SECOND_LINEAGE_REVIEWER, ESCAPE_REVIEWER}
+)
 
 # CRITICAL first; unknown labels sort last (consumers use .get(sev, 4)).
 # The ONE severity-ranking convention - few_shot (and any future consumer)

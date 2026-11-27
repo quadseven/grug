@@ -650,6 +650,33 @@ repo's `LEDGER#<owner/repo>` rows when feedback is not appearing. The ledger
 write and cache refresh happen before `last_verdict` advances, so a transient
 store failure retries the idempotent learning update on the next poll.
 
+### Escape ledger sweep
+
+Run from the checkout with a timestamped snapshot of merged pull requests and
+their recorded review evidence. The command reads local files and writes new
+ledger rows to stdout. Keep the snapshot and preview with the source evidence.
+
+```bash
+cd services/webhook
+PYTHONPATH=../_shared python3 -m escape_sweep snapshot.json \
+  --ledger ../../logs/review-ledger.jsonl > escape-rows.jsonl
+```
+
+The snapshot is a JSON object with `repo`, `as_of`, `pulls`, and
+`review_evidence`. Use offset-aware ISO timestamps. Each pull contains
+`number`, `merged_at`, and `files`, with optional `title`, `body`, and
+`commit_messages`. Include the originating PRs even if they predate the
+90-day window. An optional `commit_pulls` object maps referenced commit
+SHAs to pull numbers.
+
+Key `review_evidence` by originating pull number. Each entry has
+`reviews` containing `source` (`elder` or `deterministic-lane`) and
+`seen_paths`, and `findings` containing `path`, `finding_class`, `verdict`,
+and `reviewer`. Use two empty arrays only when the evidence confirms no
+review took place. Omit the entry when evidence is incomplete. The sweep
+reports those correcting PRs on stderr. Review the rows before adding them
+to the ledger. Repeat with the updated ledger to skip recorded corrections.
+
 ### Elder replay eval, run locally (grug#916)
 
 `make elder-eval` replays the committed ledger corpus and scores catch
