@@ -136,7 +136,7 @@ def test_ignores_unsafe_payloads_before_loading_a_backend(case):
 
 
 @pytest.mark.parametrize(("configured", "timeouts", "reason"), [
-    ("240.5", [240.5], "backend_request_failed"),
+    ("240.5", [240.5], "backend_timeout"),
     ("300.01", [], "invalid_request_timeout"),
 ])
 def test_worker_uses_the_bounded_http_deadline_and_still_refuses_an_outage(case, configured, timeouts, reason):
@@ -174,7 +174,8 @@ print(json.dumps({"timeouts": timeouts, "result": result}))
     }
 
 
-def test_paired_budget_reviews_every_hunk_beyond_the_live_plan_limit(case, monkeypatch):
+@pytest.mark.parametrize("read_timeout", [False, True])
+def test_paired_budget_reviews_every_hunk_beyond_the_live_plan_limit(case, monkeypatch, read_timeout):
     _case_runner(monkeypatch)
     import llm_client
     from personas.code_reviewer.diff_parser import parse_diff
@@ -207,8 +208,21 @@ def test_paired_budget_reviews_every_hunk_beyond_the_live_plan_limit(case, monke
         return response
 
     monkeypatch.setattr(llm_client, "review_diff", observe)
-    result = replay_arm.evaluate(case, post=lambda *_args: _reply({"findings": []}))
+    calls = 0
 
+    def post(*_args):
+        nonlocal calls
+        calls += 1
+        if read_timeout and calls == 4:
+            raise httpx.ReadTimeout("simulated cohort timeout")
+        return _reply({"findings": []})
+
+    result = replay_arm.evaluate(case, post=post)
+
+    if read_timeout:
+        assert result == {"status": "invalid", "reason": "backend_timeout"}
+        assert calls == 4
+        return
     assert result["status"] == "scored", result
     assert coverage[0].complete
     assert coverage[0].completed_cohorts == live_plan.total_cohorts_planned

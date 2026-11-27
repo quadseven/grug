@@ -131,6 +131,19 @@ def test_incomplete_arm_does_not_publish_any_comparison(tmp_path):
     assert not list((tmp_path / "out").iterdir())
 
 
+def test_incomplete_arm_reports_only_a_known_failure_code():
+    cases = (
+        ("backend_timeout", "replay case did not produce a complete verdict (backend_timeout)"),
+        ("untrusted diagnostic from the worker", "replay case did not produce a complete verdict"),
+        (["backend_timeout"], "replay case did not produce a complete verdict"),
+    )
+    for reason, expected in cases:
+        with pytest.raises(ReplayError) as reported:
+            _arm_result({"status": "invalid", "reason": reason}, backend="cave",
+                        model="model-v1", label="replay case")
+        assert str(reported.value) == expected
+
+
 def test_measurement_exports_the_named_commit_instead_of_live_worktree(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()

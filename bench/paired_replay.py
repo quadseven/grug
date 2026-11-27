@@ -27,6 +27,12 @@ SCORER_REVISION = "621b7655c4adb737a1a93404cf6687b98ff34fe4"
 BASELINE_REVISION = "a0e314393b1f99a3bd22d47eef8b3445103f3286"
 ARM = Path(__file__).with_name("replay_arm.py")
 BACKEND = "cave"
+_REPORTABLE_FAILURE_REASONS = frozenset({
+    "backend_request_failed", "backend_status", "backend_timeout", "incomplete_model_output",
+    "incomplete_publication_verdicts", "incomplete_review", "incomplete_review_findings",
+    "invalid_model_envelope", "missing_model_response", "review_cancelled",
+    "served_model_mismatch", "unexpected_model_route", "unexpected_network_request",
+})
 
 
 class ReplayError(RuntimeError):
@@ -75,7 +81,9 @@ def _number(value: object) -> bool:
 
 def _arm_result(payload, *, backend: str, model: str, label: str) -> dict:
     if not isinstance(payload, dict) or payload.get("status") != "scored":
-        raise ReplayError(f"{label} did not produce a complete verdict")
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        suffix = f" ({reason})" if isinstance(reason, str) and reason in _REPORTABLE_FAILURE_REASONS else ""
+        raise ReplayError(f"{label} did not produce a complete verdict{suffix}")
     if payload.get("model") != model or payload.get("backend") != backend:
         raise ReplayError(f"{label} did not report the requested backend and served model")
     seconds = payload.get("verdict_seconds")
