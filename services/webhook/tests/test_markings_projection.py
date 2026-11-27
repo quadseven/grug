@@ -256,7 +256,7 @@ def github(monkeypatch) -> _FakeGitHub:
     return fake
 
 
-def _publish_deep() -> None:
+def _publish_deep(*, anchor: str = "new3 = read_value()") -> None:
     tier1 = _deep_finding(2, "null-deref", "high")
     novel = (
         _deep_finding(3, "silent-failure", "medium"),
@@ -277,8 +277,8 @@ def _publish_deep() -> None:
         author_login="alice", mode="blocking", living_range="",
         deep_suppressed_count=1, combined_eval=combined,
         pr_title="Preserve PR intent", base_sha="base5678ijkl",
-        file_contents={"src/x.py": "context\nnew1\nnew2\nnew3\n"},
-        linked_issues=(42,), diff_text=_DIFF,
+        file_contents={"src/x.py": f"context\nnew1\nnew2\n{anchor}\n"},
+        linked_issues=(42,), diff_text=_DIFF.replace("+new3\n", f"+{anchor}\n"),
     )
 
 
@@ -304,6 +304,14 @@ def test_deep_append_surfaces_are_unchanged(github):
     # The deep review carries its ADR-0025 publication key; the key hashes
     # the payload, so it is pinned along with the body.
     _assert_pinned(surfaces, _DEEP)
+
+
+def test_deep_append_keeps_a_wrong_anchor_suggestion_as_prose(github):
+    _publish_deep(anchor="new3")
+    [review] = github.posted
+    comment = next(comment for comment in review.comments if comment.line == 4)
+    assert "new3 = lock(new3)" in comment.body
+    assert "```suggestion" not in comment.body
 
 
 def test_redelivered_deep_publish_applies_the_same_bodies(github, monkeypatch):

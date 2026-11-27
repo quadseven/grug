@@ -72,12 +72,22 @@ def test_fix_still_applies_returns_replacement():
     rec = _make_finding_record(
         path="a.py", line=2, suggestion="x = 2", message="set x to 2",
     )
-    file_text = "x = 1\ny = 2\n"
+    file_text = "y = 1\r\nx = 1\r\n"
     assert autofix._fix_still_applies(rec, file_text) == "x = 2"
 
 
 def test_fix_still_applies_none_when_line_out_of_range():
     rec = _make_finding_record(path="a.py", line=99, suggestion="x = 2")
+    assert autofix._fix_still_applies(rec, "x = 1\n") is None
+
+
+def test_fix_still_applies_none_when_the_reviewed_line_changed():
+    rec = _make_finding_record(path="a.py", line=1, suggestion="x = 2", evidence="x = 1")
+    assert autofix._fix_still_applies(rec, "x = 3\n") is None
+
+
+def test_fix_still_applies_none_when_legacy_record_has_no_evidence():
+    rec = _make_finding_record(path="a.py", line=1, suggestion="x = 2", evidence="")
     assert autofix._fix_still_applies(rec, "x = 1\n") is None
 
 
@@ -217,7 +227,7 @@ def test_run_fix_mixed_applied_and_skipped():
 
 def test_run_fix_preserves_multiple_fixes_in_same_file():
     first = _make_finding_record(path="a.py", line=1, suggestion="x = 2", rule="r1")
-    second = _make_finding_record(path="a.py", line=2, suggestion="y = 3", rule="r2")
+    second = _make_finding_record(path="a.py", line=2, suggestion="y = 3", rule="r2", evidence="y = 2")
     committed = {}
     res = _run_fix(
         get_session=lambda *_: _FakeSession([first, second]),
@@ -256,7 +266,7 @@ def test_run_fix_file_fetch_failure_is_skipped():
 
 def test_run_fix_commit_failure_reports_all_skipped():
     rejected = _make_finding_record(path="a.py", line=1, suggestion="x = 2")
-    valid = _make_finding_record(path="b.py", line=1, suggestion="y = 2")
+    valid = _make_finding_record(path="b.py", line=1, suggestion="y = 2", evidence="y = 1")
     session = _FakeSession([rejected, valid])
 
     def fetch(token_fn, owner, repo, path, ref):
@@ -395,7 +405,7 @@ def test_run_fix_reports_a_refused_commit_reason():
 
 def test_run_fix_reads_each_file_once():
     first = _make_finding_record(path="a.py", line=1, suggestion="x = 2", rule="r1")
-    second = _make_finding_record(path="a.py", line=2, suggestion="y = 3", rule="r2")
+    second = _make_finding_record(path="a.py", line=2, suggestion="y = 3", rule="r2", evidence="y = 2")
     reads = []
 
     def fetch(token_fn, owner, repo, path, ref):
