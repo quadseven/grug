@@ -1,7 +1,6 @@
 import json
 
 import pytest
-
 from escape_sweep import main
 
 
