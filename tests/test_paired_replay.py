@@ -134,6 +134,7 @@ def test_incomplete_arm_does_not_publish_any_comparison(tmp_path):
 def test_incomplete_arm_reports_only_a_known_failure_code():
     cases = (
         ("backend_timeout", "replay case did not produce a complete verdict (backend_timeout)"),
+        ("provider_fallback_rejected", "replay case did not produce a complete verdict (provider_fallback_rejected)"),
         ("untrusted diagnostic from the worker", "replay case did not produce a complete verdict"),
         (["backend_timeout"], "replay case did not produce a complete verdict"),
     )

@@ -27,6 +27,8 @@ from urllib.parse import unquote, urlsplit
 _SHA = re.compile(r"[0-9a-f]{40}")
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*")
 _COMPLETIONS_PATH = "/v1/chat/completions"
+_FREE_PROVIDER_FALLBACK_ROUTES = ("free-pool", "openrouter", "poolside")
+PROVIDER_FALLBACK_REJECTED = "provider_fallback_rejected"
 REQUEST_TIMEOUT_ENV = "GRUG_BENCH_TIMEOUT_SECONDS"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 150
 MAX_REQUEST_TIMEOUT_SECONDS = 300
@@ -209,6 +211,8 @@ class FixedBackend:
             or config.url != self.backend.url
             or config.model != self.backend.model
         ):
+            if identity in _FREE_PROVIDER_FALLBACK_ROUTES:
+                self.refuse(PROVIDER_FALLBACK_REJECTED)
             self.refuse("unexpected_model_route")
         schema_field = (
             "verdicts" if config.extra_headers.get("X-Spark-Caller") == "grug-elder-judge"

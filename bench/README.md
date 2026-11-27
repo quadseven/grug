@@ -28,4 +28,4 @@ The per-request timeout defaults to 150 seconds. Set `GRUG_BENCH_TIMEOUT_SECONDS
 
 The output directory holds each revision's findings and scorer result. `comparison.json` includes the corpus and diff hashes, measured revisions, served model, request timeout, metrics, and candidate-minus-baseline deltas. An incomplete verdict, inconsistent served model, scorer exclusion, or thermal stop prevents publication of the comparison file.
 
-A stopped replay reports the case and arm, plus a fixed reason code when the worker can classify the failure. `backend_timeout` means the model call reached its deadline. Worker exception messages and response bodies stay out of the report.
+A stopped replay reports the case and arm, plus a fixed reason code when the worker can classify the failure. `backend_timeout` means the model call reached its deadline. `provider_fallback_rejected` means the reviewer selected a free provider fallback and the fixed-model guard rejected it before sending a request. Worker exception messages and response bodies stay out of the report.
