@@ -286,11 +286,11 @@ def test_non_prod_uses_the_fallback_without_the_escape_hatch(real_state_secret, 
     assert _WEBHOOK in calls
 
 
-def test_the_api_deployment_sets_the_escape_hatch_until_the_key_exists():
-    """Prod fails closed by default, so the API manifest must opt in to the
-    fallback explicitly while the dedicated key is unprovisioned."""
+def test_the_api_deployment_requires_the_dedicated_signing_key():
+    """The production manifest enables the fail-closed startup check."""
     from pathlib import Path
 
     manifest = Path(__file__).resolve().parents[3] / "k8s" / "api-deployment.yaml"
     text = manifest.read_text()
-    assert "{name: GRUG_SESSION_SIGNING_ALLOW_FALLBACK, value: \"1\"}" in text
+    assert "name: GRUG_SESSION_SIGNING_SECRET_SSM," in text
+    assert "name: GRUG_SESSION_SIGNING_ALLOW_FALLBACK," not in text

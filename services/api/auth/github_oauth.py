@@ -141,7 +141,7 @@ def _is_prod() -> bool:
 
 def _refuse_fallback_in_production(reason: str) -> None:
     """Production fails closed: the webhook-secret fallback is refused unless
-    the deployment sets the escape hatch GRUG_SESSION_SIGNING_ALLOW_FALLBACK=1,
+    an operator enables GRUG_SESSION_SIGNING_ALLOW_FALLBACK=1,
     which is logged at error level on every use (#1870)."""
     if not _is_prod():
         return
