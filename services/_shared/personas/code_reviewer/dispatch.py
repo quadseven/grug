@@ -88,7 +88,7 @@ from personas.code_reviewer.dedup import (
     finding_key, parse_rule,
 )
 from personas.code_reviewer.diff_parser import (
-    added_lines,
+    REVIEW_LEDGER_PATH, added_lines,
     DiffHunk, DiffParseError, file_changes, is_tree_copy_candidate, new_file_blob_ids,
     fit_hunks_to_cohorts, parse_diff, split_duplicate_hunks,
     split_reviewable_hunks, split_tree_copy_hunks,
@@ -1976,10 +1976,13 @@ def _delta_is_empty(diff_text: str) -> bool:
     return not parse_diff(diff_text) and not removed_paths(diff_text)
 
 
-def _delta_is_excluded_metadata_only(diff_text: str) -> bool:
-    """A nonempty delta whose hunks the canonical metadata filter excludes (#1730)."""
+def _delta_is_review_metadata_only(diff_text: str) -> bool:
+    """A nonempty delta limited to the ledger and normally excluded files."""
     hunks = parse_diff(diff_text)
-    return bool(hunks) and not removed_paths(diff_text) and not split_reviewable_hunks(hunks)[0]
+    reviewable, _ = split_reviewable_hunks(hunks)
+    return bool(hunks) and not removed_paths(diff_text) and all(
+        hunk.file_path == REVIEW_LEDGER_PATH for hunk in reviewable
+    )
 
 
 def _is_lock_only(diff_text: str) -> bool:
@@ -2935,7 +2938,7 @@ def _fetch_review_diff(
             extra={"pr": run.pr_name, "range": living.range},
         )
         return full_pr_diff(), replace(living, prior_sha="", range="")
-    if _delta_is_excluded_metadata_only(diff_text):
+    if _delta_is_review_metadata_only(diff_text):
         return full_pr_diff(), replace(living, prior_sha="", range="", metadata_range=living.range)
     return diff_text, living
 
@@ -2985,7 +2988,7 @@ def _prepare_review_diff(
     )
     if living.metadata_range:
         config_note += (
-            "\n\nLiving Hunt: the delta contained only excluded metadata in `"
+            "\n\nLiving Hunt: the delta contained only review metadata in `"
             + living.metadata_range
             + "`, so Elder reviewed the full PR diff on this head instead."
         )

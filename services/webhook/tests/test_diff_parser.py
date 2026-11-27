@@ -409,6 +409,14 @@ class TestReviewExclusionSplit:
         assert [h.file_path for h in kept] == ["src/a.py", "src/b.py"]
         assert excluded == ("logs/corpus.jsonl",)
 
+    def test_required_review_ledger_changes_reach_review(self):
+        ledger = self._hunk("logs/review-ledger.jsonl")
+        named_like_ledger = self._hunk("data/logs/review-ledger.jsonl")
+        generated = self._hunk("logs/corpus.jsonl")
+        kept, excluded = split_reviewable_hunks((ledger, named_like_ledger, generated))
+        assert kept == (ledger,)
+        assert excluded == (named_like_ledger.file_path, generated.file_path)
+
     def test_all_excluded_yields_empty_kept(self):
         kept, excluded = split_reviewable_hunks((self._hunk("x.lock"),))
         assert kept == ()

@@ -114,6 +114,7 @@ _HUNK_BOUNDARY_PREFIXES: tuple[str, ...] = (
 # `_pb2_grpc.py`, not any `*_grpc.py`, so a hand-written `my_grpc.py` stays
 # reviewed. A hand edit inside generated output is still a path named in
 # the check summary, never silently dropped.
+REVIEW_LEDGER_PATH = "logs/review-ledger.jsonl"
 _REVIEW_EXCLUDED_PATH_RE = re.compile(
     r"(?:^|/)("
     r"node_modules|vendor|__snapshots__|dist|__generated__|"
@@ -134,6 +135,10 @@ _REVIEW_EXCLUDED_PATH_RE = re.compile(
 def is_review_excluded_path(path: str) -> bool:
     """True when a changed file is data/generated/vendored - no LLM review
     signal (#609). Pure; the single source the split + tests share."""
+    # The repo's review ledger contains authored dispositions and evidence.
+    # Keep it in review; the ordinary hunk and cohort limits still apply.
+    if path == REVIEW_LEDGER_PATH:
+        return False
     return _REVIEW_EXCLUDED_PATH_RE.search(path) is not None
 
 

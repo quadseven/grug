@@ -845,18 +845,18 @@ def test_a_non_empty_delta_still_reviews_only_the_delta(monkeypatch):
 # --- #1730: an excluded metadata delta still needs a current-head review ---
 
 def test_a_metadata_only_delta_reviews_full_source_on_the_current_head(monkeypatch):
-    """Excluded ledger hunks must not strand earlier source changes without a verdict."""
+    """The ledger and the earlier source both need a verdict on this head."""
     metadata = _added("logs/review-ledger.jsonl", ["{}"])
     seen = _review_after_push(monkeypatch, delta=metadata, full=_ONE_HUNK + metadata)
 
-    assert seen["reviewed"] == [{"x.py"}]
+    assert seen["reviewed"] == [{"x.py", "logs/review-ledger.jsonl"}]
     assert seen["review_heads"] == ["abcd1234efgh"]
     assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
     final = seen["checks"][-1]
     assert final.conclusion == "success"
     assert "no_diff" not in final.title
     assert not final.title.startswith("Living Hunt")
-    assert "delta contained only excluded metadata" in final.summary
+    assert "delta contained only review metadata" in final.summary
     assert "reviewed the full PR diff on this head" in final.summary
 
 
@@ -873,14 +873,14 @@ def test_a_blocking_full_review_after_a_metadata_delta_still_fails(monkeypatch):
         monkeypatch, delta=metadata, full=_ONE_HUNK + metadata, findings=(finding,),
     )
 
-    assert seen["reviewed"] == [{"x.py"}]
+    assert seen["reviewed"] == [{"x.py", "logs/review-ledger.jsonl"}]
     assert seen["review_heads"] == ["abcd1234efgh"]
     assert seen["checks"][-1].conclusion == "failure"
 
 
 def test_a_metadata_only_full_pr_still_concludes_no_diff(monkeypatch):
     """A bounded fallback does not invent a review for an entirely excluded PR."""
-    metadata = _added("logs/review-ledger.jsonl", ["{}"])
+    metadata = _added("logs/replay-corpus.jsonl", ["{}"])
     seen = _review_after_push(monkeypatch, delta=metadata, full=metadata)
 
     assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
@@ -888,6 +888,15 @@ def test_a_metadata_only_full_pr_still_concludes_no_diff(monkeypatch):
     final = seen["checks"][-1]
     assert final.conclusion == "neutral"
     assert "no_diff" in final.title
+
+
+def test_a_ledger_only_pr_still_receives_a_review(monkeypatch):
+    ledger = _added("logs/review-ledger.jsonl", ["{}"])
+    seen = _review_after_push(monkeypatch, delta=ledger, full=ledger)
+
+    assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
+    assert seen["reviewed"] == [{"logs/review-ledger.jsonl"}]
+    assert seen["checks"][-1].conclusion == "success"
 
 
 def test_metadata_fallback_keeps_the_existing_full_diff_filters(monkeypatch):
@@ -902,6 +911,7 @@ def test_metadata_fallback_keeps_the_existing_full_diff_filters(monkeypatch):
     copy_lines = [f"value_{i} = {i}" for i in range(30)]
     full = (
         _ONE_HUNK + metadata
+        + _added("logs/replay-corpus.jsonl", ["{}"])
         + _added("ignored.py", ["ignored = True"])
         + _added("oversized.py", ["x = '" + "x" * 2000 + "'"])
         + _added("first_copy.py", copy_lines)
@@ -910,7 +920,7 @@ def test_metadata_fallback_keeps_the_existing_full_diff_filters(monkeypatch):
     seen = _review_after_push(monkeypatch, delta=metadata, full=full)
 
     assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
-    assert seen["reviewed"] == [{"x.py", "first_copy.py"}]
+    assert seen["reviewed"] == [{"x.py", "first_copy.py", "logs/review-ledger.jsonl"}]
 
 
 def _prior_successful_carry_record(monkeypatch):
@@ -936,7 +946,7 @@ def test_metadata_fallback_reuses_the_full_diff_read_by_the_carry_probe(monkeypa
     seen = _review_after_push(monkeypatch, delta=metadata, full=_ONE_HUNK + metadata)
 
     assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
-    assert seen["reviewed"] == [{"x.py"}]
+    assert seen["reviewed"] == [{"x.py", "logs/review-ledger.jsonl"}]
     assert seen["review_heads"] == ["abcd1234efgh"]
     assert seen["checks"][-1].conclusion == "success"
 
@@ -951,6 +961,6 @@ def test_metadata_fallback_retries_a_failed_carry_diff_fetch(monkeypatch):
     )
 
     assert seen["full"] == [("base5678ijkl", "abcd1234efgh")] * 2
-    assert seen["reviewed"] == [{"x.py"}]
+    assert seen["reviewed"] == [{"x.py", "logs/review-ledger.jsonl"}]
     assert seen["review_heads"] == ["abcd1234efgh"]
     assert seen["checks"][-1].conclusion == "success"
