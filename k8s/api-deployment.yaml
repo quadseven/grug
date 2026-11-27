@@ -114,14 +114,9 @@ spec:
             - {name: GITHUB_APP_ID_SSM, value: /grug/github-app-id}
             - {name: GITHUB_APP_PRIVATE_KEY_SSM, value: /grug/github-app-private-key}
             - {name: GITHUB_APP_WEBHOOK_SECRET_SSM, value: /grug/github-app-webhook-secret}
-            # Dedicated key for session-cookie + CSRF-state HMAC, decoupled
-            # from the webhook secret (audit #5). In prod github_oauth refuses
-            # to start without it (#1870) unless the escape hatch below is set.
+            # The production API requires this dedicated session-cookie and
+            # CSRF-state signing key at startup.
             - {name: GRUG_SESSION_SIGNING_SECRET_SSM, value: /grug/session-signing-secret}
-            # ESCAPE HATCH: the param above is not provisioned yet (HITL
-            # prereq), so prod signs with the webhook secret and logs an
-            # error on each use. Remove this line once the param exists.
-            - {name: GRUG_SESSION_SIGNING_ALLOW_FALLBACK, value: "1"}
             - {name: GITHUB_APP_CLIENT_ID_SSM, value: /grug/github-app-client-id}
             - {name: GITHUB_APP_CLIENT_SECRET_SSM, value: /grug/github-app-client-secret}
             - {name: GRUG_CF_SHARED_SECRET_SSM, value: /grug/cf-shared-secret}
