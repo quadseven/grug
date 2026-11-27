@@ -1,9 +1,8 @@
 """SSM Parameter Store reference factory.
 
-Pulumi does NOT manage the secret VALUES — those are pre-loaded by hand
-per docs/HITL_PREREQUISITES.md. This factory only references existing
-SSM parameters by name so other components (Lambda IAM policies) can
-grant least-privilege access via the resolved ARN.
+This factory references existing SSM parameters seeded outside this stack,
+per docs/HITL_PREREQUISITES.md. It resolves their ARNs so other components
+can grant least-privilege access.
 
 Per memory `feedback_prefer_ssm_over_1p` — SSM is the canonical secret
 store; this factory is the standard intake point.
