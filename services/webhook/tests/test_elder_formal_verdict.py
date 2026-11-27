@@ -9,6 +9,7 @@ conclusion. A degraded run never approves.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -16,7 +17,7 @@ import httpx
 import pytest
 
 from github_reviews_client import ReviewResult
-from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse
+from llm_client import Backend, Finding as LlmFinding, LlmReviewResponse, _build_messages
 from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
 from personas.code_reviewer.carry_forward import CarriedFinding
@@ -94,7 +95,7 @@ def _review(rid, *, state, commit="old0000", submitted_at=None):
 
 def _run(monkeypatch, llm, *, blocking, action="opened", threads=(),
          carried=(), reviews=(), author="alice", head_state="current",
-         rerun_pending=False, diff=_DIFF, checks=None, head=_HEAD):
+         rerun_pending=False, diff=_DIFF, checks=None, head=_HEAD, model_prompts=None):
     """Drive one Tier-1 review; return (posted reviews, dismissed ids).
     `checks`, when given, collects every posted check-run.
 
@@ -103,7 +104,13 @@ def _run(monkeypatch, llm, *, blocking, action="opened", threads=(),
     posted: list[ReviewResult] = []
     dismissed: list[int] = []
     monkeypatch.setattr(cr_dispatch, "_pr_head_state", lambda *a, **k: head_state)
-    monkeypatch.setattr(cr_dispatch, "review_diff", lambda *a, **kw: llm)
+
+    def _review(evidence, *a, **kw):
+        if model_prompts is not None:
+            model_prompts.append(_build_messages(evidence, "v2")[1]["content"])
+        return llm
+
+    monkeypatch.setattr(cr_dispatch, "review_diff", _review)
     monkeypatch.setattr(
         cr_dispatch, "post_check_run",
         lambda *a, **kw: (checks.append(a[3]) if checks is not None else None) or {},
@@ -418,6 +425,45 @@ def _with_file(path: str, body: str = "+x = 1\n") -> str:
     )
 
 
+_REVIEW_LEDGER = "logs/review-ledger.jsonl"
+
+
+def _ledger_row(finding="One independent test assertion"):
+    return json.dumps({
+        "repo": "example/project", "pr": 1, "reviewer": "reviewer",
+        "class": "test-fidelity", "finding": finding, "verdict": "fixed",
+    })
+
+
+def test_small_ledger_append_is_reviewed_without_fetching_its_history(monkeypatch):
+    token = "gh" + "p_" + "x" * 40
+    fetched_paths = []
+
+    def fetch_contents(_token, _owner, _repo, paths, _ref, **_kwargs):
+        fetched_paths.extend(paths)
+        return {
+            path: "historical-ledger-row" for path in paths if path == _REVIEW_LEDGER
+        }
+
+    monkeypatch.setattr(cr_dispatch, "fetch_file_contents", fetch_contents)
+    prompts, checks = [], []
+    posted, _ = _run(
+        monkeypatch, _clean(), blocking=True,
+        diff=_with_file(_REVIEW_LEDGER, "+" + _ledger_row("Fixture value " + token) + "\n"),
+        model_prompts=prompts, checks=checks,
+    )
+
+    assert fetched_paths.count("src/x.py") >= 1
+    assert _REVIEW_LEDGER not in fetched_paths
+    assert "src/x.py" in prompts[0]
+    assert _REVIEW_LEDGER in prompts[0]
+    assert "Fixture value [REDACTED:github-pat]" in prompts[0]
+    assert token not in prompts[0]
+    assert "historical-ledger-row" not in prompts[0]
+    assert "Elder does not approve this head" not in checks[-1].summary
+    assert [review.event for review in posted] == ["APPROVE"]
+
+
 def _ignore_docs(monkeypatch):
     from personas.code_reviewer.repo_config import parse_repo_config
 
@@ -425,7 +471,10 @@ def _ignore_docs(monkeypatch):
     monkeypatch.setattr(cr_dispatch, "_load_pr_repo_config", lambda *a, **k: config)
 
 
-@pytest.mark.parametrize("kind", ["excluded", "oversized", "ignored"])
+@pytest.mark.parametrize("kind", [
+    "excluded", "oversized", "ignored", "ledger-other-path", "ledger-malformed", "ledger-oversized",
+    "ledger-cohort-unread",
+])
 @pytest.mark.parametrize("blocking", [False, True], ids=["advisory", "blocking"])
 def test_unreviewed_path_never_approves_and_is_named(monkeypatch, kind, blocking):
     """Elder approves only code it read. A changed path dropped before the
@@ -435,6 +484,15 @@ def test_unreviewed_path_never_approves_and_is_named(monkeypatch, kind, blocking
         path, body = "data/rows.csv", "+a,b\n"
     elif kind == "oversized":
         path, body = "src/huge.py", "".join(f"+v{i} = {i}\n" for i in range(2000))
+        monkeypatch.setattr(cr_dispatch, "review_cohort_char_budget", lambda: 2000)
+    elif kind == "ledger-other-path":
+        path, body = "other/" + _REVIEW_LEDGER, "+" + _ledger_row() + "\n"
+    elif kind == "ledger-malformed":
+        path, body = _REVIEW_LEDGER, "+{bad json\n"
+    elif kind == "ledger-oversized":
+        path, body = _REVIEW_LEDGER, "+" + _ledger_row("x" * (13 * 1024)) + "\n"
+    elif kind == "ledger-cohort-unread":
+        path, body = _REVIEW_LEDGER, "+" + _ledger_row("x" * 2100) + "\n"
         monkeypatch.setattr(cr_dispatch, "review_cohort_char_budget", lambda: 2000)
     else:
         path, body = "docs/guide.md", "+words\n"
