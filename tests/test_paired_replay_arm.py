@@ -135,6 +135,45 @@ def test_ignores_unsafe_payloads_before_loading_a_backend(case):
     assert result == {"status": "invalid", "reason": "invalid_diff"}
 
 
+@pytest.mark.parametrize(("configured", "timeouts", "reason"), [
+    ("240.5", [240.5], "backend_request_failed"),
+    ("300.01", [], "invalid_request_timeout"),
+])
+def test_worker_uses_the_bounded_http_deadline_and_still_refuses_an_outage(case, configured, timeouts, reason):
+    root = Path(__file__).resolve().parents[1]
+    env = {
+        "PATH": os.defpath,
+        "PYTHONPATH": os.pathsep.join(str(root / path) for path in (".", "services/webhook", "services/_shared")),
+        "GRUG_BENCH_CAVE_URL": URL,
+        "GRUG_BENCH_TIMEOUT_SECONDS": configured,
+    }
+    # Use the worker's fresh imports so the real transport reads its locked settings.
+    command = """
+import json
+import sys
+from unittest.mock import patch
+
+import httpx
+
+from bench.replay_arm import evaluate
+
+timeouts = []
+
+def post(_url, *, timeout, **_kwargs):
+    timeouts.append(timeout)
+    raise httpx.ReadTimeout("simulated outage")
+
+with patch.object(httpx, "post", post):
+    result = evaluate(json.load(sys.stdin))
+print(json.dumps({"timeouts": timeouts, "result": result}))
+"""
+    result = subprocess.run([sys.executable, "-B", "-c", command], cwd=root, env=env,
+                            input=json.dumps(case), capture_output=True, text=True, check=True, timeout=15)
+    assert json.loads(result.stdout) == {
+        "timeouts": timeouts, "result": {"status": "invalid", "reason": reason},
+    }
+
+
 def test_paired_budget_reviews_every_hunk_beyond_the_live_plan_limit(case, monkeypatch):
     _case_runner(monkeypatch)
     import llm_client

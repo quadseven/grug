@@ -14,7 +14,13 @@ from dataclasses import asdict
 from io import BytesIO
 from pathlib import Path
 
-from bench.replay_arm import REPLAY_MAX_COHORTS
+from bench.replay_arm import (
+    MAX_REQUEST_TIMEOUT_SECONDS,
+    REPLAY_MAX_COHORTS,
+    REQUEST_TIMEOUT_ENV,
+    InvalidReplay,
+    configured_request_timeout,
+)
 from bench.replay_inputs import CORPUS_SHA256, load_snapshots
 
 SCORER_REVISION = "621b7655c4adb737a1a93404cf6687b98ff34fe4"
@@ -87,12 +93,13 @@ def _inline_finding(row) -> bool:
             and bool(row["path"]) and row["severity"] in {"low", "medium", "high", "critical"})
 
 
-def _run_arm(checkout, snapshot, backend, model):
+def _run_arm(checkout, snapshot, backend, model, request_timeout_seconds):
     # Only the explicitly configured local benchmark endpoint is inherited.
     env = {name: os.environ[name] for name in ("PATH", "HOME", "TMPDIR", "LANG",
                                                "GRUG_BENCH_CAVE_URL", "GRUG_BENCH_CAVE_MODEL",
                                                "GRUG_BENCH_CAVE_KEY")
            if name in os.environ}
+    env[REQUEST_TIMEOUT_ENV] = str(request_timeout_seconds)
     env["PYTHONPATH"] = os.pathsep.join(str(checkout / name) for name in
                                      ("services/webhook", "services/_shared"))
     env["DD_TRACE_ENABLED"] = "false"
@@ -148,6 +155,12 @@ def measure(snapshots, *, suite, output, checkouts, revisions, model, pace,
     expected_ids = {case.case_id for case in snapshots}
     if not snapshots or len(expected_ids) != len(snapshots):
         raise ReplayError("the replay needs a nonempty set of unique cases")
+    try:
+        request_timeout_seconds = configured_request_timeout()
+    except InvalidReplay:
+        raise ReplayError(
+            f"{REQUEST_TIMEOUT_ENV} must be greater than 0 and at most {MAX_REQUEST_TIMEOUT_SECONDS} seconds"
+        ) from None
     output.mkdir(mode=0o700)
     results: dict[str, dict] = {arm: {} for arm in checkouts}
     for index, snapshot in enumerate(snapshots):
@@ -155,7 +168,7 @@ def measure(snapshots, *, suite, output, checkouts, revisions, model, pace,
         for arm in order:
             label = f"{snapshot.case_id} ({arm})"
             pace(label)
-            raw = run_arm(checkouts[arm], snapshot, BACKEND, model)
+            raw = run_arm(checkouts[arm], snapshot, BACKEND, model, request_timeout_seconds)
             results[arm][snapshot.case_id] = _arm_result(raw, backend=BACKEND, model=model, label=label)
     pace.check()
     scores = {}
@@ -166,6 +179,7 @@ def measure(snapshots, *, suite, output, checkouts, revisions, model, pace,
     comparison = {
         "method": "tier1-published-inline-fixed-model",
         "max_review_cohorts": REPLAY_MAX_COHORTS,
+        "request_timeout_seconds": request_timeout_seconds,
         "corpus_sha256": CORPUS_SHA256,
         "diff_sha256": {case.case_id: case.diff_sha256 for case in snapshots},
         "backend": BACKEND, "served_model": model, "revisions": revisions, "scores": scores,

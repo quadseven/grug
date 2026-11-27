@@ -27,6 +27,9 @@ from urllib.parse import unquote, urlsplit
 _SHA = re.compile(r"[0-9a-f]{40}")
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*")
 _COMPLETIONS_PATH = "/v1/chat/completions"
+REQUEST_TIMEOUT_ENV = "GRUG_BENCH_TIMEOUT_SECONDS"
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 150
+MAX_REQUEST_TIMEOUT_SECONDS = 300
 # The pinned corpus needs up to 14 cohorts on both revisions. Use the same
 # modest cushion in each arm instead of the live ceiling of 10, which crops it.
 REPLAY_MAX_COHORTS = 16
@@ -34,6 +37,16 @@ REPLAY_MAX_COHORTS = 16
 
 class InvalidReplay(RuntimeError):
     """An invalid or incomplete run, with a safe public reason code."""
+
+
+def configured_request_timeout() -> float:
+    try:
+        seconds = float(os.environ.get(REQUEST_TIMEOUT_ENV, str(DEFAULT_REQUEST_TIMEOUT_SECONDS)))
+    except ValueError:
+        raise InvalidReplay("invalid_request_timeout") from None
+    if not 0 < seconds <= MAX_REQUEST_TIMEOUT_SECONDS:
+        raise InvalidReplay("invalid_request_timeout")
+    return seconds
 
 
 @dataclass(frozen=True)
@@ -364,6 +377,7 @@ def evaluate(payload: dict, *, post=None) -> dict:
             "GRUG_BENCH_CAVE_URL": endpoint,
             "GRUG_BENCH_CAVE_KEY": os.environ.get("GRUG_BENCH_CAVE_KEY", ""),
             "GRUG_BENCH_CAVE_MODEL": case.model,
+            REQUEST_TIMEOUT_ENV: str(configured_request_timeout()),
             "GRUG_BENCH_RETRY_ATTEMPTS": "1",
             "GRUG_CAVE_GATEWAY_URL": endpoint.removesuffix(_COMPLETIONS_PATH),
             "GRUG_CAVE_REVIEW_MODEL": case.model,

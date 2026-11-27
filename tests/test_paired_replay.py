@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -5,6 +6,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bench import paired_replay  # noqa: E402
 from bench.paired_replay import CORPUS_SHA256, ReplayError, _arm_result, _export_checkout, _scored_metrics, measure  # noqa: E402
 from bench.replay_inputs import Snapshot  # noqa: E402
 
@@ -58,16 +60,29 @@ def test_successful_scorer_exit_alone_does_not_prove_completeness(rows):
         _scored_metrics(_report("old", rows), {"bug", "clean"}, "old")
 
 
-def test_pair_alternates_order_and_records_only_complete_same_model_result(tmp_path):
+@pytest.mark.parametrize(("configured", "expected_timeout"), [(None, 150), ("240.5", 240.5), ("300", 300)])
+def test_pair_alternates_order_with_one_recorded_timeout(tmp_path, monkeypatch, configured, expected_timeout):
     snapshots = [_snapshot("bug"), _snapshot("clean")]
     pace = Pacer()
     checkouts = {"baseline": Path("old"), "candidate": Path("new")}
     revisions = {"baseline": "pre", "candidate": "post"}
     calls = []
 
-    def arm(checkout, snapshot, backend, model):
-        calls.append((checkout.name, snapshot.case_id, snapshot.diff_sha256, backend, model))
-        return _result()
+    if configured is None:
+        monkeypatch.delenv("GRUG_BENCH_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("GRUG_BENCH_TIMEOUT_SECONDS", configured)
+
+    def arm(_args, *, cwd, label, timeout, env, input):
+        assert timeout == 1200
+        data = json.loads(input)
+        calls.append((cwd.name, label, data["diff_sha256"], data["backend"], data["model"]))
+        assert float(env["GRUG_BENCH_TIMEOUT_SECONDS"]) == expected_timeout
+        # Each worker still gets the original timeout if the ambient value changes mid-pair.
+        monkeypatch.setenv("GRUG_BENCH_TIMEOUT_SECONDS", "100")
+        return json.dumps(_result())
+
+    monkeypatch.setattr(paired_replay, "_command", arm)
 
     def score(suite, path, revision, expected_ids):
         assert path.is_file()
@@ -77,7 +92,7 @@ def test_pair_alternates_order_and_records_only_complete_same_model_result(tmp_p
 
     output = tmp_path / "out"
     outcome = measure(snapshots, suite=tmp_path, output=output, checkouts=checkouts,
-                      revisions=revisions, model="model-v1", pace=pace, run_arm=arm, score=score)
+                      revisions=revisions, model="model-v1", pace=pace, score=score)
     assert calls == [
         ("old", "bug", "a" * 64, "cave", "model-v1"),
         ("new", "bug", "a" * 64, "cave", "model-v1"),
@@ -87,7 +102,21 @@ def test_pair_alternates_order_and_records_only_complete_same_model_result(tmp_p
     assert pace.calls == ["bug (baseline)", "bug (candidate)", "clean (candidate)", "clean (baseline)", "done"]
     assert outcome["revisions"] == revisions
     assert outcome["delta"] == {key: 0 for key in outcome["scores"]["baseline"]}
-    assert (output / "comparison.json").is_file()
+    assert json.loads((output / "comparison.json").read_text())["request_timeout_seconds"] == expected_timeout
+
+
+@pytest.mark.parametrize("configured", ["", "bad", "-1", "0", "nan", "inf", "300.01"])
+def test_pair_refuses_invalid_timeout_before_starting_a_worker(tmp_path, monkeypatch, configured):
+    monkeypatch.setenv("GRUG_BENCH_TIMEOUT_SECONDS", configured)
+    pace = Pacer()
+    output = tmp_path / "out"
+    with pytest.raises(ReplayError, match="GRUG_BENCH_TIMEOUT_SECONDS"):
+        measure([_snapshot("bug")], suite=tmp_path, output=output,
+                checkouts={"baseline": tmp_path, "candidate": tmp_path},
+                revisions={"baseline": "old", "candidate": "new"}, model="model-v1", pace=pace,
+                run_arm=lambda *args: pytest.fail("an invalid timeout cannot start a worker"))
+    assert not pace.calls
+    assert not output.exists()
 
 
 def test_incomplete_arm_does_not_publish_any_comparison(tmp_path):
