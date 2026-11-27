@@ -199,6 +199,8 @@ class FixedBackend:
         raise InvalidReplay(reason)
 
     def call(self, config, messages, cancel_event=None):
+        from httpx import TimeoutException
+
         if cancel_event is not None and cancel_event.is_set():
             self.refuse("review_cancelled")
         identity = getattr(config.backend, "value", config.backend)
@@ -219,6 +221,8 @@ class FixedBackend:
         token = self.allowed.set(True)
         try:
             response = self.post(request, messages)
+        except (TimeoutError, TimeoutException):
+            self.refuse("backend_timeout")
         except Exception as exc:
             self.rejected = self.rejected or "backend_request_failed"
             raise InvalidReplay("backend_request_failed") from exc
@@ -341,7 +345,7 @@ def _measure(case: FrozenCase, *, post=None) -> dict:
         if response.kind != "reviewed" or response.error or (
             response.coverage is not None and not response.coverage.complete
         ):
-            raise InvalidReplay("incomplete_review")
+            raise InvalidReplay(wire.rejected or "incomplete_review")
         findings = runner._published_findings(response, hunks, evidence, grade=grade, refute=refute)
         elapsed = time.monotonic() - started
         if wire.rejected or not wire.responses:
