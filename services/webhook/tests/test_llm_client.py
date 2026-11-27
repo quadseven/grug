@@ -3101,6 +3101,68 @@ def test_build_judge_messages_includes_full_file_when_provided():
     assert "2: rm -f /tmp/x" in msgs[1]["content"]
 
 
+def test_oracle_judge_distinguishes_fixture_input_from_production_output():
+    path = "tests/test_lookup.py"
+    fixture = "cursor.fetchall.return_value = [{'id': 12345}]"
+    fixture_assertion = "assert lookup('example') == 12345"
+    circular_assertion = "assert lookup('example') == lookup('example')"
+    computed_fixture = "cursor.fetchall.return_value = lookup('example')"
+    computed_assertion = "assert lookup('example') == cursor.fetchall()"
+    evidence = assemble_evidence([Hunk(path=path, body=(
+        "@@ -0,0 +1,9 @@\n"
+        "+def test_fallback_lookup(cursor):\n"
+        "+    cursor.execute.side_effect = (SchemaError('old schema'), None)\n"
+        f"+    {fixture}\n"
+        f"+    {fixture_assertion}\n"
+        "+def test_circular_lookup():\n"
+        f"+    {circular_assertion}\n"
+        "+def test_production_derived_fixture(cursor):\n"
+        f"+    {computed_fixture}\n"
+        f"+    {computed_assertion}"
+    ))])
+    findings = [
+        {"rule_name": "unsourced-test-oracle", "file": path, "line": 4,
+         "severity": "medium", "message": f"Expected `12345` comes from `{fixture}`."},
+        {"rule_name": "unsourced-test-oracle", "file": path, "line": 6,
+         "severity": "medium", "message": f"`{circular_assertion}` uses one producer."},
+        {"rule_name": "unsourced-test-oracle", "file": path, "line": 9,
+         "severity": "medium", "message": f"`{computed_fixture}` gets the value from production."},
+        {"rule_name": "missing-test-coverage", "file": path, "line": 4,
+         "severity": "low", "message": "The test does not assert bound query arguments."},
+    ]
+
+    system, user = lc._build_judge_messages(findings, evidence)
+
+    assert system["content"].count("For an unsourced-test-oracle finding") == 1
+    assert "identify how the test obtains the expected value from production behavior" in system["content"]
+    assert "the same production helper to compute both sides is circular" in system["content"]
+    assert "inputs are the same and the assertion checks nothing else" in system["content"]
+    assert "return_value or side_effect is independently arranged input" in system["content"]
+    assert "trace what feeds the fixture" in system["content"].lower()
+    assert "if its only cited source is an independently arranged literal" in system["content"].lower()
+    assert "bound query arguments is a separate coverage claim" in system["content"]
+    assert fixture in user["content"]
+    assert fixture_assertion in user["content"]
+    assert circular_assertion in user["content"]
+    assert computed_fixture in user["content"]
+    assert computed_assertion in user["content"]
+    assert "The test does not assert bound query arguments." in user["content"]
+
+
+@pytest.mark.parametrize(("rule", "refute"), [
+    ("missing-test-coverage", False),
+    ("unsourced-test-oracle", True),
+])
+def test_oracle_guidance_is_scoped_to_the_ordinary_oracle_judge(rule, refute):
+    hunk = _hunk(path="tests/test_lookup.py")
+    findings = [{"rule_name": rule, "file": hunk.path, "line": 1,
+                 "severity": "medium", "message": "check the assertion"}]
+
+    system, _ = lc._build_judge_messages(findings, assemble_evidence([hunk]), refute=refute)
+
+    assert "For an unsourced-test-oracle finding" not in system["content"]
+
+
 def test_build_judge_messages_receives_same_context_as_reviewer():
     """A context-blind judge must not suppress a finding that relied on intent,
     an unchanged caller, production evidence, or a learned repository rule."""
