@@ -16,6 +16,7 @@ from pathlib import Path
 
 from bench.replay_arm import (
     MAX_REQUEST_TIMEOUT_SECONDS,
+    PROVIDER_FALLBACK_REJECTED,
     REPLAY_MAX_COHORTS,
     REQUEST_TIMEOUT_ENV,
     InvalidReplay,
@@ -31,6 +32,7 @@ _REPORTABLE_FAILURE_REASONS = frozenset({
     "backend_request_failed", "backend_status", "backend_timeout", "incomplete_model_output",
     "incomplete_publication_verdicts", "incomplete_review", "incomplete_review_findings",
     "invalid_model_envelope", "missing_model_response", "review_cancelled",
+    PROVIDER_FALLBACK_REJECTED,
     "served_model_mismatch", "unexpected_model_route", "unexpected_network_request",
 })
 

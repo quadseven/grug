@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -112,7 +113,6 @@ def test_uses_frozen_files_and_real_publication_gates(case, monkeypatch):
 ])
 def test_provider_replies_have_to_be_complete(reply, reason):
     from dataclasses import dataclass, field
-    from types import SimpleNamespace
 
     @dataclass
     class Backend:
@@ -127,6 +127,27 @@ def test_provider_replies_have_to_be_complete(reply, reason):
     with pytest.raises(replay_arm.InvalidReplay, match=reason):
         wire.call(config, [])
     assert wire.responses == 0
+
+
+@pytest.mark.parametrize("identity,url,model,reason", [
+    ("poolside", "https://other.example.com/v1/chat/completions", "other/model", "provider_fallback_rejected"),
+    ("openrouter", URL, MODEL, "provider_fallback_rejected"),
+    ("free-pool", URL, MODEL, "provider_fallback_rejected"),
+    ("cave-reasoner", URL, MODEL, "unexpected_model_route"),
+    ("cave", "https://other.example.com/v1/chat/completions", MODEL, "unexpected_model_route"),
+    ("cave", URL, "other/model", "unexpected_model_route"),
+])
+def test_fixed_backend_classifies_rejected_routes_before_transport(identity, url, model, reason):
+    wire = replay_arm.FixedBackend(
+        SimpleNamespace(url=URL, model=MODEL),
+        lambda *_args: pytest.fail("unexpected POST"),
+    )
+    config = SimpleNamespace(backend=identity, url=url, model=model)
+
+    with pytest.raises(replay_arm.InvalidReplay) as rejected:
+        wire.call(config, [])
+
+    assert str(rejected.value) == wire.rejected == reason
 
 
 def test_ignores_unsafe_payloads_before_loading_a_backend(case):
