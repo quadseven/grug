@@ -73,6 +73,13 @@ kubectl -n grug rollout restart deploy/grug-api deploy/grug-webhook deploy/grug-
 1. `NEW=$(openssl rand -hex 32)`. 2. Update the GH App webhook-secret field.
 3. `aws ssm put-parameter --overwrite --name /grug/github-app-webhook-secret --type SecureString --value "$NEW"`. 4. Re-seed + roll.
 
+### Dashboard session signing key
+
+Pulumi generates the signing key in SSM. To rotate it, bump the signing
+password's `keepers["version"]` in the Pulumi program, deploy the AWS stack,
+then roll both API replicas so they reload the key. The new key invalidates
+existing dashboard sessions and in-flight OAuth sign-ins.
+
 ### OAuth client secret (on suspected compromise)
 GH App -> Generate new client secret -> `aws ssm put-parameter --overwrite --name /grug/github-app-client-secret ...` -> re-seed + roll.
 
@@ -279,11 +286,12 @@ bootstrap dance: rebuild = re-run the deploy pipelines.
 **What persists (lives outside grug's Pulumi state):**
 - App data — **Postgres `grug_kv`** (CNPG, managed in the private infra repo;
   survives a grug `pulumi destroy` entirely, since grug's Pulumi never owned it).
-- All SSM params (`/grug/*`, `/infra/*`) — referenced, not created, by grug Pulumi.
+- SSM parameters seeded or managed outside the grug stack, including the GitHub App credentials and shared LLM keys.
 - GitHub App registration + installations + branch-protection (github.com).
 - The OKE cluster, in-cluster registry, and Cloudflare tunnel (private infra).
 
-**What grug's `pulumi up`/`destroy` owns (recreated from code):** KMS CMK
+**What grug's `pulumi up`/`destroy` owns (recreated from code):** The dashboard
+session signing key, KMS CMK
 (`alias/grug-tokens`, 7-day deletion delay), SQS queues + DLQs, the cave-diffs
 S3 bucket, IAM/OIDC roles, Cloudflare DNS records, Datadog monitors/RUM/
 dashboards. (A legacy DynamoDB table is still declared but is NOT the app store
