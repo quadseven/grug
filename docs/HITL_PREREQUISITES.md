@@ -60,17 +60,6 @@ aws ssm put-parameter --region us-east-1 \
   --type SecureString \
   --value "<the openssl rand -hex 32 output>"
 
-# Session-signing secret — dedicated HMAC key for the dashboard's session
-# cookie + OAuth CSRF state, kept SEPARATE from the webhook secret so the
-# two trust domains can be rotated independently (audit #5). api falls back
-# to the webhook secret if this is absent, but provisioning it is what
-# closes the finding. Use a fresh random value (do NOT reuse the webhook
-# secret).
-aws ssm put-parameter --region us-east-1 \
-  --name /grug/session-signing-secret \
-  --type SecureString \
-  --value "$(openssl rand -hex 32)"
-
 # LLM backend keys live at the SHARED cross-project path
 # `/infra/llm/<provider>_api_key` (NOT a grug-specific copy) so each key is
 # minted/rotated once across all projects. If they already exist (other
@@ -98,10 +87,15 @@ Verify:
 
 ```bash
 aws ssm get-parameters-by-path --region us-east-1 --path /grug --recursive --query 'Parameters[].Name'
-# Expected: ["/grug/github-app-id", "/grug/github-app-private-key", "/grug/github-app-webhook-secret", "/grug/session-signing-secret"]
+# Includes: ["/grug/github-app-id", "/grug/github-app-private-key", "/grug/github-app-webhook-secret"]
 aws ssm get-parameters-by-path --region us-east-1 --path /infra/llm --recursive --query 'Parameters[].Name'
 # Expected (shared): ["/infra/llm/openrouter_api_key", "/infra/llm/poolside_api_key"]
 ```
+
+The Pulumi stack generates `/grug/session-signing-secret` as a SecureString
+for the dashboard session cookie and OAuth CSRF state. Apply the AWS stack
+before rolling out the API. If you previously seeded this parameter by hand,
+plan its adoption or a key rotation before updating the stack.
 
 ## 3b. The leak-guard deny-list is NOT seeded here (grug#921, grug#1057)
 

@@ -184,18 +184,21 @@ def list_learnings(
         raise HTTPException(
             400, detail=f"status must be one of {list(STATUSES)}",
         )
-    repos = [_repo_or_400(repo)] if repo else install_store.list_learning_repos()
+    rows = (
+        install_store.list_learnings(_repo_or_400(repo), include_inactive=True)
+        if repo
+        else install_store.list_all_learnings(include_inactive=True)
+    )
     out: list[dict[str, Any]] = []
-    for r in repos:
-        for row in install_store.list_learnings(r, include_inactive=True):
-            row_d = dict(row)
-            if status and effective_status(row_d) != status:
-                continue
-            if not matches_query(row_d, q):
-                continue
-            if len(out) == limit:
-                return {"learnings": out, "truncated": True}
-            out.append(_view(row_d))
+    for row in rows:
+        row_d = dict(row)
+        if status and effective_status(row_d) != status:
+            continue
+        if not matches_query(row_d, q):
+            continue
+        if len(out) == limit:
+            return {"learnings": out, "truncated": True}
+        out.append(_view(row_d))
     return {"learnings": out, "truncated": False}
 
 
@@ -221,10 +224,12 @@ def fired_learnings(
     """Which learned rules one review was given. A rule deleted since keeps
     its id here, marked `deleted`."""
     review = fired_review_key(pr, head_sha)
-    fired: list[dict[str, Any]] = []
-    for lid in install_store.get_review_fired_learnings(_repo_or_400(repo), review):
-        row = install_store.get_learning(repo, lid)
-        fired.append(_view(dict(row)) if row else {"id": lid, "text": "", "deleted": True})
+    lids = install_store.get_review_fired_learnings(_repo_or_400(repo), review)
+    by_id = install_store.get_learnings_by_ids(repo, lids) if lids else {}
+    fired = [
+        _view(dict(by_id[lid])) if lid in by_id else {"id": lid, "text": "", "deleted": True}
+        for lid in lids
+    ]
     return {"repo": repo, "review": review, "fired": fired}
 
 

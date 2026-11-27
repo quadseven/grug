@@ -188,6 +188,7 @@ dashboard.
 | Database URL | SSM `/grug/database-url` | Your Postgres for the `grug_kv` table |
 | Domain, AWS region, Cloudflare zone and token | Pulumi stack config, from [`Pulumi.dev.yaml.example`](infra/pulumi/Pulumi.dev.yaml.example) | Provisions SQS, KMS, S3 and DNS |
 | LLM API keys | SSM, named by the `*_SSM` env vars in [`k8s/`](k8s/) | Elder's model backends |
+| `GRUG_APP_FOOTER_AUTHORS` | Env of the webhook, consumer, and poller | Comma-separated GitHub App bot logins whose Loom footer supplies Elder's author family, for example `example-lane[bot]`. Logins match exactly, ignoring case. Other Apps can use `GRUG_APP_AUTHOR_FAMILIES` with semicolon-separated `login:family` pairs. |
 | `GRUG_DATADOG_ENABLED` | Env of each Deployment and CronJob (services), and a repository Actions variable read by `web.deploy.yml` (web RUM) | Off unless truthy; see [`docs/SELF_HOST.md`](docs/SELF_HOST.md). Datadog has been off on the hosted instance since 2026-10-05. |
 
 Not in this repo: an AWS account, a Cloudflare account with a tunnel, a

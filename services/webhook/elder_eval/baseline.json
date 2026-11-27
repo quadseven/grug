@@ -1,5 +1,79 @@
 {
   "backends": {
+    "cave": {
+      "anchored_cases": [
+        "quadseven/grug#1727",
+        "quadseven/grug#1728",
+        "quadseven/grug#366",
+        "quadseven/grug#477",
+        "quadseven/grug#480",
+        "quadseven/grug#482",
+        "quadseven/grug#486",
+        "quadseven/grug#489",
+        "quadseven/grug#490",
+        "quadseven/grug#492",
+        "quadseven/grug#494",
+        "quadseven/grug#501",
+        "quadseven/grug#516",
+        "quadseven/grug#543",
+        "quadseven/grug#546",
+        "quadseven/grug#562",
+        "quadseven/grug#575",
+        "quadseven/grug#762"
+      ],
+      "backend_attribution": {},
+      "cases_scored": 25,
+      "errored_cases": [],
+      "measured_prompt_sha": "198a383c8e1523e42252dca54733082e779158d1323227faeda41bb2b111dd64",
+      "model": "spark:warm-any",
+      "noise_rate": 0.0,
+      "output_truncated_cases": [
+        "quadseven/grug#477",
+        "quadseven/grug#482",
+        "quadseven/grug#486",
+        "quadseven/grug#489",
+        "quadseven/grug#490",
+        "quadseven/grug#492",
+        "quadseven/grug#494",
+        "quadseven/grug#504",
+        "quadseven/grug#543",
+        "quadseven/grug#546",
+        "quadseven/grug#558",
+        "quadseven/grug#575"
+      ],
+      "overall_catch": 0.6176470588235294,
+      "per_class_catch": {
+        "correctness": 0.6,
+        "security-scope": 0.3333333333333333,
+        "silent-failure": 0.7333333333333333,
+        "simplification": 0.2857142857142857,
+        "test-gap": 0.8333333333333334,
+        "type-design": 0.3333333333333333,
+        "upstream-semantics": 0.8571428571428571
+      },
+      "served_models": {
+        "nemotron-3.5-super-vl": 25
+      },
+      "staged_cases": [
+        "quadseven/grug#366",
+        "quadseven/grug#477",
+        "quadseven/grug#480",
+        "quadseven/grug#482",
+        "quadseven/grug#486",
+        "quadseven/grug#489",
+        "quadseven/grug#490",
+        "quadseven/grug#492",
+        "quadseven/grug#494",
+        "quadseven/grug#501",
+        "quadseven/grug#504",
+        "quadseven/grug#516",
+        "quadseven/grug#543",
+        "quadseven/grug#546",
+        "quadseven/grug#558",
+        "quadseven/grug#575"
+      ],
+      "truncated_cases": []
+    },
     "openrouter": {
       "anchored_cases": [
         "quadseven/grug#1727",

@@ -56,7 +56,7 @@ The pods do **not** carry app secrets (App key, OAuth secrets, LLM keys, CF shar
 
 | Resource | Name | Notes |
 |---|---|---|
-| SSM `/grug/*` | App ID, private key, webhook secret, OAuth client id+secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL, DD RUM app id+token, prompt-experiment + fallback flags | SecureStrings; some Pulumi-managed (RUM ids), most hand-seeded (HITL prereqs) |
+| SSM `/grug/*` | App ID, private key, webhook secret, OAuth client id+secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL, DD RUM app id+token, prompt-experiment + fallback flags | Pulumi generates the session-signing and CF shared secrets. See HITL prerequisites for manual inputs. |
 | SSM `/infra/llm/*` | `openrouter_api_key`, `poolside_api_key` | Elder LLM backends (shared infra namespace) |
 | SQS FIFO | `grug-rerun-jobs.fifo`, `grug-cave-results.fifo`, `grug-cave-jobs.fifo` (+ DLQs) | `grug-rerun-jobs` carries snapshot-scoped Elder reviews, explicit reruns, and questions in separate bounded workload groups; failures redrive to a DLQ at `maxReceiveCount` |
 | KMS CMK | `grug-tokens` | Envelope-encrypts user OAuth/credential blobs (`crypto/kms_envelope`). `grug-api` holds `kms:Decrypt`; webhook uses the GitHub App JWT instead |
@@ -349,8 +349,8 @@ flowchart LR
 
 See `docs/SELF_HOST.md` + `docs/HITL_PREREQUISITES.md` for the full operator runbook. In brief:
 
-1. **Manual SSM pre-load** — every `/grug/*` parameter the pods read at runtime (App id/key/secret, OAuth client id+secret, webhook secret, session-signing secret, CF shared secret, KMS CMK ARN, database URL) plus `/infra/llm/*` LLM keys and `/infra/datadog/*` keys.
-2. **`pulumi up`** (`iac.deploy.yml`) — creates the AWS-side infra: SSM references, KMS CMK, OIDC role, SQS FIFO queues + DLQs, S3 cave bucket, DD monitors/dashboard/RUM app. (DynamoDB `grug-main` still exists here as legacy.)
+1. **Manual SSM pre-load.** Seed the App ID, private key, webhook secret, OAuth client ID and secret, and shared LLM keys listed in the HITL prerequisites.
+2. **`pulumi up`** (`iac.deploy.yml`) generates the session-signing and CF shared secrets in SSM and creates the KMS CMK, OIDC role, SQS FIFO queues and DLQs, and S3 cave bucket. The stack still includes the legacy `grug-main` table.
 3. **Provision Postgres** — the `grug_kv` table on the shared CNPG cluster; put its DSN in `/grug/database-url`.
 4. **Stand up the CF edge** — a `cloudflared` tunnel to the in-cluster Services; set `/grug/{api,webhook}-upstream-host` to the tunnel hostnames and `/grug/cf-shared-secret`; deploy the `*-host-rewrite` Workers via `infra/cloudflare/deploy.sh` (binds the routes, injects the secret, points upstream at the tunnel host).
 5. **First `deploy.k8s.yml` run** — builds + pushes the arm64 images, joins the tailnet, seeds the three Secrets, applies `k8s/` by digest, waits on rollout + the poller smoke job.

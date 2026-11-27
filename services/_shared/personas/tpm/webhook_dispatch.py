@@ -22,10 +22,46 @@ from __future__ import annotations
 
 import logging
 import os
+from uuid import UUID
 
 from personas.registry import PullRequestContext
+from personas.tribe import CHECK_CHIEF
 
 log = logging.getLogger(f"{os.getenv('DD_SERVICE', 'grug')}.persona.tpm.webhook_dispatch")
+
+
+def _delivered_head_has_chief_verdict(ctx: PullRequestContext) -> bool:
+    """Honor a stored verdict for a GitHub delivery of this head."""
+    if ctx.payload.get("action") not in ("opened", "synchronize"):
+        return False
+    # GitHub sends a delivery GUID. Poller recovery uses a synthetic key
+    # and explicit rerequests dispatch without one.
+    try:
+        UUID(ctx.delivery_id)
+    except ValueError:
+        return False
+
+    from github_app_auth import get_app_id, get_install_token  # type: ignore
+    from github_checks_client import has_completed_check_run  # type: ignore
+
+    from personas.publish_check import check_run_external_id  # type: ignore
+
+    try:
+        return has_completed_check_run(
+            get_install_token(ctx.installation_id),
+            ctx.owner, ctx.repo_name, ctx.head_sha,
+            app_id=get_app_id(),
+            name=CHECK_CHIEF,
+            external_id=check_run_external_id(
+                "tpm", ctx.owner, ctx.repo_name, ctx.pr_number, ctx.head_sha,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed read cannot justify skipping the verdict
+        log.warning(
+            "tpm_existing_verdict_read_failed",
+            extra={"pr_number": ctx.pr_number, "kind": type(exc).__name__},
+        )
+        return False
 
 
 def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
@@ -71,6 +107,7 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
         # config (`tpm_in_scope_blocking`) promotes it to blocking. Repo id
         # lives on the webhook payload's repository object.
         advisory_checks = set(_ADVISORY_CHECKS)
+        cfg = {}
         try:
             from adapters.install_store import get_repo_config  # type: ignore
             repo_id = ((ctx.payload or {}).get("repository") or {}).get("id")
@@ -84,6 +121,10 @@ def dispatch_pull_request(ctx: PullRequestContext) -> dict[str, str]:
                 extra={"pr_number": ctx.pr_number, "kind": type(exc).__name__},
             )
         advisory_checks = frozenset(advisory_checks)
+
+        if cfg.get("check_run_reconcile_enabled") is True and _delivered_head_has_chief_verdict(ctx):
+            log.info("tpm_head_verdict_already_present", extra={"pr_number": ctx.pr_number})
+            return {"persona": "tpm", "result": "already_checked"}
 
         # The author's trust is read here, at the impure edge, so the
         # evaluation stays pure (grug#1251).

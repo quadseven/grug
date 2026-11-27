@@ -187,33 +187,62 @@ def list_check_runs_for_ref(
     return runs
 
 
+def has_completed_check_run(
+    install_token: str, owner: str, repo: str, head_sha: str, *,
+    app_id: str, name: str, external_id: str,
+) -> bool:
+    """Look for one exact verdict with a single, bounded webhook-path read."""
+    resp = httpx.get(
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+        f"/commits/{quote(head_sha, safe='')}/check-runs",
+        params={"app_id": app_id, "check_name": name, "filter": "all", "per_page": 100},
+        headers=_headers(install_token),
+        timeout=1.5,
+    )
+    resp.raise_for_status()
+    return any(
+        run.get("name") == name
+        and run.get("head_sha") == head_sha
+        and run.get("external_id") == external_id
+        and str((run.get("app") or {}).get("id")) == app_id
+        and run.get("status") == "completed"
+        and run.get("conclusion") in ("success", "failure", "neutral")
+        for run in resp.json().get("check_runs") or []
+    )
+
+
 def patch_check_run(
     install_token: str,
     owner: str,
     repo: str,
     check_run_id: int,
     result: CheckRunResult,
+    *,
+    output_only: bool = False,
+    summary_footer: str = "",
 ) -> dict:
-    """PATCH an EXISTING check-run by id to a new status/conclusion.
+    """PATCH an EXISTING check-run by id, optionally updating only its output.
 
     Unlike `post_check_run` (create), this genuinely is idempotent in the
     sense that matters here: it updates the SAME object rather than
     creating a new one, so grug#947's sweeper can safely re-patch a run
     it already closed out without multiplying check-runs."""
+    footer = f"\n\n{summary_footer}" if summary_footer else ""
     summary = result.summary
-    if len(summary) > _MAX_SUMMARY_CHARS:
-        summary = summary[:_MAX_SUMMARY_CHARS] + "\n\n(summary truncated)"
-    body = {
-        "name": result.name,
-        "status": result.status,
+    limit = _MAX_SUMMARY_CHARS - len(footer)
+    if len(summary) > limit:
+        summary = summary[:limit] + "\n\n(summary truncated)"
+    body: dict[str, object] = {
         "output": {
             "title": result.title,
-            "summary": summary,
+            "summary": summary + footer,
             **({"text": result.text} if result.text else {}),
         },
     }
-    if result.conclusion:
-        body["conclusion"] = result.conclusion
+    if not output_only:
+        body.update(name=result.name, status=result.status)
+        if result.conclusion:
+            body["conclusion"] = result.conclusion
     resp = httpx.patch(
         f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
         f"/check-runs/{int(check_run_id)}",

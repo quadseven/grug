@@ -20,6 +20,7 @@ import json
 
 import pulumi
 import pulumi_aws as aws
+import pulumi_random as random
 
 from components import (
     cf_shared_secret,
@@ -38,9 +39,8 @@ config = pulumi.Config()
 env = config.require("env")
 domain = config.require("domain")
 
-# All secrets pre-loaded in SSM by hand per docs/HITL_PREREQUISITES.md.
-# Pulumi only references their ARNs to grant Lambda IAM read access; it
-# never writes secret values (those stay opaque to Pulumi state).
+# GitHub App credentials are pre-loaded in SSM per docs/HITL_PREREQUISITES.md.
+# Read their metadata without decrypting their values.
 secrets = ssm_secrets.reference_existing(
     name_prefix="/grug",
     parameters=[
@@ -131,6 +131,21 @@ grug_tokens_cmk = kms_cmk.create("grug-tokens")
 # both can receive the SSM param name via env var on first creation —
 # avoids a second `pulumi up` to wire the env var after the secret lands.
 cf_secret = cf_shared_secret.create()
+
+# Both API replicas resolve this key at startup through their SSM path env var.
+_session_signing_key = random.RandomPassword(
+    "grug-session-signing-secret-value",
+    length=64,
+    special=False,
+    keepers={"version": "v1"},
+)
+aws.ssm.Parameter(
+    "grug-session-signing-secret-ssm",
+    name="/grug/session-signing-secret",
+    type="SecureString",
+    value=pulumi.Output.secret(_session_signing_key.result),
+    description="Dashboard session-cookie and OAuth CSRF signing key.",
+)
 
 
 # Full 40-char commit SHA — DD source-code linking requires the full
