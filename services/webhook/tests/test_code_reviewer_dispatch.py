@@ -2647,11 +2647,7 @@ def test_dispatch_suggestion_survives_pipe_to_inline_comment(monkeypatch):
         cr_dispatch, "post_review",
         lambda t, o, r, *, pull_number, result: posted_review.append(result) or {"id": 2},
     )
-    # The head text is what #1149's check verifies the block against, so
-    # the contents fetch returns real Python rather than the diff. A plain
-    # body is the real shape: fetch_file_contents asks for the `.raw` media
-    # type, which returns the file itself, not base64 JSON. The assert pins
-    # that, so dropping the header fails here rather than in production.
+    # The suggestion gate compares the diff with raw Python at the head ref.
     head_text = "def allowed_to_run(enabled):\n    allowed = not enabled\n    return allowed\n"
     reviewed_diff = (
         "diff --git a/src/x.py b/src/x.py\n--- a/src/x.py\n+++ b/src/x.py\n"
@@ -2659,11 +2655,20 @@ def test_dispatch_suggestion_survives_pipe_to_inline_comment(monkeypatch):
         "-    allowed = False\n+    allowed = not enabled\n     return allowed\n"
     )
 
-    def _get(url, *a, **k):
-        if "/contents/" in url:
-            assert k["headers"]["Accept"] == "application/vnd.github.raw"
-            return _diff_response(head_text)
-        return _diff_response(reviewed_diff)
+    repo_url = "https://api.github.com/repos/myorg/myrepo"
+
+    def _get(url, *, headers, params=None, **_):
+        request = httpx.Request("GET", url, params=params)
+        accept = headers.get("Accept")
+        if url == f"{repo_url}/pulls/7" and accept == "application/vnd.github.diff":
+            return httpx.Response(200, request=request, text=reviewed_diff)
+        if (
+            url == f"{repo_url}/contents/src/x.py"
+            and accept == "application/vnd.github.raw"
+            and params == {"ref": "abcd1234efgh"}
+        ):
+            return httpx.Response(200, request=request, text=head_text)
+        return httpx.Response(404, request=request)
 
     with patch("httpx.get", side_effect=_get):
         cr_dispatch.dispatch_code_review(_payload(), blocking=False)
