@@ -116,6 +116,7 @@ pulumi up --stack dev --yes
 ```
 
 Creates the AWS-side infra (no Lambda, no ECR — those retired at #354):
+- Dashboard session signing key in SSM (`/grug/session-signing-secret`)
 - KMS CMK `alias/grug-tokens` (OAuth-token envelope encryption)
 - 3 SQS FIFO queues (`grug-rerun-jobs`, `grug-cave-jobs`, `grug-cave-results`) + DLQs
 - S3 cave-diff bucket (`grug-cave-diffs*`)

@@ -187,6 +187,30 @@ def list_check_runs_for_ref(
     return runs
 
 
+def has_completed_check_run(
+    install_token: str, owner: str, repo: str, head_sha: str, *,
+    app_id: str, name: str, external_id: str,
+) -> bool:
+    """Look for one exact verdict with a single, bounded webhook-path read."""
+    resp = httpx.get(
+        f"{_GH_API}/repos/{quote(owner, safe='')}/{quote(repo, safe='')}"
+        f"/commits/{quote(head_sha, safe='')}/check-runs",
+        params={"app_id": app_id, "check_name": name, "filter": "all", "per_page": 100},
+        headers=_headers(install_token),
+        timeout=1.5,
+    )
+    resp.raise_for_status()
+    return any(
+        run.get("name") == name
+        and run.get("head_sha") == head_sha
+        and run.get("external_id") == external_id
+        and str((run.get("app") or {}).get("id")) == app_id
+        and run.get("status") == "completed"
+        and run.get("conclusion") in ("success", "failure", "neutral")
+        for run in resp.json().get("check_runs") or []
+    )
+
+
 def patch_check_run(
     install_token: str,
     owner: str,

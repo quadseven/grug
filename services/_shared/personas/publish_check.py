@@ -151,6 +151,12 @@ def _publish_with_transient_retry(
 PUBLISH_FAILED = "publish_failed"
 
 
+def check_run_external_id(
+    persona_prefix: str, owner: str, repo: str, pr_number: int, head_sha: str,
+) -> str:
+    return f"grug-{persona_prefix}:{owner}/{repo}#{pr_number}:{head_sha}"
+
+
 def publish_persona_check(
     *,
     persona_key: str,
@@ -217,7 +223,7 @@ def publish_persona_check(
         title=title,
         summary=summary,
     )
-    external_id = f"grug-{persona_prefix}:{full_repo}#{pr_number}:{head_sha}"
+    external_id = check_run_external_id(persona_prefix, owner, repo, pr_number, head_sha)
 
     publish_failed = False
     try:
