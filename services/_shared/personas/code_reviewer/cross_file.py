@@ -17,7 +17,9 @@ is invisible to search - accepted for the tracer (callers needing update
 live on the default branch).
 
 TRACER SCOPE: symbol extraction uses regex for Python, JavaScript,
-TypeScript, Go, and C/C++. The lazy tree-sitter repo index is deferred.
+TypeScript, Go, and C/C++. Content lookup includes Python sources and,
+when the diff touches JS or TS, JS/TS definitions of searched identifiers.
+The lazy tree-sitter repo index is deferred.
 
 FAIL-SAFE contract: every error path degrades to `{}` - today's
 diff-only review - and logs `cross_file_context_degraded`. No cache:
@@ -155,6 +157,10 @@ _BRACE_LANGUAGES = {
 }
 
 
+def _is_javascript_path(path: str) -> bool:
+    return _BRACE_LANGUAGES.get(os.path.splitext(path)[1].lower()) is _JS
+
+
 # A quoted string literal on a changed line. No quote characters inside, so
 # the value can ride into a code-search phrase query unescaped. Only
 # natural-language text qualifies (a word character AND whitespace, 4+ chars):
@@ -239,6 +245,10 @@ def tag_candidate(candidate: CrossFileCandidate) -> CrossFileCandidate:
     if is_test_file(candidate.path):
         return replace(candidate, tag=FileTag.TEST)
 
+    # The JavaScript lookup already found the definition in its snippet.
+    if candidate.tag is FileTag.DEFINITION:
+        return candidate
+
     # If the content defines any of the matched symbols, it's a DEFINITION
     for sym in candidate.matched_symbols:
         if _defines_symbol(candidate.content, sym):
@@ -282,12 +292,22 @@ def rank_cross_file_candidates(
     return kept
 
 
-def _symbol_snippet(content: str, symbols: tuple[str, ...]) -> str | None:
-    """Bounded, original-line-numbered windows of `content` around lines
-    mentioning any of `symbols`. None when no symbol appears (a search
-    false-hit - drop the file rather than ship unrelated code). Pure."""
+def _symbol_snippet(
+    content: str, symbols: tuple[str, ...], *, javascript_definition: bool = False,
+) -> tuple[str, tuple[str, ...]] | None:
+    """Bounded, original-line-numbered windows around mentions of `symbols`
+    or their definitions for JS/TS, with the names witnessed in those windows.
+    Return None on an unrelated search hit."""
     lines = content.splitlines()
-    hits = [i for i, ln in enumerate(lines) if any(s in ln for s in symbols)]
+    definitions: dict[int, str] = {}
+    if javascript_definition:
+        for i, line in enumerate(lines):
+            name = _definition_name(_JS.definition, line, _JS.stop_names)
+            if name is not None and name in symbols:
+                definitions[i] = name
+        hits = list(definitions)
+    else:
+        hits = [i for i, line in enumerate(lines) if any(s in line for s in symbols)]
     if not hits:
         return None
     windows: list[tuple[int, int]] = []
@@ -301,6 +321,7 @@ def _symbol_snippet(content: str, symbols: tuple[str, ...]) -> str | None:
         else:
             break
     out: list[str] = []
+    shown_definitions: set[str] = set()
     total = 0
     for lo, hi in windows:
         if out:
@@ -309,8 +330,15 @@ def _symbol_snippet(content: str, symbols: tuple[str, ...]) -> str | None:
             if total >= _MAX_SNIPPET_LINES:
                 break
             out.append(f"{j + 1}: {lines[j]}")
+            if j in definitions:
+                shown_definitions.add(definitions[j])
             total += 1
-    return "\n".join(out)
+    snippet = "\n".join(out)
+    if javascript_definition:
+        matched = tuple(s for s in dict.fromkeys(symbols) if s in shown_definitions)
+    else:
+        matched = tuple(s for s in symbols if s in snippet)
+    return (snippet, matched) if matched else None
 
 
 def _definition_name(
@@ -495,6 +523,8 @@ def fetch_cross_file_context(
     # We gather more than the old _MAX_FILES limit because ranking will
     # trim to the character budget.
     candidate_paths: list[str] = []
+    javascript_paths: dict[str, list[str]] = {}
+    search_javascript = any(_is_javascript_path(path) for path in exclude_paths)
     for sym in symbols[:_MAX_SYMBOLS]:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -527,19 +557,19 @@ def fetch_cross_file_context(
             break
         for item in items:
             p = item.get("path")
-            if (
-                p
-                and p.endswith(".py")
-                and p not in exclude_paths
-                and p not in candidate_paths
-            ):
+            if not p or p in exclude_paths:
+                continue
+            if p.endswith(".py") and p not in candidate_paths:
                 candidate_paths.append(p)
+            elif search_javascript and _is_javascript_path(p) and re.fullmatch(_JS_NAME, sym):
+                javascript_paths.setdefault(p, []).append(sym)
         # Continue searching for more symbols even if we have many paths;
         # ranking will select the best ones.
 
     # Fetch content for candidate paths and build CrossFileCandidate objects.
     candidates: list[CrossFileCandidate] = []
-    for path in candidate_paths:
+    # Preserve the legacy Python fetch order under the shared wall-clock cap.
+    for path in (*candidate_paths, *javascript_paths):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             log.info(
@@ -565,28 +595,24 @@ def fetch_cross_file_context(
                     extra={"stage": "size", "path": path, "bytes": len(resp.content)},
                 )
                 continue
-            # Extract snippet around symbol matches.
-            snippet = _symbol_snippet(resp.text, symbols)
-            if snippet is None:
+            js_symbols = javascript_paths.get(path)
+            candidate_symbols = tuple(js_symbols) if js_symbols else symbols
+            evidence = _symbol_snippet(
+                resp.text, candidate_symbols, javascript_definition=js_symbols is not None,
+            )
+            if evidence is None:
                 log.info(
                     "cross_file_context_degraded",
                     extra={"stage": "no_symbol_match", "path": path},
                 )
                 continue
-            # Determine which symbols actually appear in this file's snippet.
-            matched = tuple(s for s in symbols if s in snippet)
-            if not matched:
-                log.info(
-                    "cross_file_context_degraded",
-                    extra={"stage": "no_symbol_match", "path": path},
-                )
-                continue
+            snippet, matched = evidence
             candidates.append(
                 CrossFileCandidate(
                     path=path,
                     content=snippet,
                     matched_symbols=matched,
-                    tag=FileTag.CALLER,  # placeholder; will be retagged
+                    tag=FileTag.DEFINITION if js_symbols is not None else FileTag.CALLER,
                 )
             )
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
