@@ -45,6 +45,9 @@ Two rules, each one finding per file:
   add back. Grants and credentials that only serve such a layer (an
   `id-token: write`, a role secret) are named with it. Medium when the
   ticket asks to remove that layer.
+  Not a removal (#1890): a bare path list entry (a matrix directory) that
+  another file of the same diff adds back, as when a matrix moves into a
+  registry script that runs each entry.
 
 Not evaluated (no finding): a file whose hunks are incomplete (the diff
 was cut short), and any diff past `MAX_DIFF_LINES`. Every scan is one
@@ -166,6 +169,9 @@ _SUPPORT_RE = re.compile(
     r"id-token:\s*write|\$\{\{\s*secrets\.|role-to-assume|role-arn|\bssm\b",
     re.IGNORECASE,
 )
+# A bare list value that is a path (`- tools/x`): no key, no command.
+_PATH_TOKEN_RE = re.compile(r"[\w.-]+(?:/[\w.-]+)+")
+_LIST_PATH_RE = re.compile(r"^-\s+['\"]?([\w.-]+(?:/[\w.-]+)+)['\"]?$")
 _USES_REF_RE = re.compile(r"@\S+")
 _KEY_RE = re.compile(r"^-?\s*([\w.-]+):")
 
@@ -745,12 +751,39 @@ def _layer_finding(
     )
 
 
+def _added_paths_by_file(by_file: dict[str, list[DiffHunk]]) -> dict[str, set[str]]:
+    """Path-shaped tokens on each file's added lines, for `_moved_elsewhere`."""
+    out: dict[str, set[str]] = {}
+    for path, own in by_file.items():
+        found: set[str] = set()
+        for hunk in own:
+            for raw in hunk.body.splitlines()[1:]:
+                if raw.startswith("+") and len(raw) <= _MAX_LINE:
+                    found.update(_PATH_TOKEN_RE.findall(raw))
+        out[path] = found
+    return out
+
+
+
+def _moved_elsewhere(line: str, path: str, added_paths: dict[str, set[str]]) -> bool:
+    """A removed bare path list entry (a matrix directory) that another file
+    of the same diff adds back moved there, for example into a registry
+    script that runs each entry (#1890). A scanner step, with its `uses:`,
+    `run:` or keyed settings, never matches."""
+    entry = _LIST_PATH_RE.match(line)
+    if not entry:
+        return False
+    value = entry.group(1)
+    return any(value in found for other, found in added_paths.items() if other != path)
+
+
 def _layer_findings(
     by_file: dict[str, list[DiffHunk]], hunks: tuple[DiffHunk, ...], ticket: str,
     budget: list[int],
 ) -> list[Finding] | None:
     asked = _asks_layer_removal(ticket)
     findings: list[Finding] = []
+    added_paths: dict[str, set[str]] | None = None
     for path, own in by_file.items():
         if not _CI_PATH_RE.search(path):
             continue
@@ -759,6 +792,10 @@ def _layer_findings(
             return None
         removed, added = changed
         lost = [t for t in removed if _identity(t) not in added]
+        if any(_LIST_PATH_RE.match(t) for t in lost):
+            if added_paths is None:
+                added_paths = _added_paths_by_file(by_file)
+            lost = [t for t in lost if not _moved_elsewhere(t, path, added_paths)]
         layer = [t for t in lost if _LAYER_RE.search(t)]
         if not layer:
             continue

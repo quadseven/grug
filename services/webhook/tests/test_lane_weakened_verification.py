@@ -1182,6 +1182,36 @@ def test_a_secret_change_alone_is_not_a_layer():
     assert _scan(diff, criteria=()) == ()
 
 
+_MATRIX = _diff(".github/workflows/check.units.yml", ("", [
+    "       matrix:",
+    "         dir:",
+    "-          - tools/trivy-image-scan",
+    "-          - manifests/ssm-secret-sync",
+    "-          - tools/dns",
+    "+          - .",
+]))
+
+
+def test_a_matrix_entry_moved_into_a_code_registry_is_not_a_removal():
+    # #1890: every suite directory moved from the matrix into a script that
+    # runs each one, so the paths come back as added lines in another file.
+    registry = _diff("scripts/run_units.py", ("", [
+        " SUITES = (",
+        '+    "tools/trivy-image-scan",',
+        '+    "manifests/ssm-secret-sync",',
+        '+    "tools/dns",',
+        " )",
+    ]))
+    assert _scan(_MATRIX + registry, criteria=()) == ()
+
+
+def test_a_matrix_entry_dropped_with_no_copy_elsewhere_is_still_high():
+    unrelated = _diff("scripts/run_units.py", ("", ['+    "tools/dns",']))
+    (f,) = _scan(_MATRIX + unrelated, criteria=())
+    assert (f.rule_name, f.severity) == ("removed-verification-layer", "high")
+    assert "`- tools/trivy-image-scan`" in f.message
+
+
 def test_lane_work_findings_runs_the_check():
     found = lane_work_findings(
         diff_text=_LEAK_SCAN + _FLIPPED, hunks=parse_diff(_LEAK_SCAN + _FLIPPED),
