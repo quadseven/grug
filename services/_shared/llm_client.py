@@ -4803,7 +4803,15 @@ class _ArmOutcome:
 _LOW_CONFIDENCE_PREFIX = "low confidence: "
 
 
-def _record_degenerate_review(backend: "Backend", model: str, usage: dict) -> None:
+def _review_attempt_log_context(pr_tags: dict[str, str]) -> dict[str, str]:
+    """Reuse normalized PR coordinates with a log-specific allowlist."""
+    keys = ("repo", "pr_number", "head_sha", "review_phase", "cohort_index", "cohort_count")
+    return {key: pr_tags[key] for key in keys if key in pr_tags}
+
+
+def _record_degenerate_review(
+    backend: "Backend", model: str, usage: dict, *, pr_tags: dict[str, str],
+) -> None:
     log.warning(
         "llm_review_degenerate_empty",
         extra={
@@ -4811,6 +4819,7 @@ def _record_degenerate_review(backend: "Backend", model: str, usage: dict) -> No
             "model": model,
             "input_tokens": usage.get("input_tokens"),
             "output_tokens": usage.get("output_tokens"),
+            **_review_attempt_log_context(pr_tags),
         },
     )
     try:
@@ -5167,7 +5176,12 @@ def _call_llm_attempt(
         except (httpx.RequestError, httpx.TimeoutException) as e:
             log.warning(
                 transport_log_event,
-                extra={"backend": backend.value, "kind": type(e).__name__},
+                extra={
+                    "backend": backend.value,
+                    "kind": type(e).__name__,
+                    "requested_model": config.model,
+                    **_review_attempt_log_context(pr_tags),
+                },
             )
             availability._note_model_timeout(backend, config.model, e)
             _annotate_attempt_error(
@@ -5360,7 +5374,7 @@ def _run_review_arm(
             # keep a record of the (empty) LLM Obs span for
             # post-incident forensics.
             _record_degenerate_review(
-                backend, resolved_model, attempt.usage_metrics
+                backend, resolved_model, attempt.usage_metrics, pr_tags=pr_tags,
             )
             return _ArmOutcome(
                 backend=backend,
@@ -6145,7 +6159,9 @@ def _run_subscription_fallback(
                 },
             )
             if degenerate:
-                _record_degenerate_review(Backend.SUBSCRIPTION, resolved_model, usage)
+                _record_degenerate_review(
+                    Backend.SUBSCRIPTION, resolved_model, usage, pr_tags=pr_tags,
+                )
                 return _untrusted_empty_review(
                     Backend.SUBSCRIPTION, resolved_model, _served_models(model), span_context,
                     "subscription",
