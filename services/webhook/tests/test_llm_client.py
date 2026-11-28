@@ -6412,6 +6412,75 @@ def test_low_confidence_cohort_does_not_starve_the_next_cohort(monkeypatch) -> N
     assert evaluation.degraded_reason == "low_confidence_review"
 
 
+@pytest.mark.parametrize(
+    ("staged", "child_result"),
+    [(False, "complete"), (True, "complete"), (True, "untrusted"), (True, "truncated"), (False, "large")],
+)
+def test_low_confidence_multifile_review_checks_each_file_after_original_cohorts(
+    monkeypatch, staged, child_result,
+) -> None:
+    model = "fixture-coder"
+    monkeypatch.setenv("GRUG_CAVE_REVIEW_MODEL", model)
+    monkeypatch.setenv("GRUG_CAVE_TRUSTED_EMPTY_MODELS", model)
+    monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cave")
+    monkeypatch.setenv("GRUG_REVIEW_DEPTH", "tiered")
+    monkeypatch.setenv("GRUG_REVIEW_COHORT_CHARS", "16000")
+    monkeypatch.setenv(
+        "GRUG_DISABLED_BACKENDS", "cave-reasoner,free-pool,opencode-go,openrouter,poolside,subscription",
+    )
+    second_size = 8400 if child_result == "large" else 4200
+    hunks = [
+        _hunk("src/first.py", "@@ -1 +1 @@\n+FIRST_CHANGE\n" + "a" * 4200),
+        _hunk("src/second.py", "@@ -1 +1 @@\n+SECOND_CHANGE\n" + "b" * second_size),
+    ]
+    if staged:
+        hunks.append(_hunk("tests/test_other.py", "@@ -1 +1 @@\n+OTHER_CHANGE\n" + "c" * 9000))
+    calls = []
+
+    def review_reply(url, **kwargs):
+        assert url == "http://cave.test/v1/chat/completions"
+        request = kwargs["json"]
+        assert request["model"] == model
+        prompt = request["messages"][1]["content"]
+        scope = tuple(
+            marker for marker in ("FIRST_CHANGE", "SECOND_CHANGE", "OTHER_CHANGE") if marker in prompt
+        )
+        calls.append(scope)
+        findings = []
+        if scope == ("OTHER_CHANGE",):
+            findings = [{
+                "path": "tests/test_other.py", "line": 1, "rule": "logic-error", "severity": "medium",
+                "message": "Other finding",
+            }]
+        reply = _openai_json_response(json.dumps({"findings": findings}))
+        is_second_file = scope == ("SECOND_CHANGE",)
+        reply["choices"][0]["finish_reason"] = "length" if is_second_file and child_result == "truncated" else "stop"
+        reply["usage"] = {"prompt_tokens": 22_000, "completion_tokens": 64 if findings else 9}
+        reply["model"] = "unlisted-coder" if is_second_file and child_result == "untrusted" else model
+        return httpx.Response(200, json=reply)
+
+    with patch.object(httpx, "post", side_effect=review_reply):
+        out = review_diff(assemble_evidence(hunks), installation_id=1)
+
+    expected_calls = [("FIRST_CHANGE", "SECOND_CHANGE")]
+    if staged:
+        expected_calls.append(("OTHER_CHANGE",))
+    if child_result != "large":
+        expected_calls.extend((("FIRST_CHANGE",), ("SECOND_CHANGE",)))
+    assert calls == expected_calls
+    assert out.kind == "reviewed"
+    assert [finding.path for finding in out.findings] == (["tests/test_other.py"] if staged else [])
+    if child_result == "complete":
+        assert out.error == ""
+        assert out.coverage is not None and out.coverage.complete
+        assert set(out.coverage.reviewed_paths) == {hunk.path for hunk in hunks}
+    elif child_result == "truncated":
+        assert evaluate_diff((), out).degraded_reason == "partial_review"
+    else:
+        assert out.error.startswith("low confidence:")
+        assert evaluate_diff((), out).degraded_reason == "low_confidence_review"
+
+
 def test_deepseek_degenerate_then_a_garbled_cave_reaches_the_subscription_lane(
     monkeypatch,
 ) -> None:

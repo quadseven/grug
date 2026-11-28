@@ -97,6 +97,7 @@ from review_ladder import (
     _ChunkLadder,
     _CloudPrimaryResult,
     _DEGENERATE_MAX_OUTPUT_TOKENS,
+    _DEGENERATE_MIN_DIFF_CHARS,
     _cave_empty_is_trusted,
     _empty_answers_agree,
     _empty_confirms_nothing,
@@ -3763,6 +3764,10 @@ def _partial_review_reason(
     return f"partial review: {'; '.join(reasons)}" if reasons else ""
 
 
+def _is_low_confidence_review(response: LlmReviewResponse) -> bool:
+    return response.kind == "reviewed" and response.error.startswith(_LOW_CONFIDENCE_PREFIX)
+
+
 def _with_low_confidence_cohorts(
     error: str, responses: Sequence[LlmReviewResponse],
 ) -> str:
@@ -3775,8 +3780,7 @@ def _with_low_confidence_cohorts(
     indexes = [
         index
         for index, response in enumerate(responses, start=1)
-        if response.kind == "reviewed"
-        and response.error.startswith(_LOW_CONFIDENCE_PREFIX)
+        if _is_low_confidence_review(response)
     ]
     if not indexes:
         return error
@@ -4293,15 +4297,19 @@ def _file_split_targets(
     """0-based cohorts worth re-reviewing one file at a time: they ran, failed
     in a way a smaller input could fix, and span more than one file.
 
-    A cohort whose answer hit the token cap counts too. It is `reviewed`, so
-    the retry predicate treats it as final, but one file asks for a shorter
-    answer and may well finish under the cap."""
+    Capped and low-confidence answers retain their normal ladder results.
+    Recheck them after the original pass, where a smaller input may permit
+    a complete, trusted answer."""
     return [
         index
         for index, (cohort, response) in enumerate(zip(plan.cohorts, responses, strict=True))
         if len(cohort.paths) > 1
         and not cohort.oversized
-        and (_is_retryable_cohort_failure(response) or _hit_token_cap(response))
+        and (
+            _is_retryable_cohort_failure(response)
+            or _hit_token_cap(response)
+            or (_is_low_confidence_review(response) and cohort.diff_chars >= _DEGENERATE_MIN_DIFF_CHARS)
+        )
         and not (response.error or "").startswith(_SKIPPED_COHORT_PREFIX)
     ]
 
@@ -4321,6 +4329,14 @@ def _file_chunks(cohort: ReviewCohort, hunks: Sequence[Hunk]) -> tuple[ReviewCoh
             hunk_indexes=tuple(cohort.hunk_indexes[i] for i in sub.hunk_indexes),
         )
         for sub in sub_plan.cohorts
+    )
+
+
+def _can_recheck_empty_cohort(cohort: ReviewCohort, files: tuple[ReviewCohort, ...]) -> bool:
+    """Only recheck a short empty result when each file is small and all hunks stay covered."""
+    return (
+        all(file.diff_chars < _DEGENERATE_MIN_DIFF_CHARS for file in files)
+        and sorted(index for file in files for index in file.hunk_indexes) == sorted(cohort.hunk_indexes)
     )
 
 
@@ -4399,10 +4415,10 @@ class _Tier1Review:
        into bounded cohorts by `plan_review` (ADR-0021).
     2. Each chunk walks the model ladder, then gets one retry that starts at
        the next untried model (`_ChunkLadder`).
-    3. A chunk that still failed and spans several files is split by file
-       and each file chunk is reviewed on its own, inside the remaining
-       staged budget (grug#1196). Markings from every chunk merge into one
-       response, and coverage names the files reviewed and not reviewed.
+    3. A chunk that still failed or was inconclusive and spans multiple
+       files can be reviewed file by file inside the remaining budget
+       (grug#1196). Markings from every chunk merge into one response, and
+       coverage names the files reviewed and not reviewed.
 
     The whole review runs under one deadline, `started_at` + the staged
     budget (grug#1216): every model call is clamped to the time left, so the
@@ -4494,7 +4510,8 @@ class _Tier1Review:
     def run_whole_diff(self, plan: ReviewPlan) -> LlmReviewResponse:
         """One chunk. A success returns unchanged, exactly as before staging
         existed; a failure gets the next-model retry, then the file split. An
-        answer that hit the token cap skips the retry and goes to the split."""
+        answer that hit the token cap or was low confidence skips the retry
+        and may go to the split."""
         with self._deadline():
             return self._run_whole_diff(plan)
 
@@ -4516,10 +4533,12 @@ class _Tier1Review:
                 },
             )
             response = ladder.run(0, call)
-        # A capped answer is `reviewed` but partial: it goes on to the file
-        # split like a failure does, and through the merge, so coverage names
-        # the cap even when one file leaves nothing to split.
-        clean = response.kind == "reviewed" and not _hit_token_cap(response)
+        # A capped answer is partial even when there is nothing to split.
+        # Low-confidence answers can also try one split of a multi-file cohort.
+        clean = (
+            response.kind == "reviewed" and not _hit_token_cap(response)
+            and not _file_split_targets(plan, [response])
+        )
         if clean or self._cancelled():
             return response
         return self._split_and_merge(plan, [response])
@@ -4593,18 +4612,22 @@ class _Tier1Review:
                 },
             )
             return plan, responses
-        chunks = {
-            index: _file_chunks(plan.cohorts[index], self.evidence.hunks)
-            for index in targets
-        }
-        flat = [chunk for index in targets for chunk in chunks[index]]
+        chunks = {}
+        for index in targets:
+            cohort = plan.cohorts[index]
+            files = _file_chunks(cohort, self.evidence.hunks)
+            if not _is_low_confidence_review(responses[index]) or _can_recheck_empty_cohort(cohort, files):
+                chunks[index] = files
+        if not chunks:
+            return plan, responses
+        flat = [chunk for files in chunks.values() for chunk in files]
         review_map = render_review_map(
             ReviewPlan(cohorts=tuple(flat), total_diff_chars=sum(c.diff_chars for c in flat)),
         )
         log.info(
             "llm_review_file_split",
             extra={
-                "cohorts": [index + 1 for index in targets],
+                "cohorts": [index + 1 for index in chunks],
                 "file_chunks": len(flat),
                 "budget_s": round(budget, 1),
                 "installation_id": self.installation_id,
@@ -4617,6 +4640,8 @@ class _Tier1Review:
             lambda index, chunk: self._run_cohort(flat[index], index, len(flat), review_map, chunk),
             budget,
         )
+        if len(sub_responses) != len(flat):
+            return plan, responses
         return _splice_file_chunks(plan, responses, chunks, sub_responses)
 
 
