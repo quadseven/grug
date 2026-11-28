@@ -110,7 +110,8 @@ def test_uses_frozen_files_and_real_publication_gates(case, monkeypatch):
 
 
 @pytest.mark.parametrize("refute", [False, True])
-def test_fixed_cave_judge_requests_structured_output_for_thirteen_verdicts(monkeypatch, refute):
+@pytest.mark.parametrize("finding_count", [13, 25])
+def test_fixed_cave_judge_requests_structured_output_for_a_batch(monkeypatch, refute, finding_count):
     _case_runner(monkeypatch)
     from dataclasses import replace
 
@@ -126,11 +127,11 @@ def test_fixed_cave_judge_requests_structured_output_for_thirteen_verdicts(monke
     findings = [{
         "file": "example.py", "line": index + 1, "severity": "high",
         "rule_name": "logic-error", "message": f"Finding {index}",
-    } for index in range(13)]
+    } for index in range(finding_count)]
     verdicts = [{
         "index": index, "is_real_bug": False, "confidence": 0.95,
         "reasoning": f"Counterexample {index}",
-    } for index in range(13)]
+    } for index in range(finding_count)]
     requests = []
 
     def post(backend, _messages):
@@ -159,7 +160,9 @@ def test_fixed_cave_judge_requests_structured_output_for_thirteen_verdicts(monke
     schema = response_format["json_schema"]["schema"]
     assert schema["required"] == ["verdicts"]
     assert schema["additionalProperties"] is False
-    items = schema["properties"]["verdicts"]["items"]
+    verdict_array = schema["properties"]["verdicts"]
+    assert verdict_array["maxItems"] == llm_client.JUDGE_BATCH_SIZE == 25
+    items = verdict_array["items"]
     assert set(items["required"]) == {"index", "is_real_bug", "confidence", "reasoning"}
     assert items["properties"] == {
         "index": {"type": "integer"}, "is_real_bug": {"type": "boolean"},
@@ -167,7 +170,7 @@ def test_fixed_cave_judge_requests_structured_output_for_thirteen_verdicts(monke
     }
     assert items["additionalProperties"] is False
     assert [(v.finding_index, v.is_real_bug, v.confidence, v.reasoning) for v in result] == [
-        (i, False, 0.95, f"Counterexample {i}") for i in range(13)
+        (i, False, 0.95, f"Counterexample {i}") for i in range(finding_count)
     ]
 
 

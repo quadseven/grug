@@ -48,6 +48,7 @@ _CAVE_VERDICTS_RESPONSE_FORMAT = {
             "properties": {
                 "verdicts": {
                     "type": "array",
+                    "maxItems": 25,  # Both pinned reviewers use this judge batch size.
                     "items": {
                         "type": "object",
                         "properties": {
