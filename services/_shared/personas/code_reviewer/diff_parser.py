@@ -143,6 +143,32 @@ def is_review_excluded_path(path: str) -> bool:
     return _REVIEW_EXCLUDED_PATH_RE.search(path) is not None
 
 
+def _ledger_append_lines(hunk: DiffHunk, change: FileChange) -> list[str] | None:
+    """Return the candidate appended lines after checking the hunk and context."""
+    header, *lines = hunk.body.splitlines()
+    match = _HUNK_HEADER_RE.match(header)
+    if match is None:
+        return None
+    old_count = int(match.group(1) or "1")
+    new_count = int(match.group(3) or "1")
+    if not len(lines) == new_count == old_count + change.added:
+        return None
+    if change.status == "added":
+        if not header.startswith("@@ -0,0 +1") or old_count or hunk.new_start != 1:
+            return None
+    else:
+        old_side = _OLD_SIDE_RE.match(header)
+        if (
+            not old_count
+            or old_side is None
+            or int(old_side.group(1)) != hunk.new_start
+            or not all(line.startswith(" ") for line in lines[:old_count])
+        ):
+            return None
+
+    return lines[old_count:]
+
+
 def _bounded_ledger_append(hunk: DiffHunk, change: FileChange) -> bool:
     """Accept a complete, small hunk that adds valid review ledger rows."""
     if (
@@ -153,38 +179,19 @@ def _bounded_ledger_append(hunk: DiffHunk, change: FileChange) -> bool:
     ):
         return False
 
-    header, *lines = hunk.body.splitlines()
-    match = _HUNK_HEADER_RE.match(header)
-    if match is None:
+    additions = _ledger_append_lines(hunk, change)
+    if additions is None:
         return False
-    old_count = int(match.group(1) or "1")
-    new_count = int(match.group(3) or "1")
-    if len(lines) != new_count or old_count + change.added != new_count:
-        return False
-    if change.status == "added":
-        if not header.startswith("@@ -0,0 +1") or old_count or hunk.new_start != 1:
-            return False
-    else:
-        old_side = _OLD_SIDE_RE.match(header)
-        if (
-            not old_count
-            or old_side is None
-            or int(old_side.group(1)) != hunk.new_start
-            or not all(line.startswith(" ") for line in lines[:old_count])
-        ):
-            return False
-
-    # GitHub's append hunks end in added rows after any old-side context.
-    # A removal or a mid-file insertion has a different shape.
-    for line in lines[old_count:]:
-        if not line.startswith("+"):
-            return False
-        try:
+    try:
+        for line in additions:
+            # After the old context, only added rows belong in an append.
+            if not line.startswith("+"):
+                return False
             row = json.loads(line[1:])
             if not isinstance(row, dict) or parse_row(row) is None:
                 return False
-        except (ValueError, RecursionError, OverflowError):
-            return False
+    except (ValueError, RecursionError, OverflowError):
+        return False
     return True
 
 
