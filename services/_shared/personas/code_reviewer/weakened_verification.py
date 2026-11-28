@@ -48,7 +48,7 @@ Two rules, each one finding per file:
   Not a removal (#1890): a bare path list entry (a matrix directory) that
   another file of the same diff adds back, as when a matrix moves into a
   registry script the workflow runs, as a whole quoted entry in a code
-  file the workflow names.
+  file the workflow runs by its full path.
 
 Not evaluated (no finding): a file whose hunks are incomplete (the diff
 was cut short), and any diff past `MAX_DIFF_LINES`. Every scan is one
@@ -775,12 +775,12 @@ def _registry_entries_by_file(by_file: dict[str, list[DiffHunk]]) -> dict[str, s
 
 
 def _moved_elsewhere(
-    line: str, ci_added: str, entries: dict[str, set[str]],
+    line: str, ci_added: list[str], entries: dict[str, set[str]],
 ) -> bool:
     """A removed bare path list entry (a matrix directory) that moved into a
     registry the workflow now runs (#1890): another code file of the diff
-    adds it as a whole quoted entry, and the workflow's own added lines name
-    that file. A scanner step (`uses:`, `run:`, keyed settings) or a script
+    adds it as a whole quoted entry, and the workflow's own added lines run
+    that file by its full path. A scanner step (`uses:`, `run:`, keyed settings) or a script
     path (`./x`, `x.sh`) never counts as moved."""
     entry = _LIST_PATH_RE.match(line)
     if not entry:
@@ -788,9 +788,18 @@ def _moved_elsewhere(
     value = entry.group(1)
     if value.startswith("./") or value.endswith(_SCRIPT_SUFFIXES):
         return False
+    return any(value in found and _runs(ci_added, other) for other, found in entries.items())
+
+
+def _runs(ci_added: list[str], path: str) -> bool:
+    """The workflow's added lines run `path`: its full repo path as a command
+    token, bare or under `./` or a `$VAR/` workspace root. A bare list item
+    (a `paths:` trigger) names the file without running it."""
+    token = re.compile(
+        r"""(?:^|[\s"'=]|\./|\$\{?\w+\}?/)""" + re.escape(path) + r"""(?=$|[\s"';|&)])"""
+    )
     return any(
-        value in found and other.rsplit("/", 1)[-1] in ci_added
-        for other, found in entries.items()
+        token.search(line) for line in ci_added if not _REGISTRY_ENTRY_RE.match(line)
     )
 
 
@@ -812,7 +821,7 @@ def _layer_findings(
         if any(_LIST_PATH_RE.match(t) for t in lost):
             if entries is None:
                 entries = _registry_entries_by_file(by_file)
-            ci_added = "\n".join(added)
+            ci_added = sorted(added)
             lost = [t for t in lost if not _moved_elsewhere(t, ci_added, entries)]
         layer = [t for t in lost if _LAYER_RE.search(t)]
         if not layer:

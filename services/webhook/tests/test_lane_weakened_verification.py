@@ -1213,6 +1213,34 @@ def test_a_registry_the_workflow_does_not_run_does_not_excuse():
     assert "`- tools/trivy-image-scan`" in f.message
 
 
+@pytest.mark.parametrize("command", [
+    "python3 scripts/not_run_units.py",
+    "python3 other/scripts/run_units.py",
+])
+def test_a_workflow_running_a_different_file_does_not_excuse(command):
+    ci = _MATRIX.replace("python3 scripts/run_units.py", command)
+    registry = _diff("scripts/run_units.py", ("", ['+    "tools/trivy-image-scan",']))
+    (f,) = _scan(ci + registry, criteria=())
+    assert "`- tools/trivy-image-scan`" in f.message
+
+
+def test_a_paths_trigger_on_the_registry_is_not_running_it():
+    ci = _MATRIX.replace("+      test-cmd: python3 scripts/run_units.py", "+      - 'scripts/run_units.py'")
+    registry = _diff("scripts/run_units.py", ("", ['+    "tools/trivy-image-scan",']))
+    (f,) = _scan(ci + registry, criteria=())
+    assert "`- tools/trivy-image-scan`" in f.message
+
+
+def test_a_registry_run_from_the_workspace_root_excuses():
+    ci = _MATRIX.replace(
+        "python3 scripts/run_units.py", 'python3 "$GITHUB_WORKSPACE/scripts/run_units.py" --exclude x'
+    )
+    registry = _diff("scripts/run_units.py", ("", [
+        '+    "tools/trivy-image-scan",', '+    "manifests/ssm-secret-sync",', '+    "tools/dns",',
+    ]))
+    assert _scan(ci + registry, criteria=()) == ()
+
+
 def test_a_matrix_entry_dropped_with_no_copy_elsewhere_is_still_high():
     unrelated = _diff("scripts/run_units.py", ("", ['+    "tools/dns",']))
     (f,) = _scan(_MATRIX + unrelated, criteria=())
