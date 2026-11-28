@@ -996,7 +996,7 @@ def test_the_workloads_ship_the_lane_first_within_its_cap() -> None:
         assert 'name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "3000"' in text
 
 
-# loom#3053: a paid OpenCode Go tier called from the cluster, behind a flag
+# Elder last-resort tier: a paid OpenCode Go tier called from the cluster, behind a flag
 # that is off by default, so Elder keeps a non-free verdict with no operator
 # machine and no Sparks.
 _GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"

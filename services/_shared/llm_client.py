@@ -6225,7 +6225,7 @@ def _run_subscription_fallback(
 
 
 def _go_last_resort_enabled() -> bool:
-    """Opt-in, off by default (grug#1811 follow-up to loom#3053): the cluster-side
+    """Opt-in, off by default (a follow-up to the Elder fallback tiers): the cluster-side
     paid tier that needs no operator machine."""
     return os.getenv("GRUG_ELDER_GO_LAST_RESORT", "").strip().lower() in ("1", "true", "yes")
 
