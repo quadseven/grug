@@ -1221,7 +1221,30 @@ def test_both_backends_fail_returns_all_failed_kind() -> None:
     assert out.error  # non-empty
 
 
-def test_timeout_treated_as_failure(monkeypatch) -> None:
+@pytest.fixture
+def review_attempt_pr(monkeypatch) -> lc.PrContext:
+    from adapters import pg_install_store
+
+    monkeypatch.setattr(pg_install_store, "get_repo_practices", lambda _repo: [])
+    monkeypatch.setattr(pg_install_store, "get_repo_exemplars", lambda _repo: [])
+    monkeypatch.setattr(pg_install_store, "list_learnings", lambda _repo: [])
+    return {
+        "repo": "example/project", "pr_number": 12, "head_sha": "abcdef0123456789",
+        "review_phase": "tier1", "cohort_index": 2, "cohort_count": 3,
+        "installation_id": 42, "title": "example title", "body": "example body",
+    }
+
+
+def _assert_review_attempt_log_context(event: logging.LogRecord) -> None:
+    expected = {
+        "repo": "example/project", "pr_number": "12", "head_sha": "abcdef01",
+        "review_phase": "tier1", "cohort_index": "2", "cohort_count": "3",
+    }
+    assert {key: vars(event).get(key) for key in expected} == expected
+    assert not {"installation_id", "title", "body"} & vars(event).keys()
+
+
+def test_timeout_treated_as_failure(monkeypatch, caplog, review_attempt_pr) -> None:
     """A timeout (httpx.ReadTimeout) on the coder arm should fall back to the
     reasoner arm, not crash the webhook. Both arms share the gateway URL, so the
     mock dispatches on the model in the outgoing body."""
@@ -1235,14 +1258,20 @@ def test_timeout_treated_as_failure(monkeypatch) -> None:
         # Coder arm times out; the reasoner arm answers.
         if "qwen3.5" in model:
             return success
-        raise httpx.ReadTimeout("timeout")
+        raise httpx.ReadTimeout("transport detail should stay out of logs")
 
     with patch.object(httpx, "post", side_effect=staged):
-        out = review_diff(assemble_evidence([_hunk()]), installation_id=2)
+        evidence = assemble_evidence([_hunk()], pr_context=review_attempt_pr)
+        out = review_diff(evidence, installation_id=42)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.CAVE_REASONER
     assert any("qwen3.5" in m for m in call_log)
+    [warning] = [r for r in caplog.records if r.message == "llm_backend_transport_failed"]
+    _assert_review_attempt_log_context(warning)
+    assert (warning.backend, warning.kind) == (Backend.CAVE.value, "ReadTimeout")
+    assert warning.requested_model == call_log[0]
+    assert "transport detail should stay out of logs" not in repr(vars(warning))
 
 
 def test_request_uses_openai_chat_completions_shape() -> None:
@@ -5428,7 +5457,9 @@ def _usage_response(content: str, prompt_tokens: int, completion_tokens: int) ->
     return httpx.Response(200, json=body)
 
 
-def test_degenerate_empty_review_falls_through_to_the_next_tier(monkeypatch) -> None:
+def test_degenerate_empty_review_falls_through_to_the_next_tier(
+    monkeypatch, caplog, review_attempt_pr,
+) -> None:
     """Seen live: `{"findings": []}` in 7 output tokens for a 10-20k-token
     diff, published as a clean pass. It is a miss; Poolside answers."""
     monkeypatch.setenv("GRUG_REVIEW_BACKEND_PRIORITY", "cloud")
@@ -5446,13 +5477,21 @@ def test_degenerate_empty_review_falls_through_to_the_next_tier(monkeypatch) -> 
     with patch.object(
         httpx, "post", side_effect=[_go_limit_429(), degenerate, real],
     ) as post:
-        out = review_diff(assemble_evidence([_large_hunk()]), installation_id=1)
+        evidence = assemble_evidence([_large_hunk()], pr_context=review_attempt_pr)
+        out = review_diff(evidence, installation_id=42)
 
     assert out.kind == "reviewed"
     assert out.backend_used == Backend.POOLSIDE
     assert len(out.findings) == 1
     assert post.call_count == 3
     assert counted and counted[0][0][0] == "grug.elder.degenerate_empty_review"
+    assert counted[0][1]["tags"] == {
+        "backend": Backend.OPENROUTER.value, "model": "test-model-id",
+    }
+    [warning] = [r for r in caplog.records if r.message == "llm_review_degenerate_empty"]
+    _assert_review_attempt_log_context(warning)
+    assert (warning.backend, warning.model) == (Backend.OPENROUTER.value, "test-model-id")
+    assert (warning.input_tokens, warning.output_tokens) == (15_000, 7)
 
 
 def test_small_empty_review_is_not_degenerate() -> None:
