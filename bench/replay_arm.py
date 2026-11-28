@@ -444,6 +444,8 @@ def evaluate(payload: dict, *, post=None) -> dict:
             "GRUG_CAVE_JUDGE_MODEL": case.model,
             "GRUG_CAVE_TRUSTED_EMPTY_MODELS": case.model,
             "GRUG_REVIEW_BACKEND_PRIORITY": "cave",
+            # Constrain candidate selection so the reviewer can report its own coverage.
+            "GRUG_DISABLED_BACKENDS": "cave-reasoner,free-pool,opencode-go,openrouter,poolside,subscription",
             "GRUG_REVIEW_DEPTH": "tiered",
             "GRUG_REVIEW_MAX_COHORTS": str(REPLAY_MAX_COHORTS),
             "DD_TRACE_ENABLED": "false",

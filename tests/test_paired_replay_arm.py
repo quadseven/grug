@@ -54,14 +54,17 @@ def case(tmp_path, monkeypatch):
     }
 
 
-def _reply(result, *, model=MODEL, finish_reason="stop", status=200):
-    return httpx.Response(status, json={
+def _reply(result, *, model=MODEL, finish_reason="stop", status=200, usage=None):
+    body = {
         "model": model,
         "choices": [{
             "finish_reason": finish_reason,
             "message": {"content": json.dumps(result)},
         }],
-    })
+    }
+    if usage is not None:
+        body["usage"] = usage
+    return httpx.Response(status, json=body)
 
 
 def _case_runner(monkeypatch):
@@ -383,6 +386,37 @@ def test_invalid_response_cannot_trigger_a_fallback(case, monkeypatch):
 
     assert result == {"status": "invalid", "reason": "served_model_mismatch"}
     assert attempts == [("cave", URL, MODEL)]
+
+
+@pytest.mark.parametrize(("completion_tokens", "expected_status"), [(9, "invalid"), (64, "scored")])
+def test_fixed_model_distinguishes_empty_discovery_outcomes(case, monkeypatch, completion_tokens, expected_status):
+    _case_runner(monkeypatch)
+    root = Path(case["root"])
+    fixture_value = "example text " * 8
+    fixture_lines = "".join(
+        f'fixture_{number:03} = "{fixture_value}"\n' for number in range(100)
+    )
+    (root / "large.py").write_text(fixture_lines)
+    _git(root, "add", "large.py")
+    _git(root, "commit", "-qm", "large historical change")
+    head = _git(root, "rev-parse", "HEAD").strip()
+    diff = _git(root, "diff", "--full-index", case["base_sha"], head)
+    case.update(head_sha=head, diff=diff, diff_sha256=hashlib.sha256(diff.encode()).hexdigest())
+    requests = []
+
+    def post(backend, _messages):
+        requests.append((backend.name, backend.url, backend.model))
+        return _reply(
+            {"findings": []}, usage={"prompt_tokens": 22309, "completion_tokens": completion_tokens},
+        )
+
+    result = replay_arm.evaluate(case, post=post)
+    assert result["status"] == expected_status
+    if expected_status == "invalid":
+        assert result["reason"] == "incomplete_review"
+    else:
+        assert result["findings"] == []
+    assert requests == [("cave", URL, MODEL)]
 
 
 def test_transport_refuses_redirect_destination(case, monkeypatch):
