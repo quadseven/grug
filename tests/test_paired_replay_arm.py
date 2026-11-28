@@ -72,6 +72,10 @@ def _case_runner(monkeypatch):
     monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
 
 
+def _response_schema_name(backend):
+    return backend.extra_body["response_format"]["json_schema"]["name"]
+
+
 def test_uses_frozen_files_and_real_publication_gates(case, monkeypatch):
     _case_runner(monkeypatch)
     attempts = []
@@ -81,7 +85,7 @@ def test_uses_frozen_files_and_real_publication_gates(case, monkeypatch):
         assert backend.url == URL
         prompt = "\n".join(message["content"] for message in messages)
         assert "WORKTREE ONLY" not in prompt
-        if backend.extra_body["response_format"]["type"] == "json_schema":
+        if _response_schema_name(backend) == "review_findings":
             attempts.append("review")
             assert "print(total(1))" in prompt
             return _reply({"findings": [{
@@ -105,13 +109,80 @@ def test_uses_frozen_files_and_real_publication_gates(case, monkeypatch):
     assert "judge" in attempts
 
 
+@pytest.mark.parametrize("refute", [False, True])
+def test_fixed_cave_judge_requests_structured_output_for_thirteen_verdicts(monkeypatch, refute):
+    _case_runner(monkeypatch)
+    from dataclasses import replace
+
+    import llm_client
+    from review_evidence import assemble_evidence
+    from sast_benchmark.backends import configured_backends
+
+    monkeypatch.setenv("GRUG_BENCH_CAVE_URL", URL)
+    monkeypatch.setenv("GRUG_BENCH_CAVE_MODEL", MODEL)
+    monkeypatch.setenv("GRUG_CAVE_GATEWAY_URL", URL.removesuffix("/v1/chat/completions"))
+    monkeypatch.setenv("GRUG_CAVE_JUDGE_MODEL", MODEL)
+
+    findings = [{
+        "file": "example.py", "line": index + 1, "severity": "high",
+        "rule_name": "logic-error", "message": f"Finding {index}",
+    } for index in range(13)]
+    verdicts = [{
+        "index": index, "is_real_bug": False, "confidence": 0.95,
+        "reasoning": f"Counterexample {index}",
+    } for index in range(13)]
+    requests = []
+
+    def post(backend, _messages):
+        requests.append(backend)
+        return _reply({"verdicts": verdicts})
+
+    backend = next(backend for backend in configured_backends() if backend.name == "cave")
+    wire = replay_arm.FixedBackend(backend, post)
+    config = llm_client._cave_judge_config()
+    assert config is not None
+    if refute:
+        config = replace(config, extra_body={**config.extra_body, "response_format": {"type": "json_object"}})
+
+    with wire.fenced(llm_client):
+        result = llm_client.judge_findings(
+            findings, assemble_evidence([]), 0, config=config, refute=refute,
+        )
+
+    [request] = requests
+    assert (request.name, request.model, request.url) == ("cave", MODEL, URL)
+    body = request.extra_body
+    assert body["max_tokens"] == 4096
+    assert body["reasoning_effort"] == "none"
+    response_format = body["response_format"]
+    assert response_format["type"] == "json_schema"
+    schema = response_format["json_schema"]["schema"]
+    assert schema["required"] == ["verdicts"]
+    assert schema["additionalProperties"] is False
+    items = schema["properties"]["verdicts"]["items"]
+    assert set(items["required"]) == {"index", "is_real_bug", "confidence", "reasoning"}
+    assert items["properties"] == {
+        "index": {"type": "integer"}, "is_real_bug": {"type": "boolean"},
+        "confidence": {"type": "number"}, "reasoning": {"type": "string"},
+    }
+    assert items["additionalProperties"] is False
+    assert [(v.finding_index, v.is_real_bug, v.confidence, v.reasoning) for v in result] == [
+        (i, False, 0.95, f"Counterexample {i}") for i in range(13)
+    ]
+
+
+@pytest.mark.parametrize("judge", [False, True])
 @pytest.mark.parametrize("reply,reason", [
     (_reply({"findings": []}, model="different/model"), "served_model_mismatch"),
     (_reply({"findings": []}, finish_reason="length"), "incomplete_model_output"),
+    (httpx.Response(200, json={
+        "model": MODEL,
+        "choices": [{"finish_reason": "stop", "message": {"content": "{}", "refusal": True}}],
+    }), "incomplete_model_output"),
     (_reply({"unrelated": []}), "invalid_model_envelope"),
     (_reply({"findings": []}, status=503), "backend_status"),
 ])
-def test_provider_replies_have_to_be_complete(reply, reason):
+def test_provider_replies_have_to_be_complete(reply, reason, judge):
     from dataclasses import dataclass, field
 
     @dataclass
@@ -122,7 +193,8 @@ def test_provider_replies_have_to_be_complete(reply, reason):
 
     wire = replay_arm.FixedBackend(Backend(), lambda *_args: reply)
     config = SimpleNamespace(
-        model=MODEL, url=URL, backend="cave", extra_body={}, extra_headers={},
+        model=MODEL, url=URL, backend="cave", extra_body={},
+        extra_headers={"X-Spark-Caller": "grug-elder-judge"} if judge else {},
     )
     with pytest.raises(replay_arm.InvalidReplay, match=reason):
         wire.call(config, [])
@@ -267,7 +339,7 @@ def test_missing_published_verdict_does_not_become_a_score(
     judge_calls = []
 
     def post(backend, _messages):
-        if backend.extra_body["response_format"]["type"] == "json_schema":
+        if _response_schema_name(backend) == "review_findings":
             return _reply({"findings": [{
                 "path": "main.py", "line": 2, "rule": "logic-error",
                 "severity": "high" if phase == "refute" else "medium",
