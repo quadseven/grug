@@ -250,20 +250,47 @@ def test_paired_budget_reviews_every_hunk_beyond_the_live_plan_limit(case, monke
     assert set(coverage[0].reviewed_paths) == expected_paths
 
 
-def test_missing_published_verdict_does_not_become_a_score(case, monkeypatch):
+@pytest.mark.parametrize(("phase", "wire_reason", "judge_call_count"), [
+    ("grade", None, 0),
+    ("grade", "provider_fallback_rejected", 1),
+    ("refute", "provider_fallback_rejected", 2),
+    ("grade", "backend_timeout", 1),
+])
+def test_missing_published_verdict_does_not_become_a_score(
+    case, monkeypatch, phase, wire_reason, judge_call_count,
+):
     _case_runner(monkeypatch)
+    from personas.code_reviewer import judge
+
+    if wire_reason is None:
+        monkeypatch.setattr(judge, "JUDGE_MAX_FINDINGS", 0)
+    judge_calls = []
 
     def post(backend, _messages):
         if backend.extra_body["response_format"]["type"] == "json_schema":
             return _reply({"findings": [{
-                "path": "main.py", "line": 2, "rule": "logic-error", "severity": "medium",
+                "path": "main.py", "line": 2, "rule": "logic-error",
+                "severity": "high" if phase == "refute" else "medium",
                 "message": "The returned total includes an extra unit.",
             }]})
+        judge_calls.append(backend.name)
+        if phase == "refute" and len(judge_calls) == 1:
+            return _reply({"verdicts": [{
+                "index": 0, "is_real_bug": True, "confidence": 0.99,
+                "reasoning": "The addition changes the total.",
+            }]})
+        if wire_reason == "backend_timeout":
+            raise httpx.ReadTimeout("private transport detail")
         return _reply({"verdicts": []})
 
+    coverage = {"phase": phase, "expected": 1, "returned": 0, "covered": 0}
+    if wire_reason:
+        coverage["wire_reason"] = wire_reason
     assert replay_arm.evaluate(case, post=post) == {
         "status": "invalid", "reason": "incomplete_publication_verdicts",
+        "publication": coverage,
     }
+    assert judge_calls == ["cave"] * judge_call_count
 
 
 def test_invalid_response_cannot_trigger_a_fallback(case, monkeypatch):

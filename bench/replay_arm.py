@@ -29,6 +29,7 @@ _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*")
 _COMPLETIONS_PATH = "/v1/chat/completions"
 _FREE_PROVIDER_FALLBACK_ROUTES = ("free-pool", "openrouter", "poolside")
 PROVIDER_FALLBACK_REJECTED = "provider_fallback_rejected"
+INCOMPLETE_PUBLICATION_VERDICTS = "incomplete_publication_verdicts"
 REQUEST_TIMEOUT_ENV = "GRUG_BENCH_TIMEOUT_SECONDS"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 150
 MAX_REQUEST_TIMEOUT_SECONDS = 300
@@ -39,6 +40,21 @@ REPLAY_MAX_COHORTS = 16
 
 class InvalidReplay(RuntimeError):
     """An invalid or incomplete run, with a safe public reason code."""
+
+
+class IncompletePublicationVerdicts(InvalidReplay):
+    """Structured coverage counts without verdict indices or provider data."""
+
+    def __init__(self, phase: str, expected: int, indices: list[int], wire_reason: str | None):
+        super().__init__(INCOMPLETE_PUBLICATION_VERDICTS)
+        self.coverage: dict[str, str | int] = {
+            "phase": phase,
+            "expected": expected,
+            "returned": len(indices),
+            "covered": len({index for index in indices if 0 <= index < expected}),
+        }
+        if wire_reason is not None:
+            self.coverage["wire_reason"] = wire_reason
 
 
 def configured_request_timeout() -> float:
@@ -316,10 +332,10 @@ class FixedBackend:
             yield
 
 
-def _complete_verdicts(verdicts, count: int):
+def _complete_verdicts(verdicts, count: int, *, phase: str, wire_reason: str | None):
     indices = [verdict.finding_index for verdict in verdicts]
     if sorted(indices) != list(range(count)):
-        raise InvalidReplay("incomplete_publication_verdicts")
+        raise IncompletePublicationVerdicts(phase, count, indices, wire_reason)
     return verdicts
 
 
@@ -336,11 +352,15 @@ def _measure(case: FrozenCase, *, post=None) -> dict:
 
     def grade(evaluation, evidence, install_id):
         verdicts = runner.grade_findings(evaluation, evidence, install_id)
-        return _complete_verdicts(verdicts, len(evaluation.findings))
+        return _complete_verdicts(
+            verdicts, len(evaluation.findings), phase="grade", wire_reason=wire.rejected,
+        )
 
     def refute(findings, evidence, install_id):
         verdicts = runner.production_refute(findings, evidence, install_id)
-        return _complete_verdicts(verdicts, len(findings))
+        return _complete_verdicts(
+            verdicts, len(findings), phase="refute", wire_reason=wire.rejected,
+        )
 
     hunks, evidence = _evidence(case, llm_client)
     with wire.fenced(llm_client):
@@ -405,6 +425,8 @@ def evaluate(payload: dict, *, post=None) -> dict:
         }
         with patch.dict(os.environ, locked, clear=True):
             return _measure(case, post=post)
+    except IncompletePublicationVerdicts as exc:
+        return {"status": "invalid", "reason": str(exc), "publication": exc.coverage}
     except InvalidReplay as exc:
         return {"status": "invalid", "reason": str(exc)}
     except (OSError, RuntimeError, TypeError, ValueError, AttributeError, subprocess.SubprocessError):
