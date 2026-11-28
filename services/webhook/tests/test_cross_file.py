@@ -541,6 +541,67 @@ def test_search_hits_filtered_to_python_paths():
     assert list(out) == ["src/caller.py"]
 
 
+@pytest.mark.parametrize(
+    ("changed_path", "expected_paths"),
+    [
+        ("src/summary.ts", ["src/reader.py", "src/clock.js"]),
+        ("src/summary.py", ["src/reader.py"]),
+    ],
+)
+def test_code_search_fetches_unchanged_js_definitions_for_js_or_ts_changes(
+    changed_path, expected_paths,
+):
+    def fake_get(url, *, params, **_kwargs):
+        if "/search/code" in url:
+            assert params["q"] == '"toMillis" repo:o/r'
+            return _search_response([
+                "src/clock.js", "src/another.js", "src/reader.py",
+                "docs/clock.md", changed_path,
+            ])
+        assert params == {"ref": "abc"}
+        files = {
+            "src/clock.js": "export function toMillis(seconds) {\n  return seconds * 1000;\n}\n",
+            "src/another.js": "const duration = toMillis(3);\n",
+            "src/reader.py": "duration = toMillis(3)\n",
+        }
+        return _raw_response(files[url.split("/contents/", 1)[1]])
+
+    with patch.object(cross_file.httpx, "get", side_effect=fake_get):
+        context = cross_file.fetch_cross_file_context(
+            "tok", "o", "r", ("toMillis",),
+            head_sha="abc", exclude_paths=frozenset({changed_path}),
+        )
+
+    assert list(context) == expected_paths
+    if "src/clock.js" in expected_paths:
+        assert "2:   return seconds * 1000;" in context["src/clock.js"]
+
+
+def test_javascript_snippet_ranks_only_the_search_symbols_it_defines():
+    fetched = []
+
+    def fake_get(url, *, params, **_kwargs):
+        if "/search/code" in url:
+            if params["q"] == '"formatValue" repo:o/r':
+                return _search_response(["src/z_clock.js"])
+            assert params["q"] == '"toMillis" repo:o/r'
+            return _search_response(["src/z_clock.js", "src/a_clock.js"])
+        path = url.split("/contents/", 1)[1]
+        fetched.append(path)
+        value = "formatValue(seconds)" if path == "src/z_clock.js" else "seconds"
+        return _raw_response(f"export function toMillis(seconds) {{\n  return {value} * 1000;\n}}\n")
+
+    with patch.object(cross_file.httpx, "get", side_effect=fake_get):
+        context = cross_file.fetch_cross_file_context(
+            "tok", "o", "r", ("toMillis", "formatValue"),
+            head_sha="abc", exclude_paths=frozenset({"src/summary.js"}),
+        )
+
+    assert sorted(fetched) == ["src/a_clock.js", "src/z_clock.js"]
+    assert "formatValue(seconds)" in context["src/z_clock.js"]
+    assert list(context) == ["src/a_clock.js", "src/z_clock.js"]
+
+
 def test_prompt_hardening_covers_file_context_blocks():
     """The injection-hardening clause must frame ALL repo-sourced blocks
     (diff + full-file + cross-file) as data, and the cross-file block
