@@ -88,6 +88,7 @@ from personas.code_reviewer.dedup import (
     finding_key, parse_rule,
 )
 from personas.code_reviewer.diff_parser import (
+    REVIEW_LEDGER_PATH,
     added_lines,
     DiffHunk, DiffParseError, file_changes, is_tree_copy_candidate, new_file_blob_ids,
     fit_hunks_to_cohorts, parse_diff, split_duplicate_hunks,
@@ -438,13 +439,14 @@ def _fetch_base_contents(
     going SILENT on a fetch error would hide real regressions, whereas falling
     back only restores the previous noise level.
     """
-    if not (base_ref and changed_paths):
+    context_paths = tuple(path for path in changed_paths if path != REVIEW_LEDGER_PATH)
+    if not (base_ref and context_paths):
         return {}
     try:
         return with_install_token_retry(
             installation_id,
             lambda token: fetch_file_contents(
-                token, owner, repo_name, changed_paths, base_ref
+                token, owner, repo_name, context_paths, base_ref
             ),
         ) or {}
     except (httpx.HTTPStatusError, httpx.RequestError) as e:
@@ -2308,7 +2310,7 @@ def _full_pr_lane_work_inputs(
             extra={"pr": f"{owner}/{repo_name}#{pull_number}", "kind": type(e).__name__},
         )
         return None
-    paths = tuple(dict.fromkeys(h.file_path for h in hunks))
+    paths = tuple(dict.fromkeys(h.file_path for h in hunks if h.file_path != REVIEW_LEDGER_PATH))
     missing = tuple(p for p in paths if p not in known_contents)
     contents = {p: known_contents[p] for p in paths if p in known_contents}
     if missing:
@@ -2957,7 +2959,13 @@ def _prepare_review_diff(
     # #609: drop data/generated/vendored files from the LLM's plate - a
     # big JSONL/lockfile hunk balloons the prompt into parse_failed and
     # carries no review signal. Named in the summary, never silent.
-    hunks, excluded_paths = split_reviewable_hunks(hunks)
+    ledger_change = None
+    if REVIEW_LEDGER_PATH in diff_text:
+        ledger_change = next(
+            (change for change in file_changes(diff_text) if change.path == REVIEW_LEDGER_PATH),
+            None,
+        )
+    hunks, excluded_paths = split_reviewable_hunks(hunks, ledger_change=ledger_change)
     # #1649: no verdict may come from a skip. When every changed file
     # is a lock file, the model reviews them like any other file; the
     # size rules below still apply.
@@ -3137,7 +3145,10 @@ def _fetch_head_and_cross_file(
     run: _ReviewRun, hunks: tuple[DiffHunk, ...], changed_paths: tuple[str, ...],
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Fetch changed head files, then resolve cross-file symbols from them."""
-    file_contents = _fetch_head_contents(run, changed_paths)
+    # Ledger evidence is bounded at the diff hunk. Older audit rows are not
+    # full-file context for a ledger append.
+    context_paths = tuple(path for path in changed_paths if path != REVIEW_LEDGER_PATH)
+    file_contents = _fetch_head_contents(run, context_paths)
     cross_file_contents = _review_cross_file_context(run, hunks, file_contents, changed_paths)
     return file_contents, cross_file_contents
 

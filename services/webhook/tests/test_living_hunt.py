@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 
 from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
@@ -650,7 +651,7 @@ def _added(path: str, lines: list[str]) -> str:
     )
 
 
-def _lane_work_on_delta(monkeypatch, *, delta: str, full: str) -> list[tuple]:
+def _lane_work_on_delta(monkeypatch, *, delta: str, full: str, context_paths=None) -> list[tuple]:
     """Run a delta review (a prior head is stored) of a lane PR and return
     the (diff, findings) of every lane-work call."""
     from llm_client import Backend, LlmReviewResponse
@@ -673,7 +674,12 @@ def _lane_work_on_delta(monkeypatch, *, delta: str, full: str) -> list[tuple]:
     monkeypatch.setattr(cr_dispatch, "post_check_run", lambda *a, **k: {"id": 1})
     monkeypatch.setattr(cr_dispatch, "post_review", lambda *a, **k: {"id": 2})
     monkeypatch.setattr(cr_dispatch, "grade_findings", lambda *a, **kw: ())
-    monkeypatch.setattr(cr_dispatch, "fetch_file_contents", lambda *a, **k: {})
+    def _fetch(_token, _owner, _repo, paths, _ref, **_kwargs):
+        if context_paths is not None:
+            context_paths.extend(paths)
+        return {}
+
+    monkeypatch.setattr(cr_dispatch, "fetch_file_contents", _fetch)
     monkeypatch.setattr(cr_dispatch, "build_linked_issue_context", lambda *a, **k: _LINKED)
     monkeypatch.setattr(
         cr_dispatch, "fetch_pr_diff_with_scope", lambda *a, **k: (delta, True, False),
@@ -710,10 +716,14 @@ def test_a_delta_review_judges_criteria_on_the_whole_pr(monkeypatch):
     delta only adds the script. Judged alone the delta's script is inert
     against the runtime criterion; judged as the PR it meets it."""
     delta = _added("ops/retry-upload.sh", _SCRIPT)
-    full = delta + _added(".github/workflows/nightly.yml", _WORKFLOW)
-    calls = _lane_work_on_delta(monkeypatch, delta=delta, full=full)
+    ledger = "logs/review-ledger.jsonl"
+    full = delta + _added(".github/workflows/nightly.yml", _WORKFLOW) + _added(ledger, ["{}"])
+    context_paths = []
+    calls = _lane_work_on_delta(monkeypatch, delta=delta, full=full, context_paths=context_paths)
     assert [diff for diff, _ in calls] == [full]
     assert calls[0][1] == ()
+    assert ".github/workflows/nightly.yml" in context_paths
+    assert ledger not in context_paths
 
 
 def test_a_delta_review_still_reports_a_criterion_no_commit_meets(monkeypatch):
@@ -858,6 +868,24 @@ def test_a_metadata_only_delta_reviews_full_source_on_the_current_head(monkeypat
     assert not final.title.startswith("Living Hunt")
     assert "delta contained only excluded metadata" in final.summary
     assert "reviewed the full PR diff on this head" in final.summary
+
+
+@pytest.mark.parametrize(("source", "source_paths"), [
+    ("", set()),
+    (_ONE_HUNK, {"x.py"}),
+], ids=["ledger-only-pr", "mixed-pr"])
+def test_a_reviewable_ledger_delta_expands_to_the_full_pr(monkeypatch, source, source_paths):
+    path = "logs/review-ledger.jsonl"
+    ledger = _added(path, [
+        '{"repo":"example/project","pr":1,"reviewer":"reviewer",'
+        '"class":"test-fidelity","finding":"Check expected value","verdict":"fixed"}',
+    ])
+    seen = _review_after_push(monkeypatch, delta=ledger, full=source + ledger)
+
+    assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
+    assert seen["reviewed"] == [source_paths | {path}]
+    assert seen["review_heads"] == ["abcd1234efgh"]
+    assert seen["checks"][-1].conclusion == "success"
 
 
 def test_a_blocking_full_review_after_a_metadata_delta_still_fails(monkeypatch):

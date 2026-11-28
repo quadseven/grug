@@ -15,8 +15,11 @@ Why a hand-rolled parser and not unidiff/pypatch:
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
+
+from ledger import parse_row
 
 
 class DiffParseError(ValueError):
@@ -130,6 +133,9 @@ _REVIEW_EXCLUDED_PATH_RE = re.compile(
     r"|(?:_gen|[._]generated)\.go$"
 )
 
+REVIEW_LEDGER_PATH = "logs/review-ledger.jsonl"
+_REVIEW_LEDGER_MAX_BYTES = 12 * 1024
+
 
 def is_review_excluded_path(path: str) -> bool:
     """True when a changed file is data/generated/vendored - no LLM review
@@ -137,20 +143,87 @@ def is_review_excluded_path(path: str) -> bool:
     return _REVIEW_EXCLUDED_PATH_RE.search(path) is not None
 
 
+def _ledger_append_lines(hunk: DiffHunk, change: FileChange) -> list[str] | None:
+    """Return the candidate appended lines after checking the hunk and context."""
+    header, *lines = hunk.body.splitlines()
+    match = _HUNK_HEADER_RE.match(header)
+    if match is None:
+        return None
+    old_count = int(match.group(1) or "1")
+    new_count = int(match.group(3) or "1")
+    if not len(lines) == new_count == old_count + change.added:
+        return None
+    if change.status == "added":
+        if not header.startswith("@@ -0,0 +1") or old_count or hunk.new_start != 1:
+            return None
+    else:
+        old_side = _OLD_SIDE_RE.match(header)
+        if (
+            not old_count
+            or old_side is None
+            or int(old_side.group(1)) != hunk.new_start
+            or not all(line.startswith(" ") for line in lines[:old_count])
+        ):
+            return None
+
+    return lines[old_count:]
+
+
+def _bounded_ledger_append(hunk: DiffHunk, change: FileChange) -> bool:
+    """Accept a complete, small hunk that adds valid review ledger rows."""
+    if (
+        change.status not in ("added", "modified")
+        or change.removed
+        or not change.added
+        or len(hunk.body.encode("utf-8")) > _REVIEW_LEDGER_MAX_BYTES
+    ):
+        return False
+
+    additions = _ledger_append_lines(hunk, change)
+    if additions is None:
+        return False
+    try:
+        for line in additions:
+            # After the old context, only added rows belong in an append.
+            if not line.startswith("+"):
+                return False
+            row = json.loads(line[1:])
+            if not isinstance(row, dict) or parse_row(row) is None:
+                return False
+    except (ValueError, RecursionError, OverflowError):
+        return False
+    return True
+
+
 def split_reviewable_hunks(
     hunks: tuple[DiffHunk, ...],
+    *,
+    ledger_change: FileChange | None = None,
 ) -> tuple[tuple[DiffHunk, ...], tuple[str, ...]]:
     """Partition hunks into (reviewable, excluded_paths).
 
     Excluded paths are deduped, order-preserving, so the check summary can
-    name exactly what the LLM did not see. Pure."""
+    name exactly what the LLM did not see. Review preparation can admit a
+    bounded append from the canonical ledger's matching file change. The
+    metadata-only delta check omits that exception. Pure."""
     kept: list[DiffHunk] = []
     excluded: dict[str, None] = {}
+    ledger_hunks = [h for h in hunks if h.file_path == REVIEW_LEDGER_PATH]
+    ledger_readable = (
+        ledger_change is not None
+        and ledger_change.path == REVIEW_LEDGER_PATH
+        and len(ledger_hunks) == 1
+        and _bounded_ledger_append(ledger_hunks[0], ledger_change)
+    )
     for h in hunks:
-        if is_review_excluded_path(h.file_path):
+        if h.file_path == REVIEW_LEDGER_PATH and ledger_readable:
+            kept.append(h)
+        elif is_review_excluded_path(h.file_path):
             excluded[h.file_path] = None
         else:
             kept.append(h)
+    if ledger_change is not None and ledger_change.path == REVIEW_LEDGER_PATH and not ledger_readable:
+        excluded[REVIEW_LEDGER_PATH] = None
     return tuple(kept), tuple(excluded)
 
 
