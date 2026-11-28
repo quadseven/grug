@@ -3163,6 +3163,83 @@ def test_oracle_guidance_is_scoped_to_the_ordinary_oracle_judge(rule, refute):
     assert "For an unsourced-test-oracle finding" not in system["content"]
 
 
+def _capture_intent_judge_request(monkeypatch, rule, evidence, *, refute=False):
+    _capture_llmobs(monkeypatch)
+    finding = {"rule_name": rule, "file": "scheduler.py", "line": 3,
+               "severity": "medium", "message": "An ordinary retry repeatedly requeues the job."}
+    response = httpx.Response(200, json=_openai_json_response('{"verdicts": []}'))
+    with patch.object(httpx, "post", return_value=response) as post:
+        lc.judge_findings([finding], evidence, installation_id=1, refute=refute)
+    post.assert_called_once()
+    system, user = post.call_args.kwargs["json"]["messages"]
+    return system["content"], user["content"]
+
+
+def test_intent_judge_checks_the_reachable_path_before_confirming_a_repeat(monkeypatch):
+    from personas.code_reviewer.linked_issue import render_linked_issue_block
+
+    criterion = (
+        "Normal retries leave active jobs unchanged. Requeue only after inserting a distinct job. "
+        "Resume the earlier job after the distinct job finishes."
+    )
+    guarded = "store.record_retry(job)"
+    unguarded = "queue_restart(store, job)"
+    unchanged = (
+        '4: def queue_restart(store, job):\n'
+        '5:     store.set_status(job, "queued")\n'
+        '6: def interrupt(store, job, other):\n'
+        '7:     with store.transaction():\n'
+        '8:         store.insert_job(other, before=job)\n'
+        '9:         queue_restart(store, job)\n'
+        '10: def start_queued(store, job):\n'
+        '11:     if store.status(job) == "queued" and not store.has_active_intervening_job(job):\n'
+        '12:         store.set_status(job, "active")\n'
+        '13: class Store:\n'
+        '14:     def record_retry(self, job):\n'
+        '15:         self.events.append(("retry", job))'
+    )
+    context = {"linked_issue_context": render_linked_issue_block({1: [("open", criterion)]})}
+
+    def request(retry):
+        hunk = Hunk(path="scheduler.py", body=(
+            '@@ -1,3 +1,3 @@\n def normal_retry(store, job):\n'
+            '     if store.status(job) == "active":\n'
+            '-        store.record_attempt(job)\n'
+            f'+        {retry}'
+        ))
+        return _capture_intent_judge_request(monkeypatch, "intent-mismatch", assemble_evidence(
+            [hunk], pr_context=context, cross_file_contents={"store_ops.py": unchanged},
+        ))
+
+    system, guarded_user = request(guarded)
+    unguarded_system, unguarded_user = request(unguarded)
+
+    assert system == unguarded_system
+    assert "For an intent-mismatch finding" in system
+    assert "For a state-transition claim" in system
+    assert "concrete input and starting state" in system
+    assert "changed caller or guard to the writer" in system
+    assert "Only when the finding alleges repetition" in system
+    assert "second premature transition" in system
+    assert "missing context is inconclusive" in system
+    assert criterion in guarded_user and unchanged in guarded_user
+    assert f"+        {guarded}" in guarded_user
+    assert guarded_user.replace(f"+        {guarded}", f"+        {unguarded}") == unguarded_user
+
+
+@pytest.mark.parametrize(("rule", "refute", "fresh"), [
+    ("missing-test-coverage", False, False),
+    ("intent-mismatch", True, False),
+    ("intent-mismatch", True, True),
+])
+def test_intent_reachability_guidance_stays_out_of_other_judge_requests(monkeypatch, rule, refute, fresh):
+    evidence = assemble_evidence([_hunk()], pr_context={"fresh_verifier": fresh})
+
+    system, _ = _capture_intent_judge_request(monkeypatch, rule, evidence, refute=refute)
+
+    assert "For an intent-mismatch finding" not in system
+
+
 def test_build_judge_messages_receives_same_context_as_reviewer():
     """A context-blind judge must not suppress a finding that relied on intent,
     an unchanged caller, production evidence, or a learned repository rule."""
