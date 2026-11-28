@@ -2946,6 +2946,7 @@ def _prepare_review_diff(
     run: _ReviewRun, diff_text: str, living: _LivingRange, base_repo_config: RepoConfig,
 ) -> _PreparedDiff:
     run.pr_context["base_sha"] = living.prior_sha or run.base_sha
+    run.pr_context["incremental_diff"] = bool(living.prior_sha)
     hunks = parse_diff(diff_text)
     # The lane-work checks (#1179, #1363) judge the WHOLE diff, so they
     # keep every parsed hunk, including those dropped below (excluded,

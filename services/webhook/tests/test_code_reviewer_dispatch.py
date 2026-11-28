@@ -1204,6 +1204,7 @@ def test_dispatch_passes_identity_and_intent_to_review_diff(monkeypatch):
         "pr_base_sha": "base5678ijkl",
         "title": "Preserve PR intent",
         "body": "Reviewer should understand the requested behavior.",
+        "incremental_diff": False,
         "sensitive_review": False,
     }
 
