@@ -45,6 +45,10 @@ Two rules, each one finding per file:
   add back. Grants and credentials that only serve such a layer (an
   `id-token: write`, a role secret) are named with it. Medium when the
   ticket asks to remove that layer.
+  Not a removal (#1890): a bare path list entry (a matrix directory) that
+  another file of the same diff adds back, as when a matrix moves into a
+  registry script the workflow runs, as a whole quoted entry in a code
+  file the workflow runs by its full path.
 
 Not evaluated (no finding): a file whose hunks are incomplete (the diff
 was cut short), and any diff past `MAX_DIFF_LINES`. Every scan is one
@@ -166,6 +170,11 @@ _SUPPORT_RE = re.compile(
     r"id-token:\s*write|\$\{\{\s*secrets\.|role-to-assume|role-arn|\bssm\b",
     re.IGNORECASE,
 )
+# A bare list value that is a path (`- tools/x`): no key, no command.
+# A registry entry: a whole quoted path literal, optionally a list item.
+_REGISTRY_ENTRY_RE = re.compile(r"""^(?:-\s+)?["']([\w.-]+(?:/[\w.-]+)+)["'],?$""")
+_SCRIPT_SUFFIXES = (".sh", ".bash", ".py")
+_LIST_PATH_RE = re.compile(r"^-\s+['\"]?([\w.-]+(?:/[\w.-]+)+)['\"]?$")
 _USES_REF_RE = re.compile(r"@\S+")
 _KEY_RE = re.compile(r"^-?\s*([\w.-]+):")
 
@@ -745,12 +754,62 @@ def _layer_finding(
     )
 
 
+def _registry_entries_by_file(by_file: dict[str, list[DiffHunk]]) -> dict[str, set[str]]:
+    """Each code file's added registry entries: a whole quoted path literal
+    on its own line (`"tools/x",`). Docs, CI files, comments and paths
+    inside a call or prose are not entries."""
+    out: dict[str, set[str]] = {}
+    for path, own in by_file.items():
+        if path.endswith(_DOC_SUFFIXES) or _CI_PATH_RE.search(path):
+            continue
+        found: set[str] = set()
+        for hunk in own:
+            for raw in hunk.body.splitlines()[1:]:
+                if raw.startswith("+") and len(raw) <= _MAX_LINE:
+                    entry = _REGISTRY_ENTRY_RE.match(raw[1:].strip())
+                    if entry:
+                        found.add(entry.group(1))
+        if found:
+            out[path] = found
+    return out
+
+
+def _moved_elsewhere(
+    line: str, ci_added: list[str], entries: dict[str, set[str]],
+) -> bool:
+    """A removed bare path list entry (a matrix directory) that moved into a
+    registry the workflow now runs (#1890): another code file of the diff
+    adds it as a whole quoted entry, and the workflow's own added lines run
+    that file by its full path. A scanner step (`uses:`, `run:`, keyed settings) or a script
+    path (`./x`, `x.sh`) never counts as moved."""
+    entry = _LIST_PATH_RE.match(line)
+    if not entry:
+        return False
+    value = entry.group(1)
+    if value.startswith("./") or value.endswith(_SCRIPT_SUFFIXES):
+        return False
+    return any(value in found and _runs(ci_added, other) for other, found in entries.items())
+
+
+def _runs(ci_added: list[str], path: str) -> bool:
+    """The workflow's added lines run `path`: its full repo path as a command
+    token, bare or under `./` or a `$VAR/` workspace root. A bare list item
+    (a `paths:` trigger) names the file without running it."""
+    token = re.compile(
+        r"""(?:^|[\s"'=]|\./|\$\{?\w+\}?/)""" + re.escape(path) + r"""(?=$|[\s"';|&)])"""
+    )
+    return any(
+        token.search(line) for line in ci_added if not _REGISTRY_ENTRY_RE.match(line)
+    )
+
+
 def _layer_findings(
     by_file: dict[str, list[DiffHunk]], hunks: tuple[DiffHunk, ...], ticket: str,
     budget: list[int],
 ) -> list[Finding] | None:
     asked = _asks_layer_removal(ticket)
     findings: list[Finding] = []
+    entries: dict[str, set[str]] | None = None
     for path, own in by_file.items():
         if not _CI_PATH_RE.search(path):
             continue
@@ -759,6 +818,11 @@ def _layer_findings(
             return None
         removed, added = changed
         lost = [t for t in removed if _identity(t) not in added]
+        if any(_LIST_PATH_RE.match(t) for t in lost):
+            if entries is None:
+                entries = _registry_entries_by_file(by_file)
+            ci_added = sorted(added)
+            lost = [t for t in lost if not _moved_elsewhere(t, ci_added, entries)]
         layer = [t for t in lost if _LAYER_RE.search(t)]
         if not layer:
             continue
