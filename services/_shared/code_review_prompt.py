@@ -721,6 +721,22 @@ RULES: tuple[ReviewRule, ...] = (
         'scan(line)',
         severity="medium",
     ),
+    ReviewRule(
+        name="insufficient-assertion",
+        bug_class="test fidelity",
+        description="A new or changed test, attester or guard whose check "
+        "is weaker than the claim it makes, for example one that records "
+        "which keyword names were passed when it means to prove the value "
+        "reached the right flag. Compare what the assertion proves with "
+        "what its name or comment says it proves. Emit a finding only when "
+        "you can name ONE concrete input that passes the check while "
+        "breaking the claim, and put that input in the message. No "
+        "counterexample, no finding.",
+        bad_example="# claims: the flag is forwarded\n"
+        "assert 'enabled' in call.keywords   # passes for enabled=False",
+        good_example="assert call.keywords['enabled'] is body.enabled",
+        severity="medium",
+    ),
 )
 
 
