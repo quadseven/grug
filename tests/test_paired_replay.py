@@ -145,6 +145,31 @@ def test_incomplete_arm_reports_only_a_known_failure_code():
         assert str(reported.value) == expected
 
 
+@pytest.mark.parametrize(("fields", "details"), [
+    (
+        {"wire_reason": "backend_timeout"},
+        " [refute expected=3 returned=2 covered=1 first_wire=backend_timeout]",
+    ),
+    ({"wire_reason": "private transport detail"}, " [refute expected=3 returned=2 covered=1]"),
+    ({"phase": "private phase detail"}, ""),
+    ({"returned": True}, ""),
+    ({"covered": 3}, ""),
+])
+def test_publication_failure_reports_only_valid_coverage(fields, details):
+    invalid = {
+        "status": "invalid",
+        "reason": "incomplete_publication_verdicts",
+        "publication": {"phase": "refute", "expected": 3, "returned": 2, "covered": 1, **fields},
+    }
+
+    with pytest.raises(ReplayError) as reported:
+        _arm_result(invalid, backend="cave", model="model-v1", label="replay case")
+
+    assert str(reported.value) == (
+        f"replay case did not produce a complete verdict (incomplete_publication_verdicts){details}"
+    )
+
+
 def test_measurement_exports_the_named_commit_instead_of_live_worktree(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
