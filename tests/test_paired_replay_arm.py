@@ -76,6 +76,22 @@ def _response_schema_name(backend):
     return backend.extra_body["response_format"]["json_schema"]["name"]
 
 
+def _assert_cave_verdict_schema(response_format, judge_batch_size):
+    assert response_format["type"] == "json_schema"
+    schema = response_format["json_schema"]["schema"]
+    assert schema["required"] == ["verdicts"]
+    assert schema["additionalProperties"] is False
+    verdict_array = schema["properties"]["verdicts"]
+    assert verdict_array["maxItems"] == judge_batch_size == 25
+    items = verdict_array["items"]
+    assert set(items["required"]) == {"index", "is_real_bug", "confidence", "reasoning"}
+    assert items["properties"] == {
+        "index": {"type": "integer"}, "is_real_bug": {"type": "boolean"},
+        "confidence": {"type": "number"}, "reasoning": {"type": "string"},
+    }
+    assert items["additionalProperties"] is False
+
+
 def test_uses_frozen_files_and_real_publication_gates(case, monkeypatch):
     _case_runner(monkeypatch)
     attempts = []
@@ -155,20 +171,7 @@ def test_fixed_cave_judge_requests_structured_output_for_a_batch(monkeypatch, re
     body = request.extra_body
     assert body["max_tokens"] == 4096
     assert body["reasoning_effort"] == "none"
-    response_format = body["response_format"]
-    assert response_format["type"] == "json_schema"
-    schema = response_format["json_schema"]["schema"]
-    assert schema["required"] == ["verdicts"]
-    assert schema["additionalProperties"] is False
-    verdict_array = schema["properties"]["verdicts"]
-    assert verdict_array["maxItems"] == llm_client.JUDGE_BATCH_SIZE == 25
-    items = verdict_array["items"]
-    assert set(items["required"]) == {"index", "is_real_bug", "confidence", "reasoning"}
-    assert items["properties"] == {
-        "index": {"type": "integer"}, "is_real_bug": {"type": "boolean"},
-        "confidence": {"type": "number"}, "reasoning": {"type": "string"},
-    }
-    assert items["additionalProperties"] is False
+    _assert_cave_verdict_schema(body["response_format"], llm_client.JUDGE_BATCH_SIZE)
     assert [(v.finding_index, v.is_real_bug, v.confidence, v.reasoning) for v in result] == [
         (i, False, 0.95, f"Counterexample {i}") for i in range(finding_count)
     ]
