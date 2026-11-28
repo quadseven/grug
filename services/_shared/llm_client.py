@@ -6224,6 +6224,98 @@ def _run_subscription_fallback(
     )
 
 
+def _go_last_resort_enabled() -> bool:
+    """Opt-in, off by default (a follow-up to the Elder fallback tiers): the cluster-side
+    paid tier that needs no operator machine."""
+    return os.getenv("GRUG_ELDER_GO_LAST_RESORT", "").strip().lower() in ("1", "true", "yes")
+
+
+def _go_last_resort_config() -> BackendConfig | None:
+    """The OpenCode Go model the last-resort tier calls, or None when the tier
+    is off, the model is a free one (the free pool already covers those), or
+    the Go breaker is open. It rides the existing key and the existing daily
+    cap (`GRUG_OPENCODE_GO_DAILY_CAP`), so it adds no spend of its own."""
+    if not _go_last_resort_enabled():
+        return None
+    model = os.getenv("GRUG_ELDER_GO_LAST_RESORT_MODEL", "").strip() or _OPENCODE_GO_MODEL
+    if availability._opencode_go_model_is_free(model):
+        log.warning("elder_go_last_resort_model_is_free", extra={"model": model})
+        return None
+    if not availability.backend_usable(Backend.OPENCODE_GO, model):
+        return None
+    return _opencode_go_extra_model_config(model, _subscription_timeout_s())
+
+
+def _run_go_last_resort(
+    messages: list[dict[str, str]],
+    variant: PromptVariant,
+    pr_tags: dict[str, str],
+    hunks: list[Hunk],
+    pr_context: Optional[PrContext],
+    installation_id: int,
+    *, walk: ReviewWalk,
+) -> Optional[LlmReviewResponse]:
+    """Tier 4: a paid OpenCode Go model called from the cluster, after the
+    subscription lane. It needs no operator machine, so a sleeping laptop and
+    absent Sparks still leave Elder a non-free verdict. None when the tier is
+    off or cannot answer; a miss is a miss and the walk goes on."""
+    config = _go_last_resort_config()
+    if config is None:
+        return None
+    attempt = _run_llm_attempt(
+        backend=Backend.OPENCODE_GO,
+        config=config,
+        messages=messages,
+        variant=variant,
+        pr_tags=pr_tags,
+        walk=walk,
+        transport_log_event="llm_go_last_resort_transport_failed",
+    )
+    if attempt.error_kind in ("config", "transport") or attempt.raw_response is None:
+        return None
+    if attempt.error_text:
+        return None
+    resolved_model = attempt.model or config.model
+    if not attempt.findings:
+        degenerate = _is_degenerate_empty_review(
+            attempt.findings, attempt.usage_metrics, walk.diff_chars,
+        ) or _empty_confirms_nothing((Backend.OPENCODE_GO, config.model))
+        if degenerate:
+            return _untrusted_empty_review(
+                Backend.OPENCODE_GO, resolved_model, _served_models(attempt.model),
+                attempt.span_context, "go-last-resort",
+            )
+    log.info(
+        "elder_last_resort_tier_served",
+        extra={
+            "tier": "go-last-resort",
+            "backend": Backend.OPENCODE_GO.value,
+            "model": resolved_model,
+            "installation_id": installation_id,
+        },
+    )
+    _emit_tier_served_metric("go-last-resort", Backend.OPENCODE_GO.value, resolved_model)
+    _emit_last_resort_metric("go-last-resort", Backend.OPENCODE_GO.value, resolved_model)
+    origin = _finding_origin(
+        backend=Backend.OPENCODE_GO,
+        model=resolved_model,
+        review_span_context=attempt.span_context,
+        pr_context=pr_context,
+        hunks=hunks,
+    )
+    return LlmReviewResponse(
+        kind="reviewed",
+        findings=tuple(replace(finding, origins=(origin,)) for finding in attempt.findings),
+        backend_used=Backend.OPENCODE_GO,
+        model_name=resolved_model,
+        review_span_context=attempt.span_context,
+        backends_used=(Backend.OPENCODE_GO,),
+        models_used=_served_models(attempt.model),
+        error=_attempt_truncation_error(attempt),
+        tier_served="go-last-resort",
+    )
+
+
 def review_second_lineage(
     evidence: ElderEvidence,
     installation_id: int,
@@ -6481,6 +6573,17 @@ def _review_cave_primary(
         # report; a parse failure stays the more specific answer below.
         if sub_resp is not None and sub_resp.kind == "reviewed":
             return sub_resp
+        # Tier 4 (off by default): a paid Go model from the cluster, so the
+        # walk still ends in a real verdict with no operator machine up.
+        if sub_resp is None or sub_resp.kind != "reviewed":
+            go_resp = _run_go_last_resort(
+                messages=messages, variant=variant, pr_tags=pr_tags, hunks=hunks,
+                pr_context=pr_context, installation_id=installation_id, walk=walk,
+            )
+            if go_resp is not None and go_resp.kind == "reviewed":
+                if not (go_resp.error or "").startswith(_LOW_CONFIDENCE_PREFIX):
+                    return go_resp
+                cave_low_confidence = cave_low_confidence or go_resp
         if first_parse_fail is None:
             low_confidence = cave_low_confidence or free_low_confidence
             if low_confidence is not None:
