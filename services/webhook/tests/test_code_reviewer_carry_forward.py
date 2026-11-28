@@ -312,6 +312,90 @@ def test_thread_resolved_by_pr_author_does_not_hide_finding():
     assert filtered == (finding,)
 
 
+def test_author_resolved_finding_is_not_reraised_when_its_file_is_unchanged():
+    """A finding the author answered and resolved is not posted again on a
+    later head whose changes leave the finding's file as the review saw it."""
+    thread = _thread_for_filter(
+        resolved=True, resolved_by={"login": "alice"}, rule="weakened-test", line=20,
+    )
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+        unchanged=lambda commit, path: (commit, path) == ("c0ffee", "tests/test_foo.py"),
+    )
+    assert filtered == ()
+
+
+def test_author_resolved_finding_is_reraised_when_its_file_changed():
+    """The same author-resolved thread is still re-raised when its file changed."""
+    thread = _thread_for_filter(
+        resolved=True, resolved_by={"login": "alice"}, rule="weakened-test", line=20,
+    )
+    finding = _finding(rule="weakened-test", file="tests/test_foo.py", line=20)
+    filtered = cf.filter_findings_against_resolved_threads(
+        (finding,), 1, "o", "r", 2, threads=[thread], pr_author="alice",
+        unchanged=lambda commit, path: False,
+    )
+    assert filtered == (finding,)
+
+
+def test_unchanged_checker_reads_the_compare_once_per_commit(monkeypatch):
+    """The unchanged check asks GitHub which paths changed since a commit, once."""
+    calls: list[str] = []
+
+    def fake_changed(installation_id, owner, repo, base, head):
+        calls.append(base)
+        return frozenset({"tests/test_foo.py"})
+
+    monkeypatch.setattr(cf, "changed_paths_since", fake_changed)
+    unchanged = cf.unchanged_checker(1, "o", "r", "headsha")
+    assert unchanged("c0ffee", "tests/other.py") is True
+    assert unchanged("c0ffee", "tests/test_foo.py") is False
+    assert calls == ["c0ffee"]
+
+
+def test_unchanged_checker_fails_open_to_reraise_when_compare_fails(monkeypatch):
+    """A failed compare reads as changed, so the finding is posted as before."""
+    monkeypatch.setattr(cf, "changed_paths_since", lambda *a: None)
+    unchanged = cf.unchanged_checker(1, "o", "r", "headsha")
+    assert unchanged("c0ffee", "tests/test_foo.py") is False
+
+
+def test_changed_paths_since_lists_renamed_from_paths(monkeypatch):
+    """A rename counts as a change to both the old and the new path."""
+    files = [
+        {"filename": "tests/new.py", "previous_filename": "tests/old.py", "status": "renamed"},
+    ]
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"files": files}
+
+    monkeypatch.setattr(cf, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp())
+    assert cf.changed_paths_since(1, "o", "r", "c0ffee", "headsha") == {
+        "tests/new.py", "tests/old.py"}
+
+
+def test_changed_paths_since_is_none_when_compare_is_truncated(monkeypatch):
+    """GitHub caps a compare at 300 files; a capped list cannot prove a path unchanged."""
+    files = [{"filename": f"f{i}.py", "status": "modified"} for i in range(300)]
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"files": files}
+
+    monkeypatch.setattr(cf, "with_install_token_retry", lambda iid, fn: fn("tok"))
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp())
+    assert cf.changed_paths_since(1, "o", "r", "c0ffee", "headsha") is None
+
+
 @pytest.mark.parametrize("bot_resolver", [
     {"login": "loom-lanes[bot]"},
     {"login": "some-agent[bot]"},

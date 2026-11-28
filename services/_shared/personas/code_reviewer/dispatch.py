@@ -3620,13 +3620,17 @@ def _filter_resolved_findings(
     # Filter lane-work findings that match resolved or dismissed Elder threads
     # (#1457, #1582): prevents re-raising weakened-test findings on re-reviews
     # when the thread was resolved by another maintainer. A resolve by the PR
-    # author or an App must not hide the finding.
+    # author hides the finding only while its file is unchanged since the
+    # thread's commit; a changed file re-raises it (#1582).
     if review_threads is not None:
         filtered = carry_forward.filter_findings_against_resolved_threads(
             evaluation.findings,
             run.installation_id, run.owner, run.repo_name, run.pull_number,
             threads=review_threads,
             pr_author=run.author_login,
+            unchanged=carry_forward.unchanged_checker(
+                run.installation_id, run.owner, run.repo_name, run.head_sha,
+            ),
         )
         evaluation = with_findings(evaluation, filtered)
     return evaluation, review_threads

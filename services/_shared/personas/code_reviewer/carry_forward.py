@@ -34,7 +34,10 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, replace
+
+import httpx
 
 from github_app_auth import with_install_token_retry
 from personas.code_reviewer import deferred_ruff, living_review
@@ -52,6 +55,10 @@ log = logging.getLogger(
 )
 
 MAX_LISTED = 10
+# GitHub's compare API lists at most this many files; a full list cannot
+# show that a path is absent from the change.
+_COMPARE_FILE_CAP = 300
+_TIMEOUT = 10
 _BLOCKING = ("critical", "high")
 _RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 _CLEAR_TITLE_RE = re.compile(r"Elder clear - .*$")
@@ -328,7 +335,33 @@ class _ThreadBuckets:
         return bool(self.dismissed or self.resolved_unchanged or self.resolved_outdated)
 
 
-def _partition_threads(threads: list[dict], pr_author: str) -> _ThreadBuckets:
+def _resolved_by_author_on_unchanged_file(
+    thread: dict, pr_author: str, path: str,
+    unchanged: Callable[[str, str], bool] | None,
+) -> bool:
+    """True when the PR author resolved the thread and the file it names is
+    as the review saw it, so the earlier finding still stands settled.
+
+    An author resolve alone never hides a finding (#1582). Once the file is
+    unchanged since the thread's commit, the author has changed nothing the
+    finding is about, so re-posting it only costs another round. A changed
+    or unreadable file keeps the finding (#1582)."""
+    if unchanged is None or thread.get("isOutdated"):
+        return False
+    if not _thread_is_resolved(thread) or not _is_pr_author(thread.get("resolvedBy"), pr_author):
+        return False
+    commit = (_first_node(thread).get("originalCommit") or {}).get("oid")
+    return bool(commit) and unchanged(commit, path)
+
+
+def _first_node(thread: dict) -> dict:
+    return (((thread.get("comments") or {}).get("nodes") or [{}])[0])
+
+
+def _partition_threads(
+    threads: list[dict], pr_author: str,
+    unchanged: Callable[[str, str], bool] | None = None,
+) -> _ThreadBuckets:
     """Classify threads into dismissed, maintainer-resolved unchanged, and outdated."""
     dismissed: list[tuple[str, str, int]] = []
     resolved_unchanged: list[tuple[str, str, int]] = []
@@ -345,6 +378,8 @@ def _partition_threads(threads: list[dict], pr_author: str) -> _ThreadBuckets:
             continue
 
         if not _thread_resolver_counts(t, pr_author=pr_author):
+            if _resolved_by_author_on_unchanged_file(t, pr_author, path, unchanged):
+                resolved_unchanged.append((rule, path, line))
             continue
 
         if t.get("isOutdated"):
@@ -385,12 +420,72 @@ def _filter_one_finding(finding: Finding, buckets: _ThreadBuckets) -> Finding | 
     return finding
 
 
+def _compare_paths(token: str, owner: str, repo: str, base: str, head: str) -> frozenset[str] | None:
+    """Paths the compare `base...head` touches, or None when the list is capped."""
+    resp = httpx.get(
+        f"https://api.github.com/repos/{owner}/{repo}/compare/{base}...{head}",
+        params={"per_page": _COMPARE_FILE_CAP},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    files = resp.json().get("files") or []
+    if len(files) >= _COMPARE_FILE_CAP:
+        return None
+    paths: set[str] = set()
+    for f in files:
+        paths.add(f["filename"])
+        if f.get("previous_filename"):
+            paths.add(f["previous_filename"])
+    return frozenset(paths)
+
+
+def changed_paths_since(
+    installation_id: int, owner: str, repo: str, base: str, head: str,
+) -> frozenset[str] | None:
+    """Paths changed between `base` and `head`, or None (logged) when unknown."""
+    try:
+        return with_install_token_retry(
+            installation_id,
+            lambda tok: _compare_paths(tok, owner, repo, base, head),
+        )
+    except Exception as e:  # noqa: BLE001 - unknown means the finding is posted
+        log.warning(
+            "elder_carry_compare_failed",
+            extra={"pr": f"{owner}/{repo}", "kind": type(e).__name__},
+        )
+        return None
+
+
+def unchanged_checker(
+    installation_id: int, owner: str, repo: str, head: str,
+) -> Callable[[str, str], bool]:
+    """`(commit, path) -> bool`: whether `path` is as it was at `commit`.
+
+    One compare per distinct commit, read only when asked. A path the
+    compare cannot prove unchanged reads as changed."""
+    cache: dict[str, frozenset[str] | None] = {}
+
+    def unchanged(commit: str, path: str) -> bool:
+        if commit not in cache:
+            cache[commit] = changed_paths_since(installation_id, owner, repo, commit, head)
+        changed = cache[commit]
+        return changed is not None and path not in changed
+
+    return unchanged
+
+
 def filter_findings_against_resolved_threads(
     findings: tuple[Finding, ...],
     installation_id: int, owner: str, repo: str, pull_number: int,
     *,
     pr_author: str,
     threads: list[dict] | None = None,
+    unchanged: Callable[[str, str], bool] | None = None,
 ) -> tuple[Finding, ...]:
     """Remove findings that match resolved or dismissed Elder threads.
 
@@ -406,6 +501,10 @@ def filter_findings_against_resolved_threads(
     by a thread resolve alone: only code changes or maintainer dismissal
     (living review) can clear it.
 
+    A thread the PR author resolved hides its finding only when `unchanged`
+    says the thread's file is as the review saw it (see
+    `_resolved_by_author_on_unchanged_file`); without `unchanged`, it never does.
+
     If `threads` is provided, it is used instead of fetching a new listing.
     """
     if threads is None:
@@ -413,7 +512,7 @@ def filter_findings_against_resolved_threads(
     if threads is None:
         return findings
 
-    buckets = _partition_threads(threads, pr_author)
+    buckets = _partition_threads(threads, pr_author, unchanged)
     if not buckets.has_matches:
         return findings
 
