@@ -409,11 +409,16 @@ jobs:
           # janitor + Trial pods pull the same private grug image, so it needs its
           # OWN registry-pull secret. Without it every janitor run (*/15) hits
           # ImagePullBackOff ("no basic auth credentials") and pages the
-          # cluster ImagePullBackOff monitor. The namespace is (re)applied by the
-          # `kubectl apply -k k8s/` step below; create it here idempotently so the
-          # seed lands even on a first deploy. (Was a manual DEPLOY NOTE in
-          # k8s/smasher-trial-namespace.yaml that got missed -> now codified.)
-          kubectl create namespace grug-trial --dry-run=client -o yaml | kubectl apply -f -
+          # cluster ImagePullBackOff monitor. Apply the namespace's own manifest
+          # here so the seed lands even on a first deploy. (Was a manual DEPLOY
+          # NOTE in k8s/smasher-trial-namespace.yaml that got missed -> now
+          # codified.) Never a generated bare Namespace: it carries no labels, so
+          # apply would strip the restricted Pod Security enforcement until the
+          # `kubectl apply -k k8s/` step below restored it (#1893). The label
+          # selects only the Namespace: the file's CronJob still holds its image
+          # placeholder here. Unchanged, this apply only reads, which is all the
+          # deploy identity may do to the Namespace object.
+          kubectl apply -f k8s/smasher-trial-namespace.yaml -l grug-trial-namespace=true
           kubectl -n grug-trial create secret docker-registry registry-pull \
             --docker-server="$REGISTRY_HOST" \
             --docker-username="$REGISTRY_USERNAME" \
