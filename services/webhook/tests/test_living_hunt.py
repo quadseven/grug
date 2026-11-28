@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 
 from personas import review_publish
 from personas.code_reviewer import dispatch as cr_dispatch
@@ -869,16 +870,20 @@ def test_a_metadata_only_delta_reviews_full_source_on_the_current_head(monkeypat
     assert "reviewed the full PR diff on this head" in final.summary
 
 
-def test_a_reviewable_ledger_only_delta_still_reviews_the_previous_source(monkeypatch):
+@pytest.mark.parametrize(("source", "source_paths"), [
+    ("", set()),
+    (_ONE_HUNK, {"x.py"}),
+], ids=["ledger-only-pr", "mixed-pr"])
+def test_a_reviewable_ledger_delta_expands_to_the_full_pr(monkeypatch, source, source_paths):
     path = "logs/review-ledger.jsonl"
     ledger = _added(path, [
         '{"repo":"example/project","pr":1,"reviewer":"reviewer",'
         '"class":"test-fidelity","finding":"Check expected value","verdict":"fixed"}',
     ])
-    seen = _review_after_push(monkeypatch, delta=ledger, full=_ONE_HUNK + ledger)
+    seen = _review_after_push(monkeypatch, delta=ledger, full=source + ledger)
 
     assert seen["full"] == [("base5678ijkl", "abcd1234efgh")]
-    assert seen["reviewed"] == [{"x.py", path}]
+    assert seen["reviewed"] == [source_paths | {path}]
     assert seen["review_heads"] == ["abcd1234efgh"]
     assert seen["checks"][-1].conclusion == "success"
 

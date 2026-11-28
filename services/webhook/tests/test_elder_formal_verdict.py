@@ -486,7 +486,14 @@ def test_unreviewed_path_never_approves_and_is_named(monkeypatch, kind, blocking
         path, body = "src/huge.py", "".join(f"+v{i} = {i}\n" for i in range(2000))
         monkeypatch.setattr(cr_dispatch, "review_cohort_char_budget", lambda: 2000)
     elif kind == "ledger-other-path":
-        path, body = "other/" + _REVIEW_LEDGER, "+" + _ledger_row() + "\n"
+        path, body = "data/" + _REVIEW_LEDGER, "+" + _ledger_row() + "\n"
+        contents = {"src/x.py": "context\nnew1\nnew2\n", path: _ledger_row()}
+        monkeypatch.setattr(
+            cr_dispatch, "fetch_file_contents",
+            lambda _token, _owner, _repo, paths, _ref, **_kwargs: {
+                name: contents[name] for name in paths if name in contents
+            },
+        )
     elif kind == "ledger-malformed":
         path, body = _REVIEW_LEDGER, "+{bad json\n"
     elif kind == "ledger-oversized":
@@ -498,11 +505,14 @@ def test_unreviewed_path_never_approves_and_is_named(monkeypatch, kind, blocking
         path, body = "docs/guide.md", "+words\n"
         _ignore_docs(monkeypatch)
     checks: list = []
+    prompts: list = []
     posted, _ = _run(
         monkeypatch, _clean(), blocking=blocking, diff=_with_file(path, body),
-        checks=checks,
+        checks=checks, model_prompts=prompts,
     )
     assert "APPROVE" not in [r.event for r in posted]
+    if kind == "ledger-other-path":
+        assert path not in prompts[0]
     summary = checks[-1].summary
     assert "Elder does not approve this head" in summary
     assert f"`{path}`" in summary.split("Elder does not approve this head", 1)[1]
