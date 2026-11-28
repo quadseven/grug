@@ -242,3 +242,14 @@ def test_coverage_check_rejects_the_pre_1626_filter():
         "infra/cloudflare/deploy.sh",
     ):
         assert path in missed, path
+
+
+def test_deploy_never_applies_a_generated_bare_namespace():
+    # #1893: `kubectl create namespace X --dry-run=client | kubectl apply -f -`
+    # renders a Namespace with no labels, so apply strips the labels the last
+    # apply recorded, grug-trial's restricted Pod Security enforcement among
+    # them. Apply the labelled manifest, selected to the Namespace alone (its
+    # file's CronJob still holds an image placeholder at that step).
+    text = (_WORKFLOWS / "deploy.k8s.yml").read_text()
+    assert not re.search(r"kubectl create namespace [\w-]+ --dry-run", text)
+    assert "kubectl apply -f k8s/smasher-trial-namespace.yaml -l grug-trial-namespace=true" in text
