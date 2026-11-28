@@ -994,3 +994,78 @@ def test_the_workloads_ship_the_lane_first_within_its_cap() -> None:
         text = (root / manifest).read_text()
         assert "name: GRUG_REVIEW_BACKEND_PRIORITY, value: subscription" in text
         assert 'name: GRUG_SUBSCRIPTION_DAILY_CAP, value: "3000"' in text
+
+
+# loom#3053: a paid OpenCode Go tier called from the cluster, behind a flag
+# that is off by default, so Elder keeps a non-free verdict with no operator
+# machine and no Sparks.
+_GO_URL = "https://opencode.ai/zen/go/v1/chat/completions"
+
+
+def _all_down_but_go(go_response) -> _Recorder:
+    return _Recorder({
+        _CAVE_URL: httpx.ConnectTimeout("cave down"),
+        _FREE_GATEWAY_URL: httpx.ConnectTimeout("gateway free down"),
+        _POOLSIDE_URL: httpx.ConnectTimeout("poolside down"),
+        _OPENROUTER_URL: httpx.ConnectTimeout("openrouter down"),
+        _SUBSCRIPTION_URL: httpx.ConnectTimeout("lane relay down"),
+        _GO_URL: go_response,
+    })
+
+
+def test_go_last_resort_serves_when_the_lane_and_sparks_are_away(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_ELDER_GO_LAST_RESORT", "true")
+    recorder = _all_down_but_go(_finding_body())
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert resp.kind == "reviewed"
+    assert resp.tier_served == "go-last-resort"
+    assert resp.backend_used == Backend.OPENCODE_GO
+    assert len(resp.findings) == 1
+    sub_idx = next(i for i, u in enumerate(recorder.called_urls) if "subscription" in u)
+    go_idx = next(i for i, u in enumerate(recorder.called_urls) if u == _GO_URL)
+    assert sub_idx < go_idx
+
+
+def test_go_last_resort_is_off_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("GRUG_ELDER_GO_LAST_RESORT", raising=False)
+    recorder = _all_down_but_go(_finding_body())
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert resp.tier_served != "go-last-resort"
+    assert resp.kind != "reviewed"
+    assert _GO_URL not in recorder.called_urls
+
+
+def test_go_last_resort_never_runs_while_the_lane_can_serve(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_ELDER_GO_LAST_RESORT", "true")
+    recorder = _all_down_but_go(_finding_body())
+    recorder.responses[_SUBSCRIPTION_URL] = _finding_body()
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert resp.tier_served == "subscription"
+    assert _GO_URL not in recorder.called_urls
+
+
+def test_go_last_resort_refuses_a_free_model(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_ELDER_GO_LAST_RESORT", "true")
+    monkeypatch.setenv("GRUG_ELDER_GO_LAST_RESORT_MODEL", "some-model-free")
+    assert lc._go_last_resort_config() is None
+
+
+def test_go_last_resort_stops_at_the_daily_cap(monkeypatch) -> None:
+    monkeypatch.setenv("GRUG_ELDER_GO_LAST_RESORT", "true")
+
+    def refuse(config):
+        raise availability.OpencodeGoCircuitOpenError("opencode Go daily cap reached")
+
+    monkeypatch.setattr(availability, "_reserve_opencode_go_call", refuse)
+    recorder = _all_down_but_go(_finding_body())
+    with patch.object(httpx, "post", side_effect=recorder):
+        resp = review_diff(assemble_evidence([_hunk()]), installation_id=1)
+
+    assert resp.tier_served != "go-last-resort"
+    assert _GO_URL not in recorder.called_urls
