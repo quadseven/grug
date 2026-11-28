@@ -47,7 +47,8 @@ Two rules, each one finding per file:
   ticket asks to remove that layer.
   Not a removal (#1890): a bare path list entry (a matrix directory) that
   another file of the same diff adds back, as when a matrix moves into a
-  registry script that runs each entry.
+  registry script the workflow runs, as a whole quoted entry in a code
+  file the workflow names.
 
 Not evaluated (no finding): a file whose hunks are incomplete (the diff
 was cut short), and any diff past `MAX_DIFF_LINES`. Every scan is one
@@ -170,7 +171,9 @@ _SUPPORT_RE = re.compile(
     re.IGNORECASE,
 )
 # A bare list value that is a path (`- tools/x`): no key, no command.
-_PATH_TOKEN_RE = re.compile(r"[\w.-]+(?:/[\w.-]+)+")
+# A registry entry: a whole quoted path literal, optionally a list item.
+_REGISTRY_ENTRY_RE = re.compile(r"""^(?:-\s+)?["']([\w.-]+(?:/[\w.-]+)+)["'],?$""")
+_SCRIPT_SUFFIXES = (".sh", ".bash", ".py")
 _LIST_PATH_RE = re.compile(r"^-\s+['\"]?([\w.-]+(?:/[\w.-]+)+)['\"]?$")
 _USES_REF_RE = re.compile(r"@\S+")
 _KEY_RE = re.compile(r"^-?\s*([\w.-]+):")
@@ -751,30 +754,44 @@ def _layer_finding(
     )
 
 
-def _added_paths_by_file(by_file: dict[str, list[DiffHunk]]) -> dict[str, set[str]]:
-    """Path-shaped tokens on each file's added lines, for `_moved_elsewhere`."""
+def _registry_entries_by_file(by_file: dict[str, list[DiffHunk]]) -> dict[str, set[str]]:
+    """Each code file's added registry entries: a whole quoted path literal
+    on its own line (`"tools/x",`). Docs, CI files, comments and paths
+    inside a call or prose are not entries."""
     out: dict[str, set[str]] = {}
     for path, own in by_file.items():
+        if path.endswith(_DOC_SUFFIXES) or _CI_PATH_RE.search(path):
+            continue
         found: set[str] = set()
         for hunk in own:
             for raw in hunk.body.splitlines()[1:]:
                 if raw.startswith("+") and len(raw) <= _MAX_LINE:
-                    found.update(_PATH_TOKEN_RE.findall(raw))
-        out[path] = found
+                    entry = _REGISTRY_ENTRY_RE.match(raw[1:].strip())
+                    if entry:
+                        found.add(entry.group(1))
+        if found:
+            out[path] = found
     return out
 
 
-
-def _moved_elsewhere(line: str, path: str, added_paths: dict[str, set[str]]) -> bool:
-    """A removed bare path list entry (a matrix directory) that another file
-    of the same diff adds back moved there, for example into a registry
-    script that runs each entry (#1890). A scanner step, with its `uses:`,
-    `run:` or keyed settings, never matches."""
+def _moved_elsewhere(
+    line: str, ci_added: str, entries: dict[str, set[str]],
+) -> bool:
+    """A removed bare path list entry (a matrix directory) that moved into a
+    registry the workflow now runs (#1890): another code file of the diff
+    adds it as a whole quoted entry, and the workflow's own added lines name
+    that file. A scanner step (`uses:`, `run:`, keyed settings) or a script
+    path (`./x`, `x.sh`) never counts as moved."""
     entry = _LIST_PATH_RE.match(line)
     if not entry:
         return False
     value = entry.group(1)
-    return any(value in found for other, found in added_paths.items() if other != path)
+    if value.startswith("./") or value.endswith(_SCRIPT_SUFFIXES):
+        return False
+    return any(
+        value in found and other.rsplit("/", 1)[-1] in ci_added
+        for other, found in entries.items()
+    )
 
 
 def _layer_findings(
@@ -783,7 +800,7 @@ def _layer_findings(
 ) -> list[Finding] | None:
     asked = _asks_layer_removal(ticket)
     findings: list[Finding] = []
-    added_paths: dict[str, set[str]] | None = None
+    entries: dict[str, set[str]] | None = None
     for path, own in by_file.items():
         if not _CI_PATH_RE.search(path):
             continue
@@ -793,9 +810,10 @@ def _layer_findings(
         removed, added = changed
         lost = [t for t in removed if _identity(t) not in added]
         if any(_LIST_PATH_RE.match(t) for t in lost):
-            if added_paths is None:
-                added_paths = _added_paths_by_file(by_file)
-            lost = [t for t in lost if not _moved_elsewhere(t, path, added_paths)]
+            if entries is None:
+                entries = _registry_entries_by_file(by_file)
+            ci_added = "\n".join(added)
+            lost = [t for t in lost if not _moved_elsewhere(t, ci_added, entries)]
         layer = [t for t in lost if _LAYER_RE.search(t)]
         if not layer:
             continue

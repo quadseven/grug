@@ -1189,6 +1189,7 @@ _MATRIX = _diff(".github/workflows/check.units.yml", ("", [
     "-          - manifests/ssm-secret-sync",
     "-          - tools/dns",
     "+          - .",
+    "+      test-cmd: python3 scripts/run_units.py",
 ]))
 
 
@@ -1205,11 +1206,41 @@ def test_a_matrix_entry_moved_into_a_code_registry_is_not_a_removal():
     assert _scan(_MATRIX + registry, criteria=()) == ()
 
 
+def test_a_registry_the_workflow_does_not_run_does_not_excuse():
+    ci = _MATRIX.replace("python3 scripts/run_units.py", "make units")
+    registry = _diff("scripts/run_units.py", ("", ['+    "tools/trivy-image-scan",']))
+    (f,) = _scan(ci + registry, criteria=())
+    assert "`- tools/trivy-image-scan`" in f.message
+
+
 def test_a_matrix_entry_dropped_with_no_copy_elsewhere_is_still_high():
     unrelated = _diff("scripts/run_units.py", ("", ['+    "tools/dns",']))
     (f,) = _scan(_MATRIX + unrelated, criteria=())
     assert (f.rule_name, f.severity) == ("removed-verification-layer", "high")
     assert "`- tools/trivy-image-scan`" in f.message
+
+
+@pytest.mark.parametrize("path, line", [
+    ("scripts/run_units.py", "+# tools/trivy-image-scan used to be a matrix entry"),
+    ("scripts/run_units.py", '+    run("tools/trivy-image-scan", strict=False)'),
+    ("docs/units.md", "+- tools/trivy-image-scan"),
+])
+def test_a_mention_that_is_not_a_registry_entry_does_not_excuse(path, line):
+    # Only a whole entry on its own line in code counts as the moved copy.
+    (f,) = _scan(_MATRIX + _diff(path, ("", [line])), criteria=())
+    assert "`- tools/trivy-image-scan`" in f.message
+
+
+def test_a_script_step_entry_never_counts_as_moved():
+    ci = _diff(".gitlab-ci.yml", ("", [
+        "   script:",
+        "-    - ./ci/trivy-scan.sh",
+        "-    - ci/trivy-scan.sh",
+    ]))
+    copy = _diff("ci/runner.py", ("", ['+    "./ci/trivy-scan.sh",', '+    "ci/trivy-scan.sh",']))
+    (f,) = _scan(ci + copy, criteria=())
+    assert f.rule_name == "removed-verification-layer"
+    assert "ci/trivy-scan.sh" in f.message
 
 
 def test_lane_work_findings_runs_the_check():
