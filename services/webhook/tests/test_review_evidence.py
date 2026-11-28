@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from dataclasses import replace
 
 import httpx
 
@@ -83,6 +84,37 @@ def test_reviewer_and_judge_views_share_the_evidence_blocks():
     )
     assert any("src/c.py (UNCHANGED" in block for block in reviewer.blocks)
     assert any("src/c.py (UNCHANGED" in block for block in judge_view.blocks)
+
+
+def test_incremental_evidence_identifies_the_scope_of_the_whole_pr_intent():
+    full = _evidence()
+    delta = replace(full, pr_context={**full.pr_context, "incremental_diff": True})
+    scope = "Diff evidence: changes since the previous Elder review."
+
+    for view in (delta.reviewer_view(), delta.judge_view()):
+        assert scope in view.text
+        assert "The title and body describe the whole pull request." in view.text
+        assert "All callers must migrate" in view.text
+        assert "Review scope: all finding categories." in view.text
+    assert all(scope not in view.text for view in (full.reviewer_view(), full.judge_view()))
+
+
+def test_review_and_judge_require_contradiction_for_pr_wide_claims_on_a_delta():
+    full = _evidence()
+    delta = replace(full, pr_context={**full.pr_context, "incremental_diff": True})
+    finding = {**_FINDINGS[0], "rule_name": "unsupported-claim", "message": "Others did not migrate."}
+    guard = "For a PR-wide unsupported-claim, require a contradiction in the supplied evidence."
+
+    discovery = lc._build_messages(delta, "v2")[0]["content"]
+    adjudication = lc._build_judge_messages([finding], delta)[0]["content"]
+    for system in (discovery, adjudication):
+        assert guard in system
+        assert "An implementation absent from this delta may appear in an earlier commit." in system
+        assert "Claims added to changed code, docs, or tests still need supporting evidence." in system
+
+    assert guard not in lc._build_messages(full, "v2")[0]["content"]
+    assert guard not in lc._build_judge_messages([finding], full)[0]["content"]
+    assert guard not in lc._build_judge_messages(_FINDINGS, delta)[0]["content"]
 
 
 def test_reviewer_only_signals_stay_out_of_the_judge_view():

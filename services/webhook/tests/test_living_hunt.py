@@ -750,7 +750,10 @@ def _review_after_push(
     llm = LlmReviewResponse(
         kind="reviewed", findings=findings, backend_used=Backend.CAVE, model_name="coder",
     )
-    seen: dict = {"scoped": [], "full": [], "reviewed": [], "checks": [], "review_heads": []}
+    seen: dict = {
+        "scoped": [], "full": [], "reviewed": [], "checks": [],
+        "review_heads": [], "review_contexts": [],
+    }
 
     def _scoped(*_a, **k):
         seen["scoped"].append(k)
@@ -770,6 +773,7 @@ def _review_after_push(
             return LlmReviewResponse(kind="no_diff")
         seen["reviewed"].append({h.path for h in evidence.hunks})
         seen["review_heads"].append(evidence.pr_context["head_sha"])
+        seen["review_contexts"].append(dict(evidence.pr_context))
         return llm
 
     def _check(*a, **k):
@@ -820,6 +824,7 @@ def test_an_empty_commit_since_the_last_elder_head_reviews_the_full_pr(monkeypat
 
     assert seen["reviewed"] == [{"x.py"}]
     assert ("base5678ijkl", "abcd1234efgh") in seen["full"]
+    assert seen["review_contexts"][0]["incremental_diff"] is False
     final = seen["checks"][-1]
     assert final.conclusion == "success"
     assert "no_diff" not in final.title
@@ -850,6 +855,16 @@ def test_a_non_empty_delta_still_reviews_only_the_delta(monkeypatch):
     final = seen["checks"][-1]
     assert final.title.startswith("Living Hunt prior000..abcd1234")
     assert "reviewed the full PR diff on this head" not in final.summary
+
+
+def test_fixture_delta_retains_both_incremental_and_correctness_scope(monkeypatch):
+    delta = _added("tests/test_planner.py", ["assert plan() == expected"])
+    seen = _review_after_push(monkeypatch, delta=delta, full=delta + _ONE_HUNK)
+
+    assert seen["reviewed"] == [{"tests/test_planner.py"}]
+    context, = seen["review_contexts"]
+    assert context["incremental_diff"] is True
+    assert context["review_scope"] == "correctness findings only (documentation/tests change)"
 
 
 # --- #1730: an excluded metadata delta still needs a current-head review ---
