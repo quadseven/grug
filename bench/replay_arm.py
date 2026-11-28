@@ -37,6 +37,37 @@ MAX_REQUEST_TIMEOUT_SECONDS = 300
 # modest cushion in each arm instead of the live ceiling of 10, which crops it.
 REPLAY_MAX_COHORTS = 16
 
+# Cave maps generic JSON to a mode that can truncate multi-item replies
+# (#544). Use the same required-keys structure as the discovery schema.
+_CAVE_VERDICTS_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "judge_verdicts",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "verdicts": {
+                    "type": "array",
+                    "maxItems": 25,  # Both pinned reviewers use this judge batch size.
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer"},
+                            "is_real_bug": {"type": "boolean"},
+                            "confidence": {"type": "number"},
+                            "reasoning": {"type": "string"},
+                        },
+                        "required": ["index", "is_real_bug", "confidence", "reasoning"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["verdicts"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 class InvalidReplay(RuntimeError):
     """An invalid or incomplete run, with a safe public reason code."""
@@ -236,7 +267,7 @@ class FixedBackend:
         )
         batch = dict(config.extra_body)
         if schema_field == "verdicts":
-            batch.setdefault("response_format", {"type": "json_object"})
+            batch["response_format"] = _CAVE_VERDICTS_RESPONSE_FORMAT
         request = replace(self.backend, extra_body={**self.backend.extra_body, **batch})
         token = self.allowed.set(True)
         try:

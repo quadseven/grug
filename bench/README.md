@@ -24,6 +24,8 @@ PYTHONPATH=services/webhook:services/_shared \
 
 The runner alternates which revision reviews first, checks thermal admission before every case, and checks the guards after the final case. It exports both reviewer revisions and the scorer from their committed trees before starting the pair. Each arm performs staged Tier-1 discovery and applies its publication filters using the pinned PR snapshot. Both arms use the same model, empty-answer allowlist, and limit of 16 review cohorts per case. The largest frozen case uses 14 cohorts. The scorer grades only inline-eligible findings. Timings cover review and publication filtering within a worker. The historical score measures reviews by the deployed versions at the time, including queue and publication latency.
 
+Both arms request the same required-fields Cave verdict schema for grading and refutation.
+
 The per-request timeout defaults to 150 seconds. Set `GRUG_BENCH_TIMEOUT_SECONDS` to a number greater than 0 and at most 300 to override it for both arms. Each arm still has a 1,200-second limit.
 
 The output directory holds each revision's findings and scorer result. `comparison.json` includes the corpus and diff hashes, measured revisions, served model, request timeout, metrics, and candidate-minus-baseline deltas. An incomplete verdict, inconsistent served model, scorer exclusion, or thermal stop prevents publication of the comparison file.
